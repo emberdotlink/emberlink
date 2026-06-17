@@ -26,6 +26,7 @@
 //!
 //! Tracks **AP-CONSTRUCT-RECEIPT-ROLLUP-CLI** (/S).
 
+use core_event_types::ActionRef;
 use core_events::rollup::{
     ConstructInvocationRollup, RollupOutcome, RollupReceiptView, compute_rollups,
 };
@@ -57,6 +58,9 @@ pub struct RawReceipt {
     /// `gh.pr_create`).
     #[serde(default)]
     pub action: Option<String>,
+    /// Structured authority-side action identity when present on the receipt.
+    #[serde(default)]
+    pub action_ref: Option<ActionRef>,
     /// Process exit code from `session.construct_invocation`.
     #[serde(default)]
     pub exit_code: Option<i32>,
@@ -83,6 +87,9 @@ impl RollupReceiptView for RawReceipt {
     }
     fn action(&self) -> Option<&str> {
         self.action.as_deref()
+    }
+    fn action_ref(&self) -> Option<&ActionRef> {
+        self.action_ref.as_ref()
     }
     fn exit_code(&self) -> Option<i32> {
         self.exit_code
@@ -514,6 +521,7 @@ mod tests {
             receipt_hash: Some("blake3:abc".to_string()),
             persona: Some("dev".to_string()),
             action: None,
+            action_ref: None,
             exit_code: None,
             denied_reason: None,
         };
@@ -523,6 +531,7 @@ mod tests {
         assert_eq!(r.receipt_hash(), "blake3:abc");
         assert_eq!(r.persona(), Some("dev"));
         assert_eq!(r.action(), None);
+        assert_eq!(r.action_ref(), None);
         assert_eq!(r.exit_code(), None);
         assert_eq!(r.denied_reason(), None);
     }

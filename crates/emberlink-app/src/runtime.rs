@@ -14,12 +14,17 @@ use core_identity::{create_root, device_revoked_event, root_created_event, root_
 use core_personas::{create_persona, persona_created_event, persona_revoked_event};
 use core_principals::{PublicKeyMaterial, SurvivalMode};
 use core_state::IdentityAuthorizer;
-use core_types::ValidationError;
+use core_types::{Validate, ValidationError};
 
 use crate::backend::AppBackend;
 use crate::commands::UiAction;
 use crate::local_state::{LocalKeyEntry, LocalState};
 use crate::snapshot::{AppSnapshot, GrantDetailView};
+
+enum GrantOfferAuthority<'a> {
+    Shorthand(&'a [String]),
+    TypedStatements(&'a [core_grant_types::Statement]),
+}
 
 /// The shared application runtime.
 ///
@@ -165,7 +170,22 @@ impl<S: AppBackend> AppRuntime<S> {
             } => self.do_create_grant_offer(
                 &issuing_persona_id,
                 &mode,
-                &statement_specs,
+                GrantOfferAuthority::Shorthand(&statement_specs),
+                expires_in_secs,
+                relay_hint,
+                &conditions,
+            )?,
+            UiAction::CreateGrantOfferTyped {
+                issuing_persona_id,
+                mode,
+                statements,
+                expires_in_secs,
+                relay_hint,
+                conditions,
+            } => self.do_create_grant_offer(
+                &issuing_persona_id,
+                &mode,
+                GrantOfferAuthority::TypedStatements(&statements),
                 expires_in_secs,
                 relay_hint,
                 &conditions,
@@ -729,7 +749,7 @@ impl<S: AppBackend> AppRuntime<S> {
         &mut self,
         issuing_persona_id: &str,
         mode: &str,
-        statement_specs: &[String],
+        authority: GrantOfferAuthority<'_>,
         expires_in_secs: Option<u64>,
         relay_hint: Option<String>,
         conditions: &[core_grant_types::grant_conditions::GrantCondition],
@@ -751,12 +771,34 @@ impl<S: AppBackend> AppRuntime<S> {
         // Validate mode
         let grant_mode = GrantMode::parse(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
 
-        // Validate every spec parses into a Statement before minting the offer.
-        let _parsed_stmts: Vec<core_grant_types::Statement> = statement_specs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| parse_statement_spec(s, i))
-            .collect::<Result<Vec<_>, _>>()?;
+        let authority_payload = match authority {
+            GrantOfferAuthority::Shorthand(statement_specs) => {
+                // Validate every spec parses into a Statement before minting the offer.
+                let _parsed_stmts: Vec<core_grant_types::Statement> = statement_specs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| parse_statement_spec(s, i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                serde_json::json!({
+                    "authority_format": "statement_specs_v1",
+                    "statement_specs": statement_specs,
+                })
+            }
+            GrantOfferAuthority::TypedStatements(statements) => {
+                if statements.is_empty() {
+                    return Err("typed grant offer must include at least one statement".to_string());
+                }
+                for (index, statement) in statements.iter().enumerate() {
+                    statement
+                        .validate()
+                        .map_err(|err| format!("typed statement {} invalid: {err}", index + 1))?;
+                }
+                serde_json::json!({
+                    "authority_format": "typed_statement_v1",
+                    "statements": statements,
+                })
+            }
+        };
 
         // Look up the persona's root so we can find the signing key
         let persona = self
@@ -791,12 +833,20 @@ impl<S: AppBackend> AppRuntime<S> {
         let eph = generate_ephemeral_keypair();
 
         // Build sealed payload: JSON of grant parameters
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "mode": grant_mode.as_str(),
-            "statement_specs": statement_specs,
             "issuer_persona_id": issuing_persona_id,
             "expires_at": expires_at,
         });
+        let payload_obj = payload
+            .as_object_mut()
+            .ok_or_else(|| "grant offer payload must be a JSON object".to_string())?;
+        let authority_obj = authority_payload
+            .as_object()
+            .ok_or_else(|| "grant offer authority payload must be a JSON object".to_string())?;
+        for (key, value) in authority_obj {
+            payload_obj.insert(key.clone(), value.clone());
+        }
         let payload_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
         let sealed_hex =
             seal_grant_payload(&eph.public_key_age, &payload_bytes).map_err(|e| e.to_string())?;
@@ -813,6 +863,7 @@ impl<S: AppBackend> AppRuntime<S> {
             expires_at,
             relay_hint.as_deref(),
             issuing_persona_id,
+            &persona_entry.key_pair.public_key,
             "",
         );
         let signature = signer.sign(&link_signing_payload);
@@ -857,11 +908,14 @@ impl<S: AppBackend> AppRuntime<S> {
         // Build the grant link
         let grant_link = GrantLink {
             offer_id: offer_id.clone(),
-            ephemeral_public_key_hex: eph.public_key_hex,
+            // `eph` is an EphemeralKeyPair (ZeroizeOnDrop, #5078) → cannot move
+            // its fields out; clone the public hex (non-secret).
+            ephemeral_public_key_hex: eph.public_key_hex.clone(),
             expires_at,
             issuer_signature: signature.0,
             relay_hint,
             issuer_persona_id: issuing_persona_id.to_string(),
+            issuer_public_key_hex: persona_entry.key_pair.public_key.clone(),
             recipient_pubkey_hex: String::new(),
         };
 
@@ -870,7 +924,8 @@ impl<S: AppBackend> AppRuntime<S> {
             offer_id.clone(),
             crate::local_state::EphemeralKeyEntry {
                 offer_id: offer_id.clone(),
-                private_key_age: eph.private_key_age,
+                // EphemeralKeyPair is ZeroizeOnDrop (#5078) → clone, don't move.
+                private_key_age: eph.private_key_age.clone(),
                 expires_at,
             },
         );
@@ -1004,15 +1059,6 @@ impl<S: AppBackend> AppRuntime<S> {
             .unwrap_or("")
             .to_string();
 
-        let signing_payload = GrantLink::signing_payload(
-            &offer_id,
-            &ek_hex,
-            expires_at,
-            None,
-            &stored_issuer_persona_id,
-            "",
-        );
-
         if let Some(ref offer_view) = offer_event {
             // Look up the issuer persona's public key from the event log.
             let issuer_pid = &offer_view.issuer_persona_id;
@@ -1031,6 +1077,15 @@ impl<S: AppBackend> AppRuntime<S> {
                     .or_else(|| self.local_state.keys.get(&persona.root_id))
                     .map(|entry| entry.key_pair.public_key.clone());
                 if let Some(pk_hex) = pub_key_hex {
+                    let signing_payload = GrantLink::signing_payload(
+                        &offer_id,
+                        &ek_hex,
+                        expires_at,
+                        None,
+                        &stored_issuer_persona_id,
+                        &pk_hex,
+                        "",
+                    );
                     let verified = Ed25519Verifier.verify(
                         &PublicKey(pk_hex),
                         &signing_payload,
@@ -1811,6 +1866,7 @@ fn parse_statement_spec(s: &str, index: usize) -> Result<core_grant_types::State
             budget: None,
             usage: Usage::default(),
             conditions: Vec::<Condition>::new(),
+            can_delegate: None,
         }
     }
 
@@ -1891,7 +1947,23 @@ fn append_event<S: AppBackend>(
     signer_binding: SignerBinding,
     signer: &impl Signer,
 ) -> Result<(), ValidationError> {
-    let event = EventEnvelope::from_body(event_id, body, Vec::new(), signer_binding, signer)?;
+    // Thread the per-root chain `Previous` ref so core-eventlog's `check_chain`
+    // accepts the event. The first event under a root (genesis `RootCreated`, or
+    // any body whose `root_id()` is `None`) carries no `Previous` ref; every
+    // subsequent event references the current chain head with `seq = head + 1`.
+    // Mirrors `EventRef::previous(head_event_id, head_seq + 1)` — the canonical
+    // chain-next computation in core-eventlog.
+    let refs = body
+        .root_id()
+        .and_then(|root_id| store.materialized().root_chain_heads.get(root_id))
+        .map(|(head_event_id, head_seq)| {
+            vec![core_events::EventRef::previous(
+                head_event_id.clone(),
+                head_seq + 1,
+            )]
+        })
+        .unwrap_or_default();
+    let event = EventEnvelope::from_body(event_id, body, refs, signer_binding, signer)?;
     store.append_with_authorizer(
         event,
         &Ed25519Verifier,
@@ -2410,6 +2482,73 @@ mod tests {
         assert_eq!(claim["grant_mode"].as_str().unwrap(), "one_shot");
     }
 
+    #[test]
+    fn typed_grant_offer_seals_typed_statements() {
+        use core_grant_types::{ResourceSelector, ResourceType, Statement, Usage};
+
+        let mut rt = memory_runtime();
+        let (init, _) = rt
+            .handle_action(UiAction::Init {
+                name: "Alice".into(),
+                device_label: "Laptop".into(),
+                persona_label: "Default".into(),
+            })
+            .unwrap();
+        let persona_id = init["persona_id"].as_str().unwrap().to_string();
+        let root_id = rt
+            .store
+            .materialized()
+            .personas_current
+            .get(&persona_id)
+            .unwrap()
+            .root_id
+            .clone();
+
+        let (offer, _) = rt
+            .handle_action(UiAction::CreateGrantOfferTyped {
+                issuing_persona_id: persona_id,
+                mode: "one_shot".into(),
+                statements: vec![Statement {
+                    sid: "guardian-enroll".into(),
+                    resource_type: ResourceType::Recovery,
+                    actions: vec!["recovery:guardian:enroll".into()],
+                    resource: ResourceSelector::Exact {
+                        value: root_id.clone(),
+                    },
+                    budget: None,
+                    usage: Usage::default(),
+                    conditions: Vec::new(),
+                    can_delegate: None,
+                }],
+                expires_in_secs: Some(86400),
+                relay_hint: None,
+                conditions: Vec::new(),
+            })
+            .unwrap();
+        let offer_id = offer["offer_id"].as_str().unwrap();
+        let sealed_payload_hex = offer["sealed_payload_hex"].as_str().unwrap();
+        let private_key_age = rt
+            .local_state
+            .ephemeral_keys
+            .get(offer_id)
+            .unwrap()
+            .private_key_age
+            .clone();
+        let plaintext = core_crypto::unseal_grant_payload(&private_key_age, sealed_payload_hex)
+            .expect("typed offer payload unseals");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&plaintext).expect("payload parses");
+
+        assert_eq!(payload["authority_format"], "typed_statement_v1");
+        assert!(payload.get("statement_specs").is_none());
+        assert_eq!(payload["statements"][0]["resource_type"], "recovery");
+        assert_eq!(
+            payload["statements"][0]["actions"][0],
+            "recovery:guardian:enroll"
+        );
+        assert_eq!(payload["statements"][0]["resource"]["value"], root_id);
+    }
+
     /// Existing-user claim flow — claimant already has two personas;
     /// they select one to claim with. Uses cross-runtime scenario.
     #[test]
@@ -2779,32 +2918,34 @@ mod tests {
     /// unknown variant must cause claim to fail closed — no GrantClaimed event
     /// is written and the offer remains Pending.
     ///
-    /// Setup: inject a GrantOfferCreated event with a hostile conditions_json
-    /// directly into the MemoryEventLog (bypassing normal offer creation).
-    /// MemoryEventLog::append uses AllowAllAuthorizer, so the event is accepted
-    /// even though the signer is a fixture key unrelated to any real identity.
-    /// The FixtureVerifier verifies FixtureSigner signatures, satisfying the
-    /// EventLog::append signature-check invariant.
+    /// Defense-in-depth: a `GrantOfferCreated` event carrying malformed
+    /// `conditions_json` is refused at the ingestion/materialize layer
+    /// (`core-eventlog` `materialize.rs`), so a hostile offer can never reach
+    /// materialized state — even when appended directly through
+    /// `MemoryEventLog::append` (which uses an AllowAll authorizer). This pins
+    /// the stronger, earlier guard that makes the stored-malformed-offer attack
+    /// structurally unreachable; the claim-time GC-H2 fail-closed parser is
+    /// covered separately by `malformed_conditions_json_aborts_claim`.
+    ///
+    /// (Supersedes the former `claim_rejects_malformed_conditions_json`, whose
+    /// inject-then-claim setup is no longer possible now that ingestion
+    /// validates `conditions_json`.)
     #[test]
-    fn claim_rejects_malformed_conditions_json() {
+    fn malformed_conditions_json_rejected_at_ingestion() {
         use core_crypto::{FixtureSigner, FixtureVerifier};
 
-        // Real identity so the claim path has a persona + local signing key.
         let mut rt = memory_runtime();
-        let (init, _) = rt
-            .handle_action(UiAction::Init {
-                name: "Alice".into(),
-                device_label: "Laptop".into(),
-                persona_label: "Default".into(),
-            })
-            .unwrap();
-        let claiming_persona_id = init["persona_id"].as_str().unwrap().to_string();
+        rt.handle_action(UiAction::Init {
+            name: "Alice".into(),
+            device_label: "Laptop".into(),
+            persona_label: "Default".into(),
+        })
+        .unwrap();
 
-        // Inject a GrantOfferCreated event with malformed conditions_json.
-        // The issuer_persona_id is deliberately fake — no matching persona in
-        // personas_current, so the issuer-signature check at claim step 3 is
-        // skipped. The conditions_json check (step 5b) fires before any event
-        // write, so this is the only part of the claim that matters here.
+        // A GrantOfferCreated event with an unknown conditions variant. The
+        // signer/issuer are deliberately fake; the FixtureVerifier satisfies the
+        // signature-check invariant so the only thing under test is the
+        // ingestion-layer conditions_json validation.
         let offer_id = "offer-gc-h2-test";
         let ek_hex = "aa".repeat(32); // 64-char hex — valid X25519 length
         let event = EventEnvelope::from_body(
@@ -2813,7 +2954,7 @@ mod tests {
                 core_event_types::GrantOfferCreatedEvent {
                     offer_id: offer_id.into(),
                     issuer_persona_id: "fake-issuer".into(),
-                    ephemeral_public_key_hex: ek_hex.clone(),
+                    ephemeral_public_key_hex: ek_hex,
                     sealed_payload_hex: "deadbeef".into(),
                     relay_hint: None,
                     expires_at: 9_999_999_999,
@@ -2825,66 +2966,27 @@ mod tests {
             &FixtureSigner::new("fake-key"),
         )
         .unwrap();
-        rt.store
-            .append(event, &FixtureVerifier)
-            .expect("inject malformed-conditions offer into store");
 
-        // Verify the offer landed in materialized state with the hostile JSON.
+        // Ingestion must refuse the malformed conditions_json regardless of the
+        // AllowAll authorizer used by MemoryEventLog::append.
+        let err = rt
+            .store
+            .append(event, &FixtureVerifier)
+            .expect_err("malformed conditions_json must be rejected at ingestion");
+        assert!(
+            err.to_string()
+                .contains("conditions_json is not valid JSON"),
+            "expected an ingestion-layer conditions_json rejection, got: {err}"
+        );
+
+        // The hostile offer must never reach materialized state.
         assert!(
             rt.store
                 .materialized()
                 .grant_offers_current
                 .get(offer_id)
-                .map(|o| o.conditions_json.contains("future_variant"))
-                .unwrap_or(false),
-            "offer with malformed conditions_json must be in materialized state"
-        );
-
-        // Build a SealedOffer QR referencing our injected offer.
-        // issuer_signature must be non-empty to pass the early empty-sig guard
-        // (claim step 3); any non-empty string is accepted because the fake
-        // issuer persona is absent from personas_current.
-        let sealed = SealedOffer {
-            offer_id: offer_id.into(),
-            ephemeral_public_key_hex: ek_hex,
-            sealed_payload_hex: "deadbeef".into(),
-            expires_at: 9_999_999_999,
-            issuer_signature: "fakesig".into(),
-        };
-        let qr = match encode_sealed_offer(&sealed) {
-            Ok(q) => q,
-            Err(_) => return, // skip if payload too large for QR encoding
-        };
-
-        // Attempt to claim — must return Err with a GC-H2 fail-closed message.
-        let err = rt
-            .handle_action(UiAction::ClaimGrantOffer {
-                link_url: qr,
-                claiming_persona_id: Some(claiming_persona_id),
-                new_user_name: None,
-            })
-            .unwrap_err();
-
-        assert!(
-            err.contains("unrecognised") || err.contains("GC-H2") || err.contains("malformed"),
-            "expected GC-H2 fail-closed error, got: {err}"
-        );
-
-        // No GrantClaimed event was written — offer must still be Pending.
-        let offer_after = rt
-            .store
-            .materialized()
-            .grant_offers_current
-            .get(offer_id)
-            .expect("offer must still exist after failed claim");
-        assert_eq!(
-            offer_after.status,
-            core_eventlog::GrantOfferStatus::Pending,
-            "offer status must remain Pending after fail-closed conditions rejection"
-        );
-        assert!(
-            offer_after.recipient_persona_id.is_none(),
-            "offer must not have a recipient after fail-closed rejection"
+                .is_none(),
+            "malformed offer must not be materialized"
         );
     }
 

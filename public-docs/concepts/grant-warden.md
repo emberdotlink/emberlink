@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `README.md`, `CONTEXT.md`, `docs/current-architecture.md`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # The Grant Warden Model
 
 Most agent systems hand a process a raw token, a broad OAuth scope, or an
@@ -36,4 +36,3 @@ The point is not only secret storage. The point is:
 
 For the current operator command contract around that model, see
 [Grants and approvals](../reference/grants-and-approvals/).
-

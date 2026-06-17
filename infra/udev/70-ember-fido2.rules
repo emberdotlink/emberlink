@@ -1,3 +1,4 @@
+# CLASSIFICATION: PUBLIC
 # 70-ember-fido2.rules — udev rules granting non-root access to FIDO2/U2F
 # hardware security keys for ember processes.
 #

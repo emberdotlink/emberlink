@@ -130,4 +130,21 @@ regexes = [
   #        is 14 chars total and uses ASCII-word characters that
   #        cannot encode the random bytes a real token carries.
   '''hvs\.child-rev-1''',
+
+  # ──────────────────────────────────────────────────────────────────
+  # Public construct action-manifest identifier false positives
+  # ──────────────────────────────────────────────────────────────────
+  # Files:
+  #   crates/ember-construct/construct/aws.toml
+  #   crates/ember-construct/construct/flyctl.toml
+  #   crates/ember-construct/construct/wrangler.toml
+  # Capture: action `key` values in public construct manifests.
+  # Why safe: these are stable action identifiers, not credentials. The
+  #        regexes enumerate the exact values currently flagged by
+  #        gitleaks's generic-api-key rule, so a real token elsewhere in
+  #        the manifest still fails the public sync gate.
+  '''aws\.s3api\.put-bucket-policy''',
+  '''aws\.ec2\.modify-instance-attribute''',
+  '''fly\.ips\.allocate-v[46]''',
+  '''wrangler\.d1\.execute''',
 ]

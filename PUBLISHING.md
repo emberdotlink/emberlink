@@ -18,5 +18,5 @@ There is typically a 1–3 business-day delay between PR acceptance and the
 synced commit appearing here. Your PR will be closed with a link to that
 commit.
 
-For contribution guidelines, see CONTRIBUTING.md. For
+For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md). For
 security reports, see [SECURITY.md](SECURITY.md).

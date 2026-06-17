@@ -1,8 +1,8 @@
-//! `ember trust restore --from <path>` — decrypt + write back the
-//! operator-IR + dev-IR private seeds from a backup file produced by
-//! `ember trust backup`.
+//! `ember trust restore --from <path>` — decrypt + write back exportable
+//! keychain-held operator/workstation Durable Persona seeds from a
+//! backup file produced by `ember trust backup`.
 //!
-//! Per design §Component 4 and implementation-note-32.
+//! Per design §Component 4 and implementation-note-34.
 //!
 //! ## Flow
 //!
@@ -13,11 +13,11 @@
 //! 4. Render the embedded metadata (hostname + created_at + daemon
 //!    mode + operator pubkey) so the operator sees context before
 //!    biometric.
-//! 5. Touch ID confirmation: "Restore IRs from backup created on
-//!    `<hostname>` on `<date>`. Proceed?"
-//! 6. If Keychain already holds an operator-ir / dev-ir entry, ask
-//!    a second confirmation before overwrite.
-//! 7. Write the seeds to Keychain at the canonical labels.
+//! 5. Touch ID confirmation: "Restore operator authority from backup
+//!    created on `<hostname>` on `<date>`. Proceed?"
+//! 6. If Keychain already holds an operator-role or workstation
+//!    Durable Persona entry, ask a second confirmation before overwrite.
+//! 7. Write the seeds to Keychain at the design target-state labels.
 //! 8. Caller emits the daemon-side `trust.restore` Receipt.
 //!
 //! ## Portability
@@ -88,10 +88,12 @@ pub struct RestoreOutcome {
     pub source_created_at: String,
     /// Daemon posture at backup time (`"prod"` / `"dev"`).
     pub source_daemon_mode: String,
-    /// Operator IR pubkey hex (32-byte raw). Restating it lets the
-    /// audit pair the restore Receipt back to the IR it just enrolled.
+    /// Operator-role Durable Persona pubkey hex (32-byte raw).
+    /// Restating it lets the audit pair the restore Receipt back to
+    /// the signing Principal it just enrolled.
     pub operator_pubkey_hex: String,
-    /// Whether dev IR was restored alongside operator IR.
+    /// Whether the workstation Durable Persona was restored alongside
+    /// the operator-role Durable Persona.
     pub restored_dev_ir: bool,
     /// Whether the Touch ID prompt fired.
     pub biometric_verified: bool,
@@ -100,7 +102,10 @@ pub struct RestoreOutcome {
 /// Read the backup file at `from` and decrypt it. Pure helper — kept
 /// separate from the I/O orchestration so tests can drive it on
 /// in-memory blobs.
-pub fn decrypt_backup_file(from: &Path, passphrase: &str) -> Result<BackupEnvelope, TrustRestoreError> {
+pub fn decrypt_backup_file(
+    from: &Path,
+    passphrase: &str,
+) -> Result<BackupEnvelope, TrustRestoreError> {
     let blob = std::fs::read(from).map_err(|e| TrustRestoreError::ReadFile {
         path: from.to_path_buf(),
         source: e,
@@ -118,7 +123,7 @@ pub fn render_restore_preview(envelope: &BackupEnvelope) -> String {
         "yes"
     };
     format!(
-        "Backup metadata:\n  Hostname:      {}\n  Created at:    {}\n  Daemon mode:   {}\n  Operator IR:   {}\n  Includes dev IR: {}\n",
+        "Backup metadata:\n  Hostname:                     {}\n  Created at:                   {}\n  Daemon mode:                  {}\n  Operator-role Persona pubkey: {}\n  Includes workstation Persona: {}\n",
         envelope.metadata.hostname,
         envelope.metadata.created_at,
         envelope.metadata.daemon_mode,
@@ -166,9 +171,7 @@ fn keychain_entry_exists(label: &str) -> Result<bool, TrustRestoreError> {
     match entry.get_password() {
         Ok(_) => Ok(true),
         Err(keyring_core::Error::NoEntry) => Ok(false),
-        Err(e) => Err(TrustRestoreError::Keychain(format!(
-            "probe {label}: {e}"
-        ))),
+        Err(e) => Err(TrustRestoreError::Keychain(format!("probe {label}: {e}"))),
     }
 }
 
@@ -201,7 +204,7 @@ pub fn run_restore(from: &Path, no_biometric: bool) -> Result<RestoreOutcome, Tr
     // 4. Biometric confirmation.
     let biometric_outcome = require_biometric(
         &format!(
-            "Restore IRs from backup created on {} on {}. Proceed?",
+            "Restore operator authority from backup created on {} on {}. Proceed?",
             envelope.metadata.hostname, envelope.metadata.created_at
         ),
         no_biometric,
@@ -209,21 +212,19 @@ pub fn run_restore(from: &Path, no_biometric: bool) -> Result<RestoreOutcome, Tr
     .map_err(|e: BiometricError| TrustRestoreError::Biometric(e.to_string()))?;
     let biometric_verified = matches!(biometric_outcome, BiometricOutcome::Verified { .. });
 
-    // 5. Overwrite-existing check. Both Keychain entries probed
-    //    independently so a partial state still gets the prompt.
+    // 5. Overwrite-existing check. Both target-state Keychain entries
+    //    are probed independently so a partial state still gets the prompt.
     let operator_exists = keychain_entry_exists(OPERATOR_IR_KEYCHAIN_LABEL)?;
     let dev_exists = keychain_entry_exists(DEV_IR_KEYCHAIN_LABEL)?;
     let dev_present = !envelope.dev_ir_seed.is_empty();
     if operator_exists || (dev_exists && dev_present) {
-        let confirmed = confirm_yes_no(
-            "Existing Keychain entries will be overwritten. Continue?",
-        )?;
+        let confirmed = confirm_yes_no("Existing Keychain entries will be overwritten. Continue?")?;
         if !confirmed {
             return Err(TrustRestoreError::OperatorDeclinedOverwrite);
         }
     }
 
-    // 6. Write operator IR (always present in a valid envelope).
+    // 6. Write operator-role Durable Persona (always present in a valid envelope).
     if envelope.operator_ir_seed.len() != 32 {
         return Err(TrustRestoreError::Open(BackupError::Cbor(format!(
             "operator_ir_seed length {} (expected 32)",
@@ -232,7 +233,7 @@ pub fn run_restore(from: &Path, no_biometric: bool) -> Result<RestoreOutcome, Tr
     }
     write_seed_to_keychain(OPERATOR_IR_KEYCHAIN_LABEL, &envelope.operator_ir_seed)?;
 
-    // 7. Write dev IR when present in the envelope.
+    // 7. Write workstation Durable Persona when present in the envelope.
     let restored_dev_ir = dev_present;
     if restored_dev_ir {
         if envelope.dev_ir_seed.len() != 32 {
@@ -259,7 +260,7 @@ pub fn run_restore(from: &Path, no_biometric: bool) -> Result<RestoreOutcome, Tr
 /// Format the restore outcome for stdout.
 pub fn render_outcome(outcome: &RestoreOutcome) -> String {
     format!(
-        "Trust restore complete:\n  Source path:       {}\n  Source path hash:  {}\n  Source hostname:   {}\n  Source created at: {}\n  Source daemon mode: {}\n  Operator IR:       {}\n  Restored dev IR:   {}\n  Biometric verified: {}\n",
+        "Trust restore complete:\n  Source path:                   {}\n  Source path hash:              {}\n  Source hostname:               {}\n  Source created at:             {}\n  Source daemon mode:            {}\n  Operator-role Persona pubkey:  {}\n  Restored workstation Persona:  {}\n  Biometric verified:            {}\n",
         outcome.read_from.display(),
         outcome.path_hash_hex,
         outcome.source_hostname,
@@ -363,20 +364,20 @@ mod tests {
     fn preview_renders_metadata_fields() {
         let env = envelope_fixture();
         let s = render_restore_preview(&env);
-        assert!(s.contains("Hostname:      source-mac.local"));
-        assert!(s.contains("Created at:    2026-05-21T12:00:00Z"));
-        assert!(s.contains("Daemon mode:   prod"));
+        assert!(s.contains("Hostname:                     source-mac.local"));
+        assert!(s.contains("Created at:                   2026-05-21T12:00:00Z"));
+        assert!(s.contains("Daemon mode:                  prod"));
         assert!(s.contains(&"cc".repeat(32)));
-        assert!(s.contains("Includes dev IR: yes"));
+        assert!(s.contains("Includes workstation Persona: yes"));
     }
 
-    /// Empty dev IR seed renders "no" in the preview.
+    /// Empty workstation seed renders "no" in the preview.
     #[test]
     fn preview_renders_no_dev_ir_when_absent() {
         let mut env = envelope_fixture();
         env.dev_ir_seed = Vec::new();
         let s = render_restore_preview(&env);
-        assert!(s.contains("Includes dev IR: no"));
+        assert!(s.contains("Includes workstation Persona: no"));
     }
 
     /// `render_outcome` block contains the canonical fields. Smoke
@@ -397,9 +398,9 @@ mod tests {
         assert!(s.contains("Trust restore complete:"));
         assert!(s.contains("Source path:"));
         assert!(s.contains("Source path hash:"));
-        assert!(s.contains("Source hostname:   from-host"));
-        assert!(s.contains("Source daemon mode: dev"));
-        assert!(s.contains("Restored dev IR:   true"));
+        assert!(s.contains("Source hostname:               from-host"));
+        assert!(s.contains("Source daemon mode:            dev"));
+        assert!(s.contains("Restored workstation Persona:  true"));
         assert!(s.contains(&"dd".repeat(32)));
         assert!(s.contains(&"ee".repeat(32)));
     }

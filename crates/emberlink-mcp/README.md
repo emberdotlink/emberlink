@@ -1,5 +1,6 @@
 # emberlink-mcp
 
+
 MCP server for Emberlink's daemon-backed authority surface. It speaks
 JSON-RPC 2.0 over stdio and is an MCP-shaped client of the local daemon, not a
 second trust root.
@@ -31,7 +32,7 @@ emberlink-mcp [OPTIONS]
 |---|---|---|
 | `--persona <ID>` | `default` | Persona ID to operate as |
 | `--label <LABEL>` | `emberlink-mcp` | Human-readable label for this MCP server |
-| `--daemon-socket <PATH>` | `$HOME/.ember/run/daemon.sock` | Path to the local daemon Unix socket |
+| `--daemon-socket <PATH>` | platform default | Path to the local daemon Unix socket |
 | `--db <PATH>` | in-memory | Optional local EventStore path retained for compatibility/tests; daemon-backed grant flows do not require it |
 | `--no-daemon` | off | Disable daemon transport and run fail-closed for daemon-backed tools |
 
@@ -43,13 +44,16 @@ emberlink-mcp [OPTIONS]
     "ember": {
       "command": "emberlink-mcp",
       "args": [
-        "--persona", "my-agent-persona",
-        "--daemon-socket", "${HOME}/.ember/run/daemon.sock"
+        "--persona", "my-agent-persona"
       ]
     }
   }
 }
 ```
+
+Override `--daemon-socket` only for non-standard installs. The default follows
+the installed daemon's OS system socket (`/Library/Application Support/Emberlink/run/daemon.sock`
+on macOS, `/run/ember/daemon.sock` on Linux).
 
 ## Tools
 

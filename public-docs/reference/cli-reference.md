@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Supported**.
-> Source truth: `docs/cli-reference.md`, `QUICKSTART.md`, `docs/current-architecture.md`.
+> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
+
 # CLI Reference
 
 The current public Ember CLI contract is intentionally narrower than the full
@@ -16,6 +16,14 @@ Everything else should support that journey, not compete with it.
 
 For the core delegated-authority surface beyond that top-level flow, see
 [Grants and approvals](./grants-and-approvals/).
+
+## Start here first
+
+If you are new to Ember, remember these three commands before anything else:
+
+- `ember init --for claude`
+- `ember status`
+- `ember claude`
 
 ## Primary commands
 
@@ -32,16 +40,32 @@ These commands define the current public-friendly operator surface:
 - `ember audit ...`
 - `ember version`
 
+## Repair and setup commands
+
+These are still supported, but they exist to repair or extend the main
+journey:
+
+- `ember daemon ...` for install, reload, and repair
+- `ember github ...` for GitHub App setup and GitHub authority posture
+- `ember trust ...` for trust and verification-chain inspection
+
+If the main path is unhealthy, the usual order is:
+
+```bash
+ember status
+ember status --troubleshoot
+sudo ember daemon install
+ember github status --json
+ember github setup
+```
+
 ## Advanced but supported commands
 
 These are real supported surfaces, but they are task-specific rather than the
 headline journey:
 
-- `ember daemon ...` for install, reload, and repair
 - `ember persona ...` for advanced persona management
 - `ember config ...` for resolved-config inspection
-- `ember github ...` for GitHub App setup and GitHub authority posture
-- `ember trust ...` for trust and verification-chain inspection
 - `ember sandbox ...` for managed isolated execution
 
 ## Real but still preview commands

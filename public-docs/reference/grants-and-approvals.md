@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Supported**.
-> Source truth: `docs/cli-reference.md`, `docs/current-architecture.md`.
+> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
+
 # Grants and Approvals
 
 Emberlink's core product surface is delegated authority.
@@ -85,4 +85,3 @@ local operator surface documented here.
 - [The Grant Warden Model](../concepts/grant-warden/)
 - [Receipts and audit](../concepts/receipts-and-audit/)
 - [CLI reference](./cli-reference/)
-

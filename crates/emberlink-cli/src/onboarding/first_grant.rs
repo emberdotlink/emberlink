@@ -1,11 +1,12 @@
+//! CLASSIFICATION: PUBLIC
 //! First-grant walkthrough — the closing step of `ember init` that converts
 //! every install into a witness of the wedge artifact (Grant Receipt).
 //!
-//! EMBER-INIT-FIRST-implementation-note-510 (v1, tips-only):
+//! EMBER-INIT-FIRST-implementation-note-443 (v1, tips-only):
 //! Prints an educational three-step tutorial pointing the user at daemon
 //! startup, grant issuance, and Receipt inspection.
 //!
-//! EMBER-INIT-FIRST-implementation-note-467 (v2, real signed Receipt):
+//! EMBER-INIT-FIRST-implementation-note-444 (v2, real signed Receipt):
 //! Issues a 60-second illustrative grant from the root persona to a fake
 //! local agent persona ("first-grant-tutorial"), immediately revokes it,
 //! signs the resulting Grant Receipt v2 envelope with the root persona's
@@ -14,7 +15,7 @@
 //!
 //! The checkpoint `init_first_grant_receipt_emit` is embedded as a constant
 //! so the headless ranker can grep for it as the shipped-state indicator
-//! of EMBER-INIT-FIRST-implementation-note-467.
+//! of EMBER-INIT-FIRST-implementation-note-444.
 //!
 //! Idempotency: presence of `<data_dir>/receipts/first.json` suppresses
 //! re-emission on subsequent `ember init` calls — the file-exists check
@@ -39,13 +40,13 @@ pub const TIPS_SHOWN_SENTINEL: &str = ".first-grant-tips-shown";
 
 /// `init_first_grant_walkthrough` — the literal checkpoint string the
 /// headless ranker greps for to detect the shipped state of
-/// EMBER-INIT-FIRST-implementation-note-510. Embedded as a constant so a code
+/// EMBER-INIT-FIRST-implementation-note-443. Embedded as a constant so a code
 /// reader sees it explicitly and the `target_state_anchor` value in
 /// `release-checklist` matches against the binary's strings.
 pub const INIT_FIRST_GRANT_WALKTHROUGH_SENTINEL: &str = "init_first_grant_walkthrough";
 
 /// `init_first_grant_receipt_emit` — headless ranker checkpoint for
-/// EMBER-INIT-FIRST-implementation-note-467. Presence in this source file
+/// EMBER-INIT-FIRST-implementation-note-444. Presence in this source file
 /// marks the v2 receipt-emit path as shipped.
 pub const INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL: &str = "init_first_grant_receipt_emit";
 
@@ -86,22 +87,15 @@ pub fn short_circuit_first_grant_receipt_emit(data_dir: &Path) -> Option<PathBuf
     }
 
     if receipt_path.exists() {
-        println!(
-            "note: first-grant Receipt already written - see {}",
-            receipt_path.display()
-        );
         return Some(receipt_path);
     }
 
     None
 }
 
-/// Persist a pre-built first-grant receipt file to `<data_dir>/receipts/first.json`
-/// and print the operator-facing summary block.
+/// Persist a pre-built first-grant receipt file to `<data_dir>/receipts/first.json`.
 pub fn write_first_grant_receipt_file(
     data_dir: &Path,
-    persona_id: &str,
-    persona_public_key: &str,
     file: &FirstGrantReceiptFile,
 ) -> Result<PathBuf, EmitError> {
     let receipt_path = first_receipt_path(data_dir);
@@ -110,40 +104,8 @@ pub fn write_first_grant_receipt_file(
         fs::create_dir_all(parent)?;
     }
 
-    let sig_prefix = file
-        .receipt
-        .signature
-        .clone()
-        .as_deref()
-        .and_then(|s| s.get(..24))
-        .unwrap_or("")
-        .to_string();
-
     let file_json = serde_json::to_string_pretty(file)?;
     fs::write(&receipt_path, file_json.as_bytes())?;
-
-    println!();
-    println!("-- First Grant Receipt --");
-    println!();
-    println!("  Receipt:  {}", receipt_path.display());
-    println!("  Issuer:   did:ember:persona:{persona_id}");
-    println!(
-        "  Pubkey:   {}",
-        &persona_public_key[..persona_public_key.len().min(20)]
-    );
-    println!("  Sig:      {sig_prefix}...");
-    println!(
-        "  Hash:     {}",
-        &file.evidence.hash[..file.evidence.hash.len().min(28)]
-    );
-    println!();
-    println!("Share this with anyone - they can verify your signature offline.");
-    println!(
-        "  ember receipt verify {} --pubkey <your-pubkey-hex>",
-        receipt_path.display()
-    );
-    println!();
-    println!("  ({})", INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL);
 
     Ok(receipt_path)
 }
@@ -163,13 +125,11 @@ pub fn write_first_grant_receipt_file(
 /// environment the function returns `Ok(path)` immediately without writing
 /// anything (non-interactive / CI path).
 ///
-/// Prints the receipt path, issuer DID, the first 16 chars of the
-/// signature, and the canonical checkpoint line:
-/// `"init_first_grant_receipt_emit"`.
+/// Returns the written path. Human-facing rendering lives at the CLI layer.
 pub fn emit_first_grant_receipt(
     data_dir: &Path,
     persona_id: &str,
-    persona_public_key: &str,
+    _persona_public_key: &str,
     signer: &dyn Signer,
 ) -> Result<PathBuf, EmitError> {
     if let Some(receipt_path) = short_circuit_first_grant_receipt_emit(data_dir) {
@@ -177,7 +137,7 @@ pub fn emit_first_grant_receipt(
     }
 
     let file = build_first_grant_receipt_file(persona_id, signer)?;
-    write_first_grant_receipt_file(data_dir, persona_id, persona_public_key, &file)
+    write_first_grant_receipt_file(data_dir, &file)
 }
 
 /// Path to the checkpoint file under the operator's data directory.

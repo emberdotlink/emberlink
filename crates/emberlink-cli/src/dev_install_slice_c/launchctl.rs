@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! design Phase 4 steps 9 + 10: render plist + launchctl bootstrap.
 //!
@@ -50,8 +51,11 @@ fn install_and_bootstrap_with_paths(
         stderr_path: runtime.stderr_log_path.display().to_string(),
     };
     let rendered = render_plist(&vars);
-    let staged_path =
-        std::env::temp_dir().join(format!("{}-{}.plist", runtime.plist_label, uuid::Uuid::new_v4()));
+    let staged_path = std::env::temp_dir().join(format!(
+        "{}-{}.plist",
+        runtime.plist_label,
+        uuid::Uuid::new_v4()
+    ));
     std::fs::write(&staged_path, rendered.as_bytes())?;
     let staged_path_str = staged_path
         .to_str()
@@ -66,7 +70,11 @@ fn install_and_bootstrap_with_paths(
         // Bootout so we can re-bootstrap with fresh plist content.
         runner.run(
             "sudo",
-            &["launchctl", "bootout", &format!("system/{}", runtime.plist_label)],
+            &[
+                "launchctl",
+                "bootout",
+                &format!("system/{}", runtime.plist_label),
+            ],
         )?;
     }
 
@@ -153,7 +161,8 @@ mod tests {
     fn install_and_bootstrap_calls_launchctl_bootstrap() {
         let runner = RecordingRunner::new_service_not_loaded();
         let tmp = tempfile::tempdir().unwrap();
-        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        let runtime =
+            derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
         install_and_bootstrap_with_paths(&runner, "sha256:abc123", &runtime)
             .expect("should succeed");
 
@@ -188,7 +197,8 @@ mod tests {
     fn install_and_bootstrap_boots_out_when_service_already_loaded() {
         let runner = RecordingRunner::new_service_loaded();
         let tmp = tempfile::tempdir().unwrap();
-        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        let runtime =
+            derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
         install_and_bootstrap_with_paths(&runner, "sha256:abc123", &runtime)
             .expect("should succeed");
 
@@ -206,7 +216,8 @@ mod tests {
     fn install_and_bootstrap_skips_bootout_when_service_not_loaded() {
         let runner = RecordingRunner::new_service_not_loaded();
         let tmp = tempfile::tempdir().unwrap();
-        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        let runtime =
+            derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
         install_and_bootstrap_with_paths(&runner, "sha256:abc123", &runtime)
             .expect("should succeed");
 
@@ -241,7 +252,8 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        let runtime =
+            derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
         let result =
             install_and_bootstrap_with_paths(&FailingBootstrapRunner, "sha256:abc123", &runtime);
         assert!(result.is_err(), "must propagate bootstrap failure");

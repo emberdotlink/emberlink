@@ -19,6 +19,7 @@ fn format_terminal_reason(reason: &TerminalReason) -> String {
             };
             format!("revoked (by {actor}: {reason})")
         }
+        TerminalReason::Abandoned { reason } => format!("abandoned ({reason})"),
         TerminalReason::ExhaustedByBudget {
             statement_sid,
             axis,
@@ -81,7 +82,7 @@ fn render_actions_observed(entries: &[AuditEntry]) -> String {
 /// Per design §7: output targets <80 lines for a typical receipt.
 ///
 /// The `raw` parameter is reserved for design v2 sidecar compatibility and is
-/// a no-op today. When the v2 schema lands (implementation-note-47), `raw = true` will
+/// a no-op today. When the v2 schema lands (implementation-note-53), `raw = true` will
 /// include the full sidecar tier-mapping and tool-aware redaction fields.
 pub fn render_receipt_markdown(receipt: &GrantReceipt, _raw: bool) -> String {
     let mut out = String::new();
@@ -256,7 +257,7 @@ mod tests {
 
     #[test]
     fn raw_flag_currently_noop() {
-        // design v2 sidecar lands in implementation-note-47; today the flag is parsed
+        // design v2 sidecar lands in implementation-note-53; today the flag is parsed
         // but the rendering is identical regardless of value.
         let md_default = render_receipt_markdown(&fixture(), false);
         let md_raw = render_receipt_markdown(&fixture(), true);
@@ -274,6 +275,67 @@ mod tests {
         assert!(md.contains("revoked"), "expected 'revoked' in: {md}");
         assert!(md.contains("operator"), "expected 'operator' in: {md}");
         assert!(md.contains("demo teardown"), "expected reason in: {md}");
+    }
+
+    /// Invariant H10: `ember receipt export --latest --format md` must render
+    /// a friendly-readable markdown receipt that (1) starts with the
+    /// grant-receipt header, (2) carries the grant-summary line, and (3) stays
+    /// under 100 lines for a *typical* session — not just the minimal fixture.
+    /// These are the exact properties `scripts/agent/v030-rc-postflight.sh`
+    /// asserts on the exported `latest-receipt.md`; pinning them here on the
+    /// same `render_receipt_markdown` the CLI `export --format md` path
+    /// dispatches to means a render regression fails on the recurring lane
+    /// before it reaches the host postflight. (The live `--latest` daemon
+    /// round-trip stays a T4 postflight concern; this is the deterministic
+    /// no-daemon coverage.)
+    #[test]
+    fn h10_markdown_export_typical_session_under_100_lines_with_header_and_grant() {
+        let mut f = fixture();
+        // Grow the fixture to a representative session: a short approval chain
+        // plus ~20 observed tool calls. The renderer emits one markdown row
+        // per entry, so this exercises the realistic upper end of a "typical
+        // session" receipt rather than the trivially small minimal fixture.
+        f.approval_chain = vec![
+            ApprovalEvent {
+                at: 1714492800,
+                actor: ApprovalActor::HumanCli,
+                outcome: ApprovalOutcome::Approved,
+                reason: Some("initial issuance".to_string()),
+            },
+            ApprovalEvent {
+                at: 1714492850,
+                actor: ApprovalActor::HumanDashboard,
+                outcome: ApprovalOutcome::Approved,
+                reason: Some("scope confirmed".to_string()),
+            },
+        ];
+        f.actions_observed = (0..20u64)
+            .map(|i| AuditEntry {
+                at: 1714492900 + i,
+                event: "tool_call_attempt".to_string(),
+                action: Some("Bash".to_string()),
+                resource: Some(format!("cmd-{i}")),
+                outcome: "allowed".to_string(),
+            })
+            .collect();
+
+        let md = render_receipt_markdown(&f, false);
+
+        assert!(!md.trim().is_empty(), "markdown export must be non-empty");
+        assert!(
+            md.starts_with("# Grant Receipt "),
+            "must start with the grant-receipt header, got first line: {}",
+            md.lines().next().unwrap_or_default()
+        );
+        assert!(
+            md.contains("\n**Grant:** "),
+            "must carry the grant-summary line, got: {md}"
+        );
+        let lines = md.lines().count();
+        assert!(
+            lines < 100,
+            "typical-session receipt rendered to {lines} lines (H10 bound: <100)"
+        );
     }
 
     #[test]

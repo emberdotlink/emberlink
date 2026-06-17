@@ -72,7 +72,7 @@ const KEY_DEFAULT_ROLE_ARN: &str = "AWS_DEFAULT_ROLE_ARN";
 ///
 /// The receiving field is reserved here; load_from_dir() does not
 /// yet read it (the broker accepts an already-loaded
-/// `SecretString` per the implementation-note-77 brief).
+/// `SecretString` per the implementation-note-87 brief).
 #[allow(dead_code)]
 const KEY_OIDC_TOKEN_PATH: &str = "AWS_OIDC_TOKEN_PATH";
 

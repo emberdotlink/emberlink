@@ -1,10 +1,13 @@
 //! bridge_ca_se_sealed_persistent
 //! ember_rpc_sibling_server_cert_minted_at_startup
+//! bridge_ca_pem_publish_format_reconciled
+//! CLASSIFICATION: PUBLIC
 //!
 //! SE-sealed-persistent client-auth CA per design component 3 (reversed from
-//! v1 ephemeral mlock'd). Private key encrypted at rest via design ember-kms
-//! Vault Transit; in-memory only while daemon running; mlock'd page. Sealed
-//! material persists across daemon restart (no per-restart cert wipe).
+//! v1 ephemeral mlock'd). Private key material is persisted under a
+//! vault-sealed module wrapping key, held in-memory only while the daemon is
+//! running, and survives daemon restart without wiping outstanding per-agent
+//! client certs.
 //!
 //! ## Why SE-sealed (not ephemeral mlock'd)
 //!
@@ -12,18 +15,51 @@
 //! KeepAlive) must NOT wipe outstanding per-agent client certs. The CA's
 //! persistence is what makes the cert chain stable across restart.
 //!
-//! ## This file (scaffold)
+//! ## This file
 //!
-//! Provides the `BridgeCa` type with SE-sealed API surface (`load_or_mint`,
-//! `seal`, `unseal`, `fingerprint`, `pubkey_path`). Real ember-kms wiring
-//! is a follow-up task; stubs are used here.
+//! `BridgeCa::load_or_mint` owns the persisted bridge-CA substrate:
 //!
-//! Also provides lower-level crypto primitives (`mint`, `seal_with_key`,
-//! `unseal_from_key`, `verifying_key`, `trust_root_cert_pem`) used by
-//! `infra::runtime`'s vault-sealed persistence layer until the ember-kms path
-//! supersedes it.
+//! - `bridge_ca.wrap` stores a vault-sealed 32-byte module wrapping key.
+//! - `bridge_ca.sealed` stores the ed25519 Bridge CA secret sealed under that
+//!   module key via `seal_with_key`.
+//! - `bridge_ca.pub` and `bridge_ca.pem` are always republished so the raw-key
+//!   fingerprint cache and PEM trust root stay current without opening the
+//!   sealed blob elsewhere.
 //!
-//! ## Sibling server-cert mint (implementation-note-115)
+//! ## Bridge CA publish format — dual raw+PEM (implementation-note-355)
+//!
+//! Anchor: `bridge_ca_pem_publish_format_reconciled`.
+//!
+//! Two on-disk consumers want different shapes of the same key material, and
+//! `load_or_mint` republishes BOTH on every call (Option A from the brief —
+//! least disruption to existing consumers):
+//!
+//! - `bridge_ca.pub` — **raw 32 bytes** of the ed25519 verifying key. Read
+//!   without any TLS/X.509 machinery by [`load_cached_bridge_ca_fingerprint`]
+//!   for the Spawn-Receipt fingerprint cache + the `bridge_ca_fingerprint`
+//!   embedded in receipts (Slice C/D). Preserving the raw-bytes contract is
+//!   what keeps Spawn-Receipt continuity stable across the PEM addition.
+//! - `bridge_ca.pem` — **PEM-encoded self-signed root cert** suitable for
+//!   `rustls_pemfile::certs` and rustls `RootCertStore::add`. This is what
+//!   the OS-supervised `ember-rpc` sibling (design amendment) reads at
+//!   `cfg.ca_cert_path` to build the closed `WebPkiClientVerifier` trust
+//!   domain — see `crates/ember-rpc/src/listener.rs::load_certs`.
+//!
+//! The launchd plist + systemd unit env-pin `EMBER_RPC_CA_CERT` to the `.pem`
+//! file under `<data_dir>` (see [`crate::install::render_rpc_launchd_plist_body`]
+//! and [`crate::install::render_rpc_systemd_unit_body`]) so the sibling never
+//! falls back to the lib `Config::default()` path (`/var/lib/emberd/...`),
+//! which the prod daemon never writes.
+//!
+//! T3 integration coverage that wires emberd's mint → ember-rpc's listener →
+//! a real mTLS handshake (with a client cert signed by the same BridgeCa)
+//! lives at `crates/ember-daemon/tests/bridge_ca_pem_listener_handshake.rs`.
+//!
+//! The lower-level crypto primitives (`mint`, `seal_with_key`,
+//! `unseal_from_key`, `verifying_key`, `trust_root_cert_pem`) remain here so
+//! the persistence format and the cert-minting primitives stay co-located.
+//!
+//! ## Sibling server-cert mint (implementation-note-113)
 //!
 //! Anchor: `ember_rpc_sibling_server_cert_minted_at_startup`.
 //!
@@ -76,11 +112,57 @@ use rcgen::{
 use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::infra::vault::{SealedEnvelope, Vault, VaultError};
+
+/// design Part B — purpose-bound AAD identifier for the bridge-CA module
+/// wrapping key sealed under the vault MEK. There is exactly one bridge CA
+/// per data dir, so the purpose label alone is a stable identifier (the
+/// module key is minted before the CA exists, so no owning id is available
+/// at seal time). Folded into both the DEK-wrap AAD and the payload AAD.
+pub(crate) const BRIDGE_CA_MODULE_KEY_AAD_ID: &[u8] = b"bridge-ca-module-key";
+
+/// XChaCha20-Poly1305 nonce length. NOTE: since the S6a.2 envelope, the
+/// `bridge_ca.wrap` module-key blob is a serialized `SealedEnvelope`
+/// (magic + payload nonce + dek nonce + length-framed wrapped-DEK +
+/// ciphertext), NOT a bare `[nonce][ciphertext]`. The `bridge_ca.sealed`
+/// blob (sealed under the module key, not the MEK) remains the simple shape.
+const SEALED_NONCE_LEN: usize = 24;
+/// Length of the bridge-CA module wrapping key.
+const BRIDGE_CA_MODULE_KEY_LEN: usize = 32;
+
+/// design D1 — read-only probe for the relocated Bridge-CA module-key wrap
+/// in `<data_dir>/daemon.db`'s `vault_meta.bridge_ca_wrapped` column.
+/// Mirrors the vault module's `salt_from_vault_meta` / `headless_mek_from_vault_meta`
+/// probes: opens a read-only connection so `load_or_mint` resolves the DB
+/// copy without threading a live `DaemonStore` through its (widely-called)
+/// signature. Returns `None` (→ `bridge_ca.wrap` file fallback) on any
+/// failure or NULL column.
+fn bridge_ca_wrap_from_vault_meta(data_dir: &Path) -> Option<Vec<u8>> {
+    let db_path = data_dir.join("daemon.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    use rusqlite::OptionalExtension as _;
+    let row: Option<Option<Vec<u8>>> = conn
+        .query_row(
+            "SELECT bridge_ca_wrapped FROM vault_meta WHERE id = 1",
+            [],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .ok()?;
+    row.flatten()
+}
+
 /// SE-sealed Bridge CA.
 ///
 /// `pubkey_path` — path to the on-disk pubkey file (`<data_dir>/bridge_ca.pub`).
 /// `fingerprint` — 32-byte blake3 fingerprint for Spawn Receipt embedding.
-/// `sealed`      — true when pubkey material has been published to disk.
+/// `sealed`      — true when the CA private key is persisted and the public
+///                 root artifacts have been published to disk.
 ///
 /// The ed25519 private key is held in-memory and zeroized on drop.
 pub struct BridgeCa {
@@ -118,18 +200,6 @@ impl Drop for BridgeCa {
 /// Errors from BridgeCa operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeCaError {
-    /// Failed to publish pubkey file to disk.
-    #[error("failed to publish pubkey file")]
-    PubkeyPublishFailed,
-    /// KMS (ember-kms Vault Transit) is unreachable.
-    #[error("KMS unreachable")]
-    KmsUnreachable,
-    /// Sealed material is corrupted or unrecognizable.
-    #[error("sealed material corrupted")]
-    MaterialCorrupted,
-    /// Attempted to unseal material that was never sealed.
-    #[error("not sealed")]
-    NotSealed,
     /// AEAD encrypt or decrypt failed (wrong key, tampered ciphertext, or
     /// wrong nonce). Used by the lower-level `seal_with_key`/`unseal_from_key`
     /// crypto primitives.
@@ -163,44 +233,142 @@ pub enum BridgeCaError {
     EmptySanList,
 }
 
+/// Errors from [`BridgeCa::load_or_mint`].
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeCaLoadError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("vault: {0}")]
+    Vault(#[from] VaultError),
+    #[error("bridge ca: {0}")]
+    Bridge(#[from] BridgeCaError),
+    /// On-disk sealed blob is shorter than the 24-byte nonce prefix.
+    /// Indicates either disk corruption or a truncated write from a
+    /// crash mid-`std::fs::write`.
+    #[error("malformed sealed blob at {path}: file too short ({len} bytes; need >= 24)")]
+    MalformedBlob { path: PathBuf, len: usize },
+    /// Wrapping key (decoded from `bridge_ca.wrap`) has unexpected length.
+    #[error("bridge ca wrapping key has unexpected length: {0}")]
+    WrappingKeyLen(usize),
+}
+
 impl BridgeCa {
-    // ── SE-sealed API (scaffold — real ember-kms wiring is a follow-up) ──
+    // ── Persisted Bridge CA substrate ──
 
-    /// Load or mint the Bridge CA.
+    /// Load the persisted Bridge CA from `<data_dir>` if present, otherwise
+    /// mint a fresh one.
     ///
-    /// TODO: real ember-kms seal/unseal. For now: deterministic stub that
-    /// writes a placeholder pubkey file at `data_dir/bridge_ca.pub` (mode
-    /// 0644). Returns `BridgeCaError::PubkeyPublishFailed` if the file write
-    /// fails. Sets `sealed: true` when pubkey content is non-empty.
-    pub fn load_or_mint(kms_path: &Path, data_dir: &Path) -> Result<Self, BridgeCaError> {
-        let _ = kms_path; // TODO: wire ember-kms Vault Transit
+    /// The Bridge CA private key is sealed under a module wrapping key; that
+    /// module key is itself AEAD-enveloped under the daemon vault's
+    /// Interactive MEK. The public root artifacts are always republished to
+    /// `bridge_ca.pub` and `bridge_ca.pem` so external consumers can recover
+    /// the fingerprint and trust root without opening the vault.
+    ///
+    /// **design D1 — DB-first module-key wrap.** The authoritative store for
+    /// the MEK-wrapped module key is `vault_meta.bridge_ca_wrapped` (a
+    /// serialized [`SealedEnvelope`]); the `bridge_ca.wrap` file is the
+    /// transitional/bootstrap location. Resolution order: DB column →
+    /// `bridge_ca.wrap` file → first-mint. An Interactive-MEK rotation
+    /// re-wraps the module key under the new MEK and writes the DB column
+    /// inside the rotation transaction (then retires the file), so the wrap
+    /// re-protection is atomic with the per-row DEK rewraps — closing the
+    /// brick window a separate post-commit file rewrite would open. A
+    /// rotation deletes the file, so this DB-first read is what stops the
+    /// `else`-branch from minting a NEW (identity-losing) CA after a rotation.
+    pub fn load_or_mint(data_dir: &Path, vault: &Vault) -> Result<Self, BridgeCaLoadError> {
+        let wrap_path = data_dir.join("bridge_ca.wrap");
+        let sealed_path = data_dir.join("bridge_ca.sealed");
         let pubkey_path = data_dir.join("bridge_ca.pub");
+        let pem_path = data_dir.join("bridge_ca.pem");
 
-        let placeholder = b"bridge_ca_placeholder_pubkey";
-        std::fs::write(&pubkey_path, placeholder)
-            .map_err(|_| BridgeCaError::PubkeyPublishFailed)?;
+        // design Part B / D1 — the module wrapping key is enveloped: the
+        // vault MEK no longer directly encrypts it. The wrap is a serialized
+        // `SealedEnvelope` (per-blob DEK seals the key; the DEK is wrapped
+        // under the Interactive MEK with the bridge-CA-bound AAD), held
+        // DB-first (`vault_meta.bridge_ca_wrapped`) with the `bridge_ca.wrap`
+        // file as the transitional fallback.
+        let db_wrap = bridge_ca_wrap_from_vault_meta(data_dir);
+        let module_key: Zeroizing<[u8; BRIDGE_CA_MODULE_KEY_LEN]> = if let Some(blob) = db_wrap {
+            let env =
+                SealedEnvelope::from_blob(&blob).map_err(|_| BridgeCaLoadError::MalformedBlob {
+                    path: data_dir.join("daemon.db#vault_meta.bridge_ca_wrapped"),
+                    len: blob.len(),
+                })?;
+            let plaintext = vault.open(
+                crate::infra::vault::ValueClass::DaemonOperational,
+                BRIDGE_CA_MODULE_KEY_AAD_ID,
+                &env,
+            )?;
+            if plaintext.len() != BRIDGE_CA_MODULE_KEY_LEN {
+                return Err(BridgeCaLoadError::WrappingKeyLen(plaintext.len()));
+            }
+            let mut key = [0u8; BRIDGE_CA_MODULE_KEY_LEN];
+            key.copy_from_slice(&plaintext);
+            Zeroizing::new(key)
+        } else if wrap_path.exists() {
+            let blob = std::fs::read(&wrap_path)?;
+            let env =
+                SealedEnvelope::from_blob(&blob).map_err(|_| BridgeCaLoadError::MalformedBlob {
+                    path: wrap_path.clone(),
+                    len: blob.len(),
+                })?;
+            let plaintext = vault.open(
+                crate::infra::vault::ValueClass::DaemonOperational,
+                BRIDGE_CA_MODULE_KEY_AAD_ID,
+                &env,
+            )?;
+            if plaintext.len() != BRIDGE_CA_MODULE_KEY_LEN {
+                return Err(BridgeCaLoadError::WrappingKeyLen(plaintext.len()));
+            }
+            let mut key = [0u8; BRIDGE_CA_MODULE_KEY_LEN];
+            key.copy_from_slice(&plaintext);
+            Zeroizing::new(key)
+        } else {
+            let mut key = [0u8; BRIDGE_CA_MODULE_KEY_LEN];
+            getrandom::fill(&mut key).expect("OS entropy failure");
+            let env = vault.seal(
+                crate::infra::vault::ValueClass::DaemonOperational,
+                BRIDGE_CA_MODULE_KEY_AAD_ID,
+                &key,
+            )?;
+            std::fs::write(&wrap_path, env.to_blob())?;
+            Zeroizing::new(key)
+        };
+
+        let mut bridge_ca = if sealed_path.exists() {
+            let blob = std::fs::read(&sealed_path)?;
+            if blob.len() < SEALED_NONCE_LEN {
+                return Err(BridgeCaLoadError::MalformedBlob {
+                    path: sealed_path,
+                    len: blob.len(),
+                });
+            }
+            let (nonce, ct) = blob.split_at(SEALED_NONCE_LEN);
+            BridgeCa::unseal_from_key(nonce, ct, module_key.as_slice())?
+        } else {
+            let ca = BridgeCa::mint();
+            let (nonce, ct) = ca.seal_with_key(module_key.as_slice())?;
+            let mut blob = Vec::with_capacity(nonce.len() + ct.len());
+            blob.extend_from_slice(&nonce);
+            blob.extend_from_slice(&ct);
+            std::fs::write(&sealed_path, &blob)?;
+            ca
+        };
+
+        std::fs::write(&pubkey_path, bridge_ca.verifying_key().to_bytes())?;
+        let pem = bridge_ca.trust_root_cert_pem()?;
+        std::fs::write(&pem_path, pem.as_bytes())?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o644);
-            std::fs::set_permissions(&pubkey_path, perms)
-                .map_err(|_| BridgeCaError::PubkeyPublishFailed)?;
+            std::fs::set_permissions(&pubkey_path, std::fs::Permissions::from_mode(0o644))?;
+            std::fs::set_permissions(&pem_path, std::fs::Permissions::from_mode(0o644))?;
         }
 
-        let sealed = false;
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).expect("OS entropy failure");
-        let key = SigningKey::from_bytes(&seed);
-        seed.zeroize();
-        let fingerprint = compute_fingerprint(&key.verifying_key());
-
-        Ok(BridgeCa {
-            pubkey_path,
-            fingerprint,
-            sealed,
-            key,
-        })
+        bridge_ca.pubkey_path = pubkey_path;
+        bridge_ca.sealed = true;
+        Ok(bridge_ca)
     }
 
     /// Fingerprint accessor for Spawn Receipt embedding.
@@ -215,23 +383,7 @@ impl BridgeCa {
         &self.pubkey_path
     }
 
-    /// Shutdown hook — seal the CA material under ember-kms.
-    ///
-    /// TODO: real ember-kms wrap. For now: idempotent no-op.
-    pub fn seal(&mut self, kms_path: &Path) -> Result<(), BridgeCaError> {
-        let _ = kms_path; // TODO: wire ember-kms Vault Transit
-        Ok(())
-    }
-
-    /// Startup hook — unseal the CA material from ember-kms.
-    ///
-    /// TODO: real ember-kms unwrap. For now: idempotent no-op.
-    pub fn unseal(&mut self, kms_path: &Path) -> Result<(), BridgeCaError> {
-        let _ = kms_path; // TODO: wire ember-kms Vault Transit
-        Ok(())
-    }
-
-    // ── Lower-level crypto primitives (used by infra::runtime until ember-kms) ──
+    // ── Lower-level crypto primitives ──
 
     /// Mint a fresh Bridge CA keypair from OS entropy.
     pub fn mint() -> Self {
@@ -257,7 +409,8 @@ impl BridgeCa {
     /// Seal the private-key bytes under a 32-byte wrapping key using
     /// XChaCha20-Poly1305. Returns `(nonce, ciphertext)`.
     ///
-    /// Used by `infra::runtime::load_or_mint_bridge_ca` until ember-kms lands.
+    /// Used by `BridgeCa::load_or_mint` to persist the private key under the
+    /// module wrapping key.
     pub fn seal_with_key(&self, wrapping_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), BridgeCaError> {
         if wrapping_key.len() != 32 {
             return Err(BridgeCaError::InvalidWrappingKey(wrapping_key.len()));
@@ -267,7 +420,7 @@ impl BridgeCa {
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let secret_bytes = self.key.to_bytes();
+        let secret_bytes = Zeroizing::new(self.key.to_bytes());
         let ciphertext = cipher
             .encrypt(nonce, secret_bytes.as_slice())
             .map_err(|e| BridgeCaError::Aead(e.to_string()))?;
@@ -276,7 +429,7 @@ impl BridgeCa {
 
     /// Inverse of [`Self::seal_with_key`].
     ///
-    /// Used by `infra::runtime::load_or_mint_bridge_ca` until ember-kms lands.
+    /// Used by `BridgeCa::load_or_mint` to recover the persisted private key.
     pub fn unseal_from_key(
         nonce_bytes: &[u8],
         ciphertext: &[u8],
@@ -294,9 +447,11 @@ impl BridgeCa {
         let cipher = XChaCha20Poly1305::new_from_slice(wrapping_key)
             .expect("wrapping_key length validated above");
         let nonce = XNonce::from_slice(nonce_bytes);
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| BridgeCaError::Aead(e.to_string()))?;
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| BridgeCaError::Aead(e.to_string()))?,
+        );
         if plaintext.len() != 32 {
             return Err(BridgeCaError::InvalidKeyMaterial);
         }
@@ -330,6 +485,95 @@ pub enum ServerSan {
 }
 
 impl BridgeCa {
+    /// Mint an ed25519 client keypair, build an X.509 leaf cert with the
+    /// Ember client-auth SAN shape, sign it with this `BridgeCa`, and return
+    /// `(cert_pem, key_pem)`.
+    ///
+    /// SAN policy mirrors the existing per-agent client-cert contract:
+    /// - always emit `urn:emberlink:agent:<persona_id>` for one-release compat
+    /// - when `container_id` is present, also emit:
+    ///   - `spiffe://emberd/persona/<persona_id>`
+    ///   - `spiffe://emberd/container/<container_id>`
+    ///
+    /// The validity window is anchored at the current wall clock, not the Unix
+    /// epoch, so rustls handshake-time validity checks succeed in live use.
+    pub fn sign_client_cert(
+        &self,
+        persona_id: &str,
+        container_id: Option<&str>,
+        ttl: std::time::Duration,
+    ) -> Result<(Zeroizing<String>, Zeroizing<String>), BridgeCaError> {
+        if persona_id.is_empty() {
+            return Err(BridgeCaError::EmptySubject);
+        }
+
+        let leaf_key = KeyPair::generate_for(&PKCS_ED25519)
+            .map_err(|e| BridgeCaError::CertGen(format!("leaf keygen: {e}")))?;
+
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|e| BridgeCaError::CertGen(format!("params: {e}")))?;
+
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.distinguished_name = {
+            let mut dn = rcgen::DistinguishedName::new();
+            dn.push(DnType::CommonName, format!("ember-persona-{persona_id}"));
+            dn
+        };
+
+        let mut san_entries: Vec<SanType> = Vec::with_capacity(3);
+        let urn = format!("urn:emberlink:agent:{persona_id}");
+        let urn_ia5: rcgen::string::Ia5String = urn
+            .as_str()
+            .try_into()
+            .map_err(|e: rcgen::Error| BridgeCaError::CertGen(format!("URN SAN: {e}")))?;
+        san_entries.push(SanType::URI(urn_ia5));
+
+        if let Some(container_id) = container_id {
+            let persona_uri = format!("spiffe://emberd/persona/{persona_id}");
+            let persona_ia5: rcgen::string::Ia5String =
+                persona_uri.as_str().try_into().map_err(|e: rcgen::Error| {
+                    BridgeCaError::CertGen(format!("persona SPIFFE SAN: {e}"))
+                })?;
+            san_entries.push(SanType::URI(persona_ia5));
+
+            let container_uri = format!("spiffe://emberd/container/{container_id}");
+            let container_ia5: rcgen::string::Ia5String = container_uri
+                .as_str()
+                .try_into()
+                .map_err(|e: rcgen::Error| {
+                    BridgeCaError::CertGen(format!("container SPIFFE SAN: {e}"))
+                })?;
+            san_entries.push(SanType::URI(container_ia5));
+        }
+        params.subject_alt_names = san_entries;
+
+        let now = std::time::SystemTime::now();
+        let not_before = time::OffsetDateTime::from(now);
+        let not_after = time::OffsetDateTime::from(
+            now.checked_add(ttl)
+                .ok_or_else(|| BridgeCaError::CertGen("ttl overflow".to_string()))?,
+        );
+        params.not_before = not_before;
+        params.not_after = not_after;
+
+        let ca_key_pair = signing_key_to_rcgen_keypair(&self.key)?;
+        let ca_cert = build_ca_cert_for_issuer(&ca_key_pair)?;
+        let ca_cert_der_typed = CertificateDer::from(ca_cert.der().to_vec());
+        let issuer = Issuer::from_ca_cert_der(&ca_cert_der_typed, ca_key_pair)
+            .map_err(|e| BridgeCaError::CertGen(format!("issuer: {e}")))?;
+
+        let cert = params
+            .signed_by(&leaf_key, &issuer)
+            .map_err(|e| BridgeCaError::CertGen(format!("sign: {e}")))?;
+
+        Ok((
+            Zeroizing::new(cert.pem()),
+            Zeroizing::new(leaf_key.serialize_pem()),
+        ))
+    }
+
     /// Mint an ed25519 server keypair, build an X.509 leaf cert with the
     /// supplied subject CN + SAN entries + TTL, sign it with this
     /// `BridgeCa`'s signing key, and return `(cert_pem, key_pem)`.
@@ -474,8 +718,8 @@ impl BridgeCa {
 /// per-agent client-cert path and `core_crypto::ca` is not in
 /// `ember-daemon`'s dep tree.
 fn signing_key_to_rcgen_keypair(signing_key: &SigningKey) -> Result<KeyPair, BridgeCaError> {
-    let seed: [u8; 32] = signing_key.to_bytes();
-    let pkcs8 = seed_to_pkcs8_v1_der(&seed);
+    let seed = Zeroizing::new(signing_key.to_bytes());
+    let pkcs8 = Zeroizing::new(seed_to_pkcs8_v1_der(&seed));
     let kp = KeyPair::from_pkcs8_der_and_sign_algo(
         &PrivatePkcs8KeyDer::from(pkcs8.as_slice()),
         &PKCS_ED25519,
@@ -548,27 +792,37 @@ fn compute_fingerprint(vk: &VerifyingKey) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    //! T2: bridge CA unit tests use temporary data directories.
+
     use super::*;
     use tempfile::TempDir;
 
-    /// Pre: empty data_dir. Post: bridge_ca.pub exists after load_or_mint.
+    const TEST_VAULT_KEY: [u8; 32] = [0x42u8; 32];
+
+    /// Pre: empty data_dir. Post: bridge_ca public artifacts exist and the
+    /// returned BridgeCa reflects the published path/state.
     #[test]
     fn load_or_mint_publishes_pubkey_file() {
         let dir = TempDir::new().expect("tempdir");
-        let kms_path = Path::new("/dev/null");
-        let ca = BridgeCa::load_or_mint(kms_path, dir.path()).expect("load_or_mint succeeds");
+        let vault = Vault::new(TEST_VAULT_KEY);
+        let ca = BridgeCa::load_or_mint(dir.path(), &vault).expect("load_or_mint succeeds");
         assert!(
             ca.pubkey_path().exists(),
             "pubkey file must exist after load_or_mint"
         );
+        assert!(
+            dir.path().join("bridge_ca.pem").exists(),
+            "PEM root must exist"
+        );
+        assert!(ca.sealed, "returned BridgeCa must reflect persisted state");
     }
 
     /// Pre: data_dir. Post: pubkey_path is data_dir/bridge_ca.pub.
     #[test]
     fn pubkey_path_returns_join_with_data_dir() {
         let dir = TempDir::new().expect("tempdir");
-        let kms_path = Path::new("/dev/null");
-        let ca = BridgeCa::load_or_mint(kms_path, dir.path()).expect("load_or_mint succeeds");
+        let vault = Vault::new(TEST_VAULT_KEY);
+        let ca = BridgeCa::load_or_mint(dir.path(), &vault).expect("load_or_mint succeeds");
         let expected = dir.path().join("bridge_ca.pub");
         assert_eq!(ca.pubkey_path(), expected.as_path());
     }
@@ -577,25 +831,64 @@ mod tests {
     #[test]
     fn fingerprint_is_32_bytes() {
         let dir = TempDir::new().expect("tempdir");
-        let kms_path = Path::new("/dev/null");
-        let ca = BridgeCa::load_or_mint(kms_path, dir.path()).expect("load_or_mint succeeds");
+        let vault = Vault::new(TEST_VAULT_KEY);
+        let ca = BridgeCa::load_or_mint(dir.path(), &vault).expect("load_or_mint succeeds");
         let fp = ca.fingerprint();
         assert_eq!(fp.len(), 32);
     }
 
-    /// Pre: any load_or_mint. Post: seal/unseal are idempotent no-ops.
+    /// Pre: helper called twice with the same data_dir + vault. Post: the
+    /// Bridge CA fingerprint is stable across restart.
     #[test]
-    fn seal_unseal_idempotent() {
+    fn load_or_mint_preserves_fingerprint_across_restart() {
         let dir = TempDir::new().expect("tempdir");
-        let kms_path = Path::new("/dev/null");
-        let mut ca = BridgeCa::load_or_mint(kms_path, dir.path()).expect("load_or_mint succeeds");
-        ca.seal(kms_path).expect("seal is a no-op");
-        ca.unseal(kms_path).expect("unseal is a no-op");
-        ca.seal(kms_path).expect("seal idempotent second call");
-        ca.unseal(kms_path).expect("unseal idempotent second call");
+        let vault = Vault::new(TEST_VAULT_KEY);
+        let ca1 = BridgeCa::load_or_mint(dir.path(), &vault).expect("first load_or_mint");
+        let fingerprint = ca1.fingerprint();
+        drop(ca1);
+
+        let ca2 = BridgeCa::load_or_mint(dir.path(), &vault).expect("restart load_or_mint");
+        assert_eq!(ca2.fingerprint(), fingerprint);
     }
 
-    // ─── sign_server_cert (implementation-note-115 T2) ───
+    /// design Part B — the module wrapping key is enveloped: a different
+    /// MEK cannot open the persisted `bridge_ca.wrap` blob. Proves the MEK no
+    /// longer directly encrypts the module key (the DEK does), and that the
+    /// wrap is bound to the Interactive MEK via the AEAD tag.
+    #[test]
+    fn wrap_blob_undecryptable_under_wrong_mek() {
+        let dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(TEST_VAULT_KEY);
+        let _ca = BridgeCa::load_or_mint(dir.path(), &vault).expect("mint under correct mek");
+
+        // The on-disk wrap blob parses as a SealedEnvelope (enveloped, not a
+        // bare [nonce||ct] direct-MEK blob).
+        let blob = std::fs::read(dir.path().join("bridge_ca.wrap")).unwrap();
+        let env = SealedEnvelope::from_blob(&blob).expect("wrap blob is a sealed envelope");
+
+        // A different MEK cannot open it.
+        let wrong = Vault::new([0x11u8; 32]);
+        let err = wrong
+            .open(
+                crate::infra::vault::ValueClass::DaemonOperational,
+                BRIDGE_CA_MODULE_KEY_AAD_ID,
+                &env,
+            )
+            .expect_err("wrong mek must fail to open the wrap blob");
+        assert!(matches!(err, VaultError::Crypto(_)));
+
+        // The correct MEK opens it and recovers a 32-byte module key.
+        let key = vault
+            .open(
+                crate::infra::vault::ValueClass::DaemonOperational,
+                BRIDGE_CA_MODULE_KEY_AAD_ID,
+                &env,
+            )
+            .expect("correct mek opens the wrap blob");
+        assert_eq!(key.len(), BRIDGE_CA_MODULE_KEY_LEN);
+    }
+
+    // ─── sign_server_cert (implementation-note-113 T2) ───
 
     /// Pre: minted BridgeCa, valid subject + SANs + TTL.
     /// Post: returned PEMs parse; leaf cert validates against the BridgeCa's
@@ -677,6 +970,69 @@ mod tests {
             .expect("EKU present");
         assert!(eku.value.server_auth, "serverAuth EKU set");
         assert!(!eku.value.client_auth, "clientAuth NOT set");
+    }
+
+    /// implementation-note-227 #2 — a client cert minted WITH a container_id carries both
+    /// the persona and container SPIFFE SANs (the container's mTLS identity per
+    /// design §2). WITHOUT a container_id only the compat URN is emitted (no
+    /// SPIFFE leakage). This pins the identity binding the orchestrator relies
+    /// on so the daemon's `extract_agent_id_from_cert` can cross-check
+    /// persona↔container.
+    #[test]
+    fn sign_client_cert_emits_persona_and_container_spiffe_sans() {
+        use std::time::Duration;
+        use x509_parser::prelude::*;
+
+        let ca = BridgeCa::mint();
+        let (cert_pem, _key) = ca
+            .sign_client_cert("alice", Some("ctr-abc123"), Duration::from_secs(3600))
+            .expect("sign with container_id");
+        let (_, pem) = parse_x509_pem(cert_pem.as_bytes()).expect("PEM parses");
+        let (_, parsed) = X509Certificate::from_der(&pem.contents).expect("DER parses");
+        let san = parsed
+            .subject_alternative_name()
+            .expect("SAN parses")
+            .expect("SAN present");
+        let joined = san
+            .value
+            .general_names
+            .iter()
+            .map(|gn| format!("{gn:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            joined.contains("spiffe://emberd/persona/alice"),
+            "persona SPIFFE SAN: {joined}"
+        );
+        assert!(
+            joined.contains("spiffe://emberd/container/ctr-abc123"),
+            "container SPIFFE SAN: {joined}"
+        );
+
+        // Without a container_id: compat URN only, no SPIFFE SANs.
+        let (cert_pem2, _key2) = ca
+            .sign_client_cert("alice", None, Duration::from_secs(3600))
+            .expect("sign without container_id");
+        let (_, pem2) = parse_x509_pem(cert_pem2.as_bytes()).expect("PEM parses");
+        let (_, parsed2) = X509Certificate::from_der(&pem2.contents).expect("DER parses");
+        let joined2 = parsed2
+            .subject_alternative_name()
+            .expect("SAN parses")
+            .expect("SAN present")
+            .value
+            .general_names
+            .iter()
+            .map(|gn| format!("{gn:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            joined2.contains("urn:emberlink:agent:alice"),
+            "compat URN SAN: {joined2}"
+        );
+        assert!(
+            !joined2.contains("spiffe://"),
+            "no SPIFFE SAN without container_id: {joined2}"
+        );
     }
 
     /// Pre: empty subject string. Post: EmptySubject error.

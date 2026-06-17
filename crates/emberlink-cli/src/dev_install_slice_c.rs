@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! ember dev install — phases 5-11 helper modules (design §Component 4).
 //!

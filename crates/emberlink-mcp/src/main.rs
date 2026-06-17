@@ -4,13 +4,14 @@
 //!
 //! The `main()` flow picks one of two daemon transports:
 //!
-//! - When `EMBER_DAEMON_ENDPOINT` is set (in-container mode, design
-//!   component 1 — implementation-note-536): load the per-agent
-//!   cert bundle from `EMBER_BRIDGE_CERT_DIR` (default
-//!   `/run/ember/client-cert/`) and build an mTLS+TCP transport to the
-//!   host's ember-rpc listener. Fails closed (exit non-zero) on missing
-//!   or malformed cert files. Anchor:
-//!   `emberlink_mcp_mtls_client_handshake`.
+//! - When `EMBER_BRIDGE_URL` is set (in-container mode, design component 1 —
+//!   implementation-note-485; the unified in-container bridge contract
+//!   per design §4, the SAME var the construct-shim reads): load the per-agent
+//!   cert bundle via the explicit `EMBER_CLIENT_CERT` / `EMBER_CLIENT_KEY` /
+//!   `EMBER_CA_CERT` paths (falling back to `<EMBER_BRIDGE_CERT_DIR>/*` then the
+//!   canonical `/run/ember/*`) and build an mTLS+TCP transport to the host's
+//!   ember-rpc listener. Fails closed (exit non-zero) on missing or malformed
+//!   cert files. Anchor: `emberlink_mcp_mtls_client_handshake`.
 //! - Otherwise: the legacy UDS path (host-mode emberlink-mcp running
 //!   alongside emberd on the same machine).
 //!
@@ -24,19 +25,24 @@ use std::sync::Arc;
 
 use emberlink_agent::runtime::{AgentConfig, AgentRuntime, DaemonClient, DaemonClientError};
 use emberlink_mcp::McpServer;
-use emberlink_mcp::cert_expiry::{ExpiryEventContext, parse_cert_validity, spawn_expiry_timer};
+use emberlink_mcp::cert_expiry::{
+    ExpiryEventContext, RefreshState, Tier, parse_cert_validity, spawn_refresh_client,
+};
 use emberlink_mcp::daemon_transport::{
-    DaemonTransport, MtlsBridgeConfig, build_client_tls_config, load_bridge_cert_files,
-    resolve_bridge_cert_dir,
+    DaemonTransport, MtlsBridgeConfig, build_client_tls_config, endpoint_from_bridge_url,
+    load_bridge_cert_from_paths, resolve_bridge_cert_paths,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Env var the orchestrator sets at container spawn time to point this
 /// MCP server at the host's ember-rpc listener. Format: `host:port`.
-/// Presence selects the mTLS bridge transport; absence selects the
-/// legacy UDS path. Per implementation-note-537 the
-/// orchestrator also wires the corresponding `extra_hosts` entry.
-const EMBER_DAEMON_ENDPOINT_ENV: &str = "EMBER_DAEMON_ENDPOINT";
+/// The unified in-container bridge endpoint (design §4): a full URL
+/// (`https://host.docker.internal:<port>`), the SAME var the construct-shim
+/// reads. Presence selects the mTLS bridge transport; absence selects the legacy
+/// UDS path. Per implementation-note-487 the orchestrator also
+/// wires the corresponding `extra_hosts` entry. The `host:port` for the raw mTLS
+/// dial is parsed from this URL via `endpoint_from_bridge_url`.
+const EMBER_BRIDGE_URL_ENV: &str = "EMBER_BRIDGE_URL";
 
 /// Default SNI / server-name presented during the mTLS handshake. The
 /// ember-rpc server cert SAN is minted to match this string. Override
@@ -44,7 +50,7 @@ const EMBER_DAEMON_ENDPOINT_ENV: &str = "EMBER_DAEMON_ENDPOINT";
 const DEFAULT_BRIDGE_SERVER_NAME: &str = "localhost";
 
 /// `emberlink_mcp_mtls_client_handshake` — checkpoint for the
-/// implementation-note-536 target-state grep. Don't remove or
+/// implementation-note-485 target-state grep. Don't remove or
 /// rename without also updating `release-checklist` for the task.
 #[allow(dead_code)]
 const SENTINEL_EMBERLINK_MCP_MTLS_CLIENT_HANDSHAKE: &str = "emberlink_mcp_mtls_client_handshake";
@@ -78,7 +84,13 @@ impl DaemonTransportClient {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, DaemonClientError> {
         self.0.call_raw(method, params).map_err(|e| match e {
-            emberlink_mcp::daemon_transport::DaemonTransportError::Io(_) => {
+            emberlink_mcp::daemon_transport::DaemonTransportError::Io(_)
+            | emberlink_mcp::daemon_transport::DaemonTransportError::RefreshFailing => {
+                // RefreshFailing maps to Unavailable: from the
+                // higher-layer caller's perspective the bridge is
+                // soft-fail-closed and the daemon is unreachable for
+                // new RPCs until the refresh chain recovers. design
+                // §Component 5.
                 DaemonClientError::Unavailable
             }
             emberlink_mcp::daemon_transport::DaemonTransportError::Protocol(_)
@@ -98,7 +110,8 @@ impl DaemonClient for DaemonTransportClient {
         self.0
             .call_tool("request_access", params)
             .map_err(|e| match e {
-                emberlink_mcp::daemon_transport::DaemonTransportError::Io(_) => {
+                emberlink_mcp::daemon_transport::DaemonTransportError::Io(_)
+                | emberlink_mcp::daemon_transport::DaemonTransportError::RefreshFailing => {
                     DaemonClientError::Unavailable
                 }
                 emberlink_mcp::daemon_transport::DaemonTransportError::Protocol(_)
@@ -172,7 +185,7 @@ fn build_uds_server(
 }
 
 /// Build the in-container mTLS bridge MCP server. Per design component 1
-/// (implementation-note-536): load per-agent cert bundle, build
+/// (implementation-note-485): load per-agent cert bundle, build
 /// `rustls::ClientConfig` with the bridge CA as the SOLE trust anchor,
 /// arm the 90% TTL expiry timer, and route every `DaemonTransport` call
 /// through the mTLS+TCP bridge. Fails closed (`std::process::exit(1)`) on
@@ -182,14 +195,16 @@ fn build_bridge_server(
     store: Rc<core_state::EventStore>,
     endpoint: String,
 ) -> McpServer {
-    let cert_dir = resolve_bridge_cert_dir();
-    let loaded = match load_bridge_cert_files(&cert_dir) {
+    let (cert_path, key_path, ca_path) = resolve_bridge_cert_paths();
+    let loaded = match load_bridge_cert_from_paths(&cert_path, &key_path, &ca_path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
-                "emberlink-mcp: bridge cert load failed at {}: {} — \
+                "emberlink-mcp: bridge cert load failed (cert={}, key={}, ca={}): {} — \
                  refusing to start (fail-closed per design)",
-                cert_dir.display(),
+                cert_path.display(),
+                key_path.display(),
+                ca_path.display(),
                 e
             );
             std::process::exit(1);
@@ -231,11 +246,7 @@ fn build_bridge_server(
             }),
     );
 
-    let bridge_config = MtlsBridgeConfig {
-        endpoint: endpoint.clone(),
-        tls_config,
-        server_name,
-    };
+    let bridge_config = MtlsBridgeConfig::new(endpoint.clone(), tls_config, server_name);
 
     // The DaemonClient adapter and the McpServer-receipt transport each
     // get their own DaemonTransport wrapping the same MtlsBridgeConfig +
@@ -245,50 +256,56 @@ fn build_bridge_server(
         DaemonTransport::new_mtls(bridge_config.clone(), Arc::clone(&bridge_runtime));
     let client: Box<dyn DaemonClient> = Box::new(DaemonTransportClient(client_transport));
 
-    // 90% TTL expiry timer. Failure to parse the cert isn't fatal — the
-    // bridge still works; we just lose the proactive warning.
+    // 4-band cert refresh client. Failure to parse the cert isn't fatal
+    // — the bridge still works; we just lose proactive refresh.
     //
-    // bridge_cert_expiring_soon_event: this is the MCP-server-side arm
-    // of the `bridge.cert_expiring_soon` warning flow per design
-    // §Component 3 + implementation-note-538. The
-    // module that actually computes the 90%-TTL fire time, emits the
-    // event over the daemon's `bridge_cert_expiring_soon` JSON-RPC
-    // tool, and carries the persona_id / container_id / cert expiry
-    // timestamp on the payload lives at
+    // emberlink_mcp_cert_refresh_client_landed — implementation-note-488-
+    // CERT-REFRESH-CLIENT / design §Component 1 + §Component 5. The
+    // module that owns the trigger-band scheduler, exp-backoff retry,
+    // failure-cause classification, and hot-swap apply path lives at
     // `crates/emberlink-mcp/src/cert_expiry.rs`. This call-site is the
-    // contract that the timer is armed at MCP-server boot — the
-    // checkpoint anchors it here so a grep verifies the wiring as a
-    // single unit instead of asking the reader to chase the module
-    // back to the consumer.
+    // contract that the refresh chain is armed at MCP-server boot — the
+    // checkpoint anchors it here so a grep verifies the wiring as a single
+    // unit instead of asking the reader to chase the module back to the
+    // consumer.
+    //
+    // The 90% `bridge.cert_expiring_soon` warning still fires (the
+    // refresh client owns that emission at the 90% band) so M5's
+    // pre-existing daemon-side wiring continues working unchanged.
     match parse_cert_validity(&leaf_cert_der) {
         Ok(validity) => {
             let timer_transport = Arc::new(DaemonTransport::new_mtls(
                 bridge_config.clone(),
                 Arc::clone(&bridge_runtime),
             ));
-            let _expiry_handle = spawn_expiry_timer(
+            let refresh_state = Arc::new(std::sync::RwLock::new(RefreshState::default()));
+            let _refresh_handle = spawn_refresh_client(
                 Arc::clone(&bridge_runtime),
                 validity,
                 ExpiryEventContext::from_env(),
                 timer_transport,
+                bridge_config.clone(),
+                refresh_state,
+                Tier::from_env(),
             );
             eprintln!(
-                "emberlink-mcp: bridge.cert_expiring_soon timer armed (fires at 90% TTL elapsed)"
+                "emberlink-mcp: bridge cert refresh client armed (4-band: 50/75/90/99 \
+                 with exp-backoff per design)"
             );
         }
         Err(e) => {
             eprintln!(
-                "emberlink-mcp: warn: failed to parse cert validity for expiry timer: {} — \
-                 bridge still functional, no proactive expiry warning",
+                "emberlink-mcp: warn: failed to parse cert validity for refresh client: {} — \
+                 bridge still functional, no proactive refresh",
                 e
             );
         }
     }
 
     eprintln!(
-        "emberlink-mcp: mTLS bridge transport active (endpoint={}, cert_dir={})",
+        "emberlink-mcp: mTLS bridge transport active (endpoint={}, cert={})",
         endpoint,
-        cert_dir.display()
+        cert_path.display()
     );
 
     let receipt_transport = DaemonTransport::new_mtls(bridge_config, bridge_runtime);
@@ -379,8 +396,13 @@ async fn main() {
 
     // emberlink_mcp_mtls_client_handshake — the bridge transport branch
     // sits here. We pick on env-var presence so the legacy UDS path stays
-    // the default and host-mode callers see no behavior change.
-    let bridge_endpoint = std::env::var(EMBER_DAEMON_ENDPOINT_ENV).ok();
+    // the default and host-mode callers see no behavior change. The unified
+    // contract (design §4) is EMBER_BRIDGE_URL (a full URL); the raw mTLS dial
+    // wants host:port, parsed from it.
+    let bridge_endpoint = std::env::var(EMBER_BRIDGE_URL_ENV)
+        .ok()
+        .filter(|u| !u.is_empty())
+        .map(|u| endpoint_from_bridge_url(&u));
 
     let server = if no_daemon {
         // Legacy behaviour: no daemon link, request_grant fails closed.

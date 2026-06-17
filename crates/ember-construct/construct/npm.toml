@@ -1,121 +1,202 @@
 # CLASSIFICATION: PUBLIC
-# Construct manifest for ember-npm per design §2.
-# Action schema: each [[actions]] declares an allowed action_key, optional
-# budget caps, biometric requirement, and a permit/deny default. The daemon's
-# broker.resolve consults this to decide whether the action requires a
-# credential mint, an existing grant, or refuses.
-#
-# Per-registry keys (`npm.publish.<host>`, `npm.install.<host>`) are
-# matched by family-prefix at policy time when no exact key is declared here —
-# see design §3 (server-side reclassification). Current runtime still relies
-# on caller-supplied registry auth via `NPM_TOKEN` / `.npmrc` passthrough;
-# canonical broker materialization for registry creds is follow-up work.
+# Construct manifest for ember-npm per design.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
 
 [meta]
 name = "ember-npm"
-version = "0.1.0"
+plugin_address = "registry.ember.systems/ember-systems/ember-npm"
+plugin_version = "0.1.0"
 publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "npm CLI Construct"
 description = "npm CLI Construct. Gates `npm` invocations through ember's action policy: publish/version/deprecate/dist-tag/install/ci/run-script/audit-fix are classified and gated; read-only verbs (ls, view, info, outdated, audit, config get, search, ping, whoami) are passthrough. Current runtime still relies on caller-supplied registry auth via `NPM_TOKEN` / `.npmrc` passthrough rather than broker-minted registry credentials. Mutating publish-class actions (publish, version, deprecate, dist-tag) require biometric approval and are budget-capped per session."
-headless_requirements = ["env_passthrough_authority"]
 
-# Default policy for unlisted action keys.
-default = "deny"
+[defaults]
+materialization_class = "declared_host_material"
+material_classes = [{ kind = "env", name = "NPM_TOKEN" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
 
-# --- registry write surface (publish) ---
+[runtime.cli]
+wrapped_binary = "npm"
 
 [[actions]]
 key = "npm.publish"
-default = "permit"          # family fallback for any npm.publish.<host>
+action_version = "v1"
+summary = "Run npm.publish"
+input_schema = { kind = "argv", classifier = "publish *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
 biometric = "required"
 budget_caps = { max_per_session = 5 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.publish"
+semantic_labels = ["npm.publish"]
 
 [[actions]]
 key = "npm.publish.npmjs.org"
+action_version = "v1"
+summary = "Run npm.publish.npmjs.org"
+input_schema = { kind = "argv", classifier = "publish npmjs org *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 biometric = "required"
 budget_caps = { max_per_session = 5 }
-
-# --- version bumps ---
-# `npm version <newversion>` mutates package.json + creates a git tag. Treated
-# as publish-adjacent: biometric required.
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.publish.npmjs.org"
+semantic_labels = ["npm.publish.npmjs.org"]
 
 [[actions]]
 key = "npm.version"
+action_version = "v1"
+summary = "Run npm.version"
+input_schema = { kind = "argv", classifier = "version *" }
+risk_tier = "high"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 biometric = "required"
-
-# --- registry reads (install, ci) ---
-# install/ci pull tarballs and may require a read-scoped NPM_TOKEN for private
-# packages. Family fallback `npm.install` covers any npm.install.<host>.
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.version"
+semantic_labels = ["npm.version"]
 
 [[actions]]
 key = "npm.install"
+action_version = "v1"
+summary = "Run npm.install"
+input_schema = { kind = "argv", classifier = "install *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.install"
+semantic_labels = ["npm.install"]
 
 [[actions]]
 key = "npm.install.npmjs.org"
+action_version = "v1"
+summary = "Run npm.install.npmjs.org"
+input_schema = { kind = "argv", classifier = "install npmjs org *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.install.npmjs.org"
+semantic_labels = ["npm.install.npmjs.org"]
 
 [[actions]]
 key = "npm.ci"
+action_version = "v1"
+summary = "Run npm.ci"
+input_schema = { kind = "argv", classifier = "ci *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.ci"
+semantic_labels = ["npm.ci"]
 
 [[actions]]
 key = "npm.ci.npmjs.org"
+action_version = "v1"
+summary = "Run npm.ci.npmjs.org"
+input_schema = { kind = "argv", classifier = "ci npmjs org *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
-
-# --- script execution ---
-# `npm run <script>` runs arbitrary code from package.json. Permitted by
-# default but the daemon may inject scope-narrowed env via the broker.
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.ci.npmjs.org"
+semantic_labels = ["npm.ci.npmjs.org"]
 
 [[actions]]
 key = "npm.run-script"
+action_version = "v1"
+summary = "Run npm.run-script"
+input_schema = { kind = "argv", classifier = "run-script *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
-
-# --- audit fix ---
-# Mutates the dependency tree by upgrading vulnerable transitive deps. Permit
-# at this layer; the diff is reviewable post-hoc via the receipt.
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.run-script"
+semantic_labels = ["npm.run-script"]
 
 [[actions]]
 key = "npm.audit-fix"
+action_version = "v1"
+summary = "Run npm.audit-fix"
+input_schema = { kind = "argv", classifier = "audit-fix *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
-
-# --- destructive registry ops ---
-# deprecate and dist-tag both mutate published metadata for OTHER consumers,
-# so they're treated as publish-class: biometric required.
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.audit-fix"
+semantic_labels = ["npm.audit-fix"]
 
 [[actions]]
 key = "npm.deprecate"
+action_version = "v1"
+summary = "Run npm.deprecate"
+input_schema = { kind = "argv", classifier = "deprecate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.deprecate"
+semantic_labels = ["npm.deprecate"]
 
 [[actions]]
 key = "npm.dist-tag"
+action_version = "v1"
+summary = "Run npm.dist-tag"
+input_schema = { kind = "argv", classifier = "dist-tag *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.dist-tag"
+semantic_labels = ["npm.dist-tag"]
 
-# --- explicit deny list (per construct-coverage-audit) ---
-
-# npm.unpublish: explicitly denied. Removing a published package permanently
-# affects every downstream consumer who depends on that version. High blast
-# radius, irreversible on npmjs.org. Never auto-permit; force a human + OOB
-# revocation workflow rather than letting an agent pull the trigger. This is an
-# explicit deny (not just falling through to default=deny) so the reason is
-# machine-readable in the manifest and audit receipts surface the key.
 [[actions]]
 key = "npm.unpublish"
+action_version = "v1"
+summary = "Run npm.unpublish"
+input_schema = { kind = "argv", classifier = "unpublish *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 mode = "deny"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.unpublish"
+semantic_labels = ["npm.unpublish"]
 
-# --- pre-publish local ops ---
-
-# npm.pack: non-destructive. Creates a local .tgz tarball from the current
-# package for inspection before publish. No registry writes, no credential
-# mint needed. Permit without biometric or budget cap.
 [[actions]]
 key = "npm.pack"
+action_version = "v1"
+summary = "Run npm.pack"
+input_schema = { kind = "argv", classifier = "pack *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
-
-# --- silence-override catalog (design §C8 Knob 10) ---
-
-[actions.npm-publish]
-silence_timeout_secs = 600    # registry roundtrip can be slow
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.pack"
+semantic_labels = ["npm.pack"]

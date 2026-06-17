@@ -1,6 +1,8 @@
 pub mod broker;
+pub mod grants;
 pub mod infra;
 pub mod presence;
+pub mod scion;
 pub mod spawn;
 pub mod trust;
 
@@ -10,16 +12,31 @@ pub mod binary_manifest;
 pub mod bootstrap;
 pub mod device;
 pub mod install;
+pub mod install_manifest;
 pub mod launcher_watch;
-pub mod pricing;
+/// Per-OS daemon filesystem layout per design — system paths only.
+/// Counterpart to `crates/headless-runtime/src/engine/paths.rs::EnginePaths`.
+pub mod paths;
+/// -S2 — the token/cost metering module moved into
+/// `proxy-forward-runtime` (the forwarding core depends on it). Re-exported
+/// here so existing `crate::pricing::*` call sites (proxy.rs, proxy tests)
+/// keep resolving unchanged.
+pub use proxy_forward_runtime::pricing;
+#[cfg(target_os = "macos")]
+pub mod se_probe;
 pub mod session;
 pub mod session_watcher;
 pub mod signature_verifier;
 pub mod snapshot;
 pub mod sops;
+/// Empirical-sample telemetry for the v0.3.0 friendly-drop window.
+/// Per `implementation-note-223`; distinct from `infra::telemetry`
+/// (the design Prometheus exposition surface). See `docs/v030-empirical-sample-window.md`.
+/// Anchor: `empirical_sample_pre_v031_retune_landed`
+pub mod telemetry;
 pub mod trust_graph;
 
-/// implementation-note-108: server-side WebAuthn relying-party that
+/// implementation-note-107: server-side WebAuthn relying-party that
 /// gates dashboard approvals on a verified passkey assertion.
 /// Feature-gated so non-default builds (e.g. embedded test
 /// targets) don't pull in the webauthn-rs dep tree.

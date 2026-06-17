@@ -33,6 +33,9 @@
 //! | read-only (`plan`, `validate`, `show`, `state list`, `state show`, `output`, `version`, `providers`, `init`, `fmt`, `console`) | `None` (passthrough) |
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// OpenTofu global flags that take a value as the *next* argv token (when
 /// written as `-flag value`). The `-chdir=<dir>` form (and any future
@@ -500,5 +503,199 @@ mod tests {
             let class2 = classify_tofu_argv(&with_flag).unwrap();
             proptest::prop_assert_eq!(base_class.0, class2.0);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TofuFactory — construct-factory contract for the tofu construct
+// ---------------------------------------------------------------------------
+
+static TOFU_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/tofu.toml"))
+            .expect("bundled tofu.toml must be valid")
+    });
+
+fn tofu_manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("tofu.")?;
+    TOFU_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key == format!("tofu.{suffix}"))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+fn tofu_action_in_manifest(action_key: &str) -> bool {
+    TOFU_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("tofu.")
+                .is_some_and(|suffix| a.key == format!("tofu.{suffix}"))
+    })
+}
+
+const TOFU_UNSUPPORTED_KEYS: &[&str] = &[
+    "tofu.state.push",
+    "tofu.state.rm",
+    "tofu.state.replace-provider",
+    "tofu.force-unlock",
+];
+
+#[derive(Debug, Default, Clone)]
+pub struct TofuFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TofuFactoryTarget {
+    pub provider: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TofuFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for TofuFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_tofu_argv(argv)
+    }
+}
+
+impl TargetExtractor for TofuFactory {
+    type Target = TofuFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, _argv: &[String]) -> Option<Self::Target> {
+        None
+    }
+}
+
+impl NeedTemplate for TofuFactory {
+    type Need = TofuFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        tofu_manifest_need_for_action(&action_key.0).map(TofuFactoryNeed)
+    }
+}
+
+impl ConstructFactory for TofuFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        _argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        if key.0 == "tofu.apply" || key.0 == "tofu.destroy" {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        if TOFU_UNSUPPORTED_KEYS.iter().any(|k| key.0 == *k) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if tofu_action_in_manifest(&key.0) {
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        FactoryDisposition::ResolverRequired
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tofu_factory_version_credentialless() {
+        let f = TofuFactory;
+        let a = argv(&["version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn tofu_factory_apply_is_payload_analysis() {
+        let f = TofuFactory;
+        let a = argv(&["apply", "-auto-approve"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn tofu_factory_destroy_is_payload_analysis() {
+        let f = TofuFactory;
+        let a = argv(&["destroy", "-auto-approve"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn tofu_factory_workspace_delete_is_resolver_required() {
+        let f = TofuFactory;
+        let a = argv(&["workspace", "delete", "prod"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn tofu_factory_state_push_fails_closed() {
+        let f = TofuFactory;
+        let a = argv(&["state", "push", "terraform.tfstate"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn tofu_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/tofu/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/tofu.toml"),
+        )
+        .expect("tofu manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &TofuFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

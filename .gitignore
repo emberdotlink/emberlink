@@ -12,11 +12,13 @@ memory/
 !crates/*/tests/fixtures/*.pem
 !crates/*/tests/fixtures/*.key
 
-# Sync-to-public operator-only secrets file (implementation-note-1).
-# The .example schema IS committed; the actual sync-secrets.env (with real
-# names / emails / financial figures) MUST NOT commit. Defense-in-depth:
-# scripts/sync-to-public/** is also denylisted in deny-paths.txt, so even
-# if this gitignore line is removed the file won't ship to the public mirror.
+# Public trust-anchor certificates embedded into the daemon binary via
+# include_str! (e.g. the Yubico PIV Root CA, design / ). These are PUBLIC
+# root certs (no private key), fingerprint-pinned in source + asserted by test;
+# the `*.pem` ignore above would otherwise silently drop them on `git add`,
+# which broke the build on main (the cert in #5037 was never committed).
+!crates/*/src/**/certs/*.pem
+
 
 .headless-control
 .headless-metrics.jsonl

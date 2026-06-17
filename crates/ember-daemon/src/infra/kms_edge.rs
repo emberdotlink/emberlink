@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! ember-kms-edge listener — emberd-internal mTLS listener for edge connections
 //! arriving via the Tailscale tailnet interface (design Amendment 1 v3).
@@ -82,8 +83,9 @@ fn build_server_tls_config(edge_ca: &EdgeCa) -> Result<Arc<ServerConfig>, EdgeEr
     let server_cert = CertificateDer::from(edge_ca.cert_der.as_slice()).into_owned();
 
     // Encode the edge CA signing key as PKCS#8 for rustls.
-    let seed: [u8; 32] = edge_ca.signing_key.to_bytes();
+    let mut seed: [u8; 32] = edge_ca.signing_key.to_bytes();
     let pkcs8_der = seed_to_pkcs8_v1_der(&seed);
+    zeroize::Zeroize::zeroize(&mut seed);
     let server_key = PrivatePkcs8KeyDer::from(pkcs8_der);
 
     let config = ServerConfig::builder()

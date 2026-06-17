@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! DID resolver primitives for `did:emberlink:<root-pubkey>` — design Phase 2.
 //!

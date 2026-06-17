@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
@@ -27,6 +29,32 @@ impl LiveVaultSlot {
 
     pub fn clear(&self) {
         *self.0.borrow_mut() = None;
+    }
+}
+
+/// Shared lease-KEK slot — mirrors [`LiveVaultSlot`] for the symmetric
+/// lease-wrapping key (design F1). All `DaemonStore` clones that share
+/// the same slot see writes immediately (proxy stores, session stores).
+///
+/// ADR216-F4: the inner Option wraps the key in an `Rc<LeaseWrapKey>` so
+/// `get()` is a cheap ref-count bump rather than a full key clone. Prior
+/// to F4 the slot held a bare `LeaseWrapKey` whose `Clone` impl staged
+/// the 32 raw key bytes in a `[u8; 32]` stack local on every access —
+/// that staging copy was never wiped, leaving recoverable unzeroized
+/// KEK copies on the stack of every `lease_kek()`-touching path. The
+/// `Rc` handle removes the copy entirely: all consumers share one
+/// mlocked allocation.
+#[derive(Clone, Default)]
+pub struct SharedLeaseKek(Rc<RefCell<Option<Rc<crate::trust::lease::LeaseWrapKey>>>>);
+
+impl SharedLeaseKek {
+    pub fn set(&self, key: Rc<crate::trust::lease::LeaseWrapKey>) {
+        *self.0.borrow_mut() = Some(key);
+    }
+
+    /// Cheap ref-count bump — never copies the 32 raw key bytes (ADR216-F4).
+    pub fn get(&self) -> Option<Rc<crate::trust::lease::LeaseWrapKey>> {
+        self.0.borrow().clone()
     }
 }
 
@@ -108,7 +136,7 @@ pub struct DaemonStore {
     /// reference through that chain. The `RefCell` is only touched on
     /// the single-threaded LocalSet, so runtime borrow panics cannot race.
     vault_slot: RefCell<LiveVaultSlot>,
-    /// implementation-note-287 Phase 2: in-memory rate-limit set for the
+    /// In-memory rate-limit set for the
     /// `sops_unwrap_dek` RPC. Each grant_id is consumed exactly once per
     /// daemon-process lifetime. The set is intentionally non-persistent —
     /// daemon restart clears it (acceptable: a restart-then-replay attack
@@ -118,7 +146,7 @@ pub struct DaemonStore {
     /// Single-threaded LocalSet semantics: same as `vault`. No cross-thread
     /// races possible.
     consumed_dek_grants: RefCell<HashSet<String>>,
-    /// implementation-note-73: cached
+    /// Cached
     /// copy of the daemon's Bridge CA fingerprint (blake3-256 of the SPKI
     /// bytes). Wired in by `runtime.rs` after `load_or_mint_bridge_ca`
     /// succeeds but before the socket listener starts. Read by the
@@ -130,6 +158,22 @@ pub struct DaemonStore {
     /// the same reason as `vault` (store constructed before runtime opens
     /// the CA).
     bridge_ca_fingerprint: RefCell<Option<[u8; 32]>>,
+    /// design §1 / Phase 4 — the leased-authority registry: per-grant,
+    /// TTL-bounded authority-to-act keys the daemon holds only for a grant's life
+    /// (minted at issuance, dropped on revoke/expiry). This in-memory map is now a
+    /// **hot cache**; each lease key is also SE-wrapped under the daemon's headless
+    /// lease-KEK and persisted in `lease_blobs`, so a lease **survives a daemon
+    /// restart** (AC-6) yet is non-exfiltratable. Reached through
+    /// [`DaemonStore::leases`] (a [`crate::trust::lease::BoundLeaseRegistry`])
+    /// which drives the persist / delete / rehydrate. Single `LocalSet` thread, so
+    /// its interior `RefCell` cannot race.
+    leases: crate::trust::lease::LeaseRegistry,
+    /// design S3 / F1 — the daemon's symmetric lease-wrapping key, installed
+    /// after the double-envelope unlock. `None` until unlocked — in that state
+    /// the lease registry runs **in-memory only** (no persistence). Shared via
+    /// [`SharedLeaseKek`] so proxy stores see the key immediately when the main
+    /// store receives it (mirrors [`LiveVaultSlot`] for the vault MEK).
+    lease_kek: RefCell<SharedLeaseKek>,
     /// cordon_phase1_receipt_mint_retrofitted — data directory for the
     /// daemon, used to locate `receipts.log` when minting the Phase 1
     /// cordon bridge receipt + the `audit.chain_repair_finalize` receipt
@@ -137,6 +181,47 @@ pub struct DaemonStore {
     /// receipt mint is then a logged no-op). Set at construction from the
     /// daemon.db path's parent for production callers.
     data_dir: Option<PathBuf>,
+    /// design AC-7 — trust-graph revision counter, auto-bumped by
+    /// `rusqlite::Connection::update_hook` on any INSERT/UPDATE/DELETE
+    /// to `publisher_trust_delegations`. Read via `TrustStore::trust_graph_revision()`.
+    trust_graph_rev: Arc<AtomicU64>,
+    /// design — daemon wrap key for double-envelope SE custody. Loaded at
+    /// startup from `daemon_keys` table; generated on first boot. The DWK
+    /// is the inner envelope of the SE custody model: raw key material is
+    /// wrapped under this key before the CLI SE-wraps the blob as the outer
+    /// envelope. `None` on in-memory test stores that skip SE provisioning.
+    dwk: RefCell<Option<std::rc::Rc<crate::infra::daemon_wrap_key::DaemonWrapKey>>>,
+    /// design S4 — live Bridge CA, loaded after BOTH vault MEK and lease-KEK
+    /// are unlocked via the double-envelope RPC. `None` until both envelopes
+    /// are peeled. Sandbox spawn fails closed when this is `None`. The CA is
+    /// `Arc` (not `Rc`) because `load_or_mint_bridge_ca` returns `Arc<BridgeCa>`.
+    bridge_ca: RefCell<Option<std::sync::Arc<crate::trust::bridge_ca::BridgeCa>>>,
+    /// V030-EMBER-DEVICE-REVOKE F4.1 — serialization gate for identity-store
+    /// mutations.
+    ///
+    /// Each identity-mutating RPC handler opens its own
+    /// `core_state::EventStore` from disk (see
+    /// `crate::infra::identity_substrate::open_identity_store`), then runs its
+    /// pre-flight guards against the per-instance in-memory `MaterializedState`
+    /// loaded BEFORE any concurrent commit. Without serialization, two
+    /// concurrent revoke-COMMITs against the two remaining devices in a 2-device
+    /// authority set could each independently pass the last-presence-device
+    /// guard (each sees `2 - 1 == 1` remaining), and both could land — bricking
+    /// the authority set despite the structural guard (adversarial finding
+    /// F4.1 / F1.1 on prior change).
+    ///
+    /// `tokio::sync::Mutex` (not `RefCell`): the lock MUST survive across
+    /// `.await` points so a future async-handler refactor cannot reopen the
+    /// race. Acquisition is `&Rc<…>` so the `MutexGuard` lifetime is decoupled
+    /// from the `&DaemonStore` borrow — callers `Rc::clone(&store.identity_mutation_lock())`
+    /// before `.lock().await` to keep the store available for the underlying op.
+    ///
+    /// Locked by: `handle_identity_device_revoke` (COMMIT branch). Future
+    /// identity-mutating handlers (`enroll`, `enroll_backup`, `recovery.enroll`)
+    /// SHOULD lock through here too so their pre-flight guards are likewise
+    /// race-free; that wider rollout is filed as a follow-up rather than
+    /// bundled into this surgical fix.
+    identity_mutation_lock: Rc<tokio::sync::Mutex<()>>,
 }
 
 impl DaemonStore {
@@ -171,6 +256,15 @@ impl DaemonStore {
         };
 
         let conn = Connection::open(path)?;
+        let trust_graph_rev = Arc::new(AtomicU64::new(0));
+        let rev_hook = trust_graph_rev.clone();
+        conn.update_hook(Some(
+            move |_action: rusqlite::hooks::Action, _db: &str, table: &str, _rowid: i64| {
+                if table == "publisher_trust_delegations" {
+                    rev_hook.fetch_add(1, Ordering::Release);
+                }
+            },
+        ))?;
         // cordon_phase1_receipt_mint_retrofitted — derive data_dir from
         // the daemon.db path so the cordon path can locate receipts.log
         // (Phase 1 bridge receipt) without threading another parameter
@@ -180,8 +274,14 @@ impl DaemonStore {
             conn,
             vault_slot: RefCell::new(LiveVaultSlot::default()),
             consumed_dek_grants: RefCell::new(HashSet::new()),
+            leases: crate::trust::lease::LeaseRegistry::new(),
+            lease_kek: RefCell::new(SharedLeaseKek::default()),
             bridge_ca_fingerprint: RefCell::new(None),
             data_dir,
+            trust_graph_rev,
+            dwk: RefCell::new(None),
+            bridge_ca: RefCell::new(None),
+            identity_mutation_lock: Rc::new(tokio::sync::Mutex::new(())),
         };
         let migrate_result = store.migrate();
         if migrate_result.is_err() && backup_attempted {
@@ -199,7 +299,9 @@ impl DaemonStore {
     /// the file exists and is a pre-v2 schema with rows that would be
     /// affected by the cordon. Returns Ok(Some(backup_path)) on a real
     /// copy, Ok(None) when no backup is needed.
-    fn pre_cordon_backup_if_needed(path: &Path) -> Result<Option<std::path::PathBuf>, std::io::Error> {
+    fn pre_cordon_backup_if_needed(
+        path: &Path,
+    ) -> Result<Option<std::path::PathBuf>, std::io::Error> {
         // No existing file? Fresh install, nothing to back up.
         if !path.exists() {
             return Ok(None);
@@ -207,10 +309,7 @@ impl DaemonStore {
         // Probe the DB without rusqlite (lightweight): open a read-only
         // connection, check for segment_id column. If it already exists,
         // the cordon won't run, so no backup is needed.
-        let probe = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        );
+        let probe = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         let pre_v2 = match probe {
             Ok(conn) => {
                 let mut stmt = match conn.prepare("PRAGMA table_info(audit_log)") {
@@ -256,16 +355,31 @@ impl DaemonStore {
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
+        let trust_graph_rev = Arc::new(AtomicU64::new(0));
+        let rev_hook = trust_graph_rev.clone();
+        conn.update_hook(Some(
+            move |_action: rusqlite::hooks::Action, _db: &str, table: &str, _rowid: i64| {
+                if table == "publisher_trust_delegations" {
+                    rev_hook.fetch_add(1, Ordering::Release);
+                }
+            },
+        ))?;
         let store = Self {
             conn,
             vault_slot: RefCell::new(LiveVaultSlot::default()),
             consumed_dek_grants: RefCell::new(HashSet::new()),
+            leases: crate::trust::lease::LeaseRegistry::new(),
+            lease_kek: RefCell::new(SharedLeaseKek::default()),
             bridge_ca_fingerprint: RefCell::new(None),
             // In-memory stores have no on-disk receipts.log; the cordon
             // path logs a warning and skips the receipt mint when this
             // is None. Tests that need to assert on the mint use the
             // file-backed `open(&path)` constructor.
             data_dir: None,
+            trust_graph_rev,
+            dwk: RefCell::new(None),
+            bridge_ca: RefCell::new(None),
+            identity_mutation_lock: Rc::new(tokio::sync::Mutex::new(())),
         };
         store.migrate()?;
         // V0 schema: every persona secret is vault-sealed, so an
@@ -287,12 +401,27 @@ impl DaemonStore {
     #[cfg(test)]
     pub fn open_in_memory_without_vault() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
+        let trust_graph_rev = Arc::new(AtomicU64::new(0));
+        let rev_hook = trust_graph_rev.clone();
+        conn.update_hook(Some(
+            move |_action: rusqlite::hooks::Action, _db: &str, table: &str, _rowid: i64| {
+                if table == "publisher_trust_delegations" {
+                    rev_hook.fetch_add(1, Ordering::Release);
+                }
+            },
+        ))?;
         let store = Self {
             conn,
             vault_slot: RefCell::new(LiveVaultSlot::default()),
             consumed_dek_grants: RefCell::new(HashSet::new()),
+            leases: crate::trust::lease::LeaseRegistry::new(),
+            lease_kek: RefCell::new(SharedLeaseKek::default()),
             bridge_ca_fingerprint: RefCell::new(None),
             data_dir: None,
+            trust_graph_rev,
+            dwk: RefCell::new(None),
+            bridge_ca: RefCell::new(None),
+            identity_mutation_lock: Rc::new(tokio::sync::Mutex::new(())),
         };
         store.migrate()?;
         Ok(store)
@@ -306,7 +435,17 @@ impl DaemonStore {
         self.data_dir.as_deref()
     }
 
-    /// implementation-note-287 Phase 2: claim a `grant_id` slot for a
+    /// V030-EMBER-DEVICE-REVOKE F4.1 — accessor for the identity-store
+    /// mutation lock. Callers `Rc::clone()` this and `.lock().await` to
+    /// serialize identity-store mutations across concurrent RPC handlers
+    /// (each of which opens its own `EventStore` from disk and would
+    /// otherwise race on the pre-flight last-presence-device guard).
+    /// See the field doc on `identity_mutation_lock` for the full rationale.
+    pub(crate) fn identity_mutation_lock(&self) -> &Rc<tokio::sync::Mutex<()>> {
+        &self.identity_mutation_lock
+    }
+
+    /// Claim a `grant_id` slot for a
     /// `sops_unwrap_dek` RPC call. Returns `true` on first claim,
     /// `false` if the grant has already been consumed for an unwrap.
     ///
@@ -327,6 +466,95 @@ impl DaemonStore {
     /// duplicate calls before doing any vault / decrypt work.
     pub fn is_dek_grant_consumed(&self, grant_id: &str) -> bool {
         self.consumed_dek_grants.borrow().contains(grant_id)
+    }
+
+    /// design §3 / AC-3 — issue a single-use presence nonce bound to
+    /// `(op_id, daemon_fingerprint, method)`. The operator signs the canonical
+    /// intent bytes that include this nonce on their presence Device; the
+    /// verifier later consumes it via [`Self::consume_presence_nonce`]. PIV has
+    /// no FIDO sign-counter, so this nonce is the sole freshness anchor.
+    ///
+    /// Reaps expired rows on each mint so the table cannot grow unbounded.
+    pub fn mint_presence_nonce(
+        &self,
+        op_id: &str,
+        daemon_fingerprint: &str,
+        method: &str,
+        params_digest: &str,
+        peer_uid: Option<u32>,
+        ttl_seconds: i64,
+    ) -> Result<(String, i64), StoreError> {
+        let now = presence_nonce_now();
+        let expires_at = now + ttl_seconds;
+        let nonce = core_crypto::generate_random_identifier("pnonce");
+        self.conn().execute(
+            "DELETE FROM presence_challenges WHERE expires_at < ?1",
+            rusqlite::params![now],
+        )?;
+        self.conn().execute(
+            "INSERT INTO presence_challenges \
+                (nonce, op_id, daemon_fingerprint, method, params_digest, peer_uid, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                nonce,
+                op_id,
+                daemon_fingerprint,
+                method,
+                params_digest,
+                peer_uid,
+                now,
+                expires_at
+            ],
+        )?;
+        Ok((nonce, expires_at))
+    }
+
+    /// design §3 / AC-3 — atomically consume a presence nonce, tombstoning
+    /// `(op_id, nonce)` so a captured signature cannot be replayed. Mirrors
+    /// `webauthn_challenges` consume: DELETE first (a failed verify must not
+    /// leave a replayable row), then validate the bound fields from the deleted
+    /// row. Returns `Ok(())` only if the nonce existed, was unexpired, and was
+    /// bound to exactly this `(op_id, daemon_fingerprint, method, params_digest)`.
+    ///
+    /// `params_digest` is the caller's RE-derivation over the RECEIVED op params
+    /// (`presence_gate::presence_params_digest`); a mismatch against the digest
+    /// the operator committed at mint means the daemon substituted the op body
+    /// after the tap (approval-laundering Finding 1) → fail closed.
+    pub fn consume_presence_nonce(
+        &self,
+        nonce: &str,
+        op_id: &str,
+        daemon_fingerprint: &str,
+        method: &str,
+        params_digest: &str,
+    ) -> Result<(), StoreError> {
+        let row: Option<(String, String, String, String, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT op_id, daemon_fingerprint, method, params_digest, expires_at \
+                 FROM presence_challenges WHERE nonce = ?1",
+                rusqlite::params![nonce],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .ok();
+        // Always delete — a failed verify must not leave a replayable row.
+        self.conn().execute(
+            "DELETE FROM presence_challenges WHERE nonce = ?1",
+            rusqlite::params![nonce],
+        )?;
+        let (got_op, got_fp, got_method, got_digest, expires_at) =
+            row.ok_or_else(|| StoreError::Unauthorized)?;
+        if expires_at < presence_nonce_now() {
+            return Err(StoreError::Unauthorized);
+        }
+        if got_op != op_id
+            || got_fp != daemon_fingerprint
+            || got_method != method
+            || got_digest != params_digest
+        {
+            return Err(StoreError::Unauthorized);
+        }
+        Ok(())
     }
 
     /// Attach a `Vault` handle to this store's shared live-vault slot so
@@ -366,7 +594,7 @@ impl DaemonStore {
         *self.vault_slot.borrow_mut() = slot;
     }
 
-    /// implementation-note-73: attach the
+    /// Attach the
     /// daemon's Bridge CA fingerprint after `load_or_mint_bridge_ca`
     /// succeeds in `runtime.rs`. Mirrors [`Self::set_vault`] — the store is
     /// constructed before the CA exists, so the runtime stitches them
@@ -385,16 +613,49 @@ impl DaemonStore {
         *self.bridge_ca_fingerprint.borrow()
     }
 
-    /// implementation-note-35 C2: drop the attached `Rc<Vault>` so the
+    /// design S4 — attach the live Bridge CA after double-envelope unlock
+    /// loads it via `load_or_mint_bridge_ca`. The CA is needed by sandbox
+    /// spawn (mTLS cert minting) and must be available before any sandbox
+    /// operations.
+    pub fn set_bridge_ca(&self, ca: std::sync::Arc<crate::trust::bridge_ca::BridgeCa>) {
+        *self.bridge_ca.borrow_mut() = Some(ca);
+    }
+
+    /// Return the live Bridge CA, if loaded. Sandbox spawn fails closed
+    /// when this returns `None` (vault not yet unlocked via DE path).
+    pub(crate) fn bridge_ca(&self) -> Option<std::sync::Arc<crate::trust::bridge_ca::BridgeCa>> {
+        self.bridge_ca.borrow().clone()
+    }
+
+    /// design — load or generate the DWK and cache it on this store.
+    /// Called once at daemon startup (runtime.rs). In-memory test stores
+    /// skip this; tests that need double-envelope behavior call
+    /// `set_dwk_for_test`.
+    pub fn provision_dwk(&self) -> Result<(), StoreError> {
+        let dwk = crate::infra::daemon_wrap_key::DaemonWrapKey::load_or_generate(self)?;
+        *self.dwk.borrow_mut() = Some(std::rc::Rc::new(dwk));
+        Ok(())
+    }
+
+    /// Return the cached DWK, if provisioned.
+    pub(crate) fn dwk(&self) -> Option<std::rc::Rc<crate::infra::daemon_wrap_key::DaemonWrapKey>> {
+        self.dwk.borrow().clone()
+    }
+
+    /// Drop the attached `Rc<Vault>` so the
     /// final outstanding reference is released — the MEK is wiped via
     /// `ZeroizeOnDrop` once every clone of the `Rc` has dropped. Called
     /// from `trust::presence::lock()` (explicit user-initiated lock) so
     /// the daemon enters hard-lock semantics: the next vault op MUST
     /// re-derive the MEK from the keyring-stored passphrase.
     ///
-    /// Idle auto-lock does NOT call this — it retains soft-lock so
-    /// background headless survives the idle window without forcing a
-    /// re-prompt.
+    /// Idle auto-lock does NOT call this — but the asymmetry is
+    /// observability-only. Both lock paths flip `SessionState::Locked`
+    /// and clear the macOS SE session cache, so a Touch ID re-prompt is
+    /// required either way. The retained `Rc<Vault>` after idle lock is
+    /// diagnostic surface, not a "soft-lock" privilege carve-out; the
+    /// recovery path for both is `vault_unlock`. See
+    /// `presence_gate_soft_lock_distinction_landed`.
     pub fn drop_vault(&self) {
         self.vault_slot.borrow().clear();
     }
@@ -403,10 +664,326 @@ impl DaemonStore {
         &self.conn
     }
 
+    /// design §1 / Phase 4 — the leased-authority registry, **bound to this
+    /// store's persistence**. Authority-to-act is held as per-grant, TTL-bounded
+    /// leases (minted at issuance, dropped on revoke/expiry), never as a standing
+    /// key. The Phase-2 signing/JIT-decrypt path reads leases through
+    /// `with_lease_key` (fail-closed when inert).
+    ///
+    /// Returns a [`BoundLeaseRegistry`] that pairs the in-memory hot-cache
+    /// registry with this store so `mint`/`drop_lease`/`with_lease_key`
+    /// transparently SE-wrap-persist / delete / rehydrate the lease blob (design
+    /// Phase 4 / AC-6: a lease survives a daemon restart, yet is
+    /// non-exfiltratable). Every existing call site (`self.leases().mint(...)`,
+    /// `store.leases().has_live_lease(...)`, …) keeps compiling unchanged — the
+    /// wrapper forwards the same method surface.
+    pub fn leases(&self) -> crate::trust::lease::BoundLeaseRegistry<'_> {
+        crate::trust::lease::BoundLeaseRegistry::new(&self.leases, self)
+    }
+
+    /// design S3 — the cached symmetric lease-KEK, if unlocked. `None` means
+    /// the lease registry runs in-memory only (pre-unlock / test stores).
+    ///
+    /// ADR216-F4: returns `Rc<LeaseWrapKey>` so the accessor is a cheap
+    /// ref-count bump — it never copies the 32 raw key bytes onto the
+    /// stack. Callers that previously held `LeaseWrapKey` by value now
+    /// hold an `Rc<LeaseWrapKey>` handle; `&*kek` borrows the inner
+    /// `&LeaseWrapKey` for the wrap/unwrap entry points.
+    pub(crate) fn lease_kek(&self) -> Option<Rc<crate::trust::lease::LeaseWrapKey>> {
+        self.lease_kek.borrow().get()
+    }
+
+    /// Return the shared lease-KEK slot this store currently uses.
+    pub fn lease_kek_slot(&self) -> SharedLeaseKek {
+        self.lease_kek.borrow().clone()
+    }
+
+    /// Replace this store's lease-KEK slot with an externally shared slot.
+    ///
+    /// Mirrors [`Self::replace_vault_slot`] — proxy stores call this at
+    /// construction time so `set_lease_kek` on the main store propagates
+    /// to all proxies automatically.
+    pub fn replace_lease_kek_slot(&self, slot: SharedLeaseKek) {
+        *self.lease_kek.borrow_mut() = slot;
+    }
+
+    /// design S3 — install the symmetric lease-KEK after a successful
+    /// double-envelope unlock. Replaces `provision_lease_kek()`.
+    ///
+    /// ADR216-F4: takes the key by value and immediately wraps it in an
+    /// `Rc<LeaseWrapKey>` so all subsequent accessors share one mlocked
+    /// allocation.
+    pub fn set_lease_kek(&self, key: crate::trust::lease::LeaseWrapKey) {
+        self.lease_kek.borrow().set(Rc::new(key));
+    }
+
+    /// Test-only: inject a lease-KEK so tests exercise the
+    /// wrap/persist/rehydrate path without hardware.
+    #[cfg(test)]
+    pub(crate) fn set_lease_kek_for_test(&self, key: crate::trust::lease::LeaseWrapKey) {
+        self.lease_kek.borrow().set(Rc::new(key));
+    }
+
+    /// Test-only: read the persisted lease blob for `grant_id`, flattening the
+    /// `Result` so AC-6 tests can assert presence/absence ergonomically. Panics
+    /// on a SQLite error (a real failure should fail the test loudly).
+    #[cfg(test)]
+    pub(crate) fn read_lease_blob_for_test(
+        &self,
+        grant_id: &str,
+    ) -> Option<crate::trust::lease::PersistedLease> {
+        self.read_lease_blob(grant_id).expect("read_lease_blob")
+    }
+
+    /// design Phase 4 — write (UPSERT) a SE-wrapped lease blob at rest, keyed by
+    /// `grant_id`. The blob is `se_wrap(lease_kek, lease_key)` — non-exfiltratable
+    /// and the ONLY representation of the key at rest. Raw key bytes are never
+    /// persisted. Overwrites any prior row for the grant (re-mint / re-issue).
+    pub(crate) fn write_lease_blob(
+        &self,
+        rec: &crate::trust::lease::PersistedLease,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO lease_blobs (grant_id, wrapped_blob) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(grant_id) DO UPDATE SET wrapped_blob = excluded.wrapped_blob",
+                rusqlite::params![rec.grant_id, rec.wrapped_blob],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design Phase 4 — read a single persisted lease blob by `grant_id`, or
+    /// `None` if absent (e.g. revoked, expired-and-dropped, or never minted).
+    pub(crate) fn read_lease_blob(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<crate::trust::lease::PersistedLease>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT grant_id, wrapped_blob FROM lease_blobs WHERE grant_id = ?1",
+                rusqlite::params![grant_id],
+                Self::map_lease_blob_row,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    /// design Phase 4 — load every persisted lease blob (daemon-startup
+    /// rehydration). The caller rehydrates / drops per row.
+    pub(crate) fn list_lease_blobs(
+        &self,
+    ) -> Result<Vec<crate::trust::lease::PersistedLease>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT grant_id, wrapped_blob FROM lease_blobs ORDER BY grant_id")
+            .map_err(StoreError::Sqlite)?;
+        let rows = stmt
+            .query_map([], Self::map_lease_blob_row)
+            .map_err(StoreError::Sqlite)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(StoreError::Sqlite)?);
+        }
+        Ok(out)
+    }
+
+    /// design Phase 4 — delete the persisted lease blob for `grant_id` (revoke /
+    /// terminal expiry / exhaustion). Idempotent.
+    pub(crate) fn delete_lease_blob(&self, grant_id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM lease_blobs WHERE grant_id = ?1",
+                rusqlite::params![grant_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design PR-A — persist the persona authority-to-act material re-sealed
+    /// under this grant's live lease key. The blob is opaque to the store:
+    /// `grant.rs` authenticates grant/persona binding inside the sealed payload.
+    pub(crate) fn write_grant_persona_secret(
+        &self,
+        grant_id: &str,
+        wrapped_blob: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO grant_persona_secrets (grant_id, wrapped_blob) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(grant_id) DO UPDATE SET wrapped_blob = excluded.wrapped_blob",
+                rusqlite::params![grant_id, wrapped_blob],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design PR-A — read the grant-scoped persona-root blob. Absence means
+    /// the persona is inert for this grant; callers must fail closed.
+    pub(crate) fn read_grant_persona_secret(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT wrapped_blob FROM grant_persona_secrets WHERE grant_id = ?1",
+                rusqlite::params![grant_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    /// design PR-A — delete the grant-scoped persona-root blob when the grant
+    /// lease is revoked, expired, or exhausted. Idempotent.
+    pub(crate) fn delete_grant_persona_secret(&self, grant_id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM grant_persona_secrets WHERE grant_id = ?1",
+                rusqlite::params![grant_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// H3 fix — persist the tail `pubkey_next_secret` of a grant's signed
+    /// chain, sealed under the grant's live lease. Required so a later
+    /// delegation hop can call `sign_appended_block` and produce an
+    /// append-chain that verifies end-to-end against the apex root
+    /// (Biscuit-style attenuation), instead of the pre-fix shape where each
+    /// delegated grant was a fresh single-block chain linked to the parent
+    /// only by a mutable `parent_grant_id` SQL column.
+    ///
+    /// The blob is opaque to the store: `grant.rs` authenticates
+    /// `(grant_id, tail_block_index)` binding inside the sealed payload.
+    pub(crate) fn write_grant_chain_secret(
+        &self,
+        grant_id: &str,
+        tail_block_index: u32,
+        wrapped_blob: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO grant_chain_secrets (grant_id, tail_block_index, wrapped_blob) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(grant_id) DO UPDATE SET \
+                   tail_block_index = excluded.tail_block_index, \
+                   wrapped_blob = excluded.wrapped_blob",
+                rusqlite::params![grant_id, tail_block_index, wrapped_blob],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// H3 fix — read the grant-scoped tail `pubkey_next_secret` blob and the
+    /// tail block index it was sealed for. Absence means delegation from
+    /// this grant is impossible (the chain cannot be extended); callers
+    /// must fail closed.
+    pub(crate) fn read_grant_chain_secret(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<(u32, Vec<u8>)>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT tail_block_index, wrapped_blob FROM grant_chain_secrets WHERE grant_id = ?1",
+                rusqlite::params![grant_id],
+                |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    /// H3 fix — delete the grant-scoped tail `pubkey_next_secret` blob.
+    /// Idempotent; called when the grant's lease is revoked/expired so the
+    /// chain can no longer be extended.
+    ///
+    /// Wiring into `revoke_grant_sql` is a follow-up; today the row is
+    /// reaped alongside the grant row in the bulk-grant reaper. The
+    /// `#[allow(dead_code)]` reflects "method exists, not yet wired" —
+    /// not "method unused forever."
+    #[allow(dead_code)]
+    pub(crate) fn delete_grant_chain_secret(&self, grant_id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM grant_chain_secrets WHERE grant_id = ?1",
+                rusqlite::params![grant_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_grant_persona_secret_for_test(&self, grant_id: &str) -> Option<Vec<u8>> {
+        self.read_grant_persona_secret(grant_id)
+            .expect("read_grant_persona_secret")
+    }
+
+    /// Map a `lease_blobs` row (`grant_id`, `wrapped_blob`) to a
+    /// [`crate::trust::lease::PersistedLease`]. There are **no plaintext metadata
+    /// columns**: all lease metadata (scope / persona / expiry / minted-at) is
+    /// sealed and authenticated inside `wrapped_blob` and re-derived on rehydrate
+    /// (defect-2 fix), so this map is a pure column read with nothing to validate.
+    fn map_lease_blob_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<crate::trust::lease::PersistedLease> {
+        Ok(crate::trust::lease::PersistedLease {
+            grant_id: row.get(0)?,
+            wrapped_blob: row.get(1)?,
+        })
+    }
+
+    /// design Phase 4 / AC-6 — rehydrate live persisted leases into the
+    /// in-memory hot cache at daemon startup. Requires the lease-KEK to be
+    /// installed first (via double-envelope unlock); no-op if it is not.
+    pub fn rehydrate_persisted_leases(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        let Some(kek) = self.lease_kek() else {
+            tracing::warn!(
+                "design Phase 4: rehydrate_persisted_leases called before the lease-KEK \
+                 was provisioned; skipping (leases will be in-memory only this run)"
+            );
+            return Ok(());
+        };
+        let persisted = self.list_lease_blobs()?;
+        for rec in persisted {
+            // A lease only exists for an active grant. Drop the blob if its grant
+            // is revoked / expired / exhausted (status flip; the row persists) or
+            // absent — never resurrect authority-to-act for a dead grant.
+            if !self.grant_is_active(&rec.grant_id, now) {
+                let _ = self.delete_lease_blob(&rec.grant_id);
+                let _ = self.delete_grant_persona_secret(&rec.grant_id);
+                continue;
+            }
+            match self.leases.rehydrate(&rec, now, &kek) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Expired per the authenticated TTL inside the blob: drop it.
+                    let _ = self.delete_lease_blob(&rec.grant_id);
+                    let _ = self.delete_grant_persona_secret(&rec.grant_id);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        grant_id = %rec.grant_id,
+                        error = %e,
+                        "design Phase 4: failed to rehydrate a persisted lease blob \
+                         (skipping this grant; its authority-to-act stays inert until re-minted)"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// mek_fingerprint_column_verified — read the plaintext
     /// blake3(MEK) fingerprint from vault_meta. Returns `None` if not
     /// yet written (first-run pre-MEK-provision or pre-slice-B-bis).
-    /// Per implementation-note-350.
     pub fn read_mek_fingerprint(&self) -> Result<Option<String>, StoreError> {
         use rusqlite::OptionalExtension as _;
         let row: Option<Option<String>> = self
@@ -422,19 +999,31 @@ impl DaemonStore {
     }
 
     /// mek_fingerprint_column_verified — write the plaintext
-    /// blake3(MEK) fingerprint to vault_meta. UPSERT semantics: if a
-    /// fingerprint is already present and differs from the supplied
-    /// value, returns an error (mismatch — caller must surface to the
-    /// startup-probe fail-loud path). Per
-    /// implementation-note-350.
+    /// blake3(MEK) fingerprint to vault_meta. UPSERT semantics.
+    ///
+    /// design D3 — the fingerprint is DEMOTED to a fast advisory
+    /// pre-flight. A mismatch used to be a fault (error). It is no longer:
+    /// rotation legitimately changes the MEK, so a string-compare cannot
+    /// be the key-correctness authority (it is also spoofable by anyone
+    /// who can write `vault_meta`). The AEAD canary unwrap
+    /// (`Vault::verify_canary`) is now the cryptographic authority. A
+    /// mismatch here is logged at `warn!` and the new fingerprint is
+    /// written through — the canary check on the fail-loud startup path
+    /// is what actually stops a wrong-MEK open.
     pub fn write_mek_fingerprint(&self, fingerprint_hex: &str) -> Result<(), StoreError> {
         let existing = self.read_mek_fingerprint()?;
         if let Some(prev) = &existing
-            && prev != fingerprint_hex {
-                return Err(StoreError::InvalidInput(format!(
-                    "MEK fingerprint mismatch: recorded={prev} attempted={fingerprint_hex}"
-                )));
-            }
+            && prev != fingerprint_hex
+        {
+            tracing::warn!(
+                recorded = %prev,
+                attempted = %fingerprint_hex,
+                "vault: MEK fingerprint advisory pre-flight mismatch (design D3 — \
+                 demoted to advisory; the AEAD canary is the key-correctness authority). \
+                 Writing the new fingerprint through; a genuine wrong-MEK open is caught \
+                 by Vault::verify_canary on the fail-loud startup path."
+            );
+        }
         let now = chrono::Utc::now().to_rfc3339();
         self.conn
             .execute(
@@ -449,8 +1038,659 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// mek_missing_with_state_refuses_start helper
-    /// (implementation-note-336).
+    /// design D3 — read the KDF salt from `vault_meta` if a row with a
+    /// non-NULL `salt` column exists. Returns `None` when the column is
+    /// NULL (pre-migration vault), which signals the open/derive path to
+    /// fall back to the `vault.salt` file sidecar. This is the only
+    /// transitional tolerance the committed code carries.
+    pub fn read_vault_salt(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row("SELECT salt FROM vault_meta WHERE id = 1", [], |row| {
+                row.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row.flatten())
+    }
+
+    /// design D3 — read the Argon2 params TOML from `vault_meta` if
+    /// present. `None` → fall back to the `vault.params` file sidecar.
+    pub fn read_vault_argon2_params(&self) -> Result<Option<String>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT argon2_params FROM vault_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row.flatten())
+    }
+
+    /// design D3 — read the AEAD-sealed canary `(canary, canary_nonce)`
+    /// from `vault_meta`. Returns `None` when either column is NULL
+    /// (pre-migration vault, or a vault provisioned before the canary
+    /// landed) so the caller can skip the canary check rather than fail.
+    #[allow(clippy::type_complexity)]
+    pub fn read_vault_canary(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = self
+            .conn
+            .query_row(
+                "SELECT canary, canary_nonce FROM vault_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row.and_then(|(c, n)| match (c, n) {
+            (Some(c), Some(n)) => Some((c, n)),
+            _ => None,
+        }))
+    }
+
+    /// design D3 — provision the `vault_meta` envelope columns at first
+    /// run: the KDF `salt`, the Argon2 `params` TOML, and the AEAD-sealed
+    /// `(canary, canary_nonce)`. UPSERTs the single `id = 1` row,
+    /// preserving any existing `mek_fingerprint`. `key_epoch` keeps its
+    /// schema default of 0. Idempotent in the sense of "writes whatever
+    /// the caller hands it" — the caller decides when to provision (first
+    /// run, where the salt is generated).
+    pub fn write_vault_envelope_meta(
+        &self,
+        salt: &[u8],
+        argon2_params: &str,
+        canary: &[u8],
+        canary_nonce: &[u8],
+    ) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, salt, argon2_params, canary, canary_nonce, provisioned_at) \
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   salt = excluded.salt, \
+                   argon2_params = excluded.argon2_params, \
+                   canary = excluded.canary, \
+                   canary_nonce = excluded.canary_nonce, \
+                   provisioned_at = COALESCE(vault_meta.provisioned_at, excluded.provisioned_at)",
+                rusqlite::params![salt, argon2_params, canary, canary_nonce, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design D1/D3 — read the monotonic `vault_meta.key_epoch` (the
+    /// rotation legibility/audit counter, surfaced by `vault_status` and
+    /// the rotation plan). Returns `0` when no `vault_meta` row exists yet
+    /// (the column is `NOT NULL DEFAULT 0`, so a present row always yields
+    /// a concrete value).
+    pub fn read_key_epoch(&self) -> Result<i64, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let epoch: Option<i64> = self
+            .conn
+            .query_row("SELECT key_epoch FROM vault_meta WHERE id = 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(epoch.unwrap_or(0))
+    }
+
+    /// design D3 amendment — read the relocated Headless-MEK wrap from
+    /// `vault_meta` (`(headless_mek_nonce, headless_mek_wrapped)`). The
+    /// Headless MEK is AEAD-wrapped under the Interactive MEK; relocating
+    /// it off the `vault.headless-mek.wrapped` file sidecar into the DB is
+    /// what lets `rotate_headless` (and the Interactive-MEK rekey that
+    /// re-wraps it) commit atomically with the per-row DEK rewraps in one
+    /// SQLite transaction. Returns `None` (→ file-sidecar fallback) when
+    /// either column is NULL (pre-migration vault).
+    #[allow(clippy::type_complexity)]
+    pub fn read_headless_mek_wrap(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = self
+            .conn
+            .query_row(
+                "SELECT headless_mek_nonce, headless_mek_wrapped FROM vault_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row.and_then(|(n, w)| match (n, w) {
+            (Some(n), Some(w)) => Some((n, w)),
+            _ => None,
+        }))
+    }
+
+    /// design D3 amendment — UPSERT the relocated Headless-MEK wrap into
+    /// `vault_meta`. Used at first-run provisioning. (Rotation re-writes
+    /// these columns inline inside the single rotation transaction, not via
+    /// this method, so the wrap commits atomically with the DEK rewraps.)
+    pub fn write_headless_mek_wrap(&self, nonce: &[u8], wrapped: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, headless_mek_nonce, headless_mek_wrapped, provisioned_at) \
+                 VALUES (1, ?1, ?2, ?3) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   headless_mek_nonce = excluded.headless_mek_nonce, \
+                   headless_mek_wrapped = excluded.headless_mek_wrapped, \
+                   provisioned_at = COALESCE(vault_meta.provisioned_at, excluded.provisioned_at)",
+                rusqlite::params![nonce, wrapped, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design §4 clean-break — NULL the headless-MEK wrap
+    /// (`headless_mek_nonce`/`headless_mek_wrapped`) and the key-correctness
+    /// canary (`canary`/`canary_nonce`) on the single `vault_meta` row.
+    ///
+    /// Called at `vault.se_provision` BEFORE installing the §4 scope KEK: once
+    /// the interactive vault key is re-sourced from the presence-unwrapped KEK_s,
+    /// a headless blob wrapped under the PRIOR (Argon2id/keychain) MEK can no
+    /// longer be unwrapped, and a canary sealed under that prior MEK would
+    /// false-alarm across the clean break. NULLing both forces the next vault
+    /// open to hit first-run headless generation under KEK_s; the canary is then
+    /// re-sealed under KEK_s by the caller. UPDATE-only: a fresh vault with no
+    /// `vault_meta` row is a harmless no-op (nothing to clear).
+    ///
+    /// Deliberately does NOT silently regenerate-on-mismatch elsewhere — a
+    /// passphrase-lane wrong-key must STAY a loud error; this is the one
+    /// sanctioned, operator-initiated clean break.
+    pub fn clear_headless_and_canary_meta(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE vault_meta SET \
+                   headless_mek_nonce = NULL, \
+                   headless_mek_wrapped = NULL, \
+                   canary = NULL, \
+                   canary_nonce = NULL \
+                 WHERE id = 1",
+                [],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design §4 clean-break — UPSERT ONLY the AEAD-sealed canary columns
+    /// (`canary`/`canary_nonce`), leaving every other `vault_meta` column
+    /// untouched. Used after the §4 scope KEK is installed to re-seal the
+    /// key-correctness canary under KEK_s, so the fail-loud `verify_canary`
+    /// check is live on the presence-as-decryption lane (the §4 install path
+    /// does not write `salt`/`argon2_params`, so the broader
+    /// `write_vault_envelope_meta` cannot be reused here).
+    pub fn write_vault_canary(&self, canary: &[u8], canary_nonce: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, canary, canary_nonce, provisioned_at) \
+                 VALUES (1, ?1, ?2, ?3) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   canary = excluded.canary, \
+                   canary_nonce = excluded.canary_nonce, \
+                   provisioned_at = COALESCE(vault_meta.provisioned_at, excluded.provisioned_at)",
+                rusqlite::params![canary, canary_nonce, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Read the SE-wrapped interactive key blob from `vault_meta`.
+    /// Returns `None` on first boot (column NULL or row absent).
+    pub fn read_se_wrapped_interactive_key(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT se_wrapped_interactive_key FROM vault_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?
+            .flatten())
+    }
+
+    /// UPSERT the SE-wrapped interactive key blob into `vault_meta`.
+    /// Called once at first-boot provisioning.
+    pub fn write_se_wrapped_interactive_key(&self, blob: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, se_wrapped_interactive_key, provisioned_at) \
+                 VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   se_wrapped_interactive_key = excluded.se_wrapped_interactive_key, \
+                   provisioned_at = COALESCE(vault_meta.provisioned_at, excluded.provisioned_at)",
+                rusqlite::params![blob, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    // ── design — DWK persistence ──────────────────────────────────────
+
+    pub fn read_daemon_wrap_key(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT key_blob FROM daemon_keys WHERE key_name = 'dwk'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn write_daemon_wrap_key(&self, key: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO daemon_keys (key_name, key_blob, created_at) \
+                 VALUES ('dwk', ?1, ?2) \
+                 ON CONFLICT(key_name) DO UPDATE SET \
+                   key_blob = excluded.key_blob",
+                rusqlite::params![key, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn read_double_envelope_outer(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT double_envelope_outer FROM vault_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn write_double_envelope_outer(&self, blob: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, double_envelope_outer, provisioned_at) \
+                 VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   double_envelope_outer = excluded.double_envelope_outer, \
+                   provisioned_at = COALESCE(vault_meta.provisioned_at, excluded.provisioned_at)",
+                rusqlite::params![blob, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn read_lease_kek_double_envelope_outer(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT key_blob FROM daemon_keys WHERE key_name = 'lease_kek_de_outer'",
+                [],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn write_lease_kek_double_envelope_outer(&self, blob: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO daemon_keys (key_name, key_blob, created_at) \
+                 VALUES ('lease_kek_de_outer', ?1, ?2) \
+                 ON CONFLICT(key_name) DO UPDATE SET \
+                   key_blob = excluded.key_blob",
+                rusqlite::params![blob, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    // ── design §4 — scope KEK wraps ────────────────────────────────────
+
+    /// design §4 — UPSERT the SE-ECIES-wrapped scope KEK for one enrolled
+    /// presence Device. `wrapped_kek` is the opaque blob the operator-session CLI
+    /// produced via `se_wrap(ecies_key, KEK_s)`; the daemon stores it verbatim and
+    /// never holds the unwrapped KEK_s at rest. design §4 "Never one global KEK":
+    /// the row is keyed by `(scope_kind, scope_id, device_id)` so a scope's KEK_s
+    /// is wrapped to each enrolled Device (Model C, 1-of-N) and one tap opens
+    /// exactly one scope — not the whole AuthorityBearing lane.
+    pub fn write_presence_scope_kek_wrap(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        device_id: &str,
+        ecies_key_id: &str,
+        wrapped_kek: &[u8],
+    ) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO presence_scope_kek \
+                   (scope_kind, scope_id, device_id, ecies_key_id, wrapped_kek, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(scope_kind, scope_id, device_id) DO UPDATE SET \
+                   ecies_key_id = excluded.ecies_key_id, \
+                   wrapped_kek = excluded.wrapped_kek, \
+                   created_at = excluded.created_at",
+                rusqlite::params![
+                    scope_kind,
+                    scope_id,
+                    device_id,
+                    ecies_key_id,
+                    wrapped_kek,
+                    now
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design §4 — list a SCOPE's enrolled-Device wrapped scope-KEK blobs as
+    /// `(device_id, ecies_key_id, wrapped_kek)` for `(scope_kind, scope_id)`. The
+    /// unlock handoff offers these to the operator-session CLI, which picks a
+    /// Device it can unwrap with (its SE key is present in that session's
+    /// keychain) and performs the tap — opening exactly that one scope.
+    #[allow(clippy::type_complexity)]
+    pub fn list_presence_scope_kek_wraps(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, Vec<u8>)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT device_id, ecies_key_id, wrapped_kek FROM presence_scope_kek \
+                 WHERE scope_kind = ?1 AND scope_id = ?2 \
+                 ORDER BY device_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = stmt
+            .query_map(rusqlite::params![scope_kind, scope_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(StoreError::Sqlite)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(StoreError::Sqlite)?);
+        }
+        Ok(out)
+    }
+
+    /// design §4 — drop a Device's wrapped scope-KEK row for one scope (on Device
+    /// revoke/replace, so a retired Device's recipient can no longer unwrap that
+    /// scope). Keyed by `(scope_kind, scope_id, device_id)`.
+    pub fn delete_presence_scope_kek_wrap(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        device_id: &str,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM presence_scope_kek \
+                 WHERE scope_kind = ?1 AND scope_id = ?2 AND device_id = ?3",
+                rusqlite::params![scope_kind, scope_id, device_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design D1 — read the relocated Bridge-CA module-key wrap from
+    /// `vault_meta.bridge_ca_wrapped` (a serialized [`crate::infra::vault::SealedEnvelope`]
+    /// blob, sealed under the Interactive MEK). Relocating it off the
+    /// `bridge_ca.wrap` file sidecar into the DB lets an Interactive-MEK
+    /// rotation re-wrap the bridge-CA module key atomically with everything
+    /// else. Returns `None` (→ file-sidecar fallback) when NULL.
+    pub fn read_bridge_ca_wrap(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT bridge_ca_wrapped FROM vault_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row.flatten())
+    }
+
+    /// design D1 — UPSERT the relocated Bridge-CA module-key wrap into
+    /// `vault_meta.bridge_ca_wrapped`. Used at bridge-CA load/mint time.
+    /// (Rotation re-writes this column inline inside the rotation
+    /// transaction.)
+    pub fn write_bridge_ca_wrap(&self, wrapped: &[u8]) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, bridge_ca_wrapped, provisioned_at) \
+                 VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   bridge_ca_wrapped = excluded.bridge_ca_wrapped, \
+                   provisioned_at = COALESCE(vault_meta.provisioned_at, excluded.provisioned_at)",
+                rusqlite::params![wrapped, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// design §4 clean-break — NULL the bridge-CA module-key wrap
+    /// (`vault_meta.bridge_ca_wrapped`) so the next `BridgeCa::load_or_mint`
+    /// re-mints under the §4-routed custody (bridge-CA is `DaemonOperational`,
+    /// so its module key moves from the old interactive MEK to the autonomous
+    /// headless key). The caller also removes the `bridge_ca.wrap` and
+    /// `bridge_ca.sealed` files so the re-mint does not try to unseal the old
+    /// CA under a fresh module key. UPDATE-only; a fresh vault is a no-op.
+    pub fn clear_bridge_ca_wrap(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE vault_meta SET bridge_ca_wrapped = NULL WHERE id = 1",
+                [],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    // --- design AC-7: publisher trust delegation CRUD (F8 hardened) ---
+
+    pub fn install_publisher_trust(
+        &self,
+        delegation: &crate::trust_graph::PublisherTrustDelegation,
+    ) -> Result<(), StoreError> {
+        if delegation.id.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "delegation id must not be empty".into(),
+            ));
+        }
+        if delegation.publisher_did.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "publisher_did must not be empty".into(),
+            ));
+        }
+        if delegation.pubkey_bytes == [0u8; 32] {
+            return Err(StoreError::InvalidInput(
+                "pubkey_bytes must not be all-zero".into(),
+            ));
+        }
+        if delegation.publisher_did == "did:emberlink" {
+            return Err(StoreError::InvalidInput(
+                "did:emberlink is the pinned first-party root; cannot be delegated to".into(),
+            ));
+        }
+        if let Some(until) = delegation.valid_until
+            && until < delegation.valid_from
+        {
+            return Err(StoreError::InvalidInput(format!(
+                "inverted time window: valid_until ({until}) < valid_from ({})",
+                delegation.valid_from
+            )));
+        }
+        self.conn
+            .execute(
+                "INSERT INTO publisher_trust_delegations \
+                 (id, publisher_did, pubkey_bytes, valid_from, valid_until, installed_at, revoked_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    delegation.id,
+                    delegation.publisher_did,
+                    delegation.pubkey_bytes.as_slice(),
+                    delegation.valid_from,
+                    delegation.valid_until,
+                    delegation.installed_at,
+                    delegation.revoked_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    pub fn revoke_publisher_trust(&self, id: &str, revoked_at: i64) -> Result<bool, StoreError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE publisher_trust_delegations SET revoked_at = ?1 \
+                 WHERE id = ?2 AND revoked_at IS NULL",
+                rusqlite::params![revoked_at, id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(updated > 0)
+    }
+
+    pub fn list_publisher_trusts(
+        &self,
+    ) -> Result<Vec<crate::trust_graph::PublisherTrustDelegation>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, publisher_did, pubkey_bytes, valid_from, valid_until, \
+                 installed_at, revoked_at FROM publisher_trust_delegations \
+                 ORDER BY installed_at, id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let pubkey_blob: Vec<u8> = row.get(2)?;
+                Ok((
+                    id,
+                    row.get::<_, String>(1)?,
+                    pubkey_blob,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(StoreError::Sqlite)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, publisher_did, pubkey_blob, valid_from, valid_until, installed_at, revoked_at) =
+                row.map_err(StoreError::Sqlite)?;
+            let pubkey_bytes: [u8; 32] = match pubkey_blob.try_into() {
+                Ok(b) => b,
+                Err(blob) => {
+                    tracing::warn!(
+                        delegation_id = %id,
+                        blob_len = blob.len(),
+                        "list_publisher_trusts: skipping row with malformed pubkey_bytes"
+                    );
+                    continue;
+                }
+            };
+            out.push(crate::trust_graph::PublisherTrustDelegation {
+                id,
+                publisher_did,
+                pubkey_bytes,
+                valid_from,
+                valid_until,
+                installed_at,
+                revoked_at,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn list_active_publisher_trusts(
+        &self,
+    ) -> Result<Vec<crate::trust_graph::PublisherTrustDelegation>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, publisher_did, pubkey_bytes, valid_from, valid_until, \
+                 installed_at, revoked_at FROM publisher_trust_delegations \
+                 WHERE revoked_at IS NULL ORDER BY installed_at, id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let pubkey_blob: Vec<u8> = row.get(2)?;
+                Ok((
+                    id,
+                    row.get::<_, String>(1)?,
+                    pubkey_blob,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(StoreError::Sqlite)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, publisher_did, pubkey_blob, valid_from, valid_until, installed_at, revoked_at) =
+                row.map_err(StoreError::Sqlite)?;
+            let pubkey_bytes: [u8; 32] = match pubkey_blob.try_into() {
+                Ok(b) => b,
+                Err(blob) => {
+                    tracing::warn!(
+                        delegation_id = %id,
+                        blob_len = blob.len(),
+                        "list_active_publisher_trusts: skipping row with malformed pubkey_bytes"
+                    );
+                    continue;
+                }
+            };
+            out.push(crate::trust_graph::PublisherTrustDelegation {
+                id,
+                publisher_did,
+                pubkey_bytes,
+                valid_from,
+                valid_until,
+                installed_at,
+                revoked_at,
+            });
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_write_non_trust_table(&self) {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS _test_unrelated (v INTEGER); \
+                 INSERT INTO _test_unrelated (v) VALUES (1);",
+            )
+            .unwrap();
+    }
+
+    /// mek_missing_with_state_refuses_start helper.
     ///
     /// Returns true when any state-bearing row exists in the store:
     /// personas, grants, receipts, credentials (vault). Used by the
@@ -520,6 +1760,16 @@ impl DaemonStore {
         let has_segment_id = self.audit_log_column_exists("segment_id")?;
         if has_segment_id {
             self.recreate_audit_log_indexes(&self.conn)?;
+            // cordon_phase1_receipt_backfill_landed — Part 2/3 retrofit for
+            // hosts that cordoned under pre-#4435 code: the bridge row is in
+            // audit_log but the `_unattested` receipt was never minted (and
+            // receipts.log may not exist). This already-migrated early-return
+            // path is the ONLY boot path such a host takes, so the backfill
+            // must live here — and it runs inside DaemonStore::open, before
+            // any startup verify, so the verifier never trips on the gap.
+            // No-op on fresh v2 DBs (no bridge row) and already-backfilled
+            // hosts (receipt present).
+            self.cordon_phase1_receipt_backfill_if_needed()?;
             return Ok(());
         }
 
@@ -557,8 +1807,7 @@ impl DaemonStore {
             )
             .unwrap_or(0);
 
-        let cordon_predicate_fires =
-            legacy_null_count > 0 && chained_past_genesis > 0;
+        let cordon_predicate_fires = legacy_null_count > 0 && chained_past_genesis > 0;
 
         if cordon_predicate_fires {
             self.cordon_migration_phase1_destructive()?;
@@ -584,6 +1833,109 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// cordon_phase1_receipt_backfill_landed — Part 2/3 retrofit. On an
+    /// already-cordoned host, back-fill the Phase 1
+    /// `audit.chain_v1_segment_bridge_unattested` Receipt v2 if it is
+    /// missing from `receipts.log`. Pure receipt-file backfill: reads the
+    /// in-DB bridge row and (re)mints the receipt; does NOT mutate
+    /// `audit_log`. `append_receipts_journal` creates `receipts.log`
+    /// (mode 0600) when absent — that satisfies Part 3.
+    ///
+    /// Idempotent and conservative:
+    /// - no bridge row in `audit_log` (fresh v2 DB) → no-op;
+    /// - bridge row's `row_hash` is NULL/empty (malformed) → no-op;
+    /// - `data_dir` not configured (in-memory store) → no-op;
+    /// - a matching `_unattested` receipt already present → no-op.
+    ///
+    /// The retrofit cannot recover the original `destroyed_row_ids` (those
+    /// rows were excised by the cordon), so the back-filled body carries an
+    /// empty list. The receipt still anchors the bridge row by its
+    /// `bridge_segment_genesis.row_hash`, which is what the verifier binds.
+    fn cordon_phase1_receipt_backfill_if_needed(&self) -> Result<(), StoreError> {
+        let Some(bridge) = self.lookup_cordon_bridge_row()? else {
+            return Ok(());
+        };
+        if bridge.row_hash.is_empty() || bridge.prev_hash.is_empty() {
+            return Ok(());
+        }
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return Ok(());
+        };
+        match cordon_unattested_receipt_present(data_dir, &bridge.row_hash) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            // Read failure (e.g. receipts.log perms drift, I/O error): we
+            // can't tell whether the receipt is present, so SKIP rather than
+            // risk a double-mint — and never block boot on a retrofit read.
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "cordon_phase1_receipt_backfill_landed: could not read receipts.log to \
+                     decide backfill; skipping (boot continues). Investigate receipts.log."
+                );
+                return Ok(());
+            }
+        }
+        // Best-effort: unlike the forward path (which mints inside the
+        // cordon's BEGIN IMMEDIATE and rolls back the whole migration on
+        // failure), the bridge row here ALREADY landed on a previous boot.
+        // The host was bootable before this retrofit existed, so a transient
+        // mint failure (e.g. receipts.log mode-drift refusal, I/O error) must
+        // NOT brick boot. Log loudly and continue — the verifier's existing
+        // IncompleteRepairReceipt → quarantine path is the backstop for the
+        // still-missing receipt, and the next boot retries the backfill
+        // (the presence check skips any partial/corrupt line).
+        match mint_cordon_phase1_bridge_receipt(
+            Some(data_dir),
+            &bridge.prev_hash,
+            &[],
+            &bridge.timestamp,
+            &bridge.row_hash,
+        ) {
+            Ok(()) => tracing::warn!(
+                bridge_row_hash = %bridge.row_hash,
+                "cordon_phase1_receipt_backfill_landed: back-filled missing Phase 1 bridge \
+                 receipt for an already-cordoned host (Part 2/3 retrofit; receipts.log \
+                 created if absent)"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                bridge_row_hash = %bridge.row_hash,
+                "cordon_phase1_receipt_backfill_landed: receipt backfill FAILED (best-effort, \
+                 boot continues). The audit chain stays half-anchored until the next boot \
+                 retries or the verifier quarantines on IncompleteRepairReceipt — investigate \
+                 receipts.log permissions/IO."
+            ),
+        }
+        Ok(())
+    }
+
+    /// Look up the Phase 1 cordon bridge row in `audit_log`, if present.
+    /// Returns `None` on fresh v2 DBs (never cordoned). Used by the
+    /// receipt-backfill retrofit.
+    fn lookup_cordon_bridge_row(&self) -> Result<Option<CordonBridgeRow>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT timestamp, prev_hash, row_hash FROM audit_log \
+                 WHERE action = 'audit.chain_v1_segment_bridge_unattested' \
+                   AND segment_id = 1 AND is_segment_genesis = 1 \
+                 ORDER BY id ASC LIMIT 1",
+                [],
+                |r| {
+                    Ok(CordonBridgeRow {
+                        timestamp: r.get::<_, String>(0)?,
+                        prev_hash: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        row_hash: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row)
+    }
+
     /// PRAGMA-based column existence probe.
     fn audit_log_column_exists(&self, column_name: &str) -> Result<bool, StoreError> {
         let mut stmt = self.conn.prepare("PRAGMA table_info(audit_log)")?;
@@ -595,6 +1947,38 @@ impl DaemonStore {
             }
         }
         Ok(false)
+    }
+
+    /// design §4 per-scope cutover — true when `presence_scope_kek` exists with
+    /// the pre-per-scope shape (`device_id PRIMARY KEY`, no `scope_kind` column).
+    /// Such a table holds discardable single-global wraps; `migrate()` drops it so
+    /// the per-scope `(scope_kind, scope_id, device_id)` schema can be installed
+    /// (clean break — re-provision regenerates the wraps per-scope). False for a
+    /// missing table (fresh DB) or one already carrying `scope_kind`.
+    fn presence_scope_kek_is_pre_per_scope(&self) -> Result<bool, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='presence_scope_kek'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?
+            .unwrap_or(false);
+        if !exists {
+            return Ok(false);
+        }
+        let mut stmt = self.conn.prepare("PRAGMA table_info(presence_scope_kek)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "scope_kind" {
+                return Ok(false); // already per-scope
+            }
+        }
+        Ok(true) // table exists but has no scope_kind => old single-global shape
     }
 
     /// Recreate `audit_log` from a pre-v2 schema where no rows exist (or
@@ -694,19 +2078,20 @@ impl DaemonStore {
         // is carried over (genesis + legacy NULL block). Every id >=
         // first_non_null_after_genesis is destroyed (the buggy chained
         // tail past the legacy block).
-        let boundary_id = first_non_null_after_genesis
-            .ok_or_else(|| StoreError::InvalidInput(
-                "cordon predicate fired but no non-NULL chained row past genesis exists".into()
-            ))?;
+        let boundary_id = first_non_null_after_genesis.ok_or_else(|| {
+            StoreError::InvalidInput(
+                "cordon predicate fired but no non-NULL chained row past genesis exists".into(),
+            )
+        })?;
 
         // cordon_phase1_receipt_mint_retrofitted — pre-compute the list
         // of destroyed-row ids so the bridge receipt body can record
         // them. Pre-transaction read; ordering by id is informational
         // for forensics.
         let destroyed_row_ids: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM audit_log WHERE id >= ?1 ORDER BY id ASC",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM audit_log WHERE id >= ?1 ORDER BY id ASC")?;
             stmt.query_map(rusqlite::params![boundary_id], |r| r.get::<_, i64>(0))?
                 .collect::<Result<Vec<i64>, _>>()?
         };
@@ -803,7 +2188,7 @@ impl DaemonStore {
             // DBs, so the receipt is minted exactly once per host. A
             // crash AFTER the SQLite COMMIT but BEFORE the runtime's
             // post-cordon receipt-presence check (Phase 2 attestation
-            // surface, pending `implementation-note-351`) would
+            // surface, pending the audit-chain migration CLI) would
             // leave a row without a receipt; this is the symmetric
             // `IncompleteRepairReceipt` surface and is currently
             // out-of-band recovered.
@@ -899,10 +2284,19 @@ impl DaemonStore {
                 nonce BLOB NOT NULL,
                 ciphertext BLOB NOT NULL,
                 created_at TEXT NOT NULL,
-                metadata TEXT
+                metadata TEXT,
+                -- Presence-policy unification: the prior
+                -- `requires_biometric INTEGER` column folded into the typed
+                -- `presence_policy TEXT` axis aligned with design's
+                -- AuthorityLane vocabulary. `lane_default` = defer to method
+                -- lane; `per_access_fresh` = every access demands a fresh
+                -- nonce-bound presence-Device signature (closes the cached
+                -- unlock bypass prior change originally fixed via the boolean).
+                -- Anchor: `vault_presence_policy_unified_with_adr206`.
+                presence_policy TEXT NOT NULL DEFAULT 'lane_default'
             );
 
-            -- audit_chain_v2_schema_landed (implementation-note-352).
+            -- audit_chain_v2_schema_landed (implementation-note-315).
             -- v2 audit_log shape from CREATE TABLE on fresh DBs. The CHECK
             -- constraint encodes the chain invariant. segment_id is NOT NULL
             -- with NO DEFAULT (per R5 / pass-2 finding #4) so an older binary
@@ -1001,7 +2395,8 @@ impl DaemonStore {
                 created_at TEXT NOT NULL,
                 composite_statements_json TEXT,
                 result_grant_id TEXT,
-                -- implementation-note-10:
+                resolution_kind TEXT NOT NULL DEFAULT 'grant',
+                -- implementation-note-13:
                 -- grant-shaping fields preserved through the approval queue so
                 -- the resolver can re-stamp them on the minted grant.
                 max_delegation_depth INTEGER,
@@ -1048,7 +2443,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
 
-            -- implementation-note-108: server-persisted WebAuthn credentials.
+            -- implementation-note-107: server-persisted WebAuthn credentials.
             -- Each row is a passkey enrolled by a persona via
             -- /settings/passkeys; the `passkey_json` column is the
             -- webauthn-rs `Passkey` type (serde JSON serialization)
@@ -1062,7 +2457,9 @@ impl DaemonStore {
                 persona_id TEXT NOT NULL,
                 passkey_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                last_used_at INTEGER
+                last_used_at INTEGER,
+                binding_scope TEXT,
+                binding_ref TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_persona
                 ON webauthn_credentials(persona_id);
@@ -1098,6 +2495,20 @@ impl DaemonStore {
                 PRIMARY KEY (scope_kind, scope_id, segment_no)
             );
 
+            CREATE TABLE IF NOT EXISTS service_registrations (
+                plugin_address TEXT NOT NULL,
+                plugin_version TEXT NOT NULL,
+                publisher_id TEXT NOT NULL,
+                installed_at TEXT NOT NULL,
+                installed_by TEXT NOT NULL,
+                state TEXT NOT NULL,
+                service_label TEXT,
+                install_receipt_hash TEXT NOT NULL,
+                PRIMARY KEY (plugin_address, plugin_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_service_registrations_state
+                ON service_registrations(state);
+
             CREATE TABLE IF NOT EXISTS claim_journal_claims (
                 scope_kind TEXT NOT NULL,
                 scope_id TEXT NOT NULL,
@@ -1109,22 +2520,29 @@ impl DaemonStore {
                 ts TEXT NOT NULL,
                 claim_kind TEXT NOT NULL,
                 tool TEXT NOT NULL,
+                action_plugin_address TEXT,
+                action_key TEXT,
+                action_version TEXT,
+                runner_class TEXT,
+                execution_domain TEXT,
+                materialization_class TEXT,
+                legacy_flat INTEGER NOT NULL DEFAULT 0,
                 input_hash TEXT NOT NULL,
                 input_redacted_json TEXT NOT NULL,
                 resolved_json TEXT NOT NULL,
                 persona_id TEXT,
+                grant_id TEXT,
                 device_id TEXT,
-                workflow_id TEXT,
+                delegation_id TEXT,
                 materialization_id TEXT,
                 credential_name TEXT,
                 PRIMARY KEY (scope_kind, scope_id, scope_seq),
-                UNIQUE (scope_kind, scope_id, source_key),
-                UNIQUE (audit_event_id)
+                UNIQUE (scope_kind, scope_id, source_key)
             );
             CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_scope_segment
                 ON claim_journal_claims(scope_kind, scope_id, segment_no, segment_seq);
 
-            -- implementation-note-108: in-flight WebAuthn ceremony state.
+            -- implementation-note-107: in-flight WebAuthn ceremony state.
             -- Registration ceremonies and authentication ceremonies
             -- both stash `state_json` here keyed by a freshly-minted
             -- challenge_id; the corresponding finish endpoint reads it
@@ -1150,7 +2568,36 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_persona
                 ON webauthn_challenges(persona_id);
 
-            -- credential_bindings_table_schema — implementation-note-353
+            -- presence_challenges (design §3 / AC-3) — the single-use nonce
+            -- table that anchors freshness for the dev0/PIV presence lane. PIV
+            -- has no FIDO sign-counter, so the daemon-issued nonce is the SOLE
+            -- freshness primitive: require_authority issues a nonce bound to
+            -- (op_id, daemon fingerprint), and the verifier tombstones
+            -- (op_id, nonce) as single-use — consumed atomically (DELETE then
+            -- validate, mirroring webauthn_challenges) so a captured signature
+            -- cannot be replayed. `consumed_at` marks a spent nonce; expired or
+            -- absent rows fail closed. expires_at is unix epoch seconds.
+            CREATE TABLE IF NOT EXISTS presence_challenges (
+                nonce TEXT PRIMARY KEY,
+                op_id TEXT NOT NULL,
+                daemon_fingerprint TEXT NOT NULL,
+                method TEXT NOT NULL,
+                -- params_digest (design §1.3 / approval-laundering Finding 1):
+                -- binds the canonical digest of the op's authority-relevant
+                -- params into the nonce row so the signed intent covers the
+                -- OBJECT, not just the VERB. Recomputed over the received params
+                -- at consume; a mismatch fails closed. DEFAULT '' so a legacy
+                -- in-flight nonce (pre-column, sub-minute TTL) fails closed
+                -- rather than admitting an unbound op.
+                params_digest TEXT NOT NULL DEFAULT '',
+                peer_uid INTEGER,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_presence_challenges_op
+                ON presence_challenges(op_id);
+
+            -- credential_bindings_table_schema — implementation-note-316
             -- Daemon-controlled credential-target allowlist: binds a
             -- principal (persona) + working-tree (canonical absolute
             -- repo-root path) + remote-name to a specific remote URL.
@@ -1181,9 +2628,13 @@ impl DaemonStore {
         // so multi-scope rollups can back-reference one audit row without
         // duplicating evidence.
         let rebuild_claim_journal_for_multi_scope = {
-            let mut stmt = self.conn.prepare("PRAGMA index_list(claim_journal_claims)")?;
+            let mut stmt = self
+                .conn
+                .prepare("PRAGMA index_list(claim_journal_claims)")?;
             let indexes: Vec<(String, i64)> = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             let mut found_unique_audit_only = false;
             for (index_name, is_unique) in indexes {
@@ -1218,29 +2669,92 @@ impl DaemonStore {
                      ts TEXT NOT NULL,
                      claim_kind TEXT NOT NULL,
                      tool TEXT NOT NULL,
+                     action_plugin_address TEXT,
+                     action_key TEXT,
+                     action_version TEXT,
+                     runner_class TEXT,
+                     execution_domain TEXT,
+                     materialization_class TEXT,
+                     legacy_flat INTEGER NOT NULL DEFAULT 0,
                      input_hash TEXT NOT NULL,
                      input_redacted_json TEXT NOT NULL,
                      resolved_json TEXT NOT NULL,
                      persona_id TEXT,
+                     grant_id TEXT,
                      device_id TEXT,
-                     workflow_id TEXT,
+                     delegation_id TEXT,
                      materialization_id TEXT,
                      credential_name TEXT,
                      PRIMARY KEY (scope_kind, scope_id, scope_seq),
                      UNIQUE (scope_kind, scope_id, source_key)
                  );
                  INSERT INTO claim_journal_claims
-                     (scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json, persona_id, device_id, workflow_id, materialization_id, credential_name)
-                 SELECT scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json, persona_id, device_id, workflow_id, materialization_id, credential_name
+                     (scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, action_plugin_address, action_key, action_version, runner_class, execution_domain, materialization_class, legacy_flat, input_hash, input_redacted_json, resolved_json, persona_id, grant_id, device_id, delegation_id, materialization_id, credential_name)
+                 SELECT scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, NULL, NULL, NULL, NULL, NULL, NULL, 0, input_hash, input_redacted_json, resolved_json, persona_id, NULL, device_id, delegation_id, materialization_id, credential_name
                    FROM claim_journal_claims_legacy_unique_audit;
                  DROP TABLE claim_journal_claims_legacy_unique_audit;
                  CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_scope_segment
                      ON claim_journal_claims(scope_kind, scope_id, segment_no, segment_seq);
+                 CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_plugin_time
+                     ON claim_journal_claims(action_plugin_address, ts);
+                 CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_action_full
+                     ON claim_journal_claims(action_plugin_address, action_key, action_version);
                  COMMIT;",
             )?;
         }
 
-        // implementation-note-62 — backfill `kind` column on legacy DBs so
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN action_plugin_address TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN action_key TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN action_version TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN runner_class TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN execution_domain TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN materialization_class TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN legacy_flat INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN grant_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_plugin_time \
+             ON claim_journal_claims(action_plugin_address, ts)",
+            [],
+        );
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_action_full \
+             ON claim_journal_claims(action_plugin_address, action_key, action_version)",
+            [],
+        );
+
+        // design §1.3 / approval-laundering Finding 1 — add `params_digest` to
+        // legacy `presence_challenges` DBs. Idempotent: swallowed when the column
+        // already exists (fresh DBs created it in the schema batch above).
+        let _ = self.conn.execute(
+            "ALTER TABLE presence_challenges ADD COLUMN params_digest TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
+        // Backfill `kind` column on legacy DBs so
         // the kms_wrap / kms_unwrap rows can land alongside grant rows.
         // Errors swallowed when the column already exists.
         let _ = self.conn.execute(
@@ -1248,7 +2762,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-62 — per-key fast-path index for queries shaped
+        // Per-key fast-path index for queries shaped
         // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
         // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
         // column so we don't have to project key_name into its own
@@ -1260,7 +2774,7 @@ impl DaemonStore {
                  WHERE kind IN ('kms_wrap','kms_unwrap');",
         )?;
 
-        // EMBER-implementation-note-278 — per-actor and per-resource fast-path indexes
+        // Per-actor and per-resource fast-path indexes
         // for the `ember audit` query CLI. The existing
         // `idx_receipts_persona` covers persona_id lookups; we keep the
         // `idx_receipts_actor` alias as a stable name the task spec can
@@ -1273,7 +2787,7 @@ impl DaemonStore {
                  ON receipts(json_extract(receipt_json, '$.summary.resource'));",
         )?;
 
-        // implementation-note-233 — composite-grant approval columns. Existing v0 DBs
+        // Composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -1284,6 +2798,10 @@ impl DaemonStore {
         );
         let _ = self.conn.execute(
             "ALTER TABLE approval_requests ADD COLUMN result_grant_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN resolution_kind TEXT NOT NULL DEFAULT 'grant'",
             [],
         );
 
@@ -1312,7 +2830,16 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE sandboxes ADD COLUMN owner_persona_id TEXT", []);
 
-        // implementation-note-276 — per-statement revocation list.
+        // design §I2 — session_id binds the sandbox to the internal
+        // `register_session` minted for its proxy LLM lane. Held so
+        // `sandbox_stop` / `sandbox_delete` can `close_session` it (release the
+        // vault-lock pin + revoke the host-mode enrollment + invalidate the
+        // attachment). NULL for sandboxes with no brokered lane / legacy rows.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sandboxes ADD COLUMN session_id TEXT", []);
+
+        // Per-statement revocation list.
         // Stores a JSON array of revoked Statement sids ("S0", "S1", ...) so
         // the demo can revoke a single Statement without taking down the
         // whole grant. Default `'[]'` keeps the column non-null on legacy
@@ -1343,6 +2870,19 @@ impl DaemonStore {
             [],
         );
 
+        // Daemon-operator passkeys need an
+        // explicit binding anchor that is not just persona_id. Backfill the
+        // nullable columns on legacy DBs; fresh DBs already get them via the
+        // CREATE TABLE above.
+        let _ = self.conn.execute(
+            "ALTER TABLE webauthn_credentials ADD COLUMN binding_scope TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE webauthn_credentials ADD COLUMN binding_ref TEXT",
+            [],
+        );
+
         // COMPOSITE-prior change-TESTS-DASHBOARD — skill_ref advisory pointer from
         // GrantProposal. Persisted so the dashboard approval card can surface
         // which Construct/skill originated the proposal. Nullable: pre-existing
@@ -1353,7 +2893,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-10 — grant-
+        // Grant-
         // shaping fields the auto-approve `create_grant` path writes onto the
         // freshly-minted grant row. Before this fix the approval-required
         // path silently dropped them. Persisted on the approval_requests row
@@ -1392,8 +2932,16 @@ impl DaemonStore {
             "ALTER TABLE approval_requests ADD COLUMN auto_delegate_scope_template TEXT",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN approval_binding_json TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN approval_binding_used_at TEXT",
+            [],
+        );
 
-        // implementation-note-66 (design §9 + §6) — bind a
+        // design §9 + §6 — bind a
         // workload Persona to the container identity it was minted for so
         // the reconciler can refuse to spawn a second container into the
         // same enrollment slot if the daemon restarts mid-spawn (CRIT-4
@@ -1413,8 +2961,8 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE personas ADD COLUMN parent_grant_id TEXT", []);
 
-        // implementation-note-354 (M1 of design, Bridge
-        // Cert Refresh Protocol). Per-persona client-certificate state for
+        // M1 of design, Bridge
+        // Cert Refresh Protocol. Per-persona client-certificate state for
         // the (d) refresh-and-rotate path:
         //
         // - `client_cert_fingerprint TEXT NOT NULL DEFAULT ''` — blake3 of
@@ -1453,8 +3001,8 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-272 (design §"In-container
-        // extension") — per-socket Persona enrollment table. At spawn
+        // design §"In-container
+        // extension" — per-socket Persona enrollment table. At spawn
         // time the daemon records `(agent_socket_path, persona_id,
         // grant_id, brief_content_hash)` so subsequent RPCs on that
         // socket resolve identity from the enrollment table rather
@@ -1482,7 +3030,7 @@ impl DaemonStore {
             );",
         )?;
 
-        // implementation-note-355 Step A — namespace-inode columns on
+        // Step A — namespace-inode columns on
         // agent_socket_enrollments. Errors swallowed when columns already
         // exist (fresh DBs have them via the CREATE TABLE above; old DBs
         // need the ALTER).
@@ -1499,13 +3047,13 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-297 — peer_uid
+        // peer_uid
         // column on agent_socket_enrollments. Carries the kernel-attested
         // uid the per-agent UDS socket was bound to at spawn time so the
         // broker's `check_principal_against_persona` gate can compare the
         // live `PeerCredPrincipal.uid` against the enrollment row. The
-        // in-process `PERSONA_UID_REGISTRY` thread-local was retired in
-        // implementation-note-155; the
+        // in-process `PERSONA_UID_REGISTRY` thread-local was retired when
+        // the persona registry collapsed into the enrollment table; the
         // enrollment table is now the sole source of truth.
         //
         // Nullable to preserve back-compat for legacy / pre-Step-B rows
@@ -1532,8 +3080,8 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT", []);
 
-        // cordon_phase1_recreate_table_landed (implementation-note-356-
-        // CORDON-PHASE1) — promote a v1 DB (chain columns but no segment_id)
+        // cordon_phase1_recreate_table_landed — promote a v1 DB (chain
+        // columns but no segment_id)
         // to v2 via recreate-table. No-op on v2 DBs (the column already
         // exists) and on fresh DBs (CREATE TABLE already used v2 shape).
         self.cordon_migration_phase1_if_needed()?;
@@ -1563,8 +3111,7 @@ impl DaemonStore {
             );
         }
 
-        // mek_fingerprint_column_verified
-        // (implementation-note-350).
+        // mek_fingerprint_column_verified.
         //
         // `vault_meta` table carries plaintext-fingerprint columns that
         // survive the keychain-ACL problem: the daemon can ALWAYS read
@@ -1588,8 +3135,340 @@ impl DaemonStore {
             [],
         )?;
 
+        // design D1 — MEK→DEK envelope columns on credential rows.
+        // `wrapped_dek` is the per-row Data Encryption Key AEAD-wrapped
+        // under the row's scope MEK; `dek_nonce` is the fresh 24-byte
+        // XChaCha20 nonce for that wrap. Additive ALTERs (idempotent — a
+        // second open finds the column present and the `let _ =` swallows
+        // the duplicate-column error). New rows always populate both;
+        // pre-migration rows carry NULL and read-path errors loud per D2.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE credentials ADD COLUMN wrapped_dek BLOB", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE credentials ADD COLUMN dek_nonce BLOB", []);
+        // Per-row marker for credentials that
+        // require a fresh presence-Device ceremony on every read. Existing rows
+        // default to ordinary cached-unlock behavior. Retained as an idempotent
+        // ALTER so old DBs that landed before
+        // The presence-policy unification still passes through the
+        // migration below cleanly even if they never carried the column.
+        let _ = self.conn.execute(
+            "ALTER TABLE credentials ADD COLUMN requires_biometric INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        // Presence-policy unification: add the typed
+        // `presence_policy` column and backfill it from any existing
+        // `requires_biometric=1` rows. After this migration the application
+        // code reads/writes only `presence_policy`; the legacy
+        // `requires_biometric` column is retained as dead data because
+        // SQLite column drops require a table rebuild we have no compelling
+        // reason to take. Anchor:
+        // `vault_presence_policy_unified_with_adr206`.
+        let _ = self.conn.execute(
+            "ALTER TABLE credentials ADD COLUMN presence_policy TEXT NOT NULL DEFAULT 'lane_default'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "UPDATE credentials \
+             SET presence_policy = CASE requires_biometric \
+                 WHEN 1 THEN 'per_access_fresh' \
+                 ELSE 'lane_default' \
+             END \
+             WHERE presence_policy = 'lane_default'",
+            [],
+        );
+
+        // design Part B — MEK→DEK envelope columns on persona rows. The
+        // persona Ed25519 secret was previously sealed DIRECTLY under the
+        // Interactive MEK (`Vault::seal` → `private_key_nonce` +
+        // `private_key_ciphertext`). Part B envelopes it: the secret is now
+        // sealed under a per-persona DEK whose nonce is `private_key_nonce`
+        // and whose wrap (under the Interactive MEK, persona-bound AAD) is
+        // carried by `private_key_dek_nonce` + `private_key_wrapped_dek`.
+        // Additive ALTERs (idempotent — `let _ =` swallows duplicate-column).
+        // New rows populate all four; a pre-Part-B row carries NULL in the
+        // two new columns and the read path errors loud per envelope-only.
+        let _ = self.conn.execute(
+            "ALTER TABLE personas ADD COLUMN private_key_dek_nonce BLOB",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE personas ADD COLUMN private_key_wrapped_dek BLOB",
+            [],
+        );
+
+        // design D3 — move the KDF salt/params + key epoch + key-
+        // correctness canary into `vault_meta` so they are committed
+        // atomically with the wrapped DEKs in a future rotation tx (the
+        // CRITICAL atomicity substrate). `salt` and `argon2_params` fall
+        // back to the `vault.salt` / `vault.params` file sidecars when
+        // NULL (the only transitional tolerance — lets a pre-migration
+        // vault still open). `key_epoch` is legibility/audit only.
+        // `canary` + `canary_nonce` carry the AEAD-sealed known plaintext
+        // verified on the fail-loud startup path.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE vault_meta ADD COLUMN salt BLOB", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE vault_meta ADD COLUMN argon2_params TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE vault_meta ADD COLUMN key_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE vault_meta ADD COLUMN canary BLOB", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE vault_meta ADD COLUMN canary_nonce BLOB", []);
+
+        // design D1/D3 amendment — relocate the two FILE-backed wraps that
+        // are sealed under the Interactive MEK into `vault_meta` so they
+        // commit atomically with the per-row DEK rewraps inside one rotation
+        // transaction. Before this, the Headless-MEK wrap lived in
+        // `vault.headless-mek.wrapped` and the Bridge-CA module key lived in
+        // `bridge_ca.wrap` — a crash between the SQLite commit and a separate
+        // file rewrite during rotation could leave the file under one MEK and
+        // the DB under another (the same brick-window class the salt move
+        // closed). Relocating both makes the rotation tx the single
+        // linearization point for ALL Interactive-MEK-wrapped material.
+        //   - `headless_mek_nonce` / `headless_mek_wrapped`: the 24-byte
+        //     XChaCha20 nonce + ciphertext-with-tag of the 32-byte Headless
+        //     MEK wrapped under the Interactive MEK (AAD `vault.headless-mek.v1`).
+        //   - `bridge_ca_wrapped`: a serialized `SealedEnvelope` (the bridge-CA
+        //     module wrapping key) — `SealedEnvelope::to_blob()` bytes.
+        // NULL columns fall back to the legacy file sidecars (the only
+        // transitional tolerance; the dev0 host's existing files are migrated
+        // into the DB by the out-of-tree one-shot, design D2).
+        let _ = self.conn.execute(
+            "ALTER TABLE vault_meta ADD COLUMN headless_mek_nonce BLOB",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE vault_meta ADD COLUMN headless_mek_wrapped BLOB",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE vault_meta ADD COLUMN bridge_ca_wrapped BLOB",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE vault_meta ADD COLUMN se_wrapped_interactive_key BLOB",
+            [],
+        );
+
+        // design — double-envelope outer blob. The at-rest form of each
+        // SE-custodied key is SE_ECIES_encrypt(DWK_encrypt(raw_key)). This
+        // column stores the fully double-wrapped outer blob for the vault
+        // MEK. (Lease-KEK uses the same double-envelope primitive but stores
+        // its outer blob in the lease persistence table, not here.)
+        let _ = self.conn.execute(
+            "ALTER TABLE vault_meta ADD COLUMN double_envelope_outer BLOB",
+            [],
+        );
+
+        // design — daemon wrap key (DWK). A random 256-bit symmetric key
+        // generated once and stored in daemon.db. Its security comes from
+        // file ownership (uid=450, mode 0600). The DWK never leaves the
+        // daemon process; it is the inner envelope of the double-envelope
+        // SE custody model.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS daemon_keys (
+                key_name TEXT PRIMARY KEY,
+                key_blob BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        // design §4 — presence-as-decryption scope-KEK wraps. ONE operator
+        // authority scope KEK (KEK_s) is wrapped (SE-ECIES) to EACH enrolled
+        // presence Device's recipient key (Model C — any enrolled Device can
+        // perform the unlock unwrap gesture, design §2). One row per
+        // (scope, Device) — a scope's KEK_s wrapped to each enrolled Device:
+        // the opaque `wrapped_kek` blob produced by the operator-session CLI's
+        // `se_wrap` (the separate-uid daemon never does SE crypto — it only
+        // stores/serves these blobs). `ecies_key_id` records which recipient key
+        // the blob is wrapped to (the Device's `active_encryption_key.key_id`)
+        // so the unlock handoff can tell the CLI which SE key label to unwrap
+        // with. The daemon NEVER stores the unwrapped KEK_s at rest.
+        //
+        // design §4 per-scope cutover (clean break): the table was
+        // `device_id PRIMARY KEY` (one global KEK). Drop an old-shape table —
+        // its single-global wraps are discardable; re-provision regenerates them
+        // per-scope — so the CREATE below installs the per-scope schema. A fresh
+        // or already-per-scope DB skips the drop (idempotent).
+        if self.presence_scope_kek_is_pre_per_scope()? {
+            self.conn
+                .execute("DROP TABLE presence_scope_kek", [])
+                .map_err(StoreError::Sqlite)?;
+        }
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS presence_scope_kek (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                ecies_key_id TEXT NOT NULL,
+                wrapped_kek BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (scope_kind, scope_id, device_id)
+            )",
+            [],
+        )?;
+
+        // design Phase 4 / AC-6 — SE-wrapped, restart-surviving lease blobs.
+        // One row per grant: the grant's [`crate::trust::lease::LeaseKey`] AND its
+        // metadata (scope / persona / expiry / minted-at), sealed together into a
+        // single AES-GCM-authenticated blob `se_wrap`ed under the daemon's
+        // headless lease-KEK (`crate::trust::lease::LEASE_KEK_LABEL`). The blob is
+        // the ONLY representation of the lease at rest — non-exfiltratable (only
+        // the SE key unwraps it) and fully authenticated. Raw key bytes are never
+        // stored, and there are deliberately **no plaintext metadata columns**:
+        // the live `Lease` fields are re-derived from the authenticated blob on
+        // rehydrate, so a DB-write attacker who cannot extract the SE key cannot
+        // flip a lease's scope or extend its TTL (defect-2 fix). This persistence
+        // does NOT reintroduce a standing exfiltratable key (see the lease.rs
+        // module note): it relocates restart-survival into hardware.
+        //
+        // Clean break (no users, pre-launch): a fresh CREATE; there is no prior
+        // shape to migrate — the in-memory registry was non-persistent before
+        // this slice, so there are no legacy rows to reshape.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS lease_blobs (
+                grant_id TEXT PRIMARY KEY,
+                wrapped_blob BLOB NOT NULL
+            )",
+            [],
+        )?;
+
+        // design PR-A — persona authority-to-act material re-sealed under one
+        // grant's lease key. One opaque blob per grant, deleted with the lease
+        // on revoke/expiry/exhaustion. The sealed payload binds grant_id and
+        // persona_id, so there are deliberately no plaintext metadata columns to
+        // tamper. Missing row => fail-closed: no lease-wrapped persona root, no
+        // block-0 signing.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS grant_persona_secrets (
+                grant_id TEXT PRIMARY KEY,
+                wrapped_blob BLOB NOT NULL
+            )",
+            [],
+        )?;
+
+        // H3 fix (security/c1-h1-h3 — v0.3.0 pre-release) — grant_chain_secrets
+        // holds the tail `pubkey_next_secret` of each grant's signed chain,
+        // sealed under the grant's live lease. Required so delegation can
+        // produce a real append-chain (block N+1 signed by block N's
+        // pubkey_next), not a fresh single-block child linked only via the
+        // mutable `parent_grant_id` SQL column.
+        //
+        // `tail_block_index` is the 0-indexed position of the block whose
+        // pubkey_next this secret pairs with — i.e. the LAST block in the
+        // chain (the one a future appended block would be signed by).
+        // Missing row => fail-closed: chain cannot be extended (delegation
+        // refused). The blob is opaque to the store; `grant.rs` authenticates
+        // `(grant_id, tail_block_index)` binding inside the sealed payload.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS grant_chain_secrets (
+                grant_id TEXT PRIMARY KEY,
+                tail_block_index INTEGER NOT NULL,
+                wrapped_blob BLOB NOT NULL
+            )",
+            [],
+        )?;
+
+        // design AC-7 / design §2 — installed publisher trust delegations
+        // for the WoT walk. Each row maps a third-party publisher DID to an
+        // Ed25519 pubkey the daemon trusts for Construct signature verification.
+        // Revocation is soft-delete (revoked_at) for auditability.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS publisher_trust_delegations (
+                id TEXT PRIMARY KEY,
+                publisher_did TEXT NOT NULL,
+                pubkey_bytes BLOB NOT NULL CHECK(length(pubkey_bytes) = 32),
+                valid_from INTEGER NOT NULL,
+                valid_until INTEGER,
+                installed_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            )",
+            [],
+        )?;
+
+        // design spine reconciliation (2026-06-17): retire the
+        // `transient_scope_additions` parallel auth-decision lane shipped by
+        // #6087. The functionality is
+        // canonically expressible via the existing minted lane (narrow-TTL
+        // single-use lease per design).
+        // Idempotent on fresh DBs (table never existed) and on DBs that already
+        // dropped it.
+        self.conn
+            .execute("DROP TABLE IF EXISTS transient_scope_additions", [])?;
+
         Ok(())
     }
+}
+
+/// cordon_phase1_receipt_backfill_landed — the in-DB Phase 1 bridge row,
+/// projected for the receipt-backfill retrofit. `prev_hash` is the
+/// pre-migration chain-tip (the v1 genesis row_hash); `row_hash` is the
+/// bridge row's own hash (the receipt's `bridge_segment_genesis.row_hash`).
+struct CordonBridgeRow {
+    timestamp: String,
+    prev_hash: String,
+    row_hash: String,
+}
+
+/// cordon_phase1_receipt_backfill_landed — true when `receipts.log` already
+/// holds the Phase 1 `_unattested` bridge receipt anchoring `bridge_row_hash`.
+/// Reads the append-only journal file directly (the file side of the
+/// two-store invariant — the SQLite `receipts` table is a separate store).
+/// A missing journal returns `Ok(false)`. Corrupt lines are skipped so a
+/// single bad line never blocks the backfill decision. Matching on the
+/// bridge row's `row_hash` (not merely the kind) keeps the check precise
+/// across hosts and any future multi-cordon case.
+fn cordon_unattested_receipt_present(
+    data_dir: &Path,
+    bridge_row_hash: &str,
+) -> Result<bool, StoreError> {
+    use core_events::receipt::{
+        AuditChainV1SegmentBridgeUnattestedBody,
+        RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_UNATTESTED, ReceiptEnvelope,
+    };
+    let path = data_dir.join("receipts.log");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(StoreError::InvalidInput(format!(
+                "cordon_phase1_receipt_backfill_landed: read receipts.log: {e}"
+            )));
+        }
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(env) = serde_json::from_str::<ReceiptEnvelope>(line) else {
+            continue;
+        };
+        if env.kind != RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_UNATTESTED {
+            continue;
+        }
+        let Ok(body) =
+            serde_json::from_value::<AuditChainV1SegmentBridgeUnattestedBody>(env.body.clone())
+        else {
+            continue;
+        };
+        if body.bridge_segment_genesis.row_hash == bridge_row_hash {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// cordon_phase1_receipt_mint_retrofitted — mint and append the Phase 1
@@ -1708,8 +3587,8 @@ fn mint_cordon_phase1_bridge_receipt(
     Ok(())
 }
 
-/// implementation-note-272 (design §"In-container
-/// extension") — projection of an `agent_socket_enrollments` row.
+/// design §"In-container
+/// extension" — projection of an `agent_socket_enrollments` row.
 ///
 /// Returned by [`DaemonStore::lookup_agent_socket_enrollment`] when an
 /// active enrollment exists for the queried socket path. Revoked rows
@@ -1723,18 +3602,18 @@ pub struct AgentSocketEnrollment {
     pub brief_content_hash: String,
     pub enrolled_at: String,
     pub state: String,
-    /// implementation-note-355 Step A — cgroup v2 leaf inode for
+    /// Step A — cgroup v2 leaf inode for
     /// the worker container (Step B populates; Step C gates dispatch).
     /// NULL for legacy/host-resident enrollments.
     pub cgroup_v2_id: Option<i64>,
-    /// implementation-note-355 Step A — user-namespace inode.
+    /// Step A — user-namespace inode.
     pub userns_inode: Option<i64>,
-    /// implementation-note-355 Step A — mount-namespace inode.
+    /// Step A — mount-namespace inode.
     pub mnt_ns_inode: Option<i64>,
 }
 
 impl DaemonStore {
-    /// implementation-note-272 — record a fresh per-socket
+    /// Record a fresh per-socket
     /// Persona enrollment.
     ///
     /// Called at agent-spawn time by the scion spawn pipeline once a
@@ -1760,7 +3639,7 @@ impl DaemonStore {
         userns_inode: Option<i64>,
         mnt_ns_inode: Option<i64>,
     ) -> Result<(), StoreError> {
-        // implementation-note-357 — the three Option<i64>
+        // The three Option<i64>
         // columns carry the kernel-observable binding tuple captured
         // at spawn-completion via
         // `crate::spawn::scion::capture_container_ns_inodes`. NULL is
@@ -1786,7 +3665,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-272 — resolve the Persona
+    /// Resolve the Persona
     /// bound to a per-agent UDS socket.
     ///
     /// Returns `Ok(Some(...))` only when an `active` enrollment row is
@@ -1823,7 +3702,7 @@ impl DaemonStore {
         }
     }
 
-    /// implementation-note-272 — tombstone an enrollment.
+    /// Tombstone an enrollment.
     ///
     /// Flips the row's `state` column to `'revoked'`; the row itself
     /// stays so the slot is observable for post-mortem audit and so a
@@ -1840,9 +3719,53 @@ impl DaemonStore {
         )?;
         Ok(())
     }
+
+    /// target_state_anchor: SCION-everywhere — host-mode session-open
+    /// enrollment shim. Writes an `agent_socket_enrollments` row keyed
+    /// on a synthetic socket path so a host-mode session's runtime
+    /// persona passes `check_principal_enrollment_strict` (broker.resolve
+    /// checkpoint `fail_closed_broker_resolve`) and
+    /// `check_principal_against_persona` (uid-binding gate). The
+    /// namespace tuple is intentionally NULL — the namespace gate
+    /// `check_principal_namespace_inodes` no-ops on all-NULL bindings,
+    /// which is the documented carve-out for non-container call sites.
+    ///
+    /// `peer_uid` is stamped in the same `INSERT` so the broker
+    /// gates never observe a row whose binding is half-written; the
+    /// existing two-step `seed_socket_enrollment_for_test` pattern
+    /// only exists because production code (until now) had no host-
+    /// mode writer and the test surface pre-dated this helper.
+    ///
+    /// Remove once every session opens inside a SCION container
+    /// (design); the SCION path's `enroll_container_persona` writes
+    /// the equivalent row with kernel-attested namespace inodes and
+    /// is the long-term writer.
+    pub fn record_host_mode_socket_enrollment(
+        &self,
+        socket_path: &str,
+        persona_id: &str,
+        grant_id: &str,
+        peer_uid: Option<u32>,
+    ) -> Result<(), StoreError> {
+        let enrolled_at = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO agent_socket_enrollments \
+                (socket_path, persona_id, grant_id, brief_content_hash, enrolled_at, state, \
+                 cgroup_v2_id, userns_inode, mnt_ns_inode, peer_uid) \
+             VALUES (?1, ?2, ?3, 'host-mode', ?4, 'active', NULL, NULL, NULL, ?5)",
+            rusqlite::params![
+                socket_path,
+                persona_id,
+                grant_id,
+                enrolled_at,
+                peer_uid.map(|uid| uid as i64),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
-/// implementation-note-297 — look up a
+/// Look up a
 /// persona's expected peer uid by consulting the
 /// `agent_socket_enrollments` table.
 ///
@@ -1850,8 +3773,8 @@ impl DaemonStore {
 /// gate: the per-agent UDS socket already populates this table at
 /// enrollment time, so the broker can compare the live kernel-attested
 /// `PeerCredPrincipal.uid` against the recorded `peer_uid`. The
-/// per-process `PERSONA_UID_REGISTRY` thread-local was retired in
-/// implementation-note-155; see
+/// per-process `PERSONA_UID_REGISTRY` thread-local was retired when the
+/// persona registry collapsed into the enrollment table; see
 /// `crates/ember-daemon/src/infra/handler.rs` for the tombstone.
 ///
 /// Resolution order:
@@ -1872,6 +3795,15 @@ impl DaemonStore {
 /// Returns `Err(StoreError::Sqlite)` only on a real SQLite error
 /// (corrupt db, schema-mismatch, etc.); the no-row and NULL-uid cases
 /// are mapped to `Ok(None)` so the caller can apply policy uniformly.
+/// Unix epoch seconds — the time base for `presence_challenges` (design §3
+/// AC-3 nonce TTL). Matches `webauthn_challenges`' epoch-seconds convention.
+fn presence_nonce_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn lookup_persona_uid_from_enrollments(
     store: &DaemonStore,
     persona_id: &str,
@@ -1896,7 +3828,7 @@ pub fn lookup_persona_uid_from_enrollments(
 }
 
 impl DaemonStore {
-    /// EMBER-implementation-note-278 — query the receipts table with the full
+    /// Query the receipts table with the full
     /// [`crate::infra::receipt::ReceiptFilter`] filter set (actor/kind/grant_id/
     /// since_iso/resource/limit). Returns flat [`crate::infra::receipt::ReceiptRow`]
     /// projections so callers get `materialized_at`, `terminal_reason`,
@@ -1922,7 +3854,7 @@ impl DaemonStore {
     /// Phase C callers replace the embedded `if current_status != "pending"`
     /// string-comparison guard with this fn, which also covers the
     /// scope-narrowing invariant checked by `core_approval::TransitionError::ScopeNotNarrowing`.
-    // implementation-note-358 wires this into resolve_approval_inner.
+    // Phase C wires this into resolve_approval_inner.
     #[allow(dead_code)]
     pub(crate) fn validate_approval_transition(
         state: core_grant_types::approval::ApprovalStatus,
@@ -1937,17 +3869,313 @@ impl DaemonStore {
     }
 }
 
+impl crate::signature_verifier::TrustStore for DaemonStore {
+    fn list_active_publisher_trusts(
+        &self,
+    ) -> Result<
+        Vec<crate::trust_graph::PublisherTrustDelegation>,
+        crate::signature_verifier::TrustStoreError,
+    > {
+        self.list_active_publisher_trusts()
+            .map_err(|e| crate::signature_verifier::TrustStoreError(e.to_string()))
+    }
+
+    fn trust_graph_revision(&self) -> u64 {
+        self.trust_graph_rev.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_nonce_single_use_and_bound() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let (nonce, _exp) = store
+            .mint_presence_nonce("op-1", "fp-x", "create_grant", "b3:d1", Some(501), 300)
+            .unwrap();
+
+        // Wrong binding fails (and consumes the nonce — DELETE-then-validate).
+        let (n2, _) = store
+            .mint_presence_nonce("op-2", "fp-x", "create_grant", "b3:d1", Some(501), 300)
+            .unwrap();
+        assert!(
+            store
+                .consume_presence_nonce(&n2, "op-WRONG", "fp-x", "create_grant", "b3:d1")
+                .is_err()
+        );
+        // Even the correct binding now fails — the row was tombstoned on the
+        // failed attempt (no replay window).
+        assert!(
+            store
+                .consume_presence_nonce(&n2, "op-2", "fp-x", "create_grant", "b3:d1")
+                .is_err()
+        );
+
+        // Correct binding succeeds exactly once.
+        assert!(
+            store
+                .consume_presence_nonce(&nonce, "op-1", "fp-x", "create_grant", "b3:d1")
+                .is_ok()
+        );
+        // Second consume of the same nonce fails (single-use, AC-3).
+        assert!(
+            store
+                .consume_presence_nonce(&nonce, "op-1", "fp-x", "create_grant", "b3:d1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn presence_nonce_rejects_params_digest_mismatch() {
+        // design §1.3 / Finding 1: a nonce minted committing digest-A must NOT
+        // consume when the daemon recomputes digest-B over substituted params.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let (nonce, _) = store
+            .mint_presence_nonce(
+                "op-d",
+                "fp-x",
+                "create_grant",
+                "b3:read-foo",
+                Some(501),
+                300,
+            )
+            .unwrap();
+        // Substituted params → different recomputed digest → rejected.
+        assert!(
+            store
+                .consume_presence_nonce(&nonce, "op-d", "fp-x", "create_grant", "b3:admin-all")
+                .is_err()
+        );
+        // And the failed attempt tombstoned the row (no replay even with the
+        // correct digest).
+        let (nonce2, _) = store
+            .mint_presence_nonce(
+                "op-d2",
+                "fp-x",
+                "create_grant",
+                "b3:read-foo",
+                Some(501),
+                300,
+            )
+            .unwrap();
+        assert!(
+            store
+                .consume_presence_nonce(&nonce2, "op-d2", "fp-x", "create_grant", "b3:read-foo")
+                .is_ok(),
+            "matching digest must consume"
+        );
+    }
+
+    #[test]
+    fn presence_nonce_expired_is_rejected() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        // TTL 0 → expires_at == now; the < now check fails it on consume.
+        let (nonce, _) = store
+            .mint_presence_nonce("op-e", "fp-x", "vault_add", "b3:d1", None, -1)
+            .unwrap();
+        assert!(
+            store
+                .consume_presence_nonce(&nonce, "op-e", "fp-x", "vault_add", "b3:d1")
+                .is_err()
+        );
+    }
 
     #[test]
     fn open_in_memory_succeeds() {
         assert!(DaemonStore::open_in_memory().is_ok());
     }
 
-    /// implementation-note-354 (M1) +
-    /// implementation-note-304 — verify the
+    #[test]
+    fn presence_scope_kek_wraps_round_trip_and_delete() {
+        // design §4: per-(scope, Device) wrapped scope-KEK storage. UPSERT, list
+        // a scope across its Model-C device set, delete on Device retirement, and —
+        // the F4 point — scopes are ISOLATED: a tap for one scope lists only its
+        // own wraps, never another scope's ("Never one global KEK").
+        let store = DaemonStore::open_in_memory().unwrap();
+        let (sk, s1) = ("persona", "scope-1");
+        let (ok, o2) = ("persona", "scope-2");
+        assert!(
+            store
+                .list_presence_scope_kek_wraps(sk, s1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .write_presence_scope_kek_wrap(sk, s1, "device-a", "ecies-a", b"wrapped-a")
+            .unwrap();
+        store
+            .write_presence_scope_kek_wrap(sk, s1, "device-b", "ecies-b", b"wrapped-b")
+            .unwrap();
+        // A DIFFERENT scope's wrap for the SAME device must not bleed into scope-1.
+        store
+            .write_presence_scope_kek_wrap(ok, o2, "device-a", "ecies-x", b"wrapped-x")
+            .unwrap();
+
+        let all = store.list_presence_scope_kek_wraps(sk, s1).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                (
+                    "device-a".to_string(),
+                    "ecies-a".to_string(),
+                    b"wrapped-a".to_vec()
+                ),
+                (
+                    "device-b".to_string(),
+                    "ecies-b".to_string(),
+                    b"wrapped-b".to_vec()
+                ),
+            ],
+            "list returns ONLY this scope's wraps (F4: never one global KEK)"
+        );
+
+        // UPSERT replaces the blob for an existing (scope, Device).
+        store
+            .write_presence_scope_kek_wrap(sk, s1, "device-a", "ecies-a2", b"wrapped-a2")
+            .unwrap();
+        let updated = store.list_presence_scope_kek_wraps(sk, s1).unwrap();
+        assert_eq!(updated[0].1, "ecies-a2");
+        assert_eq!(updated[0].2, b"wrapped-a2".to_vec());
+        assert_eq!(updated.len(), 2, "UPSERT must not add a row");
+
+        // Delete drops only the named (scope, Device) row — other scopes untouched.
+        store
+            .delete_presence_scope_kek_wrap(sk, s1, "device-a")
+            .unwrap();
+        let after = store.list_presence_scope_kek_wraps(sk, s1).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, "device-b");
+        let other_after = store.list_presence_scope_kek_wraps(ok, o2).unwrap();
+        assert_eq!(
+            other_after.len(),
+            1,
+            "delete on scope-1 must not touch scope-2"
+        );
+        assert_eq!(other_after[0].0, "device-a");
+    }
+
+    #[test]
+    fn presence_scope_kek_old_global_shape_is_clean_break_dropped_on_migrate() {
+        // design §4 per-scope cutover: a pre-per-scope DB (device_id PRIMARY KEY,
+        // no scope_kind) must be detected and clean-break dropped+recreated on
+        // migrate() so the per-scope schema installs. Old single-global wraps are
+        // discardable (re-provision regenerates them per-scope).
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        // Simulate a pre-per-scope DB shape with a stale single-global wrap.
+        store
+            .conn
+            .execute("DROP TABLE presence_scope_kek", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "CREATE TABLE presence_scope_kek (
+                    device_id TEXT PRIMARY KEY,
+                    ecies_key_id TEXT NOT NULL,
+                    wrapped_kek BLOB NOT NULL,
+                    created_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO presence_scope_kek (device_id, ecies_key_id, wrapped_kek, created_at) \
+                 VALUES ('old-dev', 'old-ecies', x'00', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store.presence_scope_kek_is_pre_per_scope().unwrap(),
+            "pre-per-scope shape is detected"
+        );
+
+        // migrate() is idempotent; re-running it drops the old-shape table and
+        // recreates the per-scope schema (discarding the stale global wrap).
+        store.migrate().unwrap();
+        assert!(
+            !store.presence_scope_kek_is_pre_per_scope().unwrap(),
+            "after migrate the table is per-scope"
+        );
+        assert!(
+            store
+                .list_presence_scope_kek_wraps("operator", "root-x")
+                .unwrap()
+                .is_empty(),
+            "the stale single-global wrap was discarded (clean break)"
+        );
+        // Per-scope writes work on the migrated schema.
+        store
+            .write_presence_scope_kek_wrap("operator", "root-x", "dev", "ecies", b"w")
+            .unwrap();
+        assert_eq!(
+            store
+                .list_presence_scope_kek_wraps("operator", "root-x")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn clean_break_nulls_headless_and_canary_then_canary_reseals() {
+        // design §4 clean-break: at `vault.se_provision` the prior-MEK headless
+        // wrap + canary are NULLed (so the next open regenerates headless under
+        // KEK_s), then the canary is re-sealed under KEK_s.
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        // Seed a prior-MEK headless wrap + canary (the pre-§4 state).
+        store
+            .write_vault_envelope_meta(b"salt-16-bytes!!!", "params", b"old-canary", b"old-nonce")
+            .unwrap();
+        store
+            .write_headless_mek_wrap(b"h-nonce", b"h-wrapped")
+            .unwrap();
+        assert!(store.read_vault_canary().unwrap().is_some());
+        assert!(store.read_headless_mek_wrap().unwrap().is_some());
+
+        // Clean-break NULLs both the headless wrap and the canary.
+        store.clear_headless_and_canary_meta().unwrap();
+        assert!(
+            store.read_headless_mek_wrap().unwrap().is_none(),
+            "clean-break must NULL the prior-MEK headless wrap"
+        );
+        assert!(
+            store.read_vault_canary().unwrap().is_none(),
+            "clean-break must NULL the prior-MEK canary"
+        );
+
+        // Re-seal the canary under KEK_s (canary-only UPSERT) — the headless
+        // wrap stays NULL so the next open regenerates it under KEK_s.
+        store
+            .write_vault_canary(b"kek-s-canary", b"kek-s-nonce")
+            .unwrap();
+        assert_eq!(
+            store.read_vault_canary().unwrap(),
+            Some((b"kek-s-canary".to_vec(), b"kek-s-nonce".to_vec()))
+        );
+        assert!(
+            store.read_headless_mek_wrap().unwrap().is_none(),
+            "canary re-seal must not resurrect the headless wrap"
+        );
+    }
+
+    #[test]
+    fn clean_break_on_fresh_vault_meta_is_noop() {
+        // A fresh vault has no `vault_meta` row; the clean-break UPDATE must be a
+        // harmless no-op (nothing to clear) rather than an error.
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.clear_headless_and_canary_meta().unwrap();
+        assert!(store.read_vault_canary().unwrap().is_none());
+    }
+
+    /// Bridge persona cert columns (M1) +
+    /// refresh-seq column — verify the
     /// schema migration landed: the `personas` table has
     /// `client_cert_fingerprint` (TEXT NOT NULL DEFAULT ''),
     /// `client_cert_not_after` (INTEGER NOT NULL DEFAULT 0), and
@@ -1989,7 +4217,7 @@ mod tests {
             "client_cert_not_after default must be 0"
         );
 
-        // implementation-note-304 — third M-series
+        // Third M-series
         // column on the cert refresh chain. Default 0 so legacy rows
         // observe their first refresh as seq=1 via the atomic
         // `UPDATE ... RETURNING` in `DaemonStore::increment_refresh_seq`.
@@ -2070,7 +4298,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let expected = [
-            // implementation-note-272: per-socket Persona
+            // Per-socket Persona
             // enrollment table keyed by `socket_path`.
             "agent_socket_enrollments",
             "approval_requests",
@@ -2080,26 +4308,251 @@ mod tests {
             "claim_journal_segments",
             "credential_bindings",
             "credentials",
+            "grant_chain_secrets",
             "grant_usage",
+            "grant_persona_secrets",
             "grants",
             "notifications",
             "personas",
+            // design AC-7 / design §2: installed WoT trust delegations.
+            "publisher_trust_delegations",
             "receipts",
             "sandboxes",
+            "service_registrations",
             "standing_grants",
-            // implementation-note-359-* (design / SE-sealed vault):
+            // design / SE-sealed vault:
             // single-row table holding the current MEK fingerprint + the
             // ISO-8601 timestamp it was provisioned at. Slice B-bis writes
             // it at first-provision; slice F's diagnose CLI reads it.
             "vault_meta",
-            // implementation-note-108: server-persisted WebAuthn state.
+            // Server-persisted WebAuthn state.
             "webauthn_credentials",
             "webauthn_challenges",
+            // design §3 (-S2, #5035): single-use presence-authority nonces.
+            "presence_challenges",
+            // design §4 (slice 4): per-Device SE-ECIES-wrapped scope-KEK blobs.
+            "presence_scope_kek",
+            // design Phase 4 / AC-6: SE-wrapped, restart-surviving lease blobs.
+            "lease_blobs",
+            // design: daemon wrap keys for double-envelope SE custody.
+            "daemon_keys",
         ];
-        assert_eq!(tables.len(), 20);
+        assert_eq!(tables.len(), expected.len());
         for name in &expected {
             assert!(tables.contains(&name.to_string()), "missing table: {name}");
         }
+    }
+
+    #[test]
+    fn publisher_trust_delegation_crud() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let pk_bytes: [u8; 32] = {
+            let mut s = [0u8; 32];
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = (i + 1) as u8;
+            }
+            s
+        };
+        let deleg = crate::trust_graph::PublisherTrustDelegation {
+            id: "deleg-1".to_string(),
+            publisher_did: "did:acme-tools".to_string(),
+            pubkey_bytes: pk_bytes,
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1735689600,
+            revoked_at: None,
+        };
+
+        store.install_publisher_trust(&deleg).unwrap();
+
+        let all = store.list_publisher_trusts().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].publisher_did, "did:acme-tools");
+        assert_eq!(all[0].pubkey_bytes, pk_bytes);
+
+        let active = store.list_active_publisher_trusts().unwrap();
+        assert_eq!(active.len(), 1);
+
+        let revoked = store.revoke_publisher_trust("deleg-1", 1735690000).unwrap();
+        assert!(revoked);
+
+        let active_after = store.list_active_publisher_trusts().unwrap();
+        assert_eq!(active_after.len(), 0);
+
+        let all_after = store.list_publisher_trusts().unwrap();
+        assert_eq!(all_after.len(), 1);
+        assert!(all_after[0].revoked_at.is_some());
+
+        let double_revoke = store.revoke_publisher_trust("deleg-1", 1735691000).unwrap();
+        assert!(
+            !double_revoke,
+            "already-revoked delegation must return false"
+        );
+    }
+
+    #[test]
+    fn trust_graph_revision_bumps_on_delegation_crud() {
+        use crate::signature_verifier::TrustStore;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let rev0 = store.trust_graph_revision();
+
+        let deleg = crate::trust_graph::PublisherTrustDelegation {
+            id: "rev-test".to_string(),
+            publisher_did: "did:test".to_string(),
+            pubkey_bytes: [1u8; 32],
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1000,
+            revoked_at: None,
+        };
+        store.install_publisher_trust(&deleg).unwrap();
+        let rev1 = store.trust_graph_revision();
+        assert_ne!(rev0, rev1, "INSERT must bump revision");
+
+        store.revoke_publisher_trust("rev-test", 2000).unwrap();
+        let rev2 = store.trust_graph_revision();
+        assert_ne!(rev1, rev2, "UPDATE (revoke) must bump revision");
+    }
+
+    #[test]
+    fn trust_graph_revision_unaffected_by_other_tables() {
+        use crate::signature_verifier::TrustStore;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let rev0 = store.trust_graph_revision();
+
+        store.test_write_non_trust_table();
+        let rev1 = store.trust_graph_revision();
+        assert_eq!(
+            rev0, rev1,
+            "mutation to a different table must NOT bump trust_graph_revision"
+        );
+    }
+
+    #[test]
+    fn install_publisher_trust_rejects_empty_id() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let deleg = crate::trust_graph::PublisherTrustDelegation {
+            id: "".into(),
+            publisher_did: "did:test".into(),
+            pubkey_bytes: [1u8; 32],
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1000,
+            revoked_at: None,
+        };
+        let err = store.install_publisher_trust(&deleg).unwrap_err();
+        assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn install_publisher_trust_rejects_all_zero_pubkey() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let deleg = crate::trust_graph::PublisherTrustDelegation {
+            id: "zero-pk".into(),
+            publisher_did: "did:test".into(),
+            pubkey_bytes: [0u8; 32],
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1000,
+            revoked_at: None,
+        };
+        let err = store.install_publisher_trust(&deleg).unwrap_err();
+        assert!(format!("{err}").contains("all-zero"), "got: {err}");
+    }
+
+    #[test]
+    fn install_publisher_trust_rejects_emberlink_self_delegation() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let deleg = crate::trust_graph::PublisherTrustDelegation {
+            id: "self-deleg".into(),
+            publisher_did: "did:emberlink".into(),
+            pubkey_bytes: [1u8; 32],
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1000,
+            revoked_at: None,
+        };
+        let err = store.install_publisher_trust(&deleg).unwrap_err();
+        assert!(format!("{err}").contains("did:emberlink"), "got: {err}");
+    }
+
+    #[test]
+    fn install_publisher_trust_rejects_inverted_time_window() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let deleg = crate::trust_graph::PublisherTrustDelegation {
+            id: "inverted".into(),
+            publisher_did: "did:test".into(),
+            pubkey_bytes: [1u8; 32],
+            valid_from: 2000,
+            valid_until: Some(1000),
+            installed_at: 1000,
+            revoked_at: None,
+        };
+        let err = store.install_publisher_trust(&deleg).unwrap_err();
+        assert!(format!("{err}").contains("inverted"), "got: {err}");
+    }
+
+    #[test]
+    fn list_publisher_trusts_skips_malformed_pubkey_rows() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let good = crate::trust_graph::PublisherTrustDelegation {
+            id: "good".into(),
+            publisher_did: "did:good".into(),
+            pubkey_bytes: [1u8; 32],
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1000,
+            revoked_at: None,
+        };
+        store.install_publisher_trust(&good).unwrap();
+        // Bypass Rust + CHECK by recreating table without constraint,
+        // simulating a pre-hardening DB with a corrupt row.
+        store.conn.execute_batch(
+            "CREATE TABLE _ptd_bak AS SELECT * FROM publisher_trust_delegations; \
+             DROP TABLE publisher_trust_delegations; \
+             CREATE TABLE publisher_trust_delegations ( \
+                 id TEXT PRIMARY KEY, publisher_did TEXT NOT NULL, pubkey_bytes BLOB NOT NULL, \
+                 valid_from INTEGER NOT NULL, valid_until INTEGER, installed_at INTEGER NOT NULL, revoked_at INTEGER); \
+             INSERT INTO publisher_trust_delegations SELECT * FROM _ptd_bak; \
+             DROP TABLE _ptd_bak; \
+             INSERT INTO publisher_trust_delegations (id, publisher_did, pubkey_bytes, valid_from, installed_at) \
+                 VALUES ('bad', 'did:bad', X'CAFE', 0, 2000);",
+        ).unwrap();
+        let all = store.list_publisher_trusts().unwrap();
+        assert_eq!(all.len(), 1, "malformed row must be skipped");
+        assert_eq!(all[0].id, "good");
+        let active = store.list_active_publisher_trusts().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "malformed row must be skipped in active list"
+        );
+        assert_eq!(active[0].id, "good");
+    }
+
+    #[test]
+    fn list_publisher_trusts_deterministic_order() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        for name in ["c", "a", "b"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO publisher_trust_delegations \
+                 (id, publisher_did, pubkey_bytes, valid_from, installed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![name, "did:test", [1u8; 32].as_slice(), 0i64, 1000i64],
+                )
+                .unwrap();
+        }
+        let all = store.list_publisher_trusts().unwrap();
+        let ids: Vec<&str> = all.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "same installed_at must tie-break on id"
+        );
     }
 
     #[test]
@@ -2142,15 +4595,127 @@ mod tests {
             "audit_event_id",
             "claim_kind",
             "tool",
+            "action_plugin_address",
+            "action_key",
+            "action_version",
+            "runner_class",
+            "execution_domain",
+            "materialization_class",
+            "legacy_flat",
             "input_hash",
             "input_redacted_json",
             "resolved_json",
+            "grant_id",
         ] {
             assert!(
                 names.contains(&expected),
                 "claim_journal_claims missing required column: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn service_registrations_table_has_catalog_lifecycle_columns() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let cols = collect_columns(&store, "service_registrations");
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        for expected in [
+            "plugin_address",
+            "plugin_version",
+            "publisher_id",
+            "installed_at",
+            "installed_by",
+            "state",
+            "service_label",
+            "install_receipt_hash",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "service_registrations missing required column: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_migrates_legacy_claim_journal_rows_to_catalog_substrate_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE claim_journal_claims (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                scope_seq INTEGER NOT NULL,
+                segment_no INTEGER NOT NULL,
+                segment_seq INTEGER NOT NULL,
+                source_key TEXT NOT NULL,
+                audit_event_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                claim_kind TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                input_redacted_json TEXT NOT NULL,
+                resolved_json TEXT NOT NULL,
+                persona_id TEXT,
+                device_id TEXT,
+                delegation_id TEXT,
+                materialization_id TEXT,
+                credential_name TEXT,
+                PRIMARY KEY (scope_kind, scope_id, scope_seq),
+                UNIQUE (scope_kind, scope_id, source_key),
+                UNIQUE (audit_event_id)
+            );
+            INSERT INTO claim_journal_claims
+                (scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json, persona_id, device_id, delegation_id, materialization_id, credential_name)
+            VALUES
+                ('session', 'legacy-session', 1, 0, 1, 'src-legacy', 17, '2026-05-22T12:00:00Z', 'credential_vended', 'Claude', 'h-legacy', '{\"cmd\":\"deploy\"}', '{\"allowed\":true}', 'persona-legacy', 'device-legacy', NULL, 'mid-legacy', 'anthropic');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = DaemonStore::open(&path).unwrap();
+        let cols = collect_claim_journal_claim_columns(&store);
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        for expected in [
+            "action_plugin_address",
+            "action_key",
+            "action_version",
+            "runner_class",
+            "execution_domain",
+            "materialization_class",
+            "grant_id",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "migrated claim_journal_claims missing required column: {expected}"
+            );
+        }
+
+        let row: (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store
+            .conn()
+            .query_row(
+                "SELECT tool, action_plugin_address, action_key, action_version, grant_id
+                   FROM claim_journal_claims
+                  WHERE scope_kind = 'session' AND scope_id = 'legacy-session' AND scope_seq = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, ("Claude".to_string(), None, None, None, None,));
     }
 
     #[test]
@@ -2161,7 +4726,9 @@ mod tests {
             .prepare("PRAGMA index_list(claim_journal_claims)")
             .unwrap();
         let indexes: Vec<(String, i64)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -2204,6 +4771,28 @@ mod tests {
         assert!(
             primary.vault().is_none(),
             "dropping one store's shared slot must clear the other store too"
+        );
+    }
+
+    #[test]
+    fn shared_lease_kek_propagates_across_stores() {
+        let primary = DaemonStore::open_in_memory_without_vault().unwrap();
+        let secondary = DaemonStore::open_in_memory_without_vault().unwrap();
+
+        let shared_slot = primary.lease_kek_slot();
+        secondary.replace_lease_kek_slot(shared_slot);
+
+        assert!(
+            secondary.lease_kek().is_none(),
+            "lease-KEK must be None before unlock"
+        );
+
+        let kek = crate::trust::lease::LeaseWrapKey::from_raw([0xCCu8; 32]);
+        primary.set_lease_kek(kek);
+
+        assert!(
+            secondary.lease_kek().is_some(),
+            "secondary store must observe the shared lease-KEK after set on primary"
         );
     }
 
@@ -2412,7 +5001,11 @@ mod tests {
                 let fake_hash = blake3::hash(format!("synthetic-tail-{i}").as_bytes())
                     .to_hex()
                     .to_string();
-                let prev_hash: Option<String> = if i == 0 { None } else { Some(fake_hash.clone()) };
+                let prev_hash: Option<String> = if i == 0 {
+                    None
+                } else {
+                    Some(fake_hash.clone())
+                };
                 conn.execute(
                     "INSERT INTO audit_log \
                      (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
@@ -2450,7 +5043,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(segment_0_count, 6, "segment 0 must carry genesis + 5 legacy");
+        assert_eq!(
+            segment_0_count, 6,
+            "segment 0 must carry genesis + 5 legacy"
+        );
 
         let segment_1_count: i64 = store
             .conn()
@@ -2483,11 +5079,7 @@ mod tests {
                     .starts_with("operator-shape.db.pre-cordon-")
             })
             .collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "exactly one pre-cordon backup must exist"
-        );
+        assert_eq!(entries.len(), 1, "exactly one pre-cordon backup must exist");
 
         // Idempotency: opening again no-ops the migration.
         drop(store);
@@ -2582,7 +5174,12 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*), MAX(action) FROM audit_log WHERE segment_id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(segment_1_count, 1, "exactly one bridge row at segment_id=1");
@@ -2646,6 +5243,146 @@ mod tests {
             1,
             "reopening must NOT double-mint the bridge receipt (idempotency)"
         );
+    }
+
+    /// cordon_phase1_receipt_backfill_landed — Part 2/3 retrofit. A host
+    /// that cordoned under pre-#4435 code has a bridge row in `audit_log`
+    /// but NO `_unattested` receipt in `receipts.log` (the file may not
+    /// even exist). Reopening the store must detect the missing receipt
+    /// and back-fill it from the bridge row's stored fields, creating
+    /// `receipts.log` (mode 0600) if absent — and must do so on the
+    /// already-cordoned early-return path (before any startup verify).
+    #[test]
+    fn cordon_backfill_remints_receipt_for_already_cordoned_host() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("operator.db");
+        crate::infra::receipt::init_identity(dir.path())
+            .expect("init daemon identity for cordon backfill test");
+
+        // Build pre-v2 operator-shape DB (genesis + legacy block + buggy tail).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    agent_id TEXT,
+                    action TEXT NOT NULL,
+                    credential TEXT,
+                    outcome TEXT NOT NULL,
+                    details TEXT,
+                    prev_hash TEXT,
+                    row_hash TEXT
+                );",
+            )
+            .unwrap();
+            let genesis_hash = blake3::hash(b"audit.chain_v1_genesis").to_hex().to_string();
+            conn.execute(
+                "INSERT INTO audit_log \
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                 VALUES (?1, NULL, 'audit.chain_v1_genesis', NULL, 'ok', NULL, NULL, ?2)",
+                rusqlite::params!["2026-05-01T00:00:00Z", genesis_hash],
+            )
+            .unwrap();
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO audit_log \
+                     (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                     VALUES (?1, NULL, ?2, NULL, 'ok', NULL, NULL, NULL)",
+                    rusqlite::params![
+                        format!("2026-05-{:02}T00:00:00Z", 2 + i),
+                        format!("legacy.event-{}", i),
+                    ],
+                )
+                .unwrap();
+            }
+            for i in 0..2 {
+                let fake = blake3::hash(format!("tail-{i}").as_bytes())
+                    .to_hex()
+                    .to_string();
+                let prev: Option<String> = if i == 0 { None } else { Some(fake.clone()) };
+                conn.execute(
+                    "INSERT INTO audit_log \
+                     (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                     VALUES (?1, NULL, ?2, NULL, 'ok', NULL, ?3, ?4)",
+                    rusqlite::params![
+                        format!("2026-05-{:02}T00:00:00Z", 6 + i),
+                        format!("buggy.tail-{i}"),
+                        prev,
+                        fake,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // First open: forward cordon fires + mints the receipt.
+        let store = DaemonStore::open(&path).expect("open + cordon");
+        let receipts_path = dir.path().join("receipts.log");
+        assert!(receipts_path.exists(), "forward mint creates receipts.log");
+        // Capture the bridge row's row_hash so we can match the backfilled receipt.
+        let bridge_row_hash: String = store
+            .conn()
+            .query_row(
+                "SELECT row_hash FROM audit_log \
+                 WHERE action = 'audit.chain_v1_segment_bridge_unattested' \
+                   AND segment_id = 1 AND is_segment_genesis = 1",
+                [],
+                |row| {
+                    row.get::<_, Option<String>>(0)
+                        .map(|h| h.unwrap_or_default())
+                },
+            )
+            .unwrap();
+        assert!(!bridge_row_hash.is_empty(), "bridge row has a row_hash");
+
+        // Simulate the operator's already-cordoned host: the bridge row is
+        // in audit_log (segment_id column present) but receipts.log is
+        // gone (cordoned under pre-#4435 code that never minted it).
+        drop(store);
+        std::fs::remove_file(&receipts_path).expect("delete receipts.log");
+        assert!(!receipts_path.exists());
+
+        // Reopen: the already-cordoned early-return path must back-fill.
+        let _reopen = DaemonStore::open(&path).expect("reopen + backfill");
+        assert!(
+            receipts_path.exists(),
+            "backfill must recreate receipts.log on the already-cordoned host"
+        );
+        // Part 3: file mode is 0600.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&receipts_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "receipts.log must be 0600, got {mode:#o}");
+        }
+        let contents = std::fs::read_to_string(&receipts_path).unwrap();
+        let lines: Vec<&str> = contents
+            .lines()
+            .filter(|l| l.contains("audit.chain_v1_segment_bridge_unattested"))
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one backfilled bridge receipt");
+        let env: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            env["body"]["bridge_segment_genesis"]["row_hash"]
+                .as_str()
+                .unwrap(),
+            bridge_row_hash,
+            "backfilled receipt must anchor the in-DB bridge row by hash"
+        );
+        assert!(env["signature"].is_string(), "backfilled receipt is signed");
+
+        // Idempotency: a third open does NOT double-mint.
+        let _reopen2 = DaemonStore::open(&path).expect("third open");
+        let contents2 = std::fs::read_to_string(&receipts_path).unwrap();
+        let lines2 = contents2
+            .lines()
+            .filter(|l| l.contains("audit.chain_v1_segment_bridge_unattested"))
+            .count();
+        assert_eq!(lines2, 1, "backfill must be idempotent (no double-mint)");
     }
 
     /// cordon_phase1_recreate_table_landed — on a fresh DB the cordon
@@ -2734,14 +5471,14 @@ mod tests {
             .lookup_agent_socket_enrollment("/run/emberd/agent-test-some.sock")
             .unwrap()
             .expect("inserted enrollment must resolve");
-        // implementation-note-357 — the binding tuple round-
+        // The binding tuple round-
         // trips through SQLite intact.
         assert_eq!(row.cgroup_v2_id, Some(987654321));
         assert_eq!(row.userns_inode, Some(4026531840));
         assert_eq!(row.mnt_ns_inode, Some(4026531841));
     }
 
-    // implementation-note-297 — T1 unit
+    // Unit
     // tests on `lookup_persona_uid_from_enrollments`. The helper is the
     // seam between the broker's `check_principal_against_persona` gate
     // and the per-agent UDS enrollment table; Step A only wires the
@@ -2932,8 +5669,7 @@ mod tests {
         );
     }
 
-    // mek_missing_with_state_refuses_start helper tests
-    // (implementation-note-336).
+    // mek_missing_with_state_refuses_start helper tests.
 
     #[test]
     fn has_state_bearing_rows_returns_false_for_empty_store() {
@@ -2942,14 +5678,43 @@ mod tests {
         assert!(!has, "fresh in-memory store must report empty");
     }
 
-    // mek_fingerprint_column_verified tests
-    // (implementation-note-350).
+    // mek_fingerprint_column_verified tests.
 
     #[test]
     fn read_mek_fingerprint_returns_none_on_fresh_store() {
         let store = DaemonStore::open_in_memory_without_vault().expect("open");
         let fp = store.read_mek_fingerprint().expect("read");
         assert!(fp.is_none(), "fresh store must have no fingerprint");
+    }
+
+    #[test]
+    fn read_double_envelope_outer_returns_none_for_null_legacy_row() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        store
+            .conn
+            .execute(
+                "INSERT INTO vault_meta (id, mek_fingerprint, provisioned_at) \
+                 VALUES (1, 'legacy-fingerprint', '2026-06-16T00:00:00Z')",
+                [],
+            )
+            .expect("seed legacy vault_meta row");
+
+        let outer = store.read_double_envelope_outer().expect("read");
+        assert!(
+            outer.is_none(),
+            "NULL double-envelope outer blob means unprovisioned, not corrupt"
+        );
+    }
+
+    #[test]
+    fn double_envelope_outer_round_trips() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        let expected = b"double-envelope-outer".to_vec();
+
+        store.write_double_envelope_outer(&expected).expect("write");
+
+        let got = store.read_double_envelope_outer().expect("read");
+        assert_eq!(got, Some(expected));
     }
 
     #[test]
@@ -2973,19 +5738,24 @@ mod tests {
     }
 
     #[test]
-    fn write_mek_fingerprint_mismatch_errors() {
+    fn write_mek_fingerprint_mismatch_is_advisory_write_through() {
+        // design D3 (shipped in -S6a, #4958): the `mek_fingerprint` is
+        // demoted to an advisory pre-flight. A mismatch is logged at `warn!`
+        // and the NEW value is written through — it is NOT a fault. The AEAD
+        // canary (`Vault::verify_canary`), not this blake3 string-compare, is
+        // the key-correctness authority. (Prior to the demotion this test
+        // asserted an error; the assertion is updated to the shipped contract
+        // — the demotion left this test stale/red on main.)
         let store = DaemonStore::open_in_memory_without_vault().expect("open");
         let first = "cafebabe".repeat(8);
         let second = "12345678".repeat(8);
         store.write_mek_fingerprint(&first).expect("first write");
-        let result = store.write_mek_fingerprint(&second);
-        assert!(
-            matches!(result, Err(StoreError::InvalidInput(_))),
-            "mismatched fingerprint write must error; got: {result:?}"
-        );
-        // Original fingerprint preserved on disk.
+        store
+            .write_mek_fingerprint(&second)
+            .expect("mismatched fingerprint write is advisory (write-through), not an error");
+        // New fingerprint persisted (advisory pre-flight, not a fault gate).
         let got = store.read_mek_fingerprint().expect("read");
-        assert_eq!(got.as_deref(), Some(first.as_str()));
+        assert_eq!(got.as_deref(), Some(second.as_str()));
     }
 
     #[test]

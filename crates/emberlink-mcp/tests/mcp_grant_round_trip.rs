@@ -1,4 +1,4 @@
-//! implementation-note-539 regression guard — MCP read path must see grants owned by
+//! implementation-note-489 regression guard — MCP read path must see grants owned by
 //! the caller's persona (and only those grants).
 //!
 //! The narrative being guarded is "agent asks -> human approves -> agent
@@ -35,11 +35,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ember_daemon::infra::rate_limit::RateLimiter;
-use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::socket::{SocketListener, new_shared_policy_engine};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+    ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
 use emberlink_agent::runtime::{AgentConfig, AgentRuntime, DaemonClient, DaemonClientError};
 use emberlink_mcp::daemon_transport::DaemonTransport;
@@ -54,7 +54,7 @@ use tokio::sync::watch;
 fn auto_approve_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: "credential.access.*".to_string(),
+            action: ActionSelector::named("credential.access.*"),
             risk: RiskLevel::Low,
             requirement: ApprovalRequirement::Auto,
             tier: None,
@@ -89,7 +89,7 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             let vault = Rc::new(Vault::new([42u8; 32]));
             // V0 schema: persona-secret writes require an attached vault.
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(auto_approve_policy());
+            let policy = new_shared_policy_engine(auto_approve_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault; // hold until end of scope: set_vault is the wire now
             let listener =
@@ -159,7 +159,8 @@ impl DaemonClient for TestDaemonClient {
         self.0
             .call_tool("request_access", params)
             .map_err(|e| match e {
-                emberlink_mcp::daemon_transport::DaemonTransportError::Io(_) => {
+                emberlink_mcp::daemon_transport::DaemonTransportError::Io(_)
+                | emberlink_mcp::daemon_transport::DaemonTransportError::RefreshFailing => {
                     DaemonClientError::Unavailable
                 }
                 emberlink_mcp::daemon_transport::DaemonTransportError::Protocol(_)

@@ -587,6 +587,9 @@ fn is_event_relevant_to_context(event: &EventEnvelope, context: &LightSyncContex
         EventBody::DeviceAdded(body) => {
             context.root_ids.contains(&body.root_id) || context.device_ids.contains(&body.device_id)
         }
+        EventBody::DeviceEnrolled(body) => {
+            context.root_ids.contains(&body.root_id) || context.device_ids.contains(&body.device_id)
+        }
         EventBody::DeviceKeyRotated(body) => {
             context.root_ids.contains(&body.root_id) || context.device_ids.contains(&body.device_id)
         }

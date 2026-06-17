@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use ember_daemon::infra::dashboard::run_dashboard;
 use ember_daemon::infra::rate_limit::RateLimiter;
-use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::socket::{SocketListener, new_shared_policy_engine};
 use ember_daemon::infra::store::{DaemonStore, StoreError};
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::approval::ApprovalOutcome;
 use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+    ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -27,37 +27,37 @@ fn permissive_test_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![
             PolicyRule {
-                action: "credential.access.*".to_string(),
+                action: ActionSelector::named("credential.access.*"),
                 risk: RiskLevel::Low,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
-                action: "credential.access".to_string(),
+                action: ActionSelector::named("credential.access"),
                 risk: RiskLevel::Low,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
-                action: "git.push.main".to_string(),
+                action: ActionSelector::named("git.push.main"),
                 risk: RiskLevel::Critical,
                 requirement: ApprovalRequirement::Denied,
                 tier: None,
             },
             PolicyRule {
-                action: "git.push.*".to_string(),
+                action: ActionSelector::named("git.push.*"),
                 risk: RiskLevel::Medium,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
-                action: "deploy.production".to_string(),
+                action: ActionSelector::named("deploy.production"),
                 risk: RiskLevel::Critical,
                 requirement: ApprovalRequirement::Required,
                 tier: None,
             },
             PolicyRule {
-                action: "deploy.staging".to_string(),
+                action: ActionSelector::named("deploy.staging"),
                 risk: RiskLevel::Medium,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
@@ -120,7 +120,7 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             let vault = Rc::new(Vault::new([42u8; 32]));
             // V0 schema: persona-secret writes require an attached vault.
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(permissive_test_policy());
+            let policy = new_shared_policy_engine(permissive_test_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let listener =
                 SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter)
@@ -233,6 +233,201 @@ async fn full_grant_lifecycle_via_socket() {
             access["decision"], "auto_approve",
             "expected auto_approve, got: {access}"
         );
+
+        "passed"
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result, "passed");
+    shutdown_tx.send(true).unwrap();
+}
+
+#[tokio::test]
+async fn persona_signer_rpc_round_trips_signature_via_socket() {
+    let tmp = TempDir::new().unwrap();
+    let (socket_path, shutdown_tx) = spawn_listener_thread(&tmp);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let path = socket_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use base64::Engine as _;
+        use core_crypto::{Ed25519Verifier, PublicKey, Signature, Verifier};
+        use emberlink_agent::socket_transport::SocketTransport;
+        use serde_json::json;
+
+        let mut t = SocketTransport::connect(&path).unwrap();
+        let persona = t
+            .send("create_persona", json!({"name": "persona-signer-root"}))
+            .unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+        let public_key = persona["public_key"].as_str().unwrap().to_string();
+        let payload = b"init-first-grant-persona-signer-roundtrip";
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+
+        let signed = t
+            .send(
+                "persona_signer",
+                json!({
+                    "persona_id": persona_id,
+                    "payload_b64": payload_b64,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(signed["persona_id"], json!(persona_id));
+        assert_eq!(signed["key_id"], json!(format!("persona-{persona_id}")));
+        assert_eq!(signed["algorithm"], json!("ed25519"));
+        assert_eq!(signed["public_key"], json!(public_key));
+        let signature = Signature(signed["signature"].as_str().unwrap().to_string());
+        assert!(signature.0.starts_with("ed25519sig:"));
+        assert!(Ed25519Verifier.verify(&PublicKey(public_key), payload, &signature));
+
+        "passed"
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result, "passed");
+    shutdown_tx.send(true).unwrap();
+}
+
+#[tokio::test]
+async fn receipt_list_get_dot_methods_round_trip_via_socket() {
+    let tmp = TempDir::new().unwrap();
+    let (socket_path, shutdown_tx) = spawn_listener_thread(&tmp);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let path = socket_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use emberlink_agent::socket_transport::SocketTransport;
+        use serde_json::json;
+
+        let mut t = SocketTransport::connect(&path).unwrap();
+        let persona = t
+            .send("create_persona", json!({"name": "receipt-dot-agent"}))
+            .unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+        t.send(
+            "vault_add",
+            json!({"name": "receipt-dot-key", "value": "secret"}),
+        )
+        .unwrap();
+        let grant = t
+            .send(
+                "create_grant",
+                json!({
+                    "persona_id": persona_id,
+                    "credential_name": "receipt-dot-key",
+                    "scope": "read",
+                    "ttl_secs": 3600,
+                }),
+            )
+            .unwrap();
+        let grant_id = grant["id"].as_str().unwrap().to_string();
+        t.send("revoke_grant", json!({"id": grant_id})).unwrap();
+
+        let receipts = t
+            .send(
+                "receipt.list",
+                json!({
+                    "persona_id": persona_id,
+                    "kind": "grant",
+                    "since": "1970-01-01T00:00:00Z"
+                }),
+            )
+            .unwrap();
+        let rows = receipts.as_array().expect("receipt.list array");
+        let receipt = rows
+            .iter()
+            .find(|row| row["grant_id"] == grant_id)
+            .expect("revoked grant receipt should be listed");
+        let receipt_id = receipt["id"].as_str().unwrap().to_string();
+
+        let fetched = t
+            .send("receipt.get", json!({"receipt_id": receipt_id}))
+            .unwrap();
+        assert_eq!(fetched["grant_id"], json!(grant_id));
+        assert_eq!(fetched["summary"]["persona_id"], json!(persona_id));
+        assert_eq!(fetched["evidence"]["canonical_version"], json!(1));
+
+        "passed"
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result, "passed");
+    shutdown_tx.send(true).unwrap();
+}
+
+#[tokio::test]
+async fn dotted_audit_query_rpc_round_trip_returns_audit_rows() {
+    let tmp = TempDir::new().unwrap();
+    let (socket_path, shutdown_tx) = spawn_listener_thread(&tmp);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let path = socket_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use emberlink_agent::socket_transport::SocketTransport;
+        use serde_json::json;
+
+        let mut t = SocketTransport::connect(&path).unwrap();
+
+        let empty = t.send("audit.query", json!({"limit": 10})).unwrap();
+        assert!(
+            empty.as_array().unwrap().is_empty(),
+            "new daemon store should have no user-visible audit rows"
+        );
+
+        let p = t
+            .send("create_persona", json!({"name": "audit-query-rpc-agent"}))
+            .unwrap();
+        let persona_id = p["id"].as_str().unwrap().to_string();
+
+        t.send(
+            "vault_add",
+            json!({"name": "audit-query-token", "value": "secret"}),
+        )
+        .unwrap();
+
+        t.send(
+            "create_grant",
+            json!({
+                "persona_id": persona_id,
+                "credential_name": "audit-query-token",
+                "scope": "read",
+                "ttl_secs": 3600,
+            }),
+        )
+        .unwrap();
+
+        t.send(
+            "use_credential",
+            json!({
+                "persona_id": persona_id,
+                "credential_name": "audit-query-token",
+            }),
+        )
+        .unwrap();
+
+        let rows = t
+            .send(
+                "audit.query",
+                json!({
+                    "persona_id": persona_id,
+                    "action": "credential.access",
+                    "limit": 10,
+                }),
+            )
+            .unwrap();
+        let entries = rows.as_array().unwrap();
+        assert_eq!(entries.len(), 1, "expected one filtered access row");
+        assert_eq!(entries[0]["action"], json!("credential.access"));
+        assert_eq!(entries[0]["outcome"], json!("allowed"));
+        assert_eq!(entries[0]["credential"], json!("audit-query-token"));
 
         "passed"
     })
@@ -768,7 +963,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
     );
 
     // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
-    //    fails downstream. implementation-note-108: with the WebAuthn gate active
+    //    fails downstream. implementation-note-107: with the WebAuthn gate active
     //    (no `EMBER_DISABLE_BIO=1`), an empty body reaches the gate and gets
     //    401 "missing webauthn challenge_id". Without the gate, the legacy
     //    path reaches the store and gets 400 "approval not found". Either
@@ -846,7 +1041,7 @@ async fn socket_still_works_when_dashboard_port_occupied() {
             let vault = Rc::new(Vault::new([42u8; 32]));
             // V0 schema: persona-secret writes require an attached vault.
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(PolicyEngine::default());
+            let policy = new_shared_policy_engine(PolicyEngine::default());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
 
             // Spawn the failing dashboard.
@@ -961,203 +1156,13 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-335 — auto-unseal vault from keyring on daemon startup.
+// implementation-note-375 tests — RETIRED (design S4).
 //
-// The bug: `qember.sh demo up` finished, then `grant create` failed with
-// "persona '<id>' secret is vault-sealed but no vault is attached" because
-// the in-process call path opened the SQLite store directly and never
-// attached a vault. Fix: a documented `try_auto_unseal_from_keyring` helper
-// that the daemon (`runtime.rs`) and the CLI direct-DB paths
-// (`bin/ember.rs::open_store`) both call.
-//
-// These tests exercise the helper + the runtime audit event end-to-end.
-// They share a single mutex so env-variable manipulation does not race
-// across the parallel test runner — `EMBER_VAULT_PASSPHRASE` and
-// `EMBER_VAULT_TEST_KEYRING_PRESENT` are process-global, so two tests
-// flipping them simultaneously would interfere.
+// The `try_auto_unseal_from_keyring`, `AutoUnsealOutcome`, and
+// `se_unseal_interactive` functions were deleted in design S4 (the vault
+// now opens exclusively via the double-envelope RPC). The tests that
+// exercised those code paths have been removed.
 // ---------------------------------------------------------------------------
-
-/// Serialize all implementation-note-335 tests that mutate process-global env vars
-/// (`EMBER_VAULT_PASSPHRASE`, `EMBER_VAULT_TEST_KEYRING_PRESENT`). Without
-/// this, the parallel cargo test runner can interleave env writes between
-/// tests and cause spurious `Unsealed` / `NoKeyringEntry` flips.
-fn demo_ux_8_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-#[test]
-fn auto_unseal_returns_no_keyring_entry_when_none_configured() {
-    use ember_daemon::infra::config::DaemonConfig;
-    use ember_daemon::infra::vault::{AutoUnsealOutcome, try_auto_unseal_from_keyring};
-
-    let _guard = demo_ux_8_env_lock();
-
-    // Failure-mode acceptance criterion: keyring entry absent → helper returns
-    // NoKeyringEntry, daemon can still start (caller falls back to
-    // provisioning path).
-    // SAFETY: tests holding `_guard` are serialized for env-var access.
-    unsafe {
-        std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT");
-        std::env::remove_var("EMBER_VAULT_PASSPHRASE");
-    }
-
-    let tmp = TempDir::new().unwrap();
-    let config = DaemonConfig {
-        data_dir: tmp.path().to_path_buf(),
-        ..DaemonConfig::for_test(tmp.path())
-    };
-
-    match try_auto_unseal_from_keyring(&config) {
-        AutoUnsealOutcome::NoKeyringEntry => {}
-        AutoUnsealOutcome::Unsealed(_) => {
-            panic!("expected NoKeyringEntry, got Unsealed (test gate misconfigured?)")
-        }
-        AutoUnsealOutcome::Error(e) => {
-            panic!("expected NoKeyringEntry, got Error: {e}")
-        }
-    }
-}
-
-#[test]
-fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
-    use ember_daemon::infra::config::DaemonConfig;
-    use ember_daemon::infra::store::DaemonStore;
-    use ember_daemon::infra::vault::{AutoUnsealOutcome, try_auto_unseal_from_keyring};
-    use std::rc::Rc;
-
-    let _guard = demo_ux_8_env_lock();
-
-    // Happy path: the test-keyring-present gate signals "as if the keyring
-    // had a passphrase". Auto-unseal should succeed, the returned vault
-    // should attach to the store, and `create_persona` should succeed —
-    // which is the contract that `qember.sh demo up` + `grant create` needs.
-    // SAFETY: tests holding `_guard` are serialized for env-var access.
-    unsafe {
-        std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1");
-        std::env::remove_var("EMBER_VAULT_PASSPHRASE");
-    }
-
-    let tmp = TempDir::new().unwrap();
-    let config = DaemonConfig {
-        data_dir: tmp.path().to_path_buf(),
-        ..DaemonConfig::for_test(tmp.path())
-    };
-
-    let outcome = try_auto_unseal_from_keyring(&config);
-
-    // Re-clear so other tests see a clean slate even if this one panics later.
-    unsafe {
-        std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT");
-    }
-
-    let vault = match outcome {
-        AutoUnsealOutcome::Unsealed(v) => v,
-        AutoUnsealOutcome::NoKeyringEntry => {
-            panic!(
-                "expected Unsealed; got NoKeyringEntry — test gate not honoring EMBER_VAULT_TEST_KEYRING_PRESENT"
-            )
-        }
-        AutoUnsealOutcome::Error(e) => panic!("expected Unsealed; got Error: {e}"),
-    };
-
-    // Round-trip: attach to store, create a persona, retrieve its keypair.
-    // This is the precise call sequence that `grant create` triggers and the
-    // path that was failing in implementation-note-335. If this works end-to-end, the
-    // demo-blocking bug is fixed.
-    let store = DaemonStore::open_in_memory().unwrap();
-    store.set_vault(Rc::new(vault));
-    let persona = store.create_persona("demo-ux-8-root").unwrap();
-    let _kp = store
-        .persona_root_keypair(&persona.id)
-        .expect("persona_root_keypair must succeed when vault is attached");
-}
-
-#[test]
-fn daemon_run_logs_vault_auto_unseal_audit_event() {
-    use ember_daemon::infra::audit::AuditFilter;
-    use ember_daemon::infra::config::DaemonConfig;
-    use ember_daemon::infra::runtime::DaemonRuntime;
-    use ember_daemon::infra::store::DaemonStore;
-
-    let _guard = demo_ux_8_env_lock();
-
-    // Drive `DaemonRuntime::run()` long enough for the explicit bridge
-    // bootstrap path to attach the vault and emit the
-    // `vault.auto_unseal_from_keyring` audit event, then drop the runtime
-    // task to shut it down. We don't go through the full socket loop here —
-    // the audit row is written before the listener accepts.
-    //
-    // Test gate: signal "keyring entry exists" so the helper returns Unsealed
-    // and the audit event is labeled `auto_unseal_from_keyring`.
-    // SAFETY: tests holding `_guard` are serialized for env-var access.
-    unsafe {
-        std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1");
-        std::env::remove_var("EMBER_VAULT_PASSPHRASE");
-    }
-
-    let tmp = TempDir::new().unwrap();
-    let socket_dir = tmp.path().join("run");
-    std::fs::create_dir_all(&socket_dir).unwrap();
-    let config = DaemonConfig {
-        data_dir: tmp.path().to_path_buf(),
-        pid_file: socket_dir.join("emberd.pid"),
-        policy_file: tmp.path().join("policy.toml"),
-        socket_dir,
-        // Disable dashboard so the runtime startup is purely about vault attach.
-        dashboard_addr: None,
-        // Explicit bridge opt-in keeps this test on the bootstrap-open path.
-        bridge_bind: Some("127.0.0.1:8443".parse().unwrap()),
-        ..DaemonConfig::for_test(tmp.path())
-    };
-
-    let runtime = DaemonRuntime::new(config.clone());
-    let db_path = config.data_dir.join("daemon.db");
-
-    // Run the runtime on a single-threaded tokio runtime in this thread,
-    // racing against a 1.5-second timer so the test always terminates.
-    // The audit-event write happens within the first few hundred ms of
-    // `run()` — well before any external traffic could arrive.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
-        tokio::select! {
-            res = runtime.run(None) => { let _ = res; }
-            _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
-        }
-    });
-
-    // Drop env gate before any panic-on-assertion.
-    unsafe {
-        std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT");
-    }
-
-    let store = DaemonStore::open(&db_path).unwrap();
-    let entries = store
-        .query_audit(&AuditFilter {
-            action: Some("vault.auto_unseal_from_keyring".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-
-    assert!(
-        !entries.is_empty(),
-        "expected at least one vault.auto_unseal_from_keyring audit row, found 0 — \
-         the daemon startup path must emit this audit event so `audit show` reflects \
-         when (and how) the vault came online"
-    );
-    assert_eq!(entries[0].action, "vault.auto_unseal_from_keyring");
-    assert_eq!(
-        entries[0].outcome, "auto_unseal_from_keyring",
-        "outcome should label the success branch when keyring entry is present"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // BEGIN IMMEDIATE serializes concurrent authorize+materialize pairs

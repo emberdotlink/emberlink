@@ -7,20 +7,21 @@ description = "Consolidated crate producing all 15 bundled L2 Construct binaries
 publish = false
 
 [dependencies]
-# implementation-note-93 — Compose V2 manifest
-# translator emits `bollard::container::Config<String>` +
-# `bollard::models::HostConfig`. Pinned to the same 0.18.x line the
-# daemon already uses so callers don't pay a duplicate-compile tax.
-bollard = "0.18"
+# Promoted from dev-dependency: the env_derive helper content-hash-pins
+# the trusted-resolver subprocess binary (factory_resolver_framework_landed)
+# and must run at production runtime, not only under tests.
+blake3 = "1"
 core-broker = { path = "../core-broker" }
 core-construct-runtime = { path = "../core-construct-runtime" }
+# Promoted from dev-dependency: `policy::manifest_action_need` resolves an
+# action's authority need from the bundled construct manifest at runtime via
+# `core_events::construct_toml::resolve_action_need` (design Amendment 6).
+core-events = { path = "../core-events" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# implementation-note-93 — Compose V2 manifests
-# are YAML; serde_yaml parses them into `ComposeManifest`. Same 0.9.x
-# line used by ember-kernel + headless-runtime, so cargo dedups.
-serde_yaml = "0.9"
 thiserror = "2"
 toml.workspace = true
 tracing = "0.1"
@@ -97,3 +98,6 @@ proptest = "1"
 secrecy = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

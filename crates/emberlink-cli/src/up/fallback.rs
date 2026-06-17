@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! idmapped_fallback — safe.directory + chown-on-flush fallback for container
 //! runtimes that do not support idmapped bind-mounts.

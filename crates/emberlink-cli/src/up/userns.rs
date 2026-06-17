@@ -1,4 +1,5 @@
 //! container_userns_remap_baseline
+//! CLASSIFICATION: PUBLIC
 //! Linux user-namespace remap baseline for hardened-runc per design §Component 9.
 //! Provides preflight validation + the env-var fallback when the runtime doesn't
 //! honor `userns_mode`.

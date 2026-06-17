@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 
 // --- Access grant types ---
 
+/// Logical identifier of an design unified Principal when it appears in grant
+/// issuer attribution.
+///
+/// Some compatibility field names in this crate still say `persona_id` while
+/// downstream storage and UI surfaces migrate. Those fields carry this value;
+/// they do not create a second IdentityRoot-vs-Persona issuer namespace.
+pub type PrincipalId = String;
+
 /// UX-layer classification of a grant recipient.
 /// Not a new transport primitive — layered on top of Peer/Service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,13 +61,16 @@ impl RecipientProfile {
 /// Lifecycle status of a grant. See design.
 ///
 /// `Expired` and `Pending` are derived at query time from timestamps;
-/// `Active`, `Paused`, `Revoked`, and `ExhaustedByBudget` are persisted.
+/// `Active`, `Paused`, `Revoked`, `Abandoned`, and `ExhaustedByBudget`
+/// are persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantStatus {
     Active,
     /// Human-requested freeze. No metering accrues; not a terminal state.
     Paused,
     Revoked,
+    /// Terminal recovery disposition: the grant is intentionally not rebuilt.
+    Abandoned,
     Expired,
     Pending,
     /// Terminal state: at least one statement's budget has been exhausted
@@ -73,6 +84,7 @@ impl GrantStatus {
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Revoked => "revoked",
+            Self::Abandoned => "abandoned",
             Self::Expired => "expired",
             Self::Pending => "pending",
             Self::ExhaustedByBudget => "exhausted_by_budget",
@@ -84,6 +96,7 @@ impl GrantStatus {
             "active" => Some(Self::Active),
             "paused" => Some(Self::Paused),
             "revoked" => Some(Self::Revoked),
+            "abandoned" => Some(Self::Abandoned),
             "expired" => Some(Self::Expired),
             "pending" => Some(Self::Pending),
             "exhausted_by_budget" | "expired_by_budget" => Some(Self::ExhaustedByBudget),
@@ -100,6 +113,9 @@ impl GrantStatus {
     ) -> Self {
         if stored_status == "revoked" {
             return Self::Revoked;
+        }
+        if stored_status == "abandoned" {
+            return Self::Abandoned;
         }
         if stored_status == "exhausted_by_budget" || stored_status == "expired_by_budget" {
             return Self::ExhaustedByBudget;
@@ -161,7 +177,8 @@ impl GrantMode {
 // grant" is just a Grant with `resource_type = Credential`. A "token budget
 // grant" is just a Grant with `resource_type = Session` and `budget.tokens`
 // set. A "spending grant" is `Payment + budget.cents`. Same primitive, same
-// UX, same audit log, same revocation semantics, same delegation rules.
+// UX, same audit log, same revocation semantics, same downhill attenuation
+// rules.
 
 /// Kind of resource an agent consumes through a grant.
 ///
@@ -184,6 +201,9 @@ pub enum ResourceType {
     Compute,
     /// Time grants — bounded human attention or calendar windows.
     Time,
+    /// Recovery grants — bounded recovery-plane actions such as guardian
+    /// enrollment offers.
+    Recovery,
 }
 
 impl ResourceType {
@@ -194,6 +214,7 @@ impl ResourceType {
             Self::Payment => "payment",
             Self::Compute => "compute",
             Self::Time => "time",
+            Self::Recovery => "recovery",
         }
     }
 
@@ -204,6 +225,7 @@ impl ResourceType {
             "payment" => Some(Self::Payment),
             "compute" => Some(Self::Compute),
             "time" => Some(Self::Time),
+            "recovery" => Some(Self::Recovery),
             _ => None,
         }
     }
@@ -278,7 +300,7 @@ pub struct Usage {
     /// `emit_threshold_crossings` compare this against the budget cap
     /// scaled to the same unit. Without this, a single Haiku-4.5 call
     /// (~0.1¢ per call) rounds to 0¢ via integer division and the cap
-    /// can never accumulate enough to trip — implementation-note-58.
+    /// can never accumulate enough to trip — implementation-note-65.
     /// Defaults to 0 on legacy grants; the next `increment_statement_usage`
     /// call re-derives the displayed `cents` from this field, so
     /// pre-existing (non-zero `cents`, zero `cents_micro`) grants flush
@@ -504,8 +526,8 @@ pub enum Condition {
 
 /// HITL handoff shape. When a block carries an `approval` challenge it is in
 /// `Pending` until the human completes the method. Shared across issuance,
-/// extension, threshold crossings, and delegation — the single protocol
-/// handle for design + design to plug into.
+/// extension, threshold crossings, and grant-downhill operations — the single
+/// protocol handle for design + design to plug into.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalChallenge {
     pub method: ApprovalMethod,
@@ -527,6 +549,16 @@ pub enum ApprovalMethod {
     DeviceFlow,
 }
 
+/// Per-Statement downhill delegate facet (design §6; subsumes the old
+/// StandingGrant spawn_max_depth). `None` on a Statement = not
+/// allowed to delegate further (fail-closed default);
+/// `Some { max_depth }` = may delegate downhill for `max_depth` more hops.
+/// Attenuates downhill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanDelegate {
+    pub max_depth: u32,
+}
+
 /// One IAM-shaped clause inside a grant block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Statement {
@@ -540,6 +572,8 @@ pub struct Statement {
     pub usage: Usage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_delegate: Option<CanDelegate>,
 }
 
 impl Statement {
@@ -559,7 +593,7 @@ impl Statement {
             return false;
         }
         if let Some(cap) = b.cents {
-            // implementation-note-58: budget enforcement runs on the
+            // implementation-note-65: budget enforcement runs on the
             // sub-cent `cents_micro` accumulator. Sub-cent calls (typical for
             // Haiku-4.5 pricing) round the integer `cents` field to 0 per
             // call, so a cents-only check would never trip. Compare against
@@ -637,7 +671,7 @@ pub struct GrantProposal {
 // --- Block + SignedBlock --------------------------------------------------
 //
 // A grant is a signed, append-only chain of blocks (Biscuit-style). Block 0
-// is the authority, issued under the persona's root key. Each subsequent
+// is the authority, issued under the Principal's verification key. Each subsequent
 // block is an attenuation signed by the previous block's `pubkey_next`.
 // Reorder or remove a block and the signature chain breaks.
 
@@ -651,8 +685,12 @@ pub struct Block {
     pub nbf: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    /// Persona that minted this block (block 0 = grant issuer; later blocks
-    /// = delegators). String today; will become PersonaId newtype.
+    /// Principal that minted this block.
+    ///
+    /// Block 0 is the AccessGrant issuer. Later blocks are the Principals that
+    /// delegate the grant downhill. The field name is intentionally generic:
+    /// both a self-parented root Principal and a child Durable/Runtime Persona
+    /// use the same `PrincipalId` path.
     pub issued_by: String,
     pub issued_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -664,7 +702,7 @@ pub struct Block {
 /// Block plus its Biscuit-style signature. `pubkey_next` is the public key
 /// that MUST sign the *next* appended block; the current block's bytes are
 /// signed by the previous block's `pubkey_next` — or, for block 0, by the
-/// persona's root key.
+/// issuer Principal's verification key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBlock {
     pub block: Block,
@@ -676,18 +714,25 @@ pub struct SignedBlock {
 
 // --- Grant envelope -------------------------------------------------------
 
-/// Local-only runtime object representing delegated authority. Never appears
-/// in the protocol event log or crosses the disclosure boundary.
+/// Local-only runtime object representing an AccessGrant authority envelope.
+/// Never appears in the protocol event log or crosses the disclosure boundary.
 ///
 /// Per design, a grant is a signed chain of blocks. Block 0 is the authority
-/// minted under the issuing persona; subsequent blocks are attenuations.
+/// minted under the issuing Principal; subsequent blocks are attenuations.
 /// Every block carries typed `Statement`s with per-statement budgets and
-/// conditions. Persona and attestation live on the envelope, not inside
-/// statements — a grant is always under exactly one persona.
+/// conditions. Issuer attribution and attestation live on the envelope, not
+/// inside statements — a grant is always under exactly one unified Principal.
+// identity_root_persona_core_grant_types_adaptation_landed
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessGrant {
     pub id: String,
     pub version: u32,
+    /// Compatibility field name for the grant issuer.
+    ///
+    /// The value is a unified design [`PrincipalId`]. It may name the
+    /// self-parented root Principal, a Durable Persona Principal, or a Runtime
+    /// Persona Principal. It must not be interpreted as a distinct protocol
+    /// type or a Persona-only issuer universe.
     pub issuing_persona_id: String,
     pub recipient_kind: PresentationAudienceKind,
     pub recipient_id: String,
@@ -708,23 +753,28 @@ pub struct AccessGrant {
 }
 
 impl AccessGrant {
+    /// Unified Principal issuer for this grant.
+    pub fn issuer_principal_id(&self) -> &str {
+        &self.issuing_persona_id
+    }
+
     /// Build a grant with a single block containing a single statement. Useful
     /// for tests and the simplest demo path (one credential, no budget).
     pub fn single_statement(
         id: impl Into<String>,
-        persona: impl Into<String>,
+        issuer_principal_id: impl Into<String>,
         recipient_id: impl Into<String>,
         statement: Statement,
         pubkey_next: impl Into<String>,
         signature: impl Into<String>,
         issued_at: u64,
     ) -> Self {
-        let persona = persona.into();
+        let issuer_principal_id = issuer_principal_id.into();
         let block = Block {
             statements: vec![statement],
             nbf: None,
             expires_at: None,
-            issued_by: persona.clone(),
+            issued_by: issuer_principal_id.clone(),
             issued_at,
             approval: None,
             note: None,
@@ -732,7 +782,7 @@ impl AccessGrant {
         Self {
             id: id.into(),
             version: 1,
-            issuing_persona_id: persona,
+            issuing_persona_id: issuer_principal_id,
             recipient_kind: PresentationAudienceKind::Service,
             recipient_id: recipient_id.into(),
             recipient_profile: RecipientProfile::Human,
@@ -785,8 +835,8 @@ impl AccessGrant {
     /// the block-level timestamps. A grant stored as `Active` but whose
     /// `effective_expires_at` has passed is `Expired`; a grant whose
     /// `effective_nbf` is in the future is `Pending`. Terminal statuses
-    /// (`Revoked`, `ExhaustedByBudget`, `Paused`) are never overridden by
-    /// timestamps — only `Active` can be demoted by TTL or nbf.
+    /// (`Revoked`, `Abandoned`, `ExhaustedByBudget`) and `Paused` are never
+    /// overridden by timestamps - only `Active` can be demoted by TTL or nbf.
     pub fn effective_status(&self, now_secs: u64) -> GrantStatus {
         GrantStatus::derive(
             self.status.as_str(),
@@ -831,6 +881,7 @@ impl AccessGrant {
 pub struct AccessGrantSummary {
     pub id: String,
     pub label: Option<String>,
+    /// Compatibility field name; value is the unified Principal issuer id.
     pub issuing_persona_id: String,
     pub recipient_kind: PresentationAudienceKind,
     pub recipient_id: String,
@@ -917,6 +968,7 @@ mod composite_grant_tests {
             budget: None,
             usage: Usage::default(),
             conditions: Vec::new(),
+            can_delegate: None,
         }
     }
 
@@ -934,6 +986,7 @@ mod composite_grant_tests {
             }),
             usage: Usage::default(),
             conditions: Vec::new(),
+            can_delegate: None,
         }
     }
 
@@ -951,6 +1004,7 @@ mod composite_grant_tests {
             conditions: vec![Condition::MerchantAllowlist {
                 merchants: vec!["openai.com".into(), "anthropic.com".into()],
             }],
+            can_delegate: None,
         }
     }
 
@@ -1009,7 +1063,7 @@ mod composite_grant_tests {
             ],
             nbf: None,
             expires_at: Some(1_800),
-            issued_by: "persona_work".into(),
+            issued_by: "principal_work".into(),
             issued_at: 0,
             approval: None,
             note: None,
@@ -1017,7 +1071,7 @@ mod composite_grant_tests {
         let grant = AccessGrant {
             id: "grant_01".into(),
             version: 1,
-            issuing_persona_id: "persona_work".into(),
+            issuing_persona_id: "principal_work".into(),
             recipient_kind: PresentationAudienceKind::Service,
             recipient_id: "agent_claude_code".into(),
             recipient_profile: RecipientProfile::Agent,
@@ -1046,6 +1100,15 @@ mod composite_grant_tests {
     }
 
     #[test]
+    fn recovery_resource_type_round_trips() {
+        assert_eq!(ResourceType::Recovery.as_str(), "recovery");
+        assert_eq!(
+            ResourceType::parse("recovery"),
+            Some(ResourceType::Recovery)
+        );
+    }
+
+    #[test]
     fn block_canonical_encode_is_deterministic_and_round_trips() {
         let block = Block {
             statements: vec![
@@ -1055,7 +1118,7 @@ mod composite_grant_tests {
             ],
             nbf: None,
             expires_at: Some(1_800),
-            issued_by: "persona_work".into(),
+            issued_by: "principal_work".into(),
             issued_at: 42,
             approval: None,
             note: Some("hello".into()),
@@ -1087,7 +1150,7 @@ mod composite_grant_tests {
             statements: vec![stmt_credential_github()],
             nbf: None,
             expires_at: None,
-            issued_by: "persona_a".into(),
+            issued_by: "principal_a".into(),
             issued_at: 10,
             approval: None,
             note: None,
@@ -1126,10 +1189,11 @@ mod composite_grant_tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             }],
             nbf: None,
             expires_at: Some(1700000000),
-            issued_by: "persona-test".into(),
+            issued_by: "principal-test".into(),
             issued_at: 1699999000,
             approval: None,
             note: None,
@@ -1139,12 +1203,14 @@ mod composite_grant_tests {
         let hash = sha2::Sha256::digest(&encoded);
         let hex = hex::encode(hash);
 
-        // CANONICAL-VERSION-1 BASELINE. If this value changes:
+        // CANONICAL-VERSION-1 BASELINE. Updated by the design issuer
+        // vocabulary adaptation so the fixture issuer is a Principal ID.
+        // If this value changes again:
         // 1. Determine WHY (serde_json upgrade, Block field addition, etc.)
         // 2. If the change is intentional, bump canonical_version and update this hash
         // 3. If the change is unintentional, REVERT the serde_json upgrade or field change
         assert_eq!(
-            hex, "cd399643d1e04ac2901bce8475557fdc111b947ad2655cacb73508e96293bfe5",
+            hex, "6c5ac43dc21dfabf327077b9779fe4bbfb0fc561009f4f42fa24d259ac009167",
             "Block::canonical_encode produced unexpected bytes — see test comment"
         );
     }
@@ -1154,6 +1220,10 @@ mod composite_grant_tests {
         assert_eq!(
             GrantStatus::derive("revoked", None, None, 100),
             GrantStatus::Revoked
+        );
+        assert_eq!(
+            GrantStatus::derive("abandoned", None, Some(50), 100),
+            GrantStatus::Abandoned
         );
         assert_eq!(
             GrantStatus::derive("exhausted_by_budget", None, None, 100),
@@ -1182,12 +1252,21 @@ mod composite_grant_tests {
     }
 
     #[test]
+    fn grant_status_abandoned_round_trips_as_terminal() {
+        assert_eq!(GrantStatus::Abandoned.as_str(), "abandoned");
+        assert_eq!(
+            GrantStatus::parse("abandoned"),
+            Some(GrantStatus::Abandoned)
+        );
+    }
+
+    #[test]
     fn effective_status_returns_expired_when_ttl_passed_despite_stored_active() {
         let block = Block {
             statements: vec![stmt_credential_github()],
             nbf: None,
             expires_at: Some(50),
-            issued_by: "persona_work".into(),
+            issued_by: "principal_work".into(),
             issued_at: 0,
             approval: None,
             note: None,
@@ -1195,7 +1274,7 @@ mod composite_grant_tests {
         let grant = AccessGrant {
             id: "grant_ttl_test".into(),
             version: 1,
-            issuing_persona_id: "persona_work".into(),
+            issuing_persona_id: "principal_work".into(),
             recipient_kind: PresentationAudienceKind::Service,
             recipient_id: "agent_claude".into(),
             recipient_profile: RecipientProfile::Agent,
@@ -1220,6 +1299,64 @@ mod composite_grant_tests {
         assert_eq!(grant.effective_status(100), GrantStatus::Expired);
         // Still active before expiry.
         assert_eq!(grant.effective_status(49), GrantStatus::Active);
+    }
+
+    #[test]
+    fn effective_status_preserves_abandoned_despite_timestamps() {
+        let block = Block {
+            statements: vec![stmt_credential_github()],
+            nbf: Some(200),
+            expires_at: Some(50),
+            issued_by: "principal_work".into(),
+            issued_at: 0,
+            approval: None,
+            note: None,
+        };
+        let grant = AccessGrant {
+            id: "grant_abandoned_test".into(),
+            version: 1,
+            issuing_persona_id: "principal_work".into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "agent_claude".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: GrantStatus::Abandoned,
+            mode: GrantMode::OneShot,
+            blocks: vec![SignedBlock {
+                block,
+                pubkey_next: "deadbeef".into(),
+                signature: "cafebabe".into(),
+            }],
+            attestation: AttestationBinding::default(),
+            created_at: 0,
+            updated_at: 0,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        };
+
+        assert_eq!(grant.effective_status(100), GrantStatus::Abandoned);
+        assert_eq!(grant.effective_status(300), GrantStatus::Abandoned);
+    }
+
+    #[test]
+    fn statement_can_delegate_serde_round_trips() {
+        let mut s = stmt_credential_github();
+        s.can_delegate = Some(CanDelegate { max_depth: 2 });
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: Statement = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, s);
+        assert_eq!(back.can_delegate, Some(CanDelegate { max_depth: 2 }));
+
+        // A None facet must be omitted from the canonical/JSON encoding so
+        // existing grants' signature bytes are unchanged.
+        let none_stmt = stmt_credential_github();
+        assert_eq!(none_stmt.can_delegate, None);
+        let none_json = serde_json::to_string(&none_stmt).expect("serialize");
+        assert!(
+            !none_json.contains("can_delegate"),
+            "None can_delegate must be omitted, got: {none_json}"
+        );
     }
 }
 
@@ -1261,7 +1398,7 @@ impl Validate for Statement {
 
 impl Validate for Block {
     fn validate(&self) -> Result<(), ValidationError> {
-        validate_non_empty(&self.issued_by, "block issued_by persona id")?;
+        validate_non_empty(&self.issued_by, "block issued_by principal id")?;
         if self.statements.is_empty() {
             return Err(ValidationError::new(
                 "block must contain at least one statement",
@@ -1296,7 +1433,7 @@ impl Validate for AccessGrant {
                 "access grant version must be at least 1",
             ));
         }
-        validate_non_empty(&self.issuing_persona_id, "access grant issuing persona id")?;
+        validate_non_empty(&self.issuing_persona_id, "access grant issuer principal id")?;
         validate_non_empty(&self.recipient_id, "access grant recipient id")?;
         if self.blocks.is_empty() {
             return Err(ValidationError::new(

@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `docs/current-architecture.md`, `docs/cli-reference.md`, `README.md`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Architecture Overview
 
 The primary live product is a **local daemon-centered system**.
@@ -33,9 +33,10 @@ At a high level:
 - Some deeper headless / advanced agent surfaces are still moving and should be
   treated as pre-release.
 
-For the detailed current mechanism map, the repo's canonical source remains
-`docs/current-architecture.md`.
+For the detailed public mechanism map, use this page together with
+[Trust and verification](../reference/trust-and-verification/),
+[Grants and approvals](../reference/grants-and-approvals/), and
+[Sandbox and isolated execution](../reference/sandbox-and-isolated-execution/).
 
 For the public explanation of the current mediated-tool lane, see
 [Constructs and mediated tools](../build/constructs-and-mediated-tools/).
-

@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Structured checkpoint events for the SCION agent spawn supervisor.
 //!
@@ -145,11 +146,12 @@ pub async fn emit_checkpoint(
     checkpoint: SpawnCheckpoint,
     result: SpawnCheckpointResult,
 ) -> Result<(), CheckpointError> {
-    // Resolve the primary worktree root via headless-runtime's git helper.
-    // Fall back to cwd on failure (daemon is typically launched from the
-    // repo root; this is a best-effort path).
-    let root =
-        core_construct_runtime::layout::primary_worktree_root().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Resolve the primary worktree root + engine event-log path via the
+    // shared layout contract (core-construct-runtime, below both daemon and
+    // engine per design). Fall back to cwd on failure (daemon is
+    // typically launched from the repo root; this is a best-effort path).
+    let root = core_construct_runtime::layout::primary_worktree_root()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let events_path = root.join(core_construct_runtime::layout::ENGINE_EVENTS_FILE);
     emit_checkpoint_to(&events_path, agent_id, checkpoint, result)
 }

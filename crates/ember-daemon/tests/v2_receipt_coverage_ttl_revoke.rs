@@ -1,4 +1,4 @@
-//! implementation-note-389 — T2 integration tests.
+//! implementation-note-340 — T2 integration tests.
 //!
 //! Asserts that the two gap termination paths (TTL-expiry and explicit-revoke)
 //! each emit signed v2 cohort-A Receipts with the correct `termination_reason`
@@ -16,8 +16,10 @@
 //!          sessions_dir is available on the RequestContext.
 //!   T2c — Regression guard: dirty-exit path still produces a receipt with
 //!          termination_reason = HeartbeatLost (non-regression).
+//!   T2d — Tamper variants: each non-clean class rejects body mutation via
+//!          the canonical v2 verifier.
 //!
-//! implementation-note-390 — T3 regression tests.
+//! implementation-note-341 — T3 regression tests.
 //!
 //! Guards the invariant that a CleanExit MUST NOT revoke the grant. A 24h
 //! grant must support many sessions; revoking on CleanExit broke touch #2 of
@@ -34,7 +36,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use core_events::receipt::sign::verify_receipt_v2;
+use core_events::receipt::sign::{SignError, verify_receipt_v2};
 use core_events::receipt::{ClaudeCodeBody, ReceiptEnvelope, TerminationReason};
 use core_state::sessions::{SessionMeta, SessionStore};
 use ember_daemon::infra::handler::{RequestContext, dispatch_method_with_context};
@@ -42,8 +44,11 @@ use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::receipt::{current_identity, init_identity};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
+use ember_daemon::session::heartbeat;
 use ember_daemon::session::lifecycle::transition_to_terminated_dirty_at;
-use ember_daemon::session_watcher::{close_session_clean_exit, close_session_ttl_expiry};
+use ember_daemon::session_watcher::{
+    close_session_clean_exit, close_session_heartbeat_orphan, close_session_ttl_expiry,
+};
 use ember_daemon::trust::policy::PolicyEngine;
 use serde_json::json;
 use tempfile::TempDir;
@@ -91,11 +96,14 @@ fn create_session(
     let meta = SessionMeta {
         session_id: session_id.to_string(),
         persona: persona.id.clone(),
+        durable_persona: None,
         grant_id: grant.id.clone(),
+        caller_binding_id: None,
         launcher_pid: std::process::id(),
         started_at: chrono::Utc::now(),
-        workflow_id: None,
-        workflow_template: None,
+        authority_strict: false,
+        delegation_id: None,
+        delegation_template: None,
     };
     session_store
         .create(&meta)
@@ -113,6 +121,24 @@ fn load_receipt(receipt_path: &Path) -> (ReceiptEnvelope, ClaudeCodeBody) {
     let body: ClaudeCodeBody =
         serde_json::from_value(envelope.body.clone()).expect("deserialize ClaudeCodeBody");
     (envelope, body)
+}
+
+fn assert_body_tamper_rejected<F>(
+    envelope: &ReceiptEnvelope,
+    public_key: &core_crypto::PublicKey,
+    label: &str,
+    mutate_body: F,
+) where
+    F: FnOnce(&mut serde_json::Value),
+{
+    let mut tampered = envelope.clone();
+    mutate_body(&mut tampered.body);
+    let err = verify_receipt_v2(&tampered, public_key, &core_crypto::FixtureVerifier)
+        .expect_err("tampered receipt must fail verification");
+    assert!(
+        matches!(err, SignError::ReceiptIdMismatch { .. }),
+        "{label}: expected receipt-id mismatch after body tamper, got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +220,14 @@ fn ttl_expiry_session_close_emits_v2_receipt_with_ttl_expired() {
     let pk = core_crypto::PublicKey(format!("ed25519:{}", identity.pubkey_hex()));
     verify_receipt_v2(&loaded_envelope, &pk, &core_crypto::FixtureVerifier)
         .expect("signed v2 Receipt must verify under daemon identity pubkey");
+    assert_body_tamper_rejected(
+        &loaded_envelope,
+        &pk,
+        "ttl_expired termination_reason",
+        |body| {
+            body["termination_reason"] = json!("clean_exit");
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +320,14 @@ async fn explicit_revoke_emits_v2_receipt_with_explicit_revoke() {
     let pk = core_crypto::PublicKey(format!("ed25519:{}", identity.pubkey_hex()));
     verify_receipt_v2(&loaded_envelope, &pk, &core_crypto::FixtureVerifier)
         .expect("signed v2 Receipt must verify under daemon identity pubkey");
+    assert_body_tamper_rejected(
+        &loaded_envelope,
+        &pk,
+        "explicit_revoke termination_reason",
+        |body| {
+            body["termination_reason"] = json!("clean_exit");
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -337,17 +379,97 @@ fn dirty_exit_still_emits_heartbeat_lost_receipt() {
     let pk = core_crypto::PublicKey(format!("ed25519:{}", identity.pubkey_hex()));
     verify_receipt_v2(&envelope, &pk, &core_crypto::FixtureVerifier)
         .expect("dirty-exit v2 Receipt must verify under daemon identity pubkey");
+    assert_body_tamper_rejected(&envelope, &pk, "heartbeat_lost pid diagnostic", |body| {
+        body["pid_alive_at_check"] = json!(true);
+    });
+}
+
+/// Orphan sweep fallback: the legacy 60s watcher path also maps to
+/// `HeartbeatLost`, and must carry the same heartbeat diagnostics as the
+/// canonical heartbeat watcher transition.
+#[test]
+fn orphan_sweep_heartbeat_lost_receipt_carries_diagnostics_and_verifies() {
+    let _id_dir = init_test_identity();
+    let identity = current_identity().expect("identity must be loaded");
+
+    let sessions_dir_tmp = tempfile::tempdir().expect("sessions tempdir");
+    let sessions_dir = sessions_dir_tmp.path().to_path_buf();
+    let session_store = SessionStore::new(sessions_dir.clone());
+
+    let store = store_with_vault();
+    let meta = create_session(
+        &session_store,
+        &store,
+        "sess-orphan-heartbeat-diagnostics",
+        "persona-orphan-heartbeat",
+    );
+    let heartbeat_at = chrono::Utc::now() - chrono::Duration::minutes(7);
+    heartbeat::write_heartbeat(&sessions_dir.join(&meta.session_id), heartbeat_at)
+        .expect("write stale heartbeat for orphan fixture");
+
+    close_session_heartbeat_orphan(&session_store, &store, &meta, &sessions_dir);
+
+    let orphan_receipt_path = sessions_dir.join(&meta.session_id).join("receipt.json");
+    let (orphan_envelope, orphan_body) = load_receipt(&orphan_receipt_path);
+    assert_eq!(orphan_envelope.kind, "session.claude_code");
+    assert_eq!(orphan_envelope.daemon_root_id, identity.pubkey_hex());
+    assert_eq!(
+        orphan_body.termination_reason,
+        Some(TerminationReason::HeartbeatLost)
+    );
+    let expected_heartbeat_at = heartbeat_at.to_rfc3339();
+    assert_eq!(
+        orphan_body.last_heartbeat_at.as_deref(),
+        Some(expected_heartbeat_at.as_str())
+    );
+    assert_eq!(orphan_body.pid_alive_at_check, Some(false));
+
+    let pk = core_crypto::PublicKey(format!("ed25519:{}", identity.pubkey_hex()));
+    verify_receipt_v2(&orphan_envelope, &pk, &core_crypto::FixtureVerifier)
+        .expect("orphan-sweep receipt must verify under daemon identity pubkey");
+    assert_body_tamper_rejected(
+        &orphan_envelope,
+        &pk,
+        "orphan heartbeat_lost last heartbeat diagnostic",
+        |body| {
+            body["last_heartbeat_at"] = json!("1970-01-01T00:00:00Z");
+        },
+    );
+
+    let clean_meta = create_session(
+        &session_store,
+        &store,
+        "sess-clean-equivalence",
+        "persona-clean-equivalence",
+    );
+    close_session_clean_exit(
+        &session_store,
+        &store,
+        &clean_meta.session_id,
+        &clean_meta.grant_id,
+        &sessions_dir,
+    );
+    let clean_receipt_path = sessions_dir
+        .join(&clean_meta.session_id)
+        .join("receipt.json");
+    let (clean_envelope, _) = load_receipt(&clean_receipt_path);
+    assert_eq!(
+        orphan_envelope.daemon_root_id, clean_envelope.daemon_root_id,
+        "orphan fallback and clean-exit receipts must share daemon provenance"
+    );
+    verify_receipt_v2(&clean_envelope, &pk, &core_crypto::FixtureVerifier)
+        .expect("clean-exit comparison receipt must verify under same daemon identity pubkey");
 }
 
 // ---------------------------------------------------------------------------
 // T3a — CleanExit MUST NOT revoke the grant
-// (implementation-note-390)
+// (implementation-note-341)
 // ---------------------------------------------------------------------------
 
 /// T3a: After a CleanExit session close, the grant must remain Active.
 ///
 /// This guards the multi-session-per-24h-grant invariant from the v0.3 test
-/// plan. Regression introduced by implementation-note-389
+/// plan. Regression introduced by implementation-note-340
 /// M3 which unconditionally called revoke_grant inside close_session.
 #[test]
 fn clean_exit_does_not_revoke_grant() {
@@ -377,13 +499,13 @@ fn clean_exit_does_not_revoke_grant() {
     assert_eq!(
         post_grant.status, "active",
         "CleanExit MUST NOT revoke the grant — multi-session per 24h grant is the contract \
-         (implementation-note-390)"
+         (implementation-note-341)"
     );
 }
 
 // ---------------------------------------------------------------------------
 // T3d — handler close_session RPC arm MUST NOT revoke the grant on CleanExit
-// (implementation-note-293)
+// (implementation-note-258)
 // ---------------------------------------------------------------------------
 
 /// T3d: After calling the handler's close_session RPC arm, the grant must
@@ -396,7 +518,7 @@ fn clean_exit_does_not_revoke_grant() {
 ///
 /// Invariant: a 24h grant supports many sessions. CleanExit closes the
 /// session but MUST leave the grant Active for the next session.
-/// (implementation-note-293)
+/// (implementation-note-258)
 #[tokio::test]
 async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
     let _id_dir = init_test_identity();
@@ -436,6 +558,8 @@ async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
             "persona_id": persona_id,
             "credential_name": "claude-code-default-v1",
             "scope": "claude-code",
+            "ttl_secs": 86_400,
+            "max_delegation_depth": 1,
             "force": true,
         }),
     )
@@ -491,12 +615,12 @@ async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
     );
 
     // Post-condition: grant must remain Active — MUST NOT be revoked.
-    // implementation-note-293
+    // implementation-note-258
     let post_grant = store.get_grant(&grant_id).expect("get_grant post-close");
     assert_eq!(
         post_grant.status, "active",
         "handler close_session CleanExit MUST NOT revoke the grant \
-         (implementation-note-293)"
+         (implementation-note-258)"
     );
 }
 

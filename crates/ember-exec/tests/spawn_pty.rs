@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-425: integration tests for `handle_spawn_directive`
+//! implementation-note-385: integration tests for `handle_spawn_directive`
 //! routed through the real pty pump (`pump_connection`) instead of a plain
 //! piped `Command`.
 //!
@@ -17,7 +18,7 @@
 //! 3. `test_resize_propagated` — `Resize` frames from the peer reach the pty
 //!    master via `TIOCSWINSZ` before stdin, and the child's `stty size`
 //!    observes the new geometry in its `OutputBytes`.
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use ember_exec::spawn::handle_spawn_directive;
 use ember_exec::uds::{ExecFrame, SpawnDirective, read_frame, write_frame};
@@ -52,7 +53,7 @@ fn build_directive(binary_path: &str, argv: Vec<String>) -> SpawnDirective {
     }
 }
 
-/// implementation-note-425: bash exits 37 via the pty pump; the wire-side
+/// implementation-note-385: bash exits 37 via the pty pump; the wire-side
 /// peer must see `Exit { code: 37 }`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exit_code_via_pty() {
@@ -86,7 +87,7 @@ async fn test_exit_code_via_pty() {
     assert_eq!(saw_exit, Some(37), "expected Exit(37), got {saw_exit:?}");
 }
 
-/// implementation-note-425: stdin bytes the peer sends must route through
+/// implementation-note-385: stdin bytes the peer sends must route through
 /// the pty master to the child; the child's echo must surface as
 /// `OutputBytes` frames.
 #[tokio::test(flavor = "multi_thread")]
@@ -142,7 +143,7 @@ async fn test_stdin_proxied_through_pty() {
     );
 }
 
-/// implementation-note-425: a `Resize` frame the peer sends must apply
+/// implementation-note-385: a `Resize` frame the peer sends must apply
 /// `TIOCSWINSZ` to the pty master before the child runs `stty size`, so the
 /// child reads the new geometry.
 #[tokio::test(flavor = "multi_thread")]

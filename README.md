@@ -4,7 +4,7 @@ Summary:
 - Decision status: accepted
 - Authority state: current
 - Implementation status: shipped
-- Last reviewed: 2026-05-23
+- Last reviewed: 2026-06-17
 
 # Emberlink
 
@@ -15,7 +15,7 @@ Summary:
 Public docs: <https://docs.ember.link>
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-pre--release%20source%20mirror-8e44ad.svg)](project design notes)
+[![Status](https://img.shields.io/badge/status-pre--release%20source%20mirror-8e44ad.svg)](public-docs/get-started/support-levels-and-release-posture.md)
 
 AI agents need authority to do useful work. Most systems hand them a raw token, a broad OAuth scope, or a standing platform permission. Emberlink changes that boundary: the local daemon keeps the credential, and the agent receives a grant that is scoped, time-bound, policy-gated, auditable, and revocable.
 
@@ -32,7 +32,7 @@ AI agents need authority to do useful work. Most systems hand them a raw token, 
 - `v0.3.0` remains the friendly-preview build gate, not the general-release gate.
 - `v0.3.1` is the first planned public supported build and install funnel.
 
-The canonical boundary for those milestones lives in design, [QUICKSTART.md](QUICKSTART.md), and release-notes.
+The canonical boundary for those milestones lives in [support levels and release posture](public-docs/get-started/support-levels-and-release-posture.md), [QUICKSTART.md](QUICKSTART.md), and release-notes.
 
 ## Install
 
@@ -58,8 +58,8 @@ brokered runtime lane later, rerun `ember init --for claude` with
 
 Codex stays on Codex's native login lane. Run `codex login`, or
 `codex login --device-auth` on a headless host, then `ember init --for codex`;
-isolated `ember codex` reuses the host `~/.codex` authority via bind-mount
-instead of creating a separate container login.
+isolated `ember codex` keeps host auth live while routing mutable Codex state
+through per-session overlays instead of creating a separate container login.
 
 If you're evaluating from the public source mirror today, use the
 source-build path:
@@ -77,15 +77,29 @@ first-run path.
 
 - [docs.ember.link](https://docs.ember.link) — curated public docs site
 - [QUICKSTART.md](QUICKSTART.md) — canonical install and onboarding flow
-- docs/current-architecture.md — compact current-state architecture map
-- CONTEXT.md — terminology, invariants, and architecture vocabulary
-- docs/adr-index.md — ADR entrypoint, source order, and lifecycle guidance
-- project design notes and release-notes — current release boundary and known scope cuts
-- [MANIFESTO.md](MANIFESTO.md) and DESIGN.md — background narrative and UX context
+- [Architecture overview](public-docs/concepts/architecture.md) — compact current-state architecture map
+- [Grant Warden model](public-docs/concepts/grant-warden.md) — terminology and product model
+- [CLI reference](public-docs/reference/cli-reference.md) — current public operator contract
+- [Support levels and release posture](public-docs/get-started/support-levels-and-release-posture.md) and release-notes — current release boundary and known scope cuts
+- [MANIFESTO.md](MANIFESTO.md) — background narrative and value thesis
 
 ## Current release boundary
 
-The current friendly-drop cohort is three end-to-end Constructs: `ember-gh`, `ember-git`, and `ember-kubectl`. The source mirror may be public before the first public supported build; the current milestone split is tracked in design and release-notes.
+The current friendly-drop cohort is three end-to-end Constructs: `ember-gh`, `ember-git`, and `ember-kubectl`. These are **registry-loaded Construct bundles** (manifest + projector + shim) installed at runtime — not source crates in this workspace. The source mirror may be public before the first public supported build; the current milestone split is tracked in [support levels and release posture](public-docs/get-started/support-levels-and-release-posture.md) and release-notes.
+
+The buyer-facing nouns for these surfaces are **service** (an installed
+publisher's plugin) and **catalog** (the composed view of services, actions,
+and standing grants). The read surface ships in v0.3.0:
+
+```bash
+ember service ls                         # what services are installed
+ember service show ember-gh              # which actions does ember-gh expose
+ember catalog ls                         # services + action counts + standing grants
+ember catalog show ember-gh              # service + actions + grants targeting it
+```
+
+The protocol-precise term remains *installed Construct*; `service` is the
+buyer-facing alias for an installed Construct capability.
 
 ## Contributing
 

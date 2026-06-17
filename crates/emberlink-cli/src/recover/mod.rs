@@ -1,35 +1,43 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! `ember recover {daemon, authority, broker, audit, install}` — operator
-//! recovery surface per design §Component 1.
+//! `ember recover ...` — operator recovery surface per design §Component 1
+//! and design's lifecycle recovery plane.
 //!
 //! Each class entry point routes to a sub-module (`daemon`, `authority`,
 //! `broker`, `audit`, `install`) that is incrementally populated as
 //! per-F-code implementations land. Today the scaffold exposes the verb
 //! surface and the `--explain F-CODE` runbook bridge; per-F-code recovery
-//! work is tracked as `implementation-note-455-*` tasks shipping progressively.
+//! work is tracked as `implementation-note-458-*` tasks shipping progressively.
 //!
 //! Each recovery action emits a Receipt of kind `recovery.action` once the
 //! per-F-code implementation lands. Authority-modifying recovery is gated
 //! by the existing `PresenceProof` primitive (Touch ID on macOS). The
 //! scaffold-level handlers print the Receipt-emission contract and the
 //! Touch-ID-gating contract without doing the work — the per-F-code task
-//! that wires the real action also wires the Receipt + presence-proof
-//! call. See `project design notes`.
+//! that wires the real action also wires the Receipt + presence-proof call.
 //!
 //! ## Checkpoint for `target_state_anchor`
 //!
 //! `recover_cli_scaffold_landed` is anchored in this module's docstring.
 
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Subcommand;
 
 pub mod audit;
+pub mod audit_chain;
 pub mod authority;
 pub mod broker;
 pub mod daemon;
+pub mod diagnose;
+pub mod grant;
 pub mod install;
+pub mod persona;
+pub mod symptoms;
+pub mod trust;
+pub mod vault;
 
 /// Top-level CLI subcommand surface for `ember recover`.
 ///
@@ -38,12 +46,35 @@ pub mod install;
 /// excerpt instead of routing to a class.
 #[derive(Subcommand, Debug)]
 pub enum RecoverCmd {
+    /// Diagnose the local recovery posture and print one bounded next step.
+    ///
+    /// This lifecycle umbrella composes the daemon status, vault status,
+    /// persona/grant summary, and audit verification primitives. It emits a
+    /// daemon-signed `recovery.action` receipt before rendering the result.
+    Diagnose(diagnose::RecoverDiagnoseArgs),
+
+    /// Guided audit-chain lifecycle recovery (-S3 scaffold).
+    #[command(name = "audit-chain")]
+    AuditChain(audit_chain::RecoverAuditChainArgs),
+
+    /// Guided vault lifecycle recovery: unlock-retry, rotate-key (guidance), verify-backup.
+    Vault(vault::RecoverVaultArgs),
+
+    /// Guided trust-list lifecycle recovery: list-audit provenance walk.
+    Trust(trust::RecoverTrustArgs),
+
+    /// Guided grant lifecycle recovery: rebuild-chain probe or abandon with provenance.
+    Grant(grant::RecoverGrantArgs),
+
+    /// Guided persona lifecycle recovery: restore eligibility probe or abandon with provenance.
+    Persona(persona::RecoverPersonaArgs),
+
     /// Recover daemon-side state (process, socket, db, pid).
     ///
     /// See `F-DAEMON-*` in `docs/runbook/recovery.md`.
     Daemon(daemon::RecoverDaemonArgs),
 
-    /// Recover authority (workflow grants, identity root, keychain).
+    /// Recover authority (delegated authority, identity root, keychain).
     ///
     /// See `F-AUTHORITY-*` in `docs/runbook/recovery.md`. Authority-
     /// modifying actions require Touch ID via `PresenceProof`.
@@ -76,22 +107,108 @@ pub enum RecoverCmd {
     },
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RecoverContext {
+    pub socket_path: Option<PathBuf>,
+}
+
+impl RecoverContext {
+    pub fn with_socket_path(socket_path: impl AsRef<Path>) -> Self {
+        Self {
+            socket_path: Some(socket_path.as_ref().to_path_buf()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoverOutcome {
+    exit_code: i32,
+}
+
+impl RecoverOutcome {
+    pub fn ok() -> Self {
+        Self { exit_code: 0 }
+    }
+
+    pub fn issue_found() -> Self {
+        Self { exit_code: 2 }
+    }
+
+    pub fn exit_code(self) -> i32 {
+        self.exit_code
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverError {
+    message: String,
+    exit_code: i32,
+}
+
+impl RecoverError {
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: 1,
+        }
+    }
+
+    pub fn authority(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: 3,
+        }
+    }
+
+    /// design §9 exit-4 — state changed between dry-run and execute; the
+    /// operator must rerun the dry-run. Used by `recover vault rotate-key
+    /// --execute` when the daemon reports `vault_rotate_drift` (design
+    /// amendment 1: the rotation plan's state digest no longer matches).
+    pub fn drift(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: 4,
+        }
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+impl std::fmt::Display for RecoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RecoverError {}
+
 /// Result of a recover-subcommand handler call.
 ///
-/// The scaffold returns Ok or a stable error string the bin wrapper
-/// surfaces to stderr. Once per-F-code work lands the handler may
-/// upgrade to a richer error type.
-pub type RecoverResult = Result<(), String>;
+/// The handler returns a stable outcome code or a structured error the bin
+/// wrapper surfaces to stderr.
+pub type RecoverResult = Result<RecoverOutcome, RecoverError>;
 
 /// Dispatch a `RecoverCmd` to its class sub-module (or runbook bridge).
 ///
 /// `runbook_path` defaults to `docs/runbook/recovery.md` relative to the
 /// repository root. Override for tests via the `--runbook` plumbing once
 /// the per-F-code handlers begin to need it.
-pub fn dispatch(cmd: RecoverCmd, runbook_path: Option<PathBuf>) -> RecoverResult {
+pub fn dispatch(
+    cmd: RecoverCmd,
+    runbook_path: Option<PathBuf>,
+    context: RecoverContext,
+) -> RecoverResult {
     match cmd {
-        RecoverCmd::Daemon(args) => daemon::handle(args),
-        RecoverCmd::Authority(args) => authority::handle(args),
+        RecoverCmd::Diagnose(args) => diagnose::handle(args, context),
+        RecoverCmd::AuditChain(args) => audit_chain::handle(args, context),
+        RecoverCmd::Vault(args) => vault::handle(args, context),
+        RecoverCmd::Trust(args) => trust::handle(args, context),
+        RecoverCmd::Grant(args) => grant::handle(args, context),
+        RecoverCmd::Persona(args) => persona::handle(args, context),
+        RecoverCmd::Daemon(args) => daemon::handle(args, context),
+        RecoverCmd::Authority(args) => authority::handle(args, context),
         RecoverCmd::Broker(args) => broker::handle(args),
         RecoverCmd::Audit(args) => audit::handle(args),
         RecoverCmd::Install(args) => install::handle(args),
@@ -105,15 +222,20 @@ pub fn dispatch(cmd: RecoverCmd, runbook_path: Option<PathBuf>) -> RecoverResult
 /// On miss, lists the available F-codes from the runbook headers.
 pub fn explain_f_code(f_code: &str, runbook_path: Option<PathBuf>) -> RecoverResult {
     let path = runbook_path.unwrap_or_else(|| PathBuf::from("docs/runbook/recovery.md"));
-    let body = fs::read_to_string(&path)
-        .map_err(|e| format!("could not read runbook at {}: {}", path.display(), e))?;
+    let body = fs::read_to_string(&path).map_err(|e| {
+        RecoverError::usage(format!(
+            "could not read runbook at {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
     let needle = f_code.to_ascii_uppercase();
 
-    let mut lines = body.lines().peekable();
+    let lines = body.lines().peekable();
     let mut in_section = false;
     let mut printed = false;
     let mut available: Vec<&str> = Vec::new();
-    while let Some(line) = lines.next() {
+    for line in lines {
         if let Some(header) = line.strip_prefix("## ") {
             let code = header.split_whitespace().next().unwrap_or("");
             if code.starts_with("F-") {
@@ -140,9 +262,9 @@ pub fn explain_f_code(f_code: &str, runbook_path: Option<PathBuf>) -> RecoverRes
             msg.push_str("\navailable F-codes: ");
             msg.push_str(&available.join(", "));
         }
-        return Err(msg);
+        return Err(RecoverError::usage(msg));
     }
-    Ok(())
+    Ok(RecoverOutcome::ok())
 }
 
 /// Placeholder for the Receipt-emission contract. The scaffold prints
@@ -172,8 +294,8 @@ pub(crate) fn note_presence_contract(class: &str, scope: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn fixture_runbook() -> NamedTempFile {
         let mut f = NamedTempFile::new().expect("tmp runbook");
@@ -182,7 +304,7 @@ mod tests {
             "# Recovery Runbook\n\n## F-DAEMON-1 — Daemon crashed mid-session\n\
              - Symptom: daemon process exited\n\
              - Recovery: `ember recover daemon`\n\n\
-             ## F-AUTHORITY-1 — Workflow grant expired\n\
+             ## F-AUTHORITY-1 — Delegation grant expired\n\
              - Symptom: 403 mid-session\n\
              - Recovery: relogin"
         )
@@ -209,7 +331,14 @@ mod tests {
         let runbook = fixture_runbook();
         let r = explain_f_code("F-BOGUS-9", Some(runbook.path().to_path_buf()));
         let err = r.expect_err("expected error on unknown F-code");
-        assert!(err.contains("F-DAEMON-1"), "error should list available codes; got: {err}");
-        assert!(err.contains("F-AUTHORITY-1"), "error should list available codes; got: {err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("F-DAEMON-1"),
+            "error should list available codes; got: {err}"
+        );
+        assert!(
+            err.contains("F-AUTHORITY-1"),
+            "error should list available codes; got: {err}"
+        );
     }
 }

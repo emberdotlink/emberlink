@@ -6,7 +6,10 @@ mod memory;
 mod types;
 pub mod verify;
 
-pub use authorize::{AllowAllAuthorizer, Authorizer, IdentityAuthorizer, sanitize_authorize_error};
+pub use authorize::{
+    AllowAllAuthorizer, Authorizer, IdentityAuthorizer, is_active_persona_key_under_root,
+    sanitize_authorize_error,
+};
 pub use event_log::EventLog;
 pub use memory::MEMORY_LOG_NOW_CEILING;
 pub use memory::MemoryEventLog;

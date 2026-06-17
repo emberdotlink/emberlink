@@ -1,6 +1,10 @@
-use chrono::Utc;
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use core_event_types::ActionRef;
 use core_events::receipt::{ClaimEvent, ClaimKind};
 use core_events::receipt::{merkle_leaf, merkle_root};
+use core_events::rollup::RollupOutcome;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -8,15 +12,19 @@ use tracing::{debug, warn};
 use crate::infra::audit::append_audit_event_with_chain_in_tx;
 use crate::infra::store::{DaemonStore, StoreError};
 
-/// Claim rollup scope for session/composite receipt materialization.
+/// Claim rollup scope for authority-lane/composite receipt materialization.
 ///
-/// `Session` scopes model long-running interactive/runtime lanes such as
+/// `AuthorityLane` scopes model long-running interactive/runtime lanes such as
 /// `session.claude_code`. `Grant` scopes model composite-grant lifetimes whose
 /// eventual terminal receipt is keyed by grant rather than launcher session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ClaimScopeKind {
-    Session,
+    /// Rust name intentionally avoids bare `Session` per design §3; the
+    /// serialized/storage token stays `"session"` for compatibility with
+    /// existing journal rows.
+    #[serde(rename = "session")]
+    AuthorityLane,
+    #[serde(rename = "grant")]
     Grant,
 }
 
@@ -31,6 +39,10 @@ pub struct ScopeRef {
 /// claim record. The claim-journal seam owns this transaction choreography so
 /// callers do not manually write `audit_log` and claim-journal rows
 /// separately.
+///
+/// Per design §3, `action` remains the audit-row verb classifier while the
+/// claim journal records canonical structured authority identity in
+/// [`SuccessfulClaimInput::action_ref`] and the decomposed indexed columns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEvidenceInput {
     pub agent_id: Option<String>,
@@ -56,13 +68,25 @@ pub struct SuccessfulClaimInput {
     pub occurred_at: String,
     pub claim_kind: ClaimKind,
     pub tool: String,
+    /// Structured action identity for construct-backed authority exercises.
+    /// Legacy non-construct uses leave this unset and continue to project via
+    /// the flat `tool` string.
+    pub action_ref: Option<ActionRef>,
+    /// Placement-truth runner class requested/selected for this authority
+    /// exercise when the caller can surface it.
+    pub runner_class: Option<String>,
+    /// Placement-truth execution domain actually used when known.
+    pub execution_domain: Option<String>,
+    /// Placement-truth materialization class actually used when known.
+    pub materialization_class: Option<String>,
     pub input_hash: String,
     pub input_redacted: serde_json::Value,
     pub resolved: serde_json::Value,
     pub audit: AuditEvidenceInput,
     pub persona_id: Option<String>,
+    pub grant_id: Option<String>,
     pub device_id: Option<String>,
-    pub workflow_id: Option<String>,
+    pub delegation_id: Option<String>,
     pub materialization_id: Option<String>,
     pub credential_name: Option<String>,
 }
@@ -104,6 +128,26 @@ pub struct ClosedScopeSummary {
     pub segments: Vec<ClaimSegmentSummary>,
     pub recent_claims: Vec<ClaimEvent>,
     pub recent_claims_truncated: bool,
+}
+
+/// Read-time service summary anchored to claim-journal segments.
+///
+/// Each `merkle_segment_ref` identifies one segment that contributed at least
+/// one claim to the summary window. The reference format is
+/// `<scope_kind>:<scope_id>:<segment_no>:<merkle_root>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRollupSummary {
+    pub plugin_address: String,
+    pub window_start: String,
+    pub window_end: String,
+    pub total_claims: usize,
+    pub unique_personas: usize,
+    pub unique_grants: usize,
+    pub spend_total_cents: Option<i64>,
+    pub by_outcome: HashMap<RollupOutcome, usize>,
+    pub by_runner_class: HashMap<String, usize>,
+    pub last_claim_at: Option<String>,
+    pub merkle_segment_refs: Vec<String>,
 }
 
 /// Result of appending a successful claim to the journal.
@@ -160,6 +204,8 @@ pub enum ClaimJournalError {
     MissingTool,
     #[error("successful claim input is missing input_hash")]
     MissingInputHash,
+    #[error("plugin_address must not be empty")]
+    EmptyPluginAddress,
     #[error("scope not found")]
     ScopeNotFound,
     #[error("backend error: {0}")]
@@ -212,6 +258,14 @@ pub struct SqliteClaimJournal<'a> {
 
 pub const DEFAULT_CLAIM_JOURNAL_SEGMENT_TARGET: usize = 64;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedActionRef {
+    action_ref: Option<ActionRef>,
+    /// `true` means this row only had a legacy flat tool/action string after
+    /// deterministic design parsing. Service-grouped rollups exclude it.
+    legacy_flat: bool,
+}
+
 impl<'a> SqliteClaimJournal<'a> {
     pub fn new(store: &'a DaemonStore, segment_target: usize) -> Self {
         Self {
@@ -247,7 +301,10 @@ impl<'a> SqliteClaimJournal<'a> {
         let mut normalized = Vec::with_capacity(scopes.len());
         for scope in scopes {
             Self::validate_scope(scope)?;
-            if !normalized.iter().any(|existing: &ScopeRef| existing == scope) {
+            if !normalized
+                .iter()
+                .any(|existing: &ScopeRef| existing == scope)
+            {
                 normalized.push(scope.clone());
             }
         }
@@ -257,9 +314,123 @@ impl<'a> SqliteClaimJournal<'a> {
         Ok(normalized)
     }
 
+    fn validate_plugin_address(plugin_address: &str) -> Result<(), ClaimJournalError> {
+        if plugin_address.trim().is_empty() {
+            return Err(ClaimJournalError::EmptyPluginAddress);
+        }
+        Ok(())
+    }
+
+    /// Deterministic design backfill parser.
+    ///
+    /// The only accepted legacy display form is the structured display form
+    /// produced by [`ActionRef::to_string`]:
+    /// `<plugin_address>/<action_key>@<action_version>`. Anything else is
+    /// historical flat evidence and is tagged `legacy_flat=1`.
+    pub(crate) fn backfill_action_ref_from_tool(tool: &str) -> Option<ActionRef> {
+        ActionRef::parse(tool.trim()).ok()
+    }
+
+    fn resolve_action_ref(input: &SuccessfulClaimInput) -> ResolvedActionRef {
+        if let Some(action_ref) = input.action_ref.clone() {
+            return ResolvedActionRef {
+                action_ref: Some(action_ref),
+                legacy_flat: false,
+            };
+        }
+        match Self::backfill_action_ref_from_tool(&input.tool) {
+            Some(action_ref) => ResolvedActionRef {
+                action_ref: Some(action_ref),
+                legacy_flat: false,
+            },
+            None => ResolvedActionRef {
+                action_ref: None,
+                legacy_flat: true,
+            },
+        }
+    }
+
+    fn ensure_claim_journal_adr186_columns(
+        conn: &rusqlite::Connection,
+    ) -> Result<(), ClaimJournalError> {
+        let _ = conn.execute(
+            "ALTER TABLE claim_journal_claims ADD COLUMN legacy_flat INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        conn.prepare("SELECT legacy_flat FROM claim_journal_claims LIMIT 0")
+            .map_err(Self::map_store)?;
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_plugin_time
+             ON claim_journal_claims(action_plugin_address, ts)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_action_full
+             ON claim_journal_claims(action_plugin_address, action_key, action_version)",
+            [],
+        );
+        Ok(())
+    }
+
+    fn backfill_legacy_claim_action_refs(
+        conn: &rusqlite::Connection,
+    ) -> Result<(), ClaimJournalError> {
+        Self::ensure_claim_journal_adr186_columns(conn)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, tool
+                   FROM claim_journal_claims
+                  WHERE COALESCE(legacy_flat, 0) = 0
+                    AND (action_plugin_address IS NULL
+                         OR action_key IS NULL
+                         OR action_version IS NULL)",
+            )
+            .map_err(Self::map_store)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(Self::map_store)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::map_store)?;
+        drop(stmt);
+
+        for (rowid, tool) in rows {
+            match Self::backfill_action_ref_from_tool(&tool) {
+                Some(action_ref) => {
+                    conn.execute(
+                        "UPDATE claim_journal_claims
+                            SET action_plugin_address = ?2,
+                                action_key = ?3,
+                                action_version = ?4,
+                                legacy_flat = 0
+                          WHERE rowid = ?1",
+                        params![
+                            rowid,
+                            action_ref.plugin_address,
+                            action_ref.action_key,
+                            action_ref.action_version
+                        ],
+                    )
+                    .map_err(Self::map_store)?;
+                }
+                None => {
+                    conn.execute(
+                        "UPDATE claim_journal_claims
+                            SET legacy_flat = 1
+                          WHERE rowid = ?1",
+                        params![rowid],
+                    )
+                    .map_err(Self::map_store)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn scope_kind_str(kind: ClaimScopeKind) -> &'static str {
         match kind {
-            ClaimScopeKind::Session => "session",
+            ClaimScopeKind::AuthorityLane => "session",
             ClaimScopeKind::Grant => "grant",
         }
     }
@@ -317,15 +488,33 @@ impl<'a> SqliteClaimJournal<'a> {
         if hashes.is_empty() {
             return Ok(String::new());
         }
-        let leaves: Vec<[u8; 32]> = hashes
-            .iter()
-            .map(|h| merkle_leaf(h.as_bytes()))
-            .collect();
+        let leaves: Vec<[u8; 32]> = hashes.iter().map(|h| merkle_leaf(h.as_bytes())).collect();
         Ok(Self::hex_lower(&merkle_root(&leaves)))
     }
 
     fn map_store(err: impl std::fmt::Display) -> ClaimJournalError {
         ClaimJournalError::Backend(err.to_string())
+    }
+
+    fn rollup_outcome_from_audit_outcome(outcome: &str) -> RollupOutcome {
+        match outcome {
+            "allowed" | "ok" | "success" | "minted" => RollupOutcome::Success,
+            "in_flight" => RollupOutcome::InFlight,
+            "incomplete" => RollupOutcome::Incomplete,
+            other if other.starts_with("denied") => RollupOutcome::Denied {
+                reason: other.to_string(),
+            },
+            other if other.starts_with("exit_code:") => {
+                let exit_code = other
+                    .trim_start_matches("exit_code:")
+                    .parse::<i32>()
+                    .unwrap_or(-1);
+                RollupOutcome::Errored { exit_code }
+            }
+            other => RollupOutcome::Denied {
+                reason: other.to_string(),
+            },
+        }
     }
 
     fn upsert_scope_and_segment_state(
@@ -422,10 +611,13 @@ impl<'a> SqliteClaimJournal<'a> {
         segment_no: i64,
         segment_seq: i64,
     ) -> Result<(), ClaimJournalError> {
+        Self::ensure_claim_journal_adr186_columns(conn)?;
+        let resolved = Self::resolve_action_ref(input);
+        let legacy_flat = if resolved.legacy_flat { 1_i64 } else { 0_i64 };
         conn.execute(
             "INSERT INTO claim_journal_claims
-             (scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json, persona_id, device_id, workflow_id, materialization_id, credential_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             (scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, action_plugin_address, action_key, action_version, runner_class, execution_domain, materialization_class, legacy_flat, input_hash, input_redacted_json, resolved_json, persona_id, grant_id, device_id, delegation_id, materialization_id, credential_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 Self::scope_kind_str(scope.kind),
                 scope.id,
@@ -437,12 +629,26 @@ impl<'a> SqliteClaimJournal<'a> {
                 input.occurred_at,
                 Self::claim_kind_str(input.claim_kind),
                 input.tool,
+                resolved
+                    .action_ref
+                    .as_ref()
+                    .map(|v| v.plugin_address.as_str()),
+                resolved.action_ref.as_ref().map(|v| v.action_key.as_str()),
+                resolved
+                    .action_ref
+                    .as_ref()
+                    .map(|v| v.action_version.as_str()),
+                input.runner_class.as_deref(),
+                input.execution_domain.as_deref(),
+                input.materialization_class.as_deref(),
+                legacy_flat,
                 input.input_hash,
                 serde_json::to_string(&input.input_redacted).map_err(Self::map_store)?,
                 serde_json::to_string(&input.resolved).map_err(Self::map_store)?,
                 input.persona_id,
+                input.grant_id,
                 input.device_id,
-                input.workflow_id,
+                input.delegation_id,
                 input.materialization_id,
                 input.credential_name,
             ],
@@ -456,6 +662,7 @@ impl<'a> SqliteClaimJournal<'a> {
         scope: &ScopeRef,
         opts: CloseScopeOpts,
     ) -> Result<ClosedScopeSummary, ClaimJournalError> {
+        Self::backfill_legacy_claim_action_refs(conn)?;
         let total_claims: i64 = conn
             .query_row(
                 "SELECT COUNT(*)
@@ -492,7 +699,7 @@ impl<'a> SqliteClaimJournal<'a> {
 
         let mut claim_stmt = conn
             .prepare(
-                "SELECT ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json
+                "SELECT ts, claim_kind, tool, action_plugin_address, action_key, action_version, input_hash, input_redacted_json, resolved_json
                    FROM claim_journal_claims
                   WHERE scope_kind = ?1 AND scope_id = ?2
                ORDER BY scope_seq DESC
@@ -508,20 +715,27 @@ impl<'a> SqliteClaimJournal<'a> {
                 ],
                 |row| {
                     let kind: String = row.get(1)?;
-                    let input_redacted_json: String = row.get(4)?;
-                    let resolved_json: String = row.get(5)?;
+                    let plugin_address: Option<String> = row.get(3)?;
+                    let action_key: Option<String> = row.get(4)?;
+                    let action_version: Option<String> = row.get(5)?;
+                    let input_redacted_json: String = row.get(7)?;
+                    let resolved_json: String = row.get(8)?;
                     Ok(ClaimEvent {
                         ts: row.get(0)?,
                         kind: Self::claim_kind_from_str(&kind)
                             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                         tool: row.get(2)?,
-                        input_hash: row.get(3)?,
-                        input_redacted: serde_json::from_str(&input_redacted_json).map_err(
-                            |e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-                        )?,
-                        resolved: serde_json::from_str(&resolved_json).map_err(|e| {
-                            rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-                        })?,
+                        action_ref: match (plugin_address, action_key, action_version) {
+                            (Some(plugin_address), Some(action_key), Some(action_version)) => {
+                                Some(ActionRef::new(plugin_address, action_key, action_version))
+                            }
+                            _ => None,
+                        },
+                        input_hash: row.get(6)?,
+                        input_redacted: serde_json::from_str(&input_redacted_json)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                        resolved: serde_json::from_str(&resolved_json)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                     })
                 },
             )
@@ -536,6 +750,171 @@ impl<'a> SqliteClaimJournal<'a> {
             segments,
             recent_claims_truncated: (total_claims as usize) > recent_claims.len(),
             recent_claims,
+        })
+    }
+
+    /// Public design §10d Layer 5 query entry point.
+    ///
+    /// Validates inputs + backfills any legacy flat rows, then delegates the
+    /// actual aggregation to [`Self::compute_service_rollup`]. Splitting the
+    /// helper out keeps the single indexed SELECT path explicit and gives
+    /// callers (`ember catalog usage`, `ember spend by-service`, dashboard
+    /// Layer 5) one named aggregation seam to reuse without re-running input
+    /// validation on every call.
+    pub fn summarize_by_service(
+        &self,
+        plugin_address: &str,
+        window: (DateTime<Utc>, DateTime<Utc>),
+    ) -> Result<ServiceRollupSummary, ClaimJournalError> {
+        Self::validate_plugin_address(plugin_address)?;
+        let conn = self.store.conn();
+        Self::backfill_legacy_claim_action_refs(conn)?;
+        Self::compute_service_rollup(conn, plugin_address, window)
+    }
+
+    /// design §10d aggregation helper — the single indexed SELECT path that
+    /// summarizes the `(action_plugin_address, ts)`-keyed claim rows over a
+    /// window and anchors the resulting rollup to the existing tamper-evident
+    /// segment chain via `merkle_segment_refs`.
+    ///
+    /// `legacy_flat=1` rows are excluded per design §10d; rows without a
+    /// structured `action_ref` are likewise excluded so service rollups only
+    /// reflect canonical design claims.
+    ///
+    /// The caller (`summarize_by_service`) is responsible for input validation
+    /// and the legacy-action-ref backfill so this helper stays a pure
+    /// aggregation step.
+    fn compute_service_rollup(
+        conn: &rusqlite::Connection,
+        plugin_address: &str,
+        window: (DateTime<Utc>, DateTime<Utc>),
+    ) -> Result<ServiceRollupSummary, ClaimJournalError> {
+        let window_start = window.0.to_rfc3339();
+        let window_end = window.1.to_rfc3339();
+
+        let (total_claims, unique_personas, unique_grants, last_claim_at): (
+            i64,
+            i64,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(DISTINCT persona_id),
+                        COUNT(DISTINCT grant_id),
+                        MAX(ts)
+                   FROM claim_journal_claims
+                  WHERE action_plugin_address = ?1
+                    AND ts >= ?2
+                    AND ts <= ?3
+                    AND action_key IS NOT NULL
+                    AND action_version IS NOT NULL
+                    AND COALESCE(legacy_flat, 0) = 0",
+                params![plugin_address, window_start, window_end],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(Self::map_store)?;
+
+        let mut outcome_stmt = conn
+            .prepare(
+                "SELECT a.outcome, COUNT(*)
+                   FROM claim_journal_claims c
+                   JOIN audit_log a
+                     ON a.id = c.audit_event_id
+                  WHERE c.action_plugin_address = ?1
+                    AND c.ts >= ?2
+                    AND c.ts <= ?3
+                    AND c.action_key IS NOT NULL
+                    AND c.action_version IS NOT NULL
+                    AND COALESCE(c.legacy_flat, 0) = 0
+               GROUP BY a.outcome",
+            )
+            .map_err(Self::map_store)?;
+        let by_outcome = outcome_stmt
+            .query_map(params![plugin_address, window_start, window_end], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(Self::map_store)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::map_store)?
+            .into_iter()
+            .fold(HashMap::new(), |mut acc, (outcome, count)| {
+                acc.insert(
+                    Self::rollup_outcome_from_audit_outcome(&outcome),
+                    count as usize,
+                );
+                acc
+            });
+
+        let mut runner_stmt = conn
+            .prepare(
+                "SELECT runner_class, COUNT(*)
+                   FROM claim_journal_claims
+                  WHERE action_plugin_address = ?1
+                    AND ts >= ?2
+                    AND ts <= ?3
+                    AND action_key IS NOT NULL
+                    AND action_version IS NOT NULL
+                    AND COALESCE(legacy_flat, 0) = 0
+                    AND runner_class IS NOT NULL
+                    AND runner_class <> ''
+               GROUP BY runner_class",
+            )
+            .map_err(Self::map_store)?;
+        let by_runner_class = runner_stmt
+            .query_map(params![plugin_address, window_start, window_end], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(Self::map_store)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::map_store)?
+            .into_iter()
+            .map(|(runner_class, count)| (runner_class, count as usize))
+            .collect::<HashMap<_, _>>();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT c.scope_kind, c.scope_id, c.segment_no, s.merkle_root
+                   FROM claim_journal_claims c
+                   JOIN claim_journal_segments s
+                     ON s.scope_kind = c.scope_kind
+                    AND s.scope_id = c.scope_id
+                    AND s.segment_no = c.segment_no
+                  WHERE c.action_plugin_address = ?1
+                    AND c.ts >= ?2
+                    AND c.ts <= ?3
+                    AND c.action_key IS NOT NULL
+                    AND c.action_version IS NOT NULL
+                    AND COALESCE(c.legacy_flat, 0) = 0
+               ORDER BY c.scope_kind ASC, c.scope_id ASC, c.segment_no ASC",
+            )
+            .map_err(Self::map_store)?;
+        let merkle_segment_refs = stmt
+            .query_map(params![plugin_address, window_start, window_end], |row| {
+                let scope_kind: String = row.get(0)?;
+                let scope_id: String = row.get(1)?;
+                let segment_no: i64 = row.get(2)?;
+                let merkle_root: String = row.get(3)?;
+                Ok(format!(
+                    "{scope_kind}:{scope_id}:{segment_no}:{merkle_root}"
+                ))
+            })
+            .map_err(Self::map_store)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::map_store)?;
+
+        Ok(ServiceRollupSummary {
+            plugin_address: plugin_address.to_string(),
+            window_start,
+            window_end,
+            total_claims: total_claims as usize,
+            unique_personas: unique_personas as usize,
+            unique_grants: unique_grants as usize,
+            spend_total_cents: None,
+            by_outcome,
+            by_runner_class,
+            last_claim_at,
+            merkle_segment_refs,
         })
     }
 }
@@ -612,7 +991,7 @@ pub fn close_session_scope_best_effort(
     close_scope_best_effort(
         store,
         ScopeRef {
-            kind: ClaimScopeKind::Session,
+            kind: ClaimScopeKind::AuthorityLane,
             id: session_id.to_string(),
         },
         context,
@@ -627,7 +1006,7 @@ pub fn summarize_session_scope_best_effort(
     summarize_scope_best_effort(
         store,
         ScopeRef {
-            kind: ClaimScopeKind::Session,
+            kind: ClaimScopeKind::AuthorityLane,
             id: session_id.to_string(),
         },
         context,
@@ -683,7 +1062,8 @@ impl<'a> ClaimJournal for SqliteClaimJournal<'a> {
         Self::validate_input(input)?;
 
         let conn = self.store.conn();
-        conn.execute("BEGIN IMMEDIATE", []).map_err(Self::map_store)?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(Self::map_store)?;
 
         let result = (|| -> Result<Vec<ScopedAppendDisposition>, ClaimJournalError> {
             let mut results = Vec::with_capacity(scopes.len());
@@ -837,7 +1217,8 @@ impl<'a> ClaimJournal for SqliteClaimJournal<'a> {
         scope: &ScopeRef,
         input: &SuccessfulClaimInput,
     ) -> Result<AppendDisposition, ClaimJournalError> {
-        let mut results = self.record_successful_claim_for_scopes(&[scope.clone()], input)?;
+        let mut results =
+            self.record_successful_claim_for_scopes(std::slice::from_ref(scope), input)?;
         match results.pop() {
             Some(result) => Ok(result.disposition),
             None => Err(ClaimJournalError::Backend(
@@ -927,7 +1308,8 @@ impl<'a> ClaimJournal for SqliteClaimJournal<'a> {
         Self::validate_scope(scope)?;
         let conn = self.store.conn();
         let closed_at = Utc::now().to_rfc3339();
-        conn.execute("BEGIN IMMEDIATE", []).map_err(Self::map_store)?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(Self::map_store)?;
 
         let result = (|| -> Result<ClosedScopeSummary, ClaimJournalError> {
             let updated = conn
@@ -970,12 +1352,43 @@ impl<'a> ClaimJournal for SqliteClaimJournal<'a> {
 mod tests {
     use super::*;
 
+    fn reset_quarantine_latch() {
+        crate::infra::handler::force_quarantine_latch_for_test(false);
+    }
+
+    struct ClaimJournalTestGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ClaimJournalTestGuard {
+        fn drop(&mut self) {
+            reset_quarantine_latch();
+        }
+    }
+
+    fn claim_journal_test_guard() -> ClaimJournalTestGuard {
+        let guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_quarantine_latch();
+        ClaimJournalTestGuard { _guard: guard }
+    }
+
+    fn test_store() -> DaemonStore {
+        reset_quarantine_latch();
+        DaemonStore::open_in_memory().unwrap()
+    }
+
     fn sample_input(source_key: &str, action: &str, hash: &str) -> SuccessfulClaimInput {
         SuccessfulClaimInput {
             source_key: source_key.to_string(),
             occurred_at: "2026-05-22T12:00:00Z".to_string(),
             claim_kind: ClaimKind::CredentialVended,
             tool: "Claude".to_string(),
+            action_ref: None,
+            runner_class: None,
+            execution_domain: None,
+            materialization_class: None,
             input_hash: hash.to_string(),
             input_redacted: serde_json::json!({"cmd": "deploy"}),
             resolved: serde_json::json!({"allowed": true}),
@@ -987,8 +1400,9 @@ mod tests {
                 details: Some("materialized".to_string()),
             },
             persona_id: Some("persona-test".to_string()),
+            grant_id: Some("grant-test".to_string()),
             device_id: Some("device-test".to_string()),
-            workflow_id: None,
+            delegation_id: None,
             materialization_id: Some("mid-test".to_string()),
             credential_name: Some("anthropic".to_string()),
         }
@@ -996,10 +1410,11 @@ mod tests {
 
     #[test]
     fn sqlite_claim_journal_appends_and_dedupes_by_source_key() {
-        let store = DaemonStore::open_in_memory().unwrap();
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
         let journal = SqliteClaimJournal::new(&store, 2);
         let scope = ScopeRef {
-            kind: ClaimScopeKind::Session,
+            kind: ClaimScopeKind::AuthorityLane,
             id: "session-1".to_string(),
         };
 
@@ -1038,7 +1453,14 @@ mod tests {
         assert_eq!(snapshot.segment_count, 1);
         assert_eq!(snapshot.open_segment_claims, 2);
 
-        let closed = journal.close_scope(&scope, CloseScopeOpts { recent_claim_limit: 8 }).unwrap();
+        let closed = journal
+            .close_scope(
+                &scope,
+                CloseScopeOpts {
+                    recent_claim_limit: 8,
+                },
+            )
+            .unwrap();
         assert_eq!(closed.total_claims, 2);
         assert_eq!(closed.segments.len(), 1);
         assert_eq!(closed.recent_claims.len(), 2);
@@ -1046,7 +1468,8 @@ mod tests {
 
     #[test]
     fn sqlite_claim_journal_rolls_over_segments() {
-        let store = DaemonStore::open_in_memory().unwrap();
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
         let journal = SqliteClaimJournal::new(&store, 1);
         let scope = ScopeRef {
             kind: ClaimScopeKind::Grant,
@@ -1071,11 +1494,116 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_claim_journal_round_trips_structured_action_ref_on_recent_claims() {
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
+        let journal = SqliteClaimJournal::new(&store, 2);
+        let scope = ScopeRef {
+            kind: ClaimScopeKind::AuthorityLane,
+            id: "session-action-ref".to_string(),
+        };
+        let action_ref = ActionRef::new(
+            "registry.ember.systems/ember-systems/ember-gh",
+            "pr_merge",
+            "v1",
+        );
+        let mut input = sample_input("src-1", "broker.resolve", "h1");
+        input.tool = action_ref.to_string();
+        input.action_ref = Some(action_ref.clone());
+
+        journal.record_successful_claim(&scope, &input).unwrap();
+        let summary = journal
+            .summarize_scope(
+                &scope,
+                CloseScopeOpts {
+                    recent_claim_limit: 4,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(summary.recent_claims.len(), 1);
+        assert_eq!(summary.recent_claims[0].action_ref, Some(action_ref));
+    }
+
+    #[test]
+    fn sqlite_claim_journal_parses_structured_tool_when_action_ref_absent() {
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
+        let journal = SqliteClaimJournal::new(&store, 2);
+        let scope = ScopeRef {
+            kind: ClaimScopeKind::AuthorityLane,
+            id: "session-action-ref-backfill".to_string(),
+        };
+        let action_ref = ActionRef::new(
+            "registry.ember.systems/ember-systems/ember-gh",
+            "pr_create",
+            "v1",
+        );
+        let mut input = sample_input("src-parse", "broker.resolve", "h-parse");
+        input.tool = action_ref.to_string();
+        input.action_ref = None;
+
+        journal.record_successful_claim(&scope, &input).unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT action_plugin_address, action_key, action_version, legacy_flat
+                   FROM claim_journal_claims
+                  WHERE scope_kind = 'session' AND scope_id = 'session-action-ref-backfill'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some(action_ref.plugin_address.clone()),
+                Some(action_ref.action_key.clone()),
+                Some(action_ref.action_version.clone()),
+                0,
+            )
+        );
+
+        let summary = journal
+            .summarize_scope(&scope, CloseScopeOpts::default())
+            .unwrap();
+        assert_eq!(summary.recent_claims[0].action_ref, Some(action_ref));
+    }
+
+    #[test]
+    fn sqlite_claim_journal_tags_unparseable_flat_tool_as_legacy_flat() {
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
+        let journal = SqliteClaimJournal::new(&store, 2);
+        let scope = ScopeRef {
+            kind: ClaimScopeKind::AuthorityLane,
+            id: "session-legacy-flat".to_string(),
+        };
+        let input = sample_input("src-flat", "broker.resolve", "h-flat");
+
+        journal.record_successful_claim(&scope, &input).unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT action_plugin_address, action_key, action_version, legacy_flat
+                   FROM claim_journal_claims
+                  WHERE scope_kind = 'session' AND scope_id = 'session-legacy-flat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, None, 1));
+    }
+
+    #[test]
     fn sqlite_claim_journal_projects_one_claim_into_multiple_scopes_with_shared_audit_evidence() {
-        let store = DaemonStore::open_in_memory().unwrap();
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
         let journal = SqliteClaimJournal::new(&store, 2);
         let session_scope = ScopeRef {
-            kind: ClaimScopeKind::Session,
+            kind: ClaimScopeKind::AuthorityLane,
             id: "session-multi".to_string(),
         };
         let grant_scope = ScopeRef {
@@ -1108,7 +1636,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(audit_row_count, 1, "one shared audit row must back both scope projections");
+        assert_eq!(
+            audit_row_count, 1,
+            "one shared audit row must back both scope projections"
+        );
 
         let session_claim_count: i64 = store
             .conn()
@@ -1132,10 +1663,11 @@ mod tests {
 
     #[test]
     fn close_session_scope_best_effort_marks_scope_closed() {
-        let store = DaemonStore::open_in_memory().unwrap();
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
         let journal = SqliteClaimJournal::new(&store, 2);
         let scope = ScopeRef {
-            kind: ClaimScopeKind::Session,
+            kind: ClaimScopeKind::AuthorityLane,
             id: "session-close-test".to_string(),
         };
 
@@ -1162,7 +1694,8 @@ mod tests {
 
     #[test]
     fn close_grant_scope_best_effort_marks_scope_closed() {
-        let store = DaemonStore::open_in_memory().unwrap();
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
         let journal = SqliteClaimJournal::new(&store, 2);
         let scope = ScopeRef {
             kind: ClaimScopeKind::Grant,
@@ -1188,5 +1721,187 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "closed");
+    }
+
+    // FLAKE (2026-05-27, observed under host-mode session-enrollment work,
+    // pre-existing on origin/main): fails non-deterministically under full
+    // `cargo test -p ember-daemon --lib` ordering with
+    // `Backend("daemon quarantined; audit-log write for action 'broker.resolve' refused")`.
+    // Passes in isolation. Cause: a sibling test trips the quarantine latch
+    // and exits before clearing it. `reset_quarantine_latch()` at test top
+    // is necessary but not sufficient — the latch is process-global and
+    // some sibling re-arms it after this test reads it. Follow-up: replace
+    // the global latch with a per-store / per-test-context one, or have
+    // every test that touches the latch call `reset_quarantine_latch()` in
+    // a `Drop` guard rather than only at entry.
+    #[test]
+    fn summarize_by_service_counts_structured_claims_and_excludes_legacy_rows() {
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
+        let journal = SqliteClaimJournal::new(&store, 2);
+        let service_ref = ActionRef::new(
+            "registry.ember.systems/ember-systems/ember-gh",
+            "pr_create",
+            "v1",
+        );
+
+        let scope_a = ScopeRef {
+            kind: ClaimScopeKind::AuthorityLane,
+            id: "session-service-a".to_string(),
+        };
+        let scope_b = ScopeRef {
+            kind: ClaimScopeKind::Grant,
+            id: "grant-service-b".to_string(),
+        };
+
+        let mut input_a = sample_input("src-a", "broker.resolve", "h1");
+        input_a.persona_id = Some("persona-a".to_string());
+        input_a.grant_id = Some("grant-a".to_string());
+        input_a.tool = service_ref.to_string();
+        input_a.action_ref = Some(service_ref.clone());
+        input_a.runner_class = Some("local_trusted".to_string());
+        journal.record_successful_claim(&scope_a, &input_a).unwrap();
+
+        let mut input_b = sample_input("src-b", "broker.resolve", "h2");
+        input_b.persona_id = Some("persona-b".to_string());
+        input_b.grant_id = Some("grant-b".to_string());
+        input_b.tool = service_ref.to_string();
+        input_b.action_ref = Some(service_ref.clone());
+        input_b.runner_class = Some("isolated_local".to_string());
+        journal.record_successful_claim(&scope_b, &input_b).unwrap();
+
+        let legacy_scope = ScopeRef {
+            kind: ClaimScopeKind::AuthorityLane,
+            id: "session-legacy".to_string(),
+        };
+        journal
+            .record_successful_claim(
+                &legacy_scope,
+                &sample_input("src-legacy", "broker.resolve", "h3"),
+            )
+            .unwrap();
+
+        let summary = journal
+            .summarize_by_service(
+                &service_ref.plugin_address,
+                (
+                    DateTime::parse_from_rfc3339("2026-05-22T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    DateTime::parse_from_rfc3339("2026-05-23T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(summary.total_claims, 2);
+        assert_eq!(summary.unique_personas, 2);
+        assert_eq!(summary.unique_grants, 2);
+        assert_eq!(summary.spend_total_cents, None);
+        assert_eq!(summary.by_outcome.get(&RollupOutcome::Success), Some(&2));
+        assert_eq!(summary.by_runner_class.get("local_trusted"), Some(&1));
+        assert_eq!(summary.by_runner_class.get("isolated_local"), Some(&1));
+        assert_eq!(
+            summary.last_claim_at.as_deref(),
+            Some("2026-05-22T12:00:00Z")
+        );
+        assert_eq!(summary.merkle_segment_refs.len(), 2);
+        assert!(
+            summary
+                .merkle_segment_refs
+                .iter()
+                .any(|r| r.starts_with("session:session-service-a:0:"))
+        );
+        assert!(
+            summary
+                .merkle_segment_refs
+                .iter()
+                .any(|r| r.starts_with("grant:grant-service-b:0:"))
+        );
+    }
+
+    // FLAKE (2026-05-27, see summarize_by_service_counts_structured_claims_and_excludes_legacy_rows):
+    // same global-latch contamination. Both tests share the same fragility —
+    // fixing one will likely fix both.
+    #[test]
+    fn summarize_by_service_empty_window_returns_zeroed_rollup() {
+        let _guard = claim_journal_test_guard();
+        let store = test_store();
+        let journal = SqliteClaimJournal::new(&store, 2);
+        let service_ref = ActionRef::new(
+            "registry.ember.systems/ember-systems/ember-gh",
+            "pr_create",
+            "v1",
+        );
+        let scope = ScopeRef {
+            kind: ClaimScopeKind::AuthorityLane,
+            id: "session-out-of-window".to_string(),
+        };
+
+        let mut input = sample_input("src-out-of-window", "broker.resolve", "h4");
+        input.tool = service_ref.to_string();
+        input.action_ref = Some(service_ref.clone());
+        journal.record_successful_claim(&scope, &input).unwrap();
+
+        let summary = journal
+            .summarize_by_service(
+                &service_ref.plugin_address,
+                (
+                    DateTime::parse_from_rfc3339("2026-05-23T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    DateTime::parse_from_rfc3339("2026-05-24T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(summary.total_claims, 0);
+        assert_eq!(summary.unique_personas, 0);
+        assert_eq!(summary.unique_grants, 0);
+        assert_eq!(summary.spend_total_cents, None);
+        assert!(summary.by_outcome.is_empty());
+        assert!(summary.by_runner_class.is_empty());
+        assert_eq!(summary.last_claim_at, None);
+        assert!(summary.merkle_segment_refs.is_empty());
+    }
+
+    #[test]
+    fn summarize_by_service_query_plan_uses_plugin_time_index() {
+        let store = test_store();
+        SqliteClaimJournal::ensure_claim_journal_adr186_columns(store.conn()).unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*)
+                   FROM claim_journal_claims
+                  WHERE action_plugin_address = ?1
+                    AND ts >= ?2
+                    AND ts <= ?3
+                    AND action_key IS NOT NULL
+                    AND action_version IS NOT NULL
+                    AND COALESCE(legacy_flat, 0) = 0",
+            )
+            .unwrap();
+        let plan = stmt
+            .query_map(
+                params![
+                    "registry.ember.systems/ember-systems/ember-gh",
+                    "2026-05-22T00:00:00Z",
+                    "2026-05-23T00:00:00Z"
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("idx_claim_journal_claims_plugin_time"),
+            "expected service rollup plan to use plugin_time index, got:\n{plan}"
+        );
     }
 }

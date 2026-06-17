@@ -1,4 +1,5 @@
 //! presence_cache_invalidation_impl_landed
+//! CLASSIFICATION: PUBLIC
 //!
 //! Linux logind D-Bus subscription for `org.freedesktop.login1` Lock
 //! and PrepareForSleep signals. On either signal the watcher drains
@@ -7,7 +8,7 @@
 //!
 //! ## Scaffold status
 //!
-//! Stub shipped with implementation-note-387. The real
+//! Stub shipped with implementation-note-338. The real
 //! `zbus`-based subscription lands in a successor task; this file
 //! holds the type + signature so call sites in
 //! `crate::infra::runtime` can wire the watcher into the daemon's
@@ -29,7 +30,7 @@ use std::sync::{Arc, Mutex};
 /// Linux presence-event watcher. Currently a no-op stub; logs intent
 /// and returns `Ok` so call sites can adopt the API surface now.
 ///
-/// TODO(implementation-note-387 successor): swap the
+/// TODO(implementation-note-338 successor): swap the
 /// `_cache: Arc<Mutex<()>>` placeholder for
 /// `Arc<Mutex<ember_memory::cache::PresenceCache>>` once `ember-memory`
 /// is added to `ember-daemon`'s Cargo.toml dep list and the daemon's

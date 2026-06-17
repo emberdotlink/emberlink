@@ -41,6 +41,9 @@
 //! | `list \| ls \| inspect \| logs \| bisect \| whoami \| link \| pull \| git connect` | `None` (passthrough) |
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// Vercel CLI global flags that take a value as the *next* argv token.
 /// When stripping, both the flag and its value are removed.
@@ -243,6 +246,186 @@ pub fn classify_vercel_argv(argv: &[String]) -> Option<ActionKey> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VercelFactory — construct-factory contract for the vercel construct
+// ---------------------------------------------------------------------------
+
+/// Parsed vercel.toml action manifest, initialised once at first access.
+static VERCEL_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/vercel.toml"))
+            .expect("bundled vercel.toml must be valid")
+    });
+
+/// Look up the `need` atoms for an action key from the bundled manifest.
+/// Returns `None` if the action is absent from the manifest or has an empty
+/// `need` list.
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("vercel.")?;
+    VERCEL_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key == format!("vercel.{suffix}"))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+/// Returns `true` when `action_key` (full form, e.g. `"vercel.deploy"`) has an
+/// entry in the bundled manifest (regardless of whether it carries a `need`).
+fn action_in_manifest(action_key: &str) -> bool {
+    VERCEL_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("vercel.")
+                .is_some_and(|suffix| a.key == format!("vercel.{suffix}"))
+    })
+}
+
+/// Returns `true` when the raw argv contains `--token` or `-t` (the Vercel
+/// credential-selection flags). Checks both the `--flag value` and
+/// `--flag=value` forms.
+fn has_token_flag(argv: &[String]) -> bool {
+    argv.iter().any(|tok| {
+        tok == "--token" || tok == "-t" || tok.starts_with("--token=") || tok.starts_with("-t=")
+    })
+}
+
+/// Returns `true` when the stripped argv's first positional token is `login`.
+fn is_login_argv(argv: &[String]) -> bool {
+    let stripped = strip_global_flags(argv);
+    stripped.first().is_some_and(|v| v == "login")
+}
+
+/// Extract `--scope`/`-S` value from raw argv (both `--scope value` and
+/// `--scope=value` forms).
+fn extract_scope_flag(argv: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = &argv[i];
+        // --scope=value / -S=value
+        for prefix in &["--scope=", "-S="] {
+            if let Some(value) = tok.strip_prefix(prefix)
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
+            }
+        }
+        // --scope value / -S value
+        if (tok == "--scope" || tok == "-S") && i + 1 < argv.len() {
+            let value = &argv[i + 1];
+            if !value.starts_with('-') {
+                return Some(value.clone());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// factory implementation for the `vercel` construct.
+#[derive(Debug, Default, Clone)]
+pub struct VercelFactory;
+
+/// Provider-specific target extracted from a `vercel` argv invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VercelFactoryTarget {
+    pub provider: &'static str,
+    /// Team/org scope as supplied via `--scope` / `-S`.
+    pub scope: Option<String>,
+    /// Project name (not currently extractable from argv alone; requires
+    /// vercel config / linked project resolution).
+    pub project: Option<String>,
+}
+
+/// Need atoms derived from the bundled manifest for one `vercel` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VercelFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for VercelFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_vercel_argv(argv)
+    }
+}
+
+impl TargetExtractor for VercelFactory {
+    type Target = VercelFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        // Vercel target always requires project resolution from vercel config
+        // / linked project (not present in argv). We can extract scope if
+        // supplied, but project is always None from argv alone.
+        let scope = extract_scope_flag(argv);
+        Some(VercelFactoryTarget {
+            provider: "vercel",
+            scope,
+            project: None,
+        })
+    }
+}
+
+impl NeedTemplate for VercelFactory {
+    type Need = VercelFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(VercelFactoryNeed)
+    }
+}
+
+impl ConstructFactory for VercelFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        // --token / -t in raw argv selects credential material — always fail
+        // closed regardless of what the classifier returns.
+        if has_token_flag(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // `vercel login` is classified as None by the argv classifier (it's in
+        // the read-only passthrough list) but is a credential-bypass vector.
+        if is_login_argv(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        let Some(key) = action_key else {
+            // Unclassified argv — no known mutating action (reads, version,
+            // whoami, etc.). Credentialless passthrough.
+            return FactoryDisposition::Credentialless;
+        };
+
+        // env.pull downloads environment material — authority-bearing payload
+        // that needs analysis before materialization.
+        if key.0 == "vercel.env.pull" {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        // Action not in the manifest at all — no bounded authority declared.
+        if !action_in_manifest(&key.0) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // Action is in the manifest. If it has no `need`, authority is
+        // unbounded — but for Vercel, project/team/scope must always be
+        // resolved from vercel config/linked project before mediation.
+        // All classified Vercel actions require resolver.
+        FactoryDisposition::ResolverRequired
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,11 +484,6 @@ mod tests {
     fn env_push_classified() {
         let r = classify_vercel_argv(&args(&["env", "push"])).unwrap();
         assert_eq!(r.0, "vercel.env.push");
-    }
-
-    #[test]
-    fn env_ls_passthrough() {
-        assert!(classify_vercel_argv(&args(&["env", "ls"])).is_none());
     }
 
     #[test]
@@ -864,7 +1042,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Vercel)`, and a request that
     // declares `provider = Vercel` round-trips through issue → revoke
-    // without panicking. Real Vercel impl is implementation-note-106 (separate task).
+    // without panicking. Real Vercel impl is implementation-note-105 (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;
@@ -878,6 +1056,13 @@ mod tests {
                 "actions": ["deploy", "env:write"],
             }),
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "ember-vercel integration test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -921,5 +1106,173 @@ mod tests {
     #[test]
     fn vercel_provider_as_str() {
         assert_eq!(BrokerProvider::Vercel.as_str(), "vercel");
+    }
+
+    // --- VercelFactory tests ---
+
+    #[test]
+    fn vercel_factory_deploy_is_resolver_required() {
+        let f = VercelFactory;
+        let a = args(&["deploy", "--prod"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn vercel_factory_env_pull_is_payload_analysis() {
+        let f = VercelFactory;
+        let a = args(&["env", "pull", ".env.local"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn vercel_factory_token_flag_fails_closed() {
+        let f = VercelFactory;
+        let a = args(&["--token", "vercel-token", "deploy", "--prod"]);
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn vercel_factory_short_token_flag_fails_closed() {
+        let f = VercelFactory;
+        let a = args(&["-t", "vercel-token", "deploy"]);
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn vercel_factory_token_equals_fails_closed() {
+        let f = VercelFactory;
+        let a = args(&["--token=vercel-token", "deploy"]);
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn vercel_factory_login_fails_closed() {
+        let f = VercelFactory;
+        let a = args(&["login"]);
+        let key = f.action_key_for_argv(&a);
+        // Classifier returns None for login (read-only passthrough), but
+        // factory intercepts raw argv.
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn vercel_factory_whoami_is_credentialless() {
+        let f = VercelFactory;
+        let a = args(&["whoami"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn vercel_factory_version_flag_is_credentialless() {
+        let f = VercelFactory;
+        let a = args(&["--version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn vercel_factory_env_add_is_resolver_required() {
+        let f = VercelFactory;
+        let a = args(&["env", "add", "FOO", "production"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn vercel_factory_target_extraction_with_scope() {
+        let f = VercelFactory;
+        let a = args(&["--scope", "myteam", "deploy", "--prod"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "vercel");
+        assert_eq!(target.scope, Some("myteam".to_string()));
+        assert_eq!(target.project, None);
+    }
+
+    #[test]
+    fn vercel_factory_target_extraction_short_scope() {
+        let f = VercelFactory;
+        let a = args(&["-S", "myteam", "deploy"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.scope, Some("myteam".to_string()));
+    }
+
+    #[test]
+    fn vercel_factory_target_extraction_scope_equals() {
+        let f = VercelFactory;
+        let a = args(&["--scope=myteam", "deploy"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.scope, Some("myteam".to_string()));
+    }
+
+    #[test]
+    fn vercel_factory_target_extraction_no_scope() {
+        let f = VercelFactory;
+        let a = args(&["deploy", "--prod"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "vercel");
+        assert_eq!(target.scope, None);
+        assert_eq!(target.project, None);
+    }
+
+    #[test]
+    fn vercel_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/vercel/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/vercel.toml"),
+        )
+        .expect("valid vercel manifest");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &VercelFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

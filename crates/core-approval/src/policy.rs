@@ -1,3 +1,4 @@
+pub use core_event_types::{ActionRef, ActionSelector};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,8 +41,9 @@ pub enum Tier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
-    /// Pattern to match action names (supports glob: "git.*", "deploy.*", "*")
-    pub action: String,
+    /// Pattern to match generic named actions or structured construct refs.
+    #[serde(serialize_with = "serialize_policy_action")]
+    pub action: ActionSelector,
     /// Risk level for this action
     pub risk: RiskLevel,
     /// What to do when this action is requested
@@ -127,6 +129,9 @@ pub enum PolicyError {
 
 /// Normalize an action string: lowercase, strip leading/trailing dots,
 /// collapse consecutive dots, reject empty or invalid segments.
+///
+/// This applies only to generic named actions such as `git.push.main`,
+/// not structured authority refs like `plugin/action@version`.
 pub fn normalize_action(action: &str) -> Result<String, PolicyError> {
     let trimmed = action.trim().to_lowercase();
 
@@ -168,6 +173,11 @@ pub struct PolicyEngine {
     config: PolicyConfig,
 }
 
+enum RequestedAction {
+    Named(String),
+    ActionRef(ActionRef),
+}
+
 fn matches_glob(pattern: &str, input: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -181,6 +191,43 @@ fn matches_glob(pattern: &str, input: &str) -> bool {
         .iter()
         .zip(inp_parts.iter())
         .all(|(p, i)| *p == "*" || *p == *i)
+}
+
+fn parse_requested_action(action: &str) -> Result<RequestedAction, PolicyError> {
+    let trimmed = action.trim();
+    if let Ok(action_ref) = ActionRef::parse(trimmed) {
+        return Ok(RequestedAction::ActionRef(action_ref));
+    }
+    normalize_action(trimmed).map(RequestedAction::Named)
+}
+
+fn rule_matches_requested_action(rule: &ActionSelector, requested: &RequestedAction) -> bool {
+    match requested {
+        RequestedAction::Named(action) => match rule {
+            ActionSelector::Named { pattern } => matches_glob(pattern, action),
+            ActionSelector::ActionRef(_) => false,
+        },
+        RequestedAction::ActionRef(action_ref) => match rule {
+            ActionSelector::Named { pattern } => matches_glob(pattern, &action_ref.to_string()),
+            ActionSelector::ActionRef(pattern) => pattern.matches(action_ref),
+        },
+    }
+}
+
+fn invalid_action_evaluation() -> PolicyEvaluation {
+    PolicyEvaluation {
+        requirement: ApprovalRequirement::Denied,
+        risk: RiskLevel::Critical,
+        matched_rule: Some("invalid action".to_string()),
+        tier: Tier::Tier2,
+    }
+}
+
+fn serialize_policy_action<S>(action: &ActionSelector, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&action.to_string())
 }
 
 impl PolicyEngine {
@@ -222,26 +269,27 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&self, action: &str) -> PolicyEvaluation {
-        let action = match normalize_action(action) {
-            Ok(a) => a,
-            Err(_) => {
-                return PolicyEvaluation {
-                    requirement: ApprovalRequirement::Denied,
-                    risk: RiskLevel::Critical,
-                    matched_rule: Some("invalid action".to_string()),
-                    tier: Tier::Tier2,
-                };
-            }
+        let requested = match parse_requested_action(action) {
+            Ok(requested) => requested,
+            Err(_) => return invalid_action_evaluation(),
         };
+        self.evaluate_requested_action(&requested)
+    }
+
+    pub fn evaluate_action_ref(&self, action_ref: &ActionRef) -> PolicyEvaluation {
+        self.evaluate_requested_action(&RequestedAction::ActionRef(action_ref.clone()))
+    }
+
+    fn evaluate_requested_action(&self, requested: &RequestedAction) -> PolicyEvaluation {
         for rule in &self.config.rules {
-            if matches_glob(&rule.action, &action) {
+            if rule_matches_requested_action(&rule.action, requested) {
                 let tier = rule
                     .tier
                     .unwrap_or_else(|| classify_tier(&rule.requirement));
                 return PolicyEvaluation {
                     requirement: rule.requirement.clone(),
                     risk: rule.risk.clone(),
-                    matched_rule: Some(rule.action.clone()),
+                    matched_rule: Some(rule.action.to_string()),
                     tier,
                 };
             }
@@ -260,37 +308,37 @@ impl Default for PolicyEngine {
     fn default() -> Self {
         let rules = vec![
             PolicyRule {
-                action: "git.push.main".to_string(),
+                action: ActionSelector::named("git.push.main"),
                 risk: RiskLevel::Critical,
                 requirement: ApprovalRequirement::Denied,
                 tier: None,
             },
             PolicyRule {
-                action: "git.push.*".to_string(),
+                action: ActionSelector::named("git.push.*"),
                 risk: RiskLevel::Medium,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
-                action: "deploy.production".to_string(),
+                action: ActionSelector::named("deploy.production"),
                 risk: RiskLevel::Critical,
                 requirement: ApprovalRequirement::Required,
                 tier: Some(Tier::Tier2),
             },
             PolicyRule {
-                action: "deploy.staging".to_string(),
+                action: ActionSelector::named("deploy.staging"),
                 risk: RiskLevel::Medium,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
-                action: "credential.access".to_string(),
+                action: ActionSelector::named("credential.access"),
                 risk: RiskLevel::High,
                 requirement: ApprovalRequirement::Required,
                 tier: None,
             },
             PolicyRule {
-                action: "*".to_string(),
+                action: ActionSelector::named("*"),
                 risk: RiskLevel::Medium,
                 requirement: ApprovalRequirement::Required,
                 tier: None,
@@ -468,7 +516,7 @@ default_risk = "low"
     fn merge_prepends_rules() {
         let mut user_config = PolicyConfig {
             rules: vec![PolicyRule {
-                action: "deploy.production".to_string(),
+                action: ActionSelector::named("deploy.production"),
                 risk: RiskLevel::Critical,
                 requirement: ApprovalRequirement::Required,
                 tier: None,
@@ -477,7 +525,7 @@ default_risk = "low"
         };
         let project_config = PolicyConfig {
             rules: vec![PolicyRule {
-                action: "deploy.production".to_string(),
+                action: ActionSelector::named("deploy.production"),
                 risk: RiskLevel::Low,
                 requirement: ApprovalRequirement::Auto,
                 tier: None,
@@ -615,5 +663,86 @@ default_risk = "low"
         let eval = engine.evaluate("");
         assert_eq!(eval.requirement, ApprovalRequirement::Denied);
         assert_eq!(eval.tier, Tier::Tier2);
+    }
+
+    #[test]
+    fn structured_action_ref_rule_matches_string_input() {
+        let toml_str = r#"
+[[rules]]
+action = "registry.ember.systems/ember-systems/ember-gh/pr_merge@v1"
+risk = "critical"
+requirement = "denied"
+"#;
+        let engine = PolicyEngine::from_toml(toml_str).unwrap();
+        let eval = engine.evaluate("registry.ember.systems/ember-systems/ember-gh/pr_merge@v1");
+        assert_eq!(eval.requirement, ApprovalRequirement::Denied);
+        assert_eq!(
+            eval.matched_rule.as_deref(),
+            Some("registry.ember.systems/ember-systems/ember-gh/pr_merge@v1")
+        );
+    }
+
+    #[test]
+    fn structured_action_ref_rule_matches_typed_input() {
+        let engine = PolicyEngine::new(PolicyConfig {
+            rules: vec![PolicyRule {
+                action: ActionSelector::action_ref(core_event_types::ActionRefPattern::new(
+                    "registry.ember.systems/ember-systems/ember-gh",
+                    "pr_merge",
+                    "v1",
+                )),
+                risk: RiskLevel::Critical,
+                requirement: ApprovalRequirement::Denied,
+                tier: None,
+            }],
+            default_requirement: ApprovalRequirement::Required,
+            default_risk: RiskLevel::Medium,
+        });
+        let eval = engine.evaluate_action_ref(&ActionRef::new(
+            "registry.ember.systems/ember-systems/ember-gh",
+            "pr_merge",
+            "v1",
+        ));
+        assert_eq!(eval.requirement, ApprovalRequirement::Denied);
+        assert_eq!(
+            eval.matched_rule.as_deref(),
+            Some("registry.ember.systems/ember-systems/ember-gh/pr_merge@v1")
+        );
+    }
+
+    #[test]
+    fn policy_config_serializes_named_rules_as_strings() {
+        let config = PolicyConfig {
+            rules: vec![PolicyRule {
+                action: ActionSelector::named("git.push.main"),
+                risk: RiskLevel::Critical,
+                requirement: ApprovalRequirement::Denied,
+                tier: None,
+            }],
+            ..PolicyConfig::default()
+        };
+        let toml = toml::to_string(&config).unwrap();
+        assert!(toml.contains("action = \"git.push.main\""));
+    }
+
+    #[test]
+    fn policy_config_serializes_structured_rules_as_canonical_strings() {
+        let config = PolicyConfig {
+            rules: vec![PolicyRule {
+                action: ActionSelector::action_ref(core_event_types::ActionRefPattern::new(
+                    "registry.ember.systems/ember-systems/ember-gh",
+                    "pr_merge",
+                    "v1",
+                )),
+                risk: RiskLevel::Critical,
+                requirement: ApprovalRequirement::Denied,
+                tier: None,
+            }],
+            ..PolicyConfig::default()
+        };
+        let toml = toml::to_string(&config).unwrap();
+        assert!(
+            toml.contains("action = \"registry.ember.systems/ember-systems/ember-gh/pr_merge@v1\"")
+        );
     }
 }

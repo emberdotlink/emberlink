@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! design Phase 4 step 11: post-install verify.
 //!

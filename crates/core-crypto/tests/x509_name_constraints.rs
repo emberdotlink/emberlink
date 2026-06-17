@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! T1 property tests for per-agent X.509 CA with nameConstraints.
 //!

@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use crate::infra::store::{DaemonStore, StoreError};
 
+mod docker;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub id: String,
@@ -205,22 +207,110 @@ pub(crate) fn validate_sandbox_opts(opts: &SandboxCreateOpts) -> Result<(), Stor
     Ok(())
 }
 
+/// Credential env keys that must NEVER reach a sandbox container's `-e` env.
+///
+/// Per design §I1 (Principle #1 — agents never hold raw credentials), the
+/// container's LLM lane arrives as a proxy-injected gateway bundle
+/// (`ANTHROPIC_BASE_URL` + `X-Ember-*` headers minted by
+/// `mint_sandbox_gateway_env`); a raw key in the container env is the exact
+/// violation this strip closes. Enforced as a tripwire at the single `-e` emit
+/// point in [`build_run_args`] so it holds even if a future caller re-adds
+/// host-env passthrough upstream.
+///
+/// NOTE: the inert `ANTHROPIC_AUTH_TOKEN` *checkpoint*
+/// ([`CONTAINER_PROXY_AUTH_PLACEHOLDER`]) is deliberately NOT here — Claude Code
+/// refuses to start under a custom `ANTHROPIC_BASE_URL` without some bearer
+/// present, and the proxy strips the inbound `authorization` regardless of value
+/// before injecting the real vault-backed credential upstream.
+pub(crate) const FORBIDDEN_CONTAINER_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+];
+
+/// Inert bearer the sandbox container carries so Claude Code clears its
+/// client-side auth-presence preflight under a brokered `ANTHROPIC_BASE_URL`.
+/// Mirrors the host launcher's `ISOLATED_CLAUDE_PROXY_AUTH_PLACEHOLDER`
+/// (`emberlink-cli` `up::ISOLATED_CLAUDE_PROXY_AUTH_PLACEHOLDER`). The real
+/// credential is injected server-side by the proxy.
+pub(crate) const CONTAINER_PROXY_AUTH_PLACEHOLDER: &str = "ember-proxy-session";
+
+/// Container-side paths for the design mTLS bridge client material. The daemon
+/// bind-mounts a per-sandbox cert directory read-only at
+/// [`CONTAINER_BRIDGE_MOUNT_DIR`]; the agent dials `EMBER_BRIDGE_URL` with the
+/// client cert/key and validates the daemon against the CA. Mirrors the CLI
+/// isolated lane's `up::CONTAINER_BRIDGE_*` — the two container lanes share the
+/// launch contract (design) while keeping separate implementations (design
+/// open decision: keep daemon-sandbox and launcher-isolated split until a
+/// uid/threat-model identity is proven).
+const CONTAINER_BRIDGE_MOUNT_DIR: &str = "/run/ember";
+const CONTAINER_BRIDGE_CERT: &str = "/run/ember/client.crt";
+const CONTAINER_BRIDGE_KEY: &str = "/run/ember/client.key";
+const CONTAINER_BRIDGE_CA: &str = "/run/ember/ca.crt";
+
+/// The per-spawn design mTLS bridge client material a sandbox container mounts
+/// as its emberd control plane (design seam 6). `cert_dir` holds `client.crt`,
+/// `client.key`, and `ca.crt` on the host and is bind-mounted read-only at
+/// `/run/ember`; `port` builds the `EMBER_BRIDGE_URL` the container dials. This
+/// replaces the (non-functional, design) daemon-UDS bind mount that previously
+/// shipped into every container — a bind-mounted `AF_UNIX` socket is remapped
+/// `root:root` by the runtime userns so the agent uid (1000) can never
+/// `connect(2)` to it.
+pub struct SandboxBridgeMount<'a> {
+    pub cert_dir: &'a Path,
+    pub port: u16,
+}
+
+/// Rewrite a daemon-loopback proxy URL so a sandbox container can reach the
+/// host proxy. `start_container` shells out to the `docker` CLI directly, so the
+/// container-reachable host alias is always `host.docker.internal` (Docker
+/// Desktop / OrbStack resolve it automatically; Linux needs the
+/// `--add-host=host.docker.internal:host-gateway` that [`build_run_args`] adds
+/// for non-`none` networks). Mirrors `emberlink-cli`
+/// `up::rewrite_loopback_url_for_container` (the compose lane's parity path).
+pub(crate) fn rewrite_loopback_url_for_container(url: &str) -> String {
+    const CONTAINER_HOST: &str = "host.docker.internal";
+    for prefix in [
+        "http://127.0.0.1:",
+        "https://127.0.0.1:",
+        "http://localhost:",
+        "https://localhost:",
+    ] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let scheme = if prefix.starts_with("https") {
+                "https"
+            } else {
+                "http"
+            };
+            return format!("{scheme}://{CONTAINER_HOST}:{rest}");
+        }
+    }
+    url.to_string()
+}
+
 /// Pure helper: compose the `docker run` argument vector from the sandbox
 /// configuration. Kept separate from the subprocess call so tests can assert
 /// the exact argument shape without spawning docker.
+///
+/// target_state_anchor: adr207_seam6_one_response_parser_cli_contract_parity
+///
+/// design §Migration seam 6 — the last container-lane consolidation seam — is
+/// complete: the daemon-sandbox and CLI `--isolated` lanes share one launch
+/// contract (no daemon UDS in-container; the brokered-tool control path rides the
+/// design mTLS bridge via the per-spawn client bundle mounted at `/run/ember`),
+/// and there is one `register_session` response parser
+/// (`launcher::session_rpc::parse_register_session_result`; the duplicate
+/// `up::parse_session_open_response` was deleted). Shipped by #5249 (parser) and
+/// #5250 (daemon-sandbox bridge control plane).
 pub(crate) fn build_run_args(
     name: &str,
     image: &str,
-    socket_dir: &Path,
     network: Option<&str>,
     extra_env: &[(String, String)],
     workspace_host_path: Option<&Path>,
+    bridge_cert_dir: Option<&Path>,
 ) -> Vec<String> {
     let net = network.unwrap_or("bridge");
-    let socket_mount = format!(
-        "{}:/run/ember/daemon.sock:ro",
-        socket_dir.join("daemon.sock").display()
-    );
 
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -238,16 +328,65 @@ pub(crate) fn build_run_args(
         "/tmp:rw,noexec,nosuid,size=1g".into(),
         "--tmpfs".into(),
         "/home/agent:rw,nosuid,uid=1000,gid=1000,size=100m".into(),
-        "-v".into(),
-        socket_mount,
     ];
+
+    // design / design seam 6 — the container's emberd control plane is the
+    // mTLS bridge, never the daemon UDS. The per-spawn client bundle
+    // (`client.crt`/`client.key`/`ca.crt`) is bind-mounted read-only at
+    // `/run/ember`; the matching `EMBER_BRIDGE_URL` / `EMBER_CLIENT_*` /
+    // `EMBER_CA_CERT` env is set by `start_container`. Absent when the bridge
+    // listener is unconfigured (fail-soft: the container still starts, just
+    // without a control plane — never with the dead `root:root`-remapped UDS).
+    if let Some(cert_dir) = bridge_cert_dir {
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{CONTAINER_BRIDGE_MOUNT_DIR}:ro",
+            cert_dir.display()
+        ));
+    }
 
     if let Some(ws) = workspace_host_path {
         args.push("-v".into());
         args.push(format!("{}:/workspace:rw", ws.display()));
     }
 
+    // design — let the proxy-injected `ANTHROPIC_BASE_URL=http://host.docker.internal:<port>`
+    // resolve to the host proxy. Docker Desktop / OrbStack provide
+    // `host.docker.internal` automatically but accept the explicit host-gateway
+    // mapping too; Linux Docker requires it. Skipped on `--network=none` (the
+    // offline test path has no host gateway).
+    if net != "none" {
+        args.push("--add-host".into());
+        args.push("host.docker.internal:host-gateway".into());
+    }
+
     for (k, v) in extra_env {
+        // design §I1 tripwire — a raw credential key must never become a
+        // container `-e` var. Stripped here at the sole emit point so the
+        // invariant holds even if an upstream caller re-introduces host-env
+        // passthrough; the LLM lane arrives as a proxy-injected gateway bundle.
+        if FORBIDDEN_CONTAINER_ENV_KEYS
+            .iter()
+            .any(|forbidden| forbidden.eq_ignore_ascii_case(k))
+        {
+            tracing::warn!(
+                key = %k,
+                "refusing to pass forbidden credential env var into sandbox container (design §I1)"
+            );
+            continue;
+        }
+        // design §I1 — `ANTHROPIC_AUTH_TOKEN` may ONLY carry the inert proxy
+        // checkpoint. The host launcher strips any inherited real bearer and
+        // re-sets the checkpoint; mirror that here so a caller cannot smuggle a
+        // real token through `extra_env` (the daemon's own injected value is
+        // exactly the checkpoint, so it survives this gate).
+        if k.eq_ignore_ascii_case("ANTHROPIC_AUTH_TOKEN") && v != CONTAINER_PROXY_AUTH_PLACEHOLDER {
+            tracing::warn!(
+                key = %k,
+                "stripping non-checkpoint ANTHROPIC_AUTH_TOKEN from sandbox container env (design §I1)"
+            );
+            continue;
+        }
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }
@@ -338,20 +477,85 @@ impl DaemonStore {
         })
     }
 
+    /// design §I2 — record the internal `register_session` id minted for this
+    /// sandbox's proxy LLM lane, so `sandbox_stop` / `sandbox_delete` can later
+    /// `close_session` it (releasing the vault-lock pin + host-mode enrollment
+    /// + attachment).
+    ///
+    /// Returns [`StoreError::NotFound`] when no row matched (e.g. a concurrent
+    /// delete). The caller MUST treat that as fatal for the lane and close the
+    /// minted session itself — a silently-unbound session can never be closed by
+    /// stop/delete, stranding the pin.
+    pub fn set_sandbox_session_id(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        let affected = self.conn().execute(
+            "UPDATE sandboxes SET session_id = ?1 WHERE id = ?2",
+            rusqlite::params![session_id, sandbox_id],
+        )?;
+        if affected == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Read the internal `register_session` id bound to a sandbox (design §I2),
+    /// if one was minted. `Ok(None)` for sandboxes with no brokered LLM lane or
+    /// rows predating the migration.
+    pub fn sandbox_session_id(&self, sandbox_id: &str) -> Result<Option<String>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT session_id FROM sandboxes WHERE id = ?1",
+                rusqlite::params![sandbox_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound,
+                other => StoreError::Sqlite(other),
+            })
+    }
+
+    /// Clear the session binding after the sandbox's session has been closed
+    /// (design §I2), so a later stop/delete does not attempt a redundant close.
+    pub fn clear_sandbox_session_id(&self, sandbox_id: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE sandboxes SET session_id = NULL WHERE id = ?1",
+            rusqlite::params![sandbox_id],
+        )?;
+        Ok(())
+    }
+
     /// Start the container for a previously-created sandbox.
     ///
     /// `network` defaults to bridge (MVS-A default) when `None`; tests pass
     /// `Some("none")` to keep the docker path fast and offline. `extra_env`
     /// is passed through as `-e KEY=VAL` to the container — the daemon also
-    /// injects `EMBER_PERSONA_ID`, `EMBER_DAEMON_SOCKET`, `EMBER_PROXY_URL`
-    /// (pass-through from the daemon env, if set), and `ANTHROPIC_API_KEY`
-    /// (pass-through from the daemon env, if set).
+    /// injects `EMBER_PERSONA_ID`.
+    ///
+    /// `bridge` carries the per-spawn design mTLS bridge client material (ADR
+    /// 207 seam 6). When `Some`, the cert dir is bind-mounted at `/run/ember`
+    /// and the matching `EMBER_BRIDGE_URL` / `EMBER_CLIENT_CERT` /
+    /// `EMBER_CLIENT_KEY` / `EMBER_CA_CERT` env is injected, wiring the
+    /// container's brokered-tool (`core-construct-runtime` shim) control path to
+    /// the bridge. (The `emberlink-mcp` grant-resolution bridge mode keys off a
+    /// separate, still-unwired `EMBER_DAEMON_ENDPOINT` — see the env block below.)
+    /// When `None` (bridge listener unconfigured) the container still starts,
+    /// just without a control path — the daemon UDS is **never** mounted in (it
+    /// is non-functional across the userns, design).
+    ///
+    /// design §I1: this no longer pushes a raw `ANTHROPIC_API_KEY` (nor an
+    /// `EMBER_PROXY_URL`) from the daemon env. The LLM lane reaches the
+    /// container as a proxy-injected gateway bundle supplied in `extra_env` by
+    /// the sandbox RPC handler (`mint_sandbox_gateway_env`); raw credential keys
+    /// are stripped at the `-e` emit point by [`build_run_args`].
     pub fn start_container(
         &self,
         sandbox_id: &str,
-        socket_dir: &Path,
         network: Option<&str>,
         extra_env: &[(String, String)],
+        bridge: Option<SandboxBridgeMount<'_>>,
     ) -> Result<String, StoreError> {
         let (name, image, persona_id, workspace_path): (String, String, String, Option<String>) =
             self.conn()
@@ -372,38 +576,68 @@ impl DaemonStore {
                     other => StoreError::Sqlite(other),
                 })?;
 
-        // Compose the env block: caller-provided vars first, then the daemon's
-        // mandatory trio, then pass-through vars from the daemon env if set.
+        // Compose the env block: caller-provided vars first (the daemon's
+        // sandbox RPC handler injects the proxy-minted LLM gateway bundle here,
+        // design §I1/§I2), then the daemon's injected vars.
         let mut env: Vec<(String, String)> = extra_env.to_vec();
         env.push(("EMBER_PERSONA_ID".to_string(), persona_id));
-        env.push((
-            "EMBER_DAEMON_SOCKET".to_string(),
-            "/run/ember/daemon.sock".to_string(),
-        ));
-        if let Ok(url) = std::env::var("EMBER_PROXY_URL")
-            && !url.is_empty()
-        {
-            env.push(("EMBER_PROXY_URL".to_string(), url));
+        // design / design seam 6 — wire the container's BROKER/construct-shim
+        // control path onto the mTLS bridge. These are the env vars the in-container
+        // `core-construct-runtime` shims (`ember-git` / `ember-gh`) read to broker
+        // tool calls over the bridge: `EMBER_BRIDGE_URL` + the cert/key/CA paths
+        // under `/run/ember` (bind-mounted by `build_run_args`). This matches the
+        // CLI `--isolated` lane's `isolated_child_env` contract (seam 6 parity).
+        //
+        // SCOPE: this does NOT launch the `emberlink-mcp` grant-resolution bridge
+        // lane — that path is still unwired in BOTH container lanes (the
+        // orchestrator's launch of emberlink-mcp is an open TODO, design §2 /
+        // demo invariant #2). As of design §4, emberlink-mcp now selects on and
+        // reads the SAME unified contract this block sets (`EMBER_BRIDGE_URL` +
+        // `EMBER_CLIENT_*`), so wiring it becomes launch-only. The brokered-tool
+        // path (construct-shim, the demo's "brokered push" beat) is wired here.
+        //
+        // The daemon UDS (`EMBER_DAEMON_SOCKET` + the socket bind mount) is GONE —
+        // it was remapped `root:root` by the runtime userns so the agent uid could
+        // never `connect(2)` to it (design); it was already non-functional.
+        if let Some(ref b) = bridge {
+            // `start_container` shells out to the `docker` CLI directly, so the
+            // container-reachable host is always `host.docker.internal` (the
+            // `--add-host=host.docker.internal:host-gateway` that `build_run_args`
+            // adds for non-`none` networks), matching `rewrite_loopback_url_for_container`.
+            env.push((
+                "EMBER_BRIDGE_URL".to_string(),
+                format!("https://host.docker.internal:{}", b.port),
+            ));
+            env.push((
+                "EMBER_CLIENT_CERT".to_string(),
+                CONTAINER_BRIDGE_CERT.to_string(),
+            ));
+            env.push((
+                "EMBER_CLIENT_KEY".to_string(),
+                CONTAINER_BRIDGE_KEY.to_string(),
+            ));
+            env.push(("EMBER_CA_CERT".to_string(), CONTAINER_BRIDGE_CA.to_string()));
         }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
-            && !key.is_empty()
-        {
-            env.push(("ANTHROPIC_API_KEY".to_string(), key));
-        }
+        // design §I1 (Principle #1 — agents never hold raw credentials): the
+        // daemon-env pass-through of `EMBER_PROXY_URL` and `ANTHROPIC_API_KEY`
+        // is DELETED. The container receives a proxy-injected gateway bundle
+        // (`ANTHROPIC_BASE_URL` + `X-Ember-*` headers, minted by
+        // `mint_sandbox_gateway_env`) through `extra_env` instead — it never
+        // sees a raw key. `build_run_args` strips the forbidden credential keys
+        // at the `-e` emit point as a tripwire even if a future caller re-adds
+        // host-env passthrough.
 
         let workspace_buf = workspace_path.as_ref().map(PathBuf::from);
         let args = build_run_args(
             &name,
             &image,
-            socket_dir,
             network,
             &env,
             workspace_buf.as_deref(),
+            bridge.as_ref().map(|b| b.cert_dir),
         );
 
-        let output = std::process::Command::new("docker")
-            .args(&args)
-            .output()
+        let output = docker::output(&args)
             .map_err(|e| StoreError::InvalidInput(format!("docker not available: {e}")))?;
 
         if !output.status.success() {
@@ -476,7 +710,13 @@ impl DaemonStore {
             })
     }
 
-    pub fn stop_sandbox(&self, id: &str) -> Result<(), StoreError> {
+    /// Stop a sandbox's container, revoke its persona/grants, and remove its
+    /// on-disk state. `data_dir`, when `Some`, removes the whole per-sandbox
+    /// state dir (`<data_dir>/sandboxes/<id>/`) — workspace + the design
+    /// bridge-cert bundle (design seam 6) — so the 0600 client key does not
+    /// linger past the (now-closed) session. `None` (legacy / tests) falls back
+    /// to removing only the recorded `workspace_path`.
+    pub fn stop_sandbox(&self, id: &str, data_dir: Option<&Path>) -> Result<(), StoreError> {
         let (persona_id, container_id, workspace_path): (String, Option<String>, Option<String>) =
             self.conn()
                 .query_row(
@@ -490,10 +730,7 @@ impl DaemonStore {
                 })?;
 
         if let Some(ref cid) = container_id {
-            match std::process::Command::new("docker")
-                .args(["stop", cid.as_str()])
-                .output()
-            {
+            match docker::output(["stop", cid.as_str()]) {
                 Ok(out) if !out.status.success() => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     tracing::warn!(
@@ -509,10 +746,7 @@ impl DaemonStore {
                     tracing::warn!(cmd = "docker stop", container_id = %cid, error = %e, "subprocess spawn failed");
                 }
             }
-            match std::process::Command::new("docker")
-                .args(["rm", cid.as_str()])
-                .output()
-            {
+            match docker::output(["rm", cid.as_str()]) {
                 Ok(out) if !out.status.success() => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     tracing::warn!(
@@ -530,13 +764,35 @@ impl DaemonStore {
             }
         }
 
-        // Clean up fresh-clone workspace, if any. Container must be removed
-        // first (above) so the bind mount is released.
-        if let Some(ref ws) = workspace_path {
-            let ws_path = PathBuf::from(ws);
-            match std::fs::remove_dir_all(&ws_path) {
-                Ok(()) => tracing::info!(workspace = %ws, "workspace removed"),
-                Err(e) => tracing::warn!(workspace = %ws, error = %e, "workspace remove failed"),
+        // Clean up the sandbox's on-disk state (fresh-clone workspace + design
+        // bridge-cert bundle). Container must be removed first (above) so any
+        // bind mounts are released. When `data_dir` is known, remove the whole
+        // per-sandbox dir so the 0600 bridge client key never lingers past the
+        // closed session; otherwise fall back to the recorded workspace path.
+        match data_dir {
+            Some(dd) => {
+                let state_dir = sandbox_state_dir(dd, id);
+                match std::fs::remove_dir_all(&state_dir) {
+                    Ok(()) => {
+                        tracing::info!(state_dir = %state_dir.display(), "sandbox state removed")
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(state_dir = %state_dir.display(), error = %e, "sandbox state remove failed")
+                    }
+                }
+            }
+            None => {
+                if let Some(ref ws) = workspace_path {
+                    let ws_path = PathBuf::from(ws);
+                    match std::fs::remove_dir_all(&ws_path) {
+                        Ok(()) => tracing::info!(workspace = %ws, "workspace removed"),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            tracing::warn!(workspace = %ws, error = %e, "workspace remove failed")
+                        }
+                    }
+                }
             }
         }
 
@@ -557,11 +813,17 @@ impl DaemonStore {
     /// too. Idempotent: returns `Ok(())` when the sandbox is already gone so
     /// `ember sandbox delete` retries don't fail loudly.
     ///
-    /// implementation-note-346: addresses the "stale `coding-agent` container blocks
+    /// implementation-note-310: addresses the "stale `coding-agent` container blocks
     /// retry" demo failure. `stop_sandbox` leaves the row + persona behind so
     /// a second `sandbox create --name coding-agent` hits the
     /// `personas.name` UNIQUE constraint. `delete_sandbox` is the GC path.
-    pub fn delete_sandbox(&self, id: &str) -> Result<(), StoreError> {
+    /// Delete a sandbox row, reap its container, and remove its on-disk state.
+    ///
+    /// `data_dir`, when `Some`, removes the whole per-sandbox state dir
+    /// (`<data_dir>/sandboxes/<id>/`), covering both the fresh-clone workspace
+    /// and the design bridge-cert bundle (design seam 6) in one shot. `None`
+    /// (legacy / tests) falls back to removing only the recorded `workspace_path`.
+    pub fn delete_sandbox(&self, id: &str, data_dir: Option<&Path>) -> Result<(), StoreError> {
         // Look up the row. NotFound is the idempotent path — caller already
         // got what they wanted.
         let row: Option<(String, String, Option<String>, Option<String>)> = self
@@ -585,10 +847,7 @@ impl DaemonStore {
         // and removes in one shot and is idempotent against an already-gone
         // container (it errors but we tolerate that).
         if let Some(ref cid) = container_id {
-            match std::process::Command::new("docker")
-                .args(["rm", "-f", cid.as_str()])
-                .output()
-            {
+            match docker::output(["rm", "-f", cid.as_str()]) {
                 Ok(out) if !out.status.success() => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     tracing::warn!(
@@ -612,14 +871,11 @@ impl DaemonStore {
         }
 
         // Belt-and-suspenders: also reap any container whose --name matches
-        // the sandbox name. Covers the implementation-note-346 case where the row
+        // the sandbox name. Covers the implementation-note-310 case where the row
         // was inserted but `start_container` failed before recording a
         // container_id, leaving an orphan docker container with the sandbox
         // name. `docker rm -f <name>` is a no-op when the container is gone.
-        match std::process::Command::new("docker")
-            .args(["rm", "-f", sandbox_name.as_str()])
-            .output()
-        {
+        match docker::output(["rm", "-f", sandbox_name.as_str()]) {
             Ok(out) if !out.status.success() => {
                 // No-such-container is the common case here; downgrade to debug.
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -642,14 +898,35 @@ impl DaemonStore {
             }
         }
 
-        // Clean up the fresh-clone workspace if any. Container must be gone
-        // first (above) so the bind mount is released.
-        if let Some(ref ws) = workspace_path {
-            let ws_path = PathBuf::from(ws);
-            match std::fs::remove_dir_all(&ws_path) {
-                Ok(()) => tracing::info!(workspace = %ws, "workspace removed"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(workspace = %ws, error = %e, "workspace remove failed"),
+        // Clean up the sandbox's on-disk state (fresh-clone workspace + design
+        // bridge-cert bundle). Container must be gone first (above) so any bind
+        // mounts are released. When `data_dir` is known, remove the whole
+        // per-sandbox dir so the 0600 bridge client key never lingers; otherwise
+        // fall back to the recorded workspace path (legacy / tests).
+        match data_dir {
+            Some(dd) => {
+                let state_dir = sandbox_state_dir(dd, id);
+                match std::fs::remove_dir_all(&state_dir) {
+                    Ok(()) => {
+                        tracing::info!(state_dir = %state_dir.display(), "sandbox state removed")
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(state_dir = %state_dir.display(), error = %e, "sandbox state remove failed")
+                    }
+                }
+            }
+            None => {
+                if let Some(ref ws) = workspace_path {
+                    let ws_path = PathBuf::from(ws);
+                    match std::fs::remove_dir_all(&ws_path) {
+                        Ok(()) => tracing::info!(workspace = %ws, "workspace removed"),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            tracing::warn!(workspace = %ws, error = %e, "workspace remove failed")
+                        }
+                    }
+                }
             }
         }
 
@@ -769,12 +1046,10 @@ impl DaemonStore {
         let cid = container_id
             .ok_or_else(|| StoreError::InvalidInput("sandbox has no container".to_string()))?;
 
-        let mut args = vec!["exec", &cid];
-        args.extend_from_slice(command);
+        let mut args = vec!["exec".to_string(), cid.clone()];
+        args.extend(command.iter().map(|arg| arg.to_string()));
 
-        let output = std::process::Command::new("docker")
-            .args(&args)
-            .output()
+        let output = docker::output(&args)
             .map_err(|e| StoreError::InvalidInput(format!("docker not available: {e}")))?;
 
         if !output.status.success() {
@@ -799,8 +1074,33 @@ impl DaemonStore {
 /// happens as the daemon user; `chown_workspace_best_effort` follows up to
 /// make the tree readable/writable by UID 1000 inside the container.
 fn clone_workspace(url: &str, target: &Path) -> Result<(), StoreError> {
+    // The clone runs as the daemon user BEFORE any container isolation, so the
+    // operator-supplied `workspace_from` URL is a host-side injection surface:
+    //   * a leading '-' is parsed by git as an option (e.g.
+    //     `--upload-pack=<cmd>`), yielding arbitrary command execution;
+    //   * the `xxx::yyy` remote-helper syntax (`ext::sh -c <cmd>`, `fd::`) runs
+    //     arbitrary commands regardless of a `--` end-of-options separator.
+    // Refuse both, and pass `--` so any remaining value is unambiguously a
+    // positional repo argument. (Sweep 3 finding S-SANDBOX; design.)
+    if url.starts_with('-') {
+        return Err(StoreError::InvalidInput(format!(
+            "refusing to clone workspace_from beginning with '-' (git-option injection): {url}"
+        )));
+    }
+    if url.contains("::") {
+        return Err(StoreError::InvalidInput(format!(
+            "refusing to clone workspace_from with git remote-helper syntax \
+             (`ext::`/`fd::` enable command execution): {url}"
+        )));
+    }
     let output = std::process::Command::new("git")
-        .args(["clone", "--depth=1", url, target.to_string_lossy().as_ref()])
+        .args([
+            "clone",
+            "--depth=1",
+            "--",
+            url,
+            target.to_string_lossy().as_ref(),
+        ])
         .output()
         .map_err(|e| StoreError::InvalidInput(format!("git not available: {e}")))?;
 
@@ -852,15 +1152,58 @@ fn chown_workspace_best_effort(target: &Path) {
     }
 }
 
+/// Host directory holding a sandbox's persistent state (`workspace/`,
+/// `bridge-certs/`). Removed wholesale by [`DaemonStore::delete_sandbox`].
+fn sandbox_state_dir(data_dir: &Path, sandbox_id: &str) -> PathBuf {
+    data_dir.join("sandboxes").join(sandbox_id)
+}
+
+fn set_unix_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+fn write_sandbox_cert_file(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    set_unix_mode(path, mode)
+}
+
+/// Write a sandbox's per-spawn design bridge client bundle to disk so it can be
+/// bind-mounted into the container at `/run/ember` (design seam 6). Returns the
+/// host cert directory for [`SandboxBridgeMount`].
+///
+/// The cert + CA are world-readable (0644); the client KEY is 0600 inside a 0700
+/// dir (so a sibling host uid cannot even list the key). The dir is chowned to
+/// the container uid (1000) best-effort so the agent can read the 0600 key on
+/// Linux Docker; macOS Docker bind-mounts remap ownership in the VM regardless.
+///
+/// Honest caveat (same as the fresh-clone workspace, which uses the identical
+/// `chown_workspace_best_effort` pattern): on Linux Docker WITHOUT userns-remap
+/// and a non-root daemon, the `chown 1000:1000` lacks `CAP_CHOWN` and fails, so
+/// the container uid may not be able to read the 0600 key — the bridge then
+/// fail-soft degrades. Robust cross-uid key delivery (userns-remap or handshake
+/// bootstrap) is a follow-up shared with the workspace mount. Cleaned up with the
+/// rest of the sandbox state on `stop_sandbox` / `delete_sandbox`.
+pub(crate) fn materialize_sandbox_bridge_certs(
+    data_dir: &Path,
+    sandbox_id: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    ca_cert_pem: &str,
+) -> std::io::Result<PathBuf> {
+    let dir = sandbox_state_dir(data_dir, sandbox_id).join("bridge-certs");
+    std::fs::create_dir_all(&dir)?;
+    set_unix_mode(&dir, 0o700)?;
+    write_sandbox_cert_file(&dir.join("client.crt"), client_cert_pem.as_bytes(), 0o644)?;
+    write_sandbox_cert_file(&dir.join("client.key"), client_key_pem.as_bytes(), 0o600)?;
+    write_sandbox_cert_file(&dir.join("ca.crt"), ca_cert_pem.as_bytes(), 0o644)?;
+    chown_workspace_best_effort(&dir);
+    Ok(dir)
+}
+
 #[cfg(test)]
 fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    docker::available_with_local_image("alpine:latest")
 }
 
 #[cfg(test)]
@@ -904,7 +1247,7 @@ mod tests {
         let sandbox = store
             .create_sandbox("no-container-box", "alpine:latest")
             .unwrap();
-        store.stop_sandbox(&sandbox.id).unwrap();
+        store.stop_sandbox(&sandbox.id, None).unwrap();
 
         let list = store.list_sandboxes().unwrap();
         assert_eq!(list[0].status, "stopped");
@@ -913,7 +1256,7 @@ mod tests {
         assert_eq!(persona.status, "revoked");
     }
 
-    // ---------- implementation-note-346: delete_sandbox ----------
+    // ---------- implementation-note-310: delete_sandbox ----------
 
     #[test]
     fn delete_sandbox_removes_row_and_unreferenced_persona() {
@@ -923,7 +1266,7 @@ mod tests {
             .unwrap();
         let persona_id = sandbox.persona_id.clone();
 
-        store.delete_sandbox(&sandbox.id).unwrap();
+        store.delete_sandbox(&sandbox.id, None).unwrap();
 
         // Sandbox row gone.
         let list = store.list_sandboxes().unwrap();
@@ -939,14 +1282,14 @@ mod tests {
 
     #[test]
     fn delete_sandbox_unblocks_recreate_with_same_name() {
-        // The whole point of implementation-note-346: after a stale sandbox is
+        // The whole point of implementation-note-310: after a stale sandbox is
         // deleted, the demo can re-create a sandbox with the same name
         // without hitting the `personas.name UNIQUE` constraint.
         let store = DaemonStore::open_in_memory().unwrap();
         let first = store
             .create_sandbox("coding-agent", "alpine:latest")
             .unwrap();
-        store.delete_sandbox(&first.id).unwrap();
+        store.delete_sandbox(&first.id, None).unwrap();
 
         let second = store
             .create_sandbox("coding-agent", "alpine:latest")
@@ -960,7 +1303,7 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         // No sandbox exists; delete must succeed silently.
         store
-            .delete_sandbox("sandbox-does-not-exist")
+            .delete_sandbox("sandbox-does-not-exist", None)
             .expect("delete must be idempotent on missing id");
     }
 
@@ -988,7 +1331,7 @@ mod tests {
             )
             .unwrap();
 
-        store.delete_sandbox(&sandbox.id).unwrap();
+        store.delete_sandbox(&sandbox.id, None).unwrap();
 
         // Sandbox row gone.
         assert!(store.list_sandboxes().unwrap().is_empty());
@@ -1079,7 +1422,8 @@ mod tests {
                     created_at TEXT NOT NULL,
                     stopped_at TEXT,
                     workspace_path TEXT,
-                    owner_persona_id TEXT
+                    owner_persona_id TEXT,
+                    session_id TEXT
                 );
                 INSERT INTO sandboxes_noconstraint SELECT * FROM sandboxes;
                 DROP TABLE sandboxes;
@@ -1121,14 +1465,7 @@ mod tests {
     // ---------- 69J.3: start_container hardening invariants ----------
 
     fn args_for(env: &[(String, String)], network: Option<&str>) -> Vec<String> {
-        build_run_args(
-            "test-name",
-            "alpine:latest",
-            &PathBuf::from("/tmp/ember-test/run"),
-            network,
-            env,
-            None,
-        )
+        build_run_args("test-name", "alpine:latest", network, env, None, None)
     }
 
     #[test]
@@ -1205,18 +1542,53 @@ mod tests {
     }
 
     #[test]
-    fn start_container_mounts_daemon_socket_readonly() {
+    fn build_run_args_never_mounts_daemon_socket() {
+        // design / design seam 6 — the daemon UDS is never bind-mounted into a
+        // container: it is remapped `root:root` by the runtime userns so the
+        // agent uid (1000) can never `connect(2)` to it. The container's control
+        // plane is the mTLS bridge instead.
         let args = args_for(&[], Some("none"));
-        let mut saw = false;
-        for w in args.windows(2) {
-            if w[0] == "-v" && w[1].ends_with(":/run/ember/daemon.sock:ro") {
-                saw = true;
-                break;
-            }
-        }
         assert!(
-            saw,
-            "missing -v <host>:/run/ember/daemon.sock:ro in {args:?}"
+            !args.iter().any(|a| a.contains("daemon.sock")),
+            "daemon UDS must never be mounted into a sandbox container; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_args_mounts_bridge_certs_when_present() {
+        // design seam 6 — when a per-spawn mTLS bridge bundle was minted, its
+        // host cert dir is bind-mounted read-only at /run/ember.
+        let cert_dir = PathBuf::from("/var/data/sandboxes/sbx-1/bridge-certs");
+        let args = build_run_args(
+            "test-name",
+            "alpine:latest",
+            Some("none"),
+            &[],
+            None,
+            Some(cert_dir.as_path()),
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-v"
+                    && w[1] == "/var/data/sandboxes/sbx-1/bridge-certs:/run/ember:ro"),
+            "missing -v <cert_dir>:/run/ember:ro in {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("daemon.sock")),
+            "bridge mount must not reintroduce the daemon UDS; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_args_omits_bridge_mount_when_absent() {
+        // Fail-soft: no bridge bundle ⇒ no /run/ember mount (container still
+        // starts, just without an emberd control plane).
+        let args = args_for(&[], Some("none"));
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "-v" && w[1].contains(":/run/ember:ro")),
+            "expected no bridge cert mount when bridge is absent; got {args:?}"
         );
     }
 
@@ -1237,45 +1609,184 @@ mod tests {
     }
 
     #[test]
-    fn start_container_passes_daemon_socket_env() {
+    fn build_run_args_sets_bridge_env_via_extra_env() {
+        // The bridge control-plane env (`EMBER_BRIDGE_URL` / `EMBER_CLIENT_*` /
+        // `EMBER_CA_CERT`) is assembled by `start_container` into `extra_env`;
+        // `build_run_args` emits it as `-e`. Verify the emit point passes it
+        // through (and never the removed `EMBER_DAEMON_SOCKET`).
         let args = args_for(
-            &[(
-                "EMBER_DAEMON_SOCKET".into(),
-                "/run/ember/daemon.sock".into(),
-            )],
-            Some("none"),
-        );
-        let mut saw = false;
-        for w in args.windows(2) {
-            if w[0] == "-e" && w[1] == "EMBER_DAEMON_SOCKET=/run/ember/daemon.sock" {
-                saw = true;
-                break;
-            }
-        }
-        assert!(
-            saw,
-            "missing -e EMBER_DAEMON_SOCKET=/run/ember/daemon.sock in {args:?}"
-        );
-    }
-
-    #[test]
-    fn start_container_passes_anthropic_key_when_set_and_omits_when_unset() {
-        // With key
-        let args = args_for(
-            &[("ANTHROPIC_API_KEY".into(), "sk-test".into())],
+            &[
+                (
+                    "EMBER_BRIDGE_URL".into(),
+                    "https://host.docker.internal:8765".into(),
+                ),
+                ("EMBER_CLIENT_CERT".into(), "/run/ember/client.crt".into()),
+            ],
             Some("none"),
         );
         assert!(
             args.windows(2)
-                .any(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY=sk-test"),
-            "expected ANTHROPIC_API_KEY pass-through in {args:?}"
+                .any(|w| w[0] == "-e"
+                    && w[1] == "EMBER_BRIDGE_URL=https://host.docker.internal:8765"),
+            "missing -e EMBER_BRIDGE_URL in {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("EMBER_DAEMON_SOCKET")),
+            "EMBER_DAEMON_SOCKET must no longer appear; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn materialize_bridge_certs_perms_and_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        // design seam 6 — bridge bundle on disk: dir 0700, client.key 0600,
+        // cert/CA 0644; removed wholesale by stop/delete so the key never lingers.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sandbox = store
+            .create_sandbox("bridge-cert-box", "alpine:latest")
+            .unwrap();
+
+        let cert_dir =
+            materialize_sandbox_bridge_certs(data_dir, &sandbox.id, "CERT", "KEY", "CA").unwrap();
+        assert!(cert_dir.join("client.crt").exists());
+        assert!(cert_dir.join("client.key").exists());
+        assert!(cert_dir.join("ca.crt").exists());
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&cert_dir), 0o700, "bridge-certs dir must be 0700");
+        assert_eq!(
+            mode(&cert_dir.join("client.key")),
+            0o600,
+            "client.key must be 0600"
+        );
+        assert_eq!(mode(&cert_dir.join("client.crt")), 0o644);
+
+        // delete removes the whole per-sandbox state dir (incl. the 0600 key).
+        store.delete_sandbox(&sandbox.id, Some(data_dir)).unwrap();
+        assert!(
+            !cert_dir.exists(),
+            "delete_sandbox must remove the bridge-cert dir"
+        );
+        assert!(!sandbox_state_dir(data_dir, &sandbox.id).exists());
+    }
+
+    // design §I1 tripwire: a raw credential key in `extra_env` must NEVER reach
+    // the container `-e` env — the strip drops it (and its value) at the sole
+    // emit point. This test fails if host-env credential passthrough is ever
+    // re-added. (Replaces the prior test that asserted ANTHROPIC_API_KEY
+    // pass-through — that behavior was the Principle #1 violation design closes.)
+    #[test]
+    fn start_container_strips_forbidden_credential_keys() {
+        for key in FORBIDDEN_CONTAINER_ENV_KEYS {
+            let args = args_for(
+                &[((*key).to_string(), "sk-secret-value".to_string())],
+                Some("none"),
+            );
+            assert!(
+                !args.iter().any(|a| a.starts_with(&format!("{key}="))),
+                "forbidden credential key {key} leaked into container env: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a.contains("sk-secret-value")),
+                "forbidden credential value for {key} leaked into container env: {args:?}"
+            );
+        }
+
+        // The inert checkpoint `ANTHROPIC_AUTH_TOKEN` (and ONLY that exact value)
+        // passes — Claude needs a bearer present to start under a brokered base
+        // URL, and the proxy strips inbound `authorization` regardless.
+        let args = args_for(
+            &[(
+                "ANTHROPIC_AUTH_TOKEN".into(),
+                CONTAINER_PROXY_AUTH_PLACEHOLDER.into(),
+            )],
+            Some("none"),
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-e"
+                && w[1] == format!("ANTHROPIC_AUTH_TOKEN={CONTAINER_PROXY_AUTH_PLACEHOLDER}")),
+            "inert checkpoint ANTHROPIC_AUTH_TOKEN must pass through: {args:?}"
         );
 
-        // Without key — env slice does not contain the var
-        let args = args_for(&[], Some("none"));
+        // design §I1 — a caller-smuggled REAL `ANTHROPIC_AUTH_TOKEN` (any value
+        // other than the checkpoint) is stripped, so `extra_env` can't bypass the
+        // broker with a raw bearer.
+        let args = args_for(
+            &[("ANTHROPIC_AUTH_TOKEN".into(), "sk-ant-real-bearer".into())],
+            Some("none"),
+        );
         assert!(
-            !args.iter().any(|a| a.starts_with("ANTHROPIC_API_KEY=")),
-            "expected no ANTHROPIC_API_KEY when unset, got {args:?}"
+            !args.iter().any(|a| a.contains("sk-ant-real-bearer")),
+            "non-checkpoint ANTHROPIC_AUTH_TOKEN must be stripped: {args:?}"
+        );
+    }
+
+    // design — the host-gateway mapping must be present on a real (bridge)
+    // network so the proxy-injected `host.docker.internal` base URL resolves,
+    // and absent on the offline `--network=none` test path.
+    #[test]
+    fn start_container_adds_host_gateway_on_bridge_only() {
+        let args = args_for(&[], Some("bridge"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--add-host" && w[1] == "host.docker.internal:host-gateway"),
+            "expected --add-host host.docker.internal:host-gateway on bridge: {args:?}"
+        );
+        let args_none = args_for(&[], Some("none"));
+        assert!(
+            !args_none
+                .iter()
+                .any(|a| a == "host.docker.internal:host-gateway"),
+            "must not add host-gateway mapping on --network=none: {args_none:?}"
+        );
+    }
+
+    // design §I2 — the sandbox↔session binding must round-trip and clear, so
+    // `sandbox_stop`/`sandbox_delete` can close the internal LLM-lane session.
+    #[test]
+    fn sandbox_session_id_round_trips_and_clears() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sandbox = store
+            .create_sandbox("session-bind", "alpine:latest")
+            .unwrap();
+
+        // Freshly created: no session bound.
+        assert_eq!(store.sandbox_session_id(&sandbox.id).unwrap(), None);
+
+        store
+            .set_sandbox_session_id(&sandbox.id, "sess_abc123")
+            .unwrap();
+        assert_eq!(
+            store.sandbox_session_id(&sandbox.id).unwrap().as_deref(),
+            Some("sess_abc123")
+        );
+
+        store.clear_sandbox_session_id(&sandbox.id).unwrap();
+        assert_eq!(store.sandbox_session_id(&sandbox.id).unwrap(), None);
+
+        // Unknown sandbox id surfaces NotFound, not a silent None.
+        assert!(matches!(
+            store.sandbox_session_id("sandbox-does-not-exist"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn rewrite_loopback_url_for_container_maps_to_host_docker_internal() {
+        assert_eq!(
+            rewrite_loopback_url_for_container("http://127.0.0.1:8484"),
+            "http://host.docker.internal:8484"
+        );
+        assert_eq!(
+            rewrite_loopback_url_for_container("https://localhost:4243"),
+            "https://host.docker.internal:4243"
+        );
+        // Non-loopback URLs pass through untouched.
+        assert_eq!(
+            rewrite_loopback_url_for_container("https://api.anthropic.com"),
+            "https://api.anthropic.com"
         );
     }
 
@@ -1305,10 +1816,10 @@ mod tests {
         let args = build_run_args(
             "test-name",
             "alpine:latest",
-            &PathBuf::from("/tmp/ember-test/run"),
             Some("none"),
             &[],
             Some(&PathBuf::from("/var/data/ws")),
+            None,
         );
         assert!(
             args.windows(2)
@@ -1499,6 +2010,25 @@ mod tests {
     }
 
     #[test]
+    fn clone_workspace_refuses_injection_urls() {
+        // git-option injection (leading '-') and remote-helper command exec
+        // (ext::/fd::) must be refused before git runs. (Sweep 3 S-SANDBOX.)
+        let target = std::env::temp_dir().join("bosco-clone-injection-target");
+        for bad in [
+            "--upload-pack=touch /tmp/pwned",
+            "-x",
+            "ext::sh -c touch% /tmp/pwned",
+            "fd::17/foo",
+        ] {
+            let r = clone_workspace(bad, &target);
+            assert!(
+                matches!(r, Err(StoreError::InvalidInput(_))),
+                "expected refusal for {bad:?}, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
     fn create_sandbox_with_workspace_from_clones_repo() {
         if !git_available() {
             return;
@@ -1540,7 +2070,7 @@ mod tests {
         let ws = PathBuf::from(sandbox.workspace_path.unwrap());
         assert!(ws.exists());
 
-        store.stop_sandbox(&sandbox.id).unwrap();
+        store.stop_sandbox(&sandbox.id, None).unwrap();
         assert!(!ws.exists(), "workspace dir should be removed after stop");
     }
 
@@ -1555,9 +2085,7 @@ mod tests {
     struct DockerContainerGuard(String);
     impl Drop for DockerContainerGuard {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["rm", "-f", &self.0])
-                .output();
+            let _ = docker::output(["rm", "-f", self.0.as_str()]);
         }
     }
 
@@ -1576,10 +2104,9 @@ mod tests {
         let _cleanup = DockerContainerGuard(name.clone());
         let store = DaemonStore::open_in_memory().unwrap();
         let sandbox = store.create_sandbox(&name, "alpine:latest").unwrap();
-        let socket_dir = PathBuf::from("/tmp/ember-test/run");
         // Use --network=none so this test doesn't need to pull a bridge image.
         let container_id = store
-            .start_container(&sandbox.id, &socket_dir, Some("none"), &[])
+            .start_container(&sandbox.id, Some("none"), &[], None)
             .unwrap();
         assert!(!container_id.is_empty());
 
@@ -1588,7 +2115,7 @@ mod tests {
         assert_eq!(list[0].status, "running");
 
         // Clean up
-        store.stop_sandbox(&sandbox.id).unwrap();
+        store.stop_sandbox(&sandbox.id, None).unwrap();
     }
 
     #[test]
@@ -1600,9 +2127,8 @@ mod tests {
         let _cleanup = DockerContainerGuard(name.clone());
         let store = DaemonStore::open_in_memory().unwrap();
         let sandbox = store.create_sandbox(&name, "alpine:latest").unwrap();
-        let socket_dir = PathBuf::from("/tmp/ember-test/run");
         store
-            .start_container(&sandbox.id, &socket_dir, Some("none"), &[])
+            .start_container(&sandbox.id, Some("none"), &[], None)
             .unwrap();
 
         let output = store
@@ -1611,7 +2137,7 @@ mod tests {
         assert!(output.contains("hello"));
 
         // Clean up
-        store.stop_sandbox(&sandbox.id).unwrap();
+        store.stop_sandbox(&sandbox.id, None).unwrap();
     }
 
     #[test]
@@ -1633,7 +2159,7 @@ mod tests {
         assert_eq!(grant.status, "active");
 
         // Stop sandbox
-        store.stop_sandbox(&sandbox.id).unwrap();
+        store.stop_sandbox(&sandbox.id, None).unwrap();
 
         // Grant should be revoked
         let result = store.evaluate_grant(&sandbox.persona_id, "api-key");
@@ -1655,7 +2181,7 @@ mod tests {
         assert_eq!(list.len(), 1);
 
         // Stop
-        store.stop_sandbox(&sandbox.id).unwrap();
+        store.stop_sandbox(&sandbox.id, None).unwrap();
         let list = store.list_sandboxes().unwrap();
         assert_eq!(list[0].status, "stopped");
 

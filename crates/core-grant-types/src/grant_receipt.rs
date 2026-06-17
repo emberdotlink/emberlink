@@ -2,9 +2,9 @@ use crate::grant_chain::{AttestationBinding, SignedBlock, StatementId, Usage};
 use serde::{Deserialize, Serialize};
 
 // GrantId is `AccessGrant.id: String` — no type alias exists yet.
-// PersonaId is `Persona.id: String` — no type alias exists yet.
-// Both will become newtypes in a future refactor; use String here so callers
-// don't need to import a temporary newtype that will be renamed.
+// PrincipalId is still stored as String on receipt compatibility fields.
+// Use String here so callers do not need to import a temporary newtype while
+// the downstream field-name migration is still rolling.
 
 /// Stable identifier for a receipt. Format: `rct_<26-char crockford base32>`.
 /// Follows the same opaque-string convention as `AccessGrant.id`.
@@ -74,6 +74,9 @@ pub enum TerminalReason {
     Expired,
     Revoked {
         by: RevokeActor,
+        reason: String,
+    },
+    Abandoned {
         reason: String,
     },
     ExhaustedByBudget {
@@ -163,8 +166,9 @@ pub struct AuditEntry {
 pub struct ReceiptSummary {
     /// Human identity label (display name or email of the vault owner).
     pub human_owner: String,
-    /// Issuing persona identifier. Matches `AccessGrant.issuing_persona_id`.
-    pub persona_id: String, // TODO: PersonaId newtype when it lands
+    /// Issuing Principal identifier. Historical summary field name retained
+    /// for receipt compatibility; matches `AccessGrant.issuer_principal_id()`.
+    pub persona_id: String,
     /// Agent runtime identifier (e.g. `"claude_code"`, `"openclaw"`).
     pub agent_id: String,
     /// Service provider label (e.g. `"github"`, `"anthropic"`).
@@ -226,10 +230,10 @@ impl Default for Evidence {
 /// - `Grant` — legacy `GrantReceipt` (grant termination).
 /// - `KmsWrap` / `KmsUnwrap` — `ember-kms` encrypt / decrypt (design).
 /// - `VaultRetrieval` — `ember vault get` retrieval Receipt (per
-///   `RECEIPT-COVERAGE-FIX-implementation-note-59`; emission lands in a
+///   `RECEIPT-COVERAGE-FIX-implementation-note-66`; emission lands in a
 ///   follow-up task — this variant is the type-system seat).
 /// - `BrokerMaterialization` / `BrokerRevocation` — `ember broker`
-///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-60`; today
+///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-67`; today
 ///   broker emits an audit-log row only — these variants are the
 ///   type-system seats for the typed-Receipt promotion).
 ///
@@ -395,7 +399,7 @@ pub struct BrokerReceipt {
 }
 
 // ---------------------------------------------------------------------------
-// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-59 — vault_retrieval)
+// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-66 — vault_retrieval)
 // ---------------------------------------------------------------------------
 //
 // Receipts emitted by the vault-get handler. Carry NON-SENSITIVE metadata
@@ -440,7 +444,7 @@ pub struct VaultReceipt {
 /// Signed by the Daemon Persona Ed25519 key — same signing path as [`KmsReceipt`]
 /// and [`BrokerReceipt`].
 ///
-/// **Snapshot scope** per the recovery inventory (implementation-note-61):
+/// **Snapshot scope** per the recovery inventory (implementation-note-68):
 /// includes `credentials`, `vault.salt`, `personas`, `grants`, `standing_grants`,
 /// `audit_log`, `receipts`. Excludes `policy.toml` (config, recovered via GitOps)
 /// and active broker materializations (ephemeral, re-issued on restart).
@@ -573,6 +577,19 @@ mod tests {
         assert_eq!(reason, decoded);
     }
 
+    #[test]
+    fn abandoned_variant_serializes_reason() {
+        let reason = TerminalReason::Abandoned {
+            reason: "missing embed-canonical chain evidence".into(),
+        };
+        let json = serde_json::to_string(&reason).expect("serialize");
+        let obj: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(obj["kind"], "abandoned");
+        assert_eq!(obj["reason"], "missing embed-canonical chain evidence");
+        let decoded: TerminalReason = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(reason, decoded);
+    }
+
     /// Test 4: Golden-bytes test — canonical-version-1 stability baseline.
     ///
     /// Serialize a fixed minimal receipt, hash it with sha256, and assert that:
@@ -627,7 +644,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // KMS receipt tests (implementation-note-62)
+    // KMS receipt tests (implementation-note-69)
     // ----------------------------------------------------------------------
 
     fn minimal_kms_wrap_receipt() -> KmsReceipt {

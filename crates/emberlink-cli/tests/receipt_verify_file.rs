@@ -13,21 +13,11 @@ fn ember_bin() -> &'static str {
 }
 
 fn run(args: &[&str]) -> (String, String, i32) {
-    // ember-cli eager-loads `~/.ember/config.toml` before dispatching subcommands
-    // (implementation-note-462 loud-fail). receipt verify --file/--tree/
-    // --materialization don't actually need the config, but the eager-load runs
-    // anyway — see implementation-note-534.
-    // Until the structural fix ships, point EMBER_CONFIG at a writable tempdir
-    // for these tests so they pass on hosts without a host-level ~/.ember/config.toml.
-    let tmp = tempfile::tempdir().expect("config tempdir");
-    let config_path = tmp.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "# fixture for receipt verify --file integration tests\n",
-    )
-    .expect("write fixture config");
+    let home = tempfile::tempdir().expect("home tempdir");
     let out = Command::new(ember_bin())
-        .env("EMBER_CONFIG", &config_path)
+        .env("HOME", home.path())
+        .env_remove("EMBER_CONFIG")
+        .env_remove("EMBER_DEMO_DIR")
         .args(args)
         .output()
         .expect("spawn ember");
@@ -72,18 +62,12 @@ fn verify_file_with_nonexistent_path_errors() {
 
 #[test]
 fn verify_file_with_garbage_json_errors() {
-    // EMBER_CONFIG env-pin per the run() helper's rationale (see top of file +
-    // implementation-note-534).
-    let tmp = tempfile::tempdir().expect("config tempdir");
-    let config_path = tmp.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "# fixture for receipt verify --file integration tests\n",
-    )
-    .expect("write fixture config");
+    let home = tempfile::tempdir().expect("home tempdir");
     let (_stdout, stderr, code) = {
         let mut child = Command::new(ember_bin())
-            .env("EMBER_CONFIG", &config_path)
+            .env("HOME", home.path())
+            .env_remove("EMBER_CONFIG")
+            .env_remove("EMBER_DEMO_DIR")
             .args(["receipt", "verify", "--file", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -111,12 +95,12 @@ fn verify_file_with_garbage_json_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// v2 dispatch tests (implementation-note-535)
+// v2 dispatch tests (implementation-note-483)
 // ---------------------------------------------------------------------------
 
 /// Build a signed v2 ReceiptEnvelope using the deterministic FixtureSigner,
 /// returning (envelope_json, pubkey_bare_hex).
-fn make_signed_v2_receipt() -> (String, String) {
+fn make_signed_v2_receipt_with_body(body: serde_json::Value) -> (String, String) {
     use core_crypto::{FixtureSigner, Signer as _};
     use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
     use core_events::receipt::sign::sign_receipt_v2;
@@ -134,11 +118,7 @@ fn make_signed_v2_receipt() -> (String, String) {
         traceparent: None,
         termination_authority: TerminationAuthority::DaemonPersona,
         presence_kind: None,
-        body: serde_json::json!({
-            "session_id": "sess_verify_v2_test",
-            "claim_events": [],
-            "permits_merkle_root": ""
-        }),
+        body,
         signature: None,
         calling_principal: None,
         presence_reason: None,
@@ -149,6 +129,14 @@ fn make_signed_v2_receipt() -> (String, String) {
     sign_receipt_v2(&mut env, &signer).expect("sign");
     let json = serde_json::to_string_pretty(&env).expect("serialize");
     (json, pubkey_bare_hex)
+}
+
+fn make_signed_v2_receipt() -> (String, String) {
+    make_signed_v2_receipt_with_body(serde_json::json!({
+        "session_id": "sess_verify_v2_test",
+        "claim_events": [],
+        "permits_merkle_root": ""
+    }))
 }
 
 #[test]
@@ -202,6 +190,93 @@ fn verify_v2_sidecar_tamper_fails() {
         stderr.contains("FAILED") || stderr.contains("failed") || stderr.contains("mismatch"),
         "expected verification failure message, got: {stderr}"
     );
+}
+
+#[test]
+fn verify_v2_non_clean_termination_sidecars_cover_happy_and_tamper() {
+    let cases = [
+        (
+            "heartbeat_lost",
+            serde_json::json!({
+                "session_id": "sess_verify_v2_heartbeat_lost",
+                "claim_events": [],
+                "permits_merkle_root": "",
+                "termination_reason": "heartbeat_lost",
+                "last_heartbeat_at": "2026-05-27T08:00:00Z",
+                "pid_alive_at_check": false
+            }),
+            "last_heartbeat_at",
+            serde_json::json!("1970-01-01T00:00:00Z"),
+        ),
+        (
+            "ttl_expired",
+            serde_json::json!({
+                "session_id": "sess_verify_v2_ttl_expired",
+                "claim_events": [],
+                "permits_merkle_root": "",
+                "termination_reason": "ttl_expired"
+            }),
+            "termination_reason",
+            serde_json::json!("clean_exit"),
+        ),
+        (
+            "explicit_revoke",
+            serde_json::json!({
+                "session_id": "sess_verify_v2_explicit_revoke",
+                "claim_events": [],
+                "permits_merkle_root": "",
+                "termination_reason": "explicit_revoke"
+            }),
+            "termination_reason",
+            serde_json::json!("clean_exit"),
+        ),
+    ];
+
+    for (reason, body, tamper_field, tamper_value) in cases {
+        let (json, pubkey_hex) = make_signed_v2_receipt_with_body(body);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let happy_path = dir.path().join(format!("receipt-v2-{reason}.json"));
+        std::fs::write(&happy_path, json.as_bytes()).expect("write fixture");
+
+        let (stdout, stderr, code) = run(&[
+            "receipt",
+            "verify",
+            "--file",
+            happy_path.to_str().unwrap(),
+            "--pubkey",
+            &pubkey_hex,
+        ]);
+        assert_eq!(
+            code, 0,
+            "{reason}: v2 sidecar must verify; stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("Verified:"),
+            "{reason}: expected 'Verified:' in stdout, got: {stdout}"
+        );
+
+        let mut v: serde_json::Value = serde_json::from_str(&json).expect("parse signed receipt");
+        v["body"][tamper_field] = tamper_value;
+        let tampered_path = dir
+            .path()
+            .join(format!("receipt-v2-{reason}-tampered.json"));
+        std::fs::write(&tampered_path, serde_json::to_vec_pretty(&v).unwrap())
+            .expect("write tampered fixture");
+
+        let (_stdout, stderr, code) = run(&[
+            "receipt",
+            "verify",
+            "--file",
+            tampered_path.to_str().unwrap(),
+            "--pubkey",
+            &pubkey_hex,
+        ]);
+        assert_ne!(code, 0, "{reason}: tampered v2 receipt must fail");
+        assert!(
+            stderr.contains("receipt_id mismatch"),
+            "{reason}: expected receipt_id mismatch from canonical verifier, got: {stderr}"
+        );
+    }
 }
 
 #[test]

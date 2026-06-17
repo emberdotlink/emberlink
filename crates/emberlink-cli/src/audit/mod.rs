@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember audit ...` CLI subcommands. Installed-path `show` / `export`
 //! route through the daemon's operator-only `audit_log_query` seam, while
@@ -12,7 +13,11 @@
 //! operator gets the authoritative answer from the trust authority that
 //! owns the chain.
 
+pub mod export;
+pub mod import_verify;
 pub mod query;
+pub mod redact;
+pub mod repair_chain;
 pub mod summary;
 pub mod usage;
 pub mod verify;

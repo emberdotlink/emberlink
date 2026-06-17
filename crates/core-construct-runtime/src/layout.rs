@@ -6,16 +6,40 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
+/// Relative path of the engine's append-only event log, anchored at the
+/// primary worktree root. Written by the engine and (best-effort) by the
+/// daemon's spawn-checkpoint emitter.
 pub const ENGINE_EVENTS_FILE: &str = ".ember/runtime/events.jsonl";
+
+/// Relative path of the authority permission-gap log, anchored at the primary
+/// worktree root. Appended by the orchestrator on `harness denied` releases
+/// and read by the daemon's `headless_preflight_gaps` socket method.
 pub const PERMISSION_GAPS_FILE: &str = ".ember/runtime/permission-gaps.jsonl";
 
+/// Resolve the repository's **primary** worktree root.
+///
+/// Resolution order:
+///   1. `EMBER_FORGE_PRIMARY_WORKTREE_ROOT` env hatch (verbatim) — the
+///      documented back-compat override that state-mutating tests set to a
+///      tempdir so they don't race the production state files.
+///   2. `git rev-parse --git-common-dir` + canonicalize → the parent of the
+///      shared `.git` common dir is the primary worktree root (stable across
+///      `git worktree add`-ed siblings, which all share one common dir).
+///   3. On canonicalize failure (dangling symlink / removed worktree), fall
+///      back to `git rev-parse --show-toplevel` (the *current* worktree root).
+///
+/// This mirrors `ember_forge::git::resolve_primary_worktree_root` so a process
+/// resolving via either path observes the same `.ember/runtime/` directory.
+/// Unlike the forge resolver it carries no test-override `RwLock` and no cache:
+/// its callers (the daemon's checkpoint emitter and the gap-log reader) hit it
+/// rarely and run with cwd already at the repo root.
 pub fn primary_worktree_root() -> Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("EMBER_FORGE_PRIMARY_WORKTREE_ROOT") {
-        if !override_path.is_empty() {
-            return Ok(PathBuf::from(override_path));
-        }
+    if let Ok(override_path) = std::env::var("EMBER_FORGE_PRIMARY_WORKTREE_ROOT")
+        && !override_path.is_empty()
+    {
+        return Ok(PathBuf::from(override_path));
     }
 
     let common_dir = run_git(&["rev-parse", "--git-common-dir"])?
@@ -29,6 +53,8 @@ pub fn primary_worktree_root() -> Result<PathBuf> {
             Ok(parent.to_path_buf())
         }
         Err(canon_err) => {
+            // Dangling symlink, removed worktree, or other FS corruption —
+            // fall back to the current worktree's top level.
             let fallback = run_git(&["rev-parse", "--show-toplevel"])?
                 .map(PathBuf::from)
                 .ok_or(canon_err)?;
@@ -37,33 +63,77 @@ pub fn primary_worktree_root() -> Result<PathBuf> {
     }
 }
 
+/// Append a single line to `path` under the engine substrate, creating the
+/// file (and parent dirs) if necessary. The `.ember/runtime/*.jsonl` logs are
+/// append-only and best-effort, so a plain buffered append is sufficient.
+/// Shared by every writer of the engine logs (the orchestrator's gap log, the
+/// daemon/proxy event-checkpoint echo) so the on-disk write discipline lives
+/// in one place below the engine.
 pub fn append_line(path: &std::path::Path, line: &str) -> Result<()> {
+    use anyhow::Context as _;
     use std::fs::OpenOptions;
     use std::io::Write as _;
-
     let parent = path
         .parent()
-        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating parent dir for {}", path.display()))?;
-    let mut file = OpenOptions::new()
+    let mut f = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening {} for append", path.display()))?;
-    writeln!(file, "{}", line.trim_end_matches('\n'))?;
+    writeln!(f, "{}", line.trim_end_matches('\n'))?;
     Ok(())
 }
 
+/// Run `git <args>`, returning trimmed stdout. `Ok(None)` when git exits
+/// non-zero (e.g. not a repository) or prints nothing.
 fn run_git(args: &[&str]) -> Result<Option<String>> {
-    let output = Command::new("git")
+    let out = Command::new("git")
         .args(args)
         .stderr(Stdio::null())
         .output()?;
-    if !output.status.success() {
+    if !out.status.success() {
         return Ok(None);
     }
-    let text = String::from_utf8(output.stdout)?.trim().to_string();
-    Ok(if text.is_empty() { None } else { Some(text) })
+    let s = String::from_utf8(out.stdout)?.trim().to_string();
+    Ok(if s.is_empty() { None } else { Some(s) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both resolution paths in one test: process-global env is shared across
+    /// parallel test threads, so the env-hatch and git-resolution cases must
+    /// run sequentially in a single test to avoid racing on the override var.
+    #[test]
+    fn primary_worktree_root_resolution_paths() {
+        let key = "EMBER_FORGE_PRIMARY_WORKTREE_ROOT";
+
+        // 1. git resolution (env unset): inside the emberlink repo, the
+        //    resolved root must contain a `crates/` dir (the workspace root).
+        // SAFETY: single-threaded test body.
+        unsafe { std::env::remove_var(key) };
+        let root = primary_worktree_root().expect("resolves in-repo");
+        assert!(
+            root.join("crates").is_dir(),
+            "resolved root {} should contain crates/",
+            root.display()
+        );
+
+        // 2. env hatch wins verbatim when set.
+        unsafe { std::env::set_var(key, "/tmp/ember-layout-test-root") };
+        let overridden = primary_worktree_root().expect("env hatch resolves");
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(overridden, PathBuf::from("/tmp/ember-layout-test-root"));
+    }
+
+    #[test]
+    fn layout_consts_are_engine_relative() {
+        assert_eq!(ENGINE_EVENTS_FILE, ".ember/runtime/events.jsonl");
+        assert_eq!(PERMISSION_GAPS_FILE, ".ember/runtime/permission-gaps.jsonl");
+    }
 }

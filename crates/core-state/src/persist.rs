@@ -14,6 +14,7 @@ use core_types::{
     CanonicalEncode, SchemaVersion, Validate, ValidationError, bytes_to_hex, hex_to_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use zeroize::Zeroizing;
 
 const COLUMN_ENC_TAG: &str = "ENC1:";
 
@@ -37,14 +38,20 @@ pub(crate) fn encrypt_column(
 ///
 /// If the stored value does not start with `ENC1:` it is returned as-is,
 /// allowing existing plaintext rows to be read without a migration step.
+///
+/// Returns a `Zeroizing<String>` so the decrypted secret zeroizes on drop
+/// (N6-deeper, see prior change). Callers should keep the value in the
+/// `Zeroizing` wrapper end-to-end and use `.as_str()` at point of use.
 pub(crate) fn decrypt_column(
     master_key: &str,
     stored: &str,
     aad: &[u8],
-) -> Result<String, ValidationError> {
+) -> Result<Zeroizing<String>, ValidationError> {
     let Some(rest) = stored.strip_prefix(COLUMN_ENC_TAG) else {
         // Plaintext fallback: row was written before encryption was enabled.
-        return Ok(stored.to_string());
+        // Wrap so the caller path is uniform even when the row hasn't been
+        // upgraded to ENC1 yet — the secret bytes still want to zeroize.
+        return Ok(Zeroizing::new(stored.to_string()));
     };
     let (nonce_hex, ciphertext_hex) = rest.split_once(':').ok_or_else(|| {
         ValidationError::new("malformed encrypted column value: missing ':' separator".to_string())
@@ -61,6 +68,7 @@ pub(crate) fn decrypt_column(
         aad,
     )?;
     String::from_utf8(plaintext_bytes)
+        .map(Zeroizing::new)
         .map_err(|e| ValidationError::new(format!("decrypted column is not valid UTF-8: {e}")))
 }
 
@@ -108,11 +116,17 @@ pub(crate) fn persist_event(
 
     for reference in &event.refs {
         tx.execute(
-            "INSERT INTO event_refs (event_id, relation, target_event_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO event_refs (event_id, relation, target_event_id, seq) \
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 &event.event_id,
                 reference.relation.as_str(),
                 &reference.target_event_id,
+                // `seq` is part of the canonical signing pre-image — persist it so a
+                // reloaded chain still verifies (design AC-1). Dropping it (the
+                // pre-fix behavior) silently broke `verify_chain` after restart.
+                // SQLite has no u64; store as i64 (per-root seq never approaches i64::MAX).
+                reference.seq as i64,
             ],
         )
         .map_err(|err| ValidationError::new(format!("insert event ref row: {err}")))?;
@@ -727,11 +741,16 @@ pub(crate) fn validate_encrypted_manifest_blocks(
     Ok(())
 }
 
+/// Load the head of a local vault catalog along with its content key.
+///
+/// The content key is returned in a `Zeroizing<String>` (N6-deeper, see
+/// prior change) so it zeroizes on drop. Callers should keep the value in the
+/// wrapper end-to-end and only `.as_str()` at point of use.
 pub(crate) fn load_local_vault_catalog_head(
     conn: &Connection,
     namespace: &VaultNamespace,
     master_key: Option<&str>,
-) -> Result<Option<(FileManifest, String)>, ValidationError> {
+) -> Result<Option<(FileManifest, Zeroizing<String>)>, ValidationError> {
     let row = conn
         .query_row(
             "SELECT manifest_payload, content_key
@@ -751,7 +770,7 @@ pub(crate) fn load_local_vault_catalog_head(
         return Ok(None);
     };
 
-    let content_key = if let Some(mk) = master_key {
+    let content_key: Zeroizing<String> = if let Some(mk) = master_key {
         let aad = format!(
             "vault-catalog-key:{}:{}",
             namespace.owner_kind.as_str(),
@@ -759,7 +778,9 @@ pub(crate) fn load_local_vault_catalog_head(
         );
         decrypt_column(mk, &stored_key, aad.as_bytes())?
     } else {
-        stored_key
+        // Plaintext fallback: vault was never sealed at rest, but the value is
+        // still a content key and should zeroize on drop.
+        Zeroizing::new(stored_key)
     };
 
     let manifest = FileManifest::decode_canonical(&manifest_payload)?;
@@ -1023,11 +1044,16 @@ pub(crate) fn load_local_device_encryption_key(
 
     match (row, master_key) {
         (Some(mut kp), Some(mk)) => {
-            kp.private_key = decrypt_column(
+            // decrypt_column returns Zeroizing<String>; LocalKeyPair is
+            // ZeroizeOnDrop so the cloned target also zeroizes on drop.
+            // The transient Zeroizing wrapper zeroizes when it falls out of
+            // scope at the end of the expression.
+            let decrypted = decrypt_column(
                 mk,
                 &kp.private_key,
                 format!("device-enc-key:{device_id}").as_bytes(),
             )?;
+            kp.private_key = (*decrypted).clone();
             Ok(Some(kp))
         }
         (row, _) => Ok(row),
@@ -1046,11 +1072,15 @@ pub(crate) fn delete_local_manifest_key(
     Ok(())
 }
 
+/// Load the content key for a local manifest.
+///
+/// Returns `Zeroizing<String>` so the content key zeroizes on drop
+/// (N6-deeper, see prior change).
 pub(crate) fn load_local_manifest_key(
     conn: &Connection,
     manifest_id: &str,
     master_key: Option<&str>,
-) -> Result<Option<String>, ValidationError> {
+) -> Result<Option<Zeroizing<String>>, ValidationError> {
     let stored = conn
         .query_row(
             "SELECT content_key
@@ -1068,7 +1098,10 @@ pub(crate) fn load_local_manifest_key(
             &s,
             format!("manifest-key:{manifest_id}").as_bytes(),
         )?)),
-        (stored, _) => Ok(stored),
+        // Plaintext fallback: row predates encryption. Still a secret — wrap
+        // so the residue hygiene is the same as the encrypted path.
+        (Some(s), None) => Ok(Some(Zeroizing::new(s))),
+        (None, _) => Ok(None),
     }
 }
 
@@ -1614,9 +1647,15 @@ fn load_all_event_refs(
 ) -> Result<HashMap<String, Vec<EventRef>>, ValidationError> {
     let mut stmt = conn
         .prepare(
-            "SELECT event_id, relation, target_event_id
+            // Order by `seq` within each event so a reloaded multi-ref event
+            // reconstructs its refs in the chain order they were signed in (the
+            // signing pre-image iterates refs by Vec position). Single-`Previous`-ref
+            // events (all current event types) are unaffected; this hardens the
+            // reload path for any future multi-ref event. A fully order-faithful
+            // reload would persist an explicit insertion ordinal — noted follow-up.
+            "SELECT event_id, relation, target_event_id, seq
              FROM event_refs
-             ORDER BY event_id, relation, target_event_id",
+             ORDER BY event_id, seq, relation, target_event_id",
         )
         .map_err(|err| ValidationError::new(format!("prepare all event refs query: {err}")))?;
 
@@ -1638,11 +1677,14 @@ fn load_all_event_refs(
         let target_event_id: String = row
             .get(2)
             .map_err(|err| ValidationError::new(format!("read event ref target: {err}")))?;
+        let seq: i64 = row
+            .get(3)
+            .map_err(|err| ValidationError::new(format!("read event ref seq: {err}")))?;
         refs_by_event.entry(event_id).or_default().push(EventRef {
             relation: EventRefRelation::parse(&relation)
                 .ok_or_else(|| ValidationError::new("unsupported event ref relation in sqlite"))?,
             target_event_id,
-            seq: 0,
+            seq: seq as u64,
         });
     }
 
@@ -1683,13 +1725,15 @@ pub(crate) fn write_materialized_tables(
     // --- Upsert devices ---
     for device in materialized.devices_current.values() {
         tx.execute(
-            "INSERT INTO devices_current (device_id, root_id, label, active_key_id, active_public_key, active_encryption_key_id, active_encryption_public_key, status, replacement_device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO devices_current (device_id, root_id, label, active_key_id, active_public_key, active_encryption_key_id, active_encryption_public_key, status, replacement_device_id, custody_class, attestation_statement, attestation_tier, presence_factor)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(device_id) DO UPDATE SET
                 root_id = excluded.root_id, label = excluded.label,
                 active_key_id = excluded.active_key_id, active_public_key = excluded.active_public_key,
                 active_encryption_key_id = excluded.active_encryption_key_id, active_encryption_public_key = excluded.active_encryption_public_key,
-                status = excluded.status, replacement_device_id = excluded.replacement_device_id",
+                status = excluded.status, replacement_device_id = excluded.replacement_device_id,
+                custody_class = excluded.custody_class, attestation_statement = excluded.attestation_statement,
+                attestation_tier = excluded.attestation_tier, presence_factor = excluded.presence_factor",
             params![
                 &device.device_id,
                 &device.root_id,
@@ -1700,6 +1744,10 @@ pub(crate) fn write_materialized_tables(
                 &device.active_encryption_key.public_key,
                 device_status_name(&device.status),
                 &device.replacement_device_id,
+                device.custody_class.as_str(),
+                &device.attestation_statement,
+                device.attestation_tier.as_str(),
+                device.presence_factor.as_str(),
             ],
         )
         .map_err(|err| ValidationError::io_error(format!("upsert devices_current: {err}")))?;

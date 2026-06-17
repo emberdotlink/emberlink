@@ -1,5 +1,5 @@
 //! `core-receipts` — receipt v2 surface for verify dispatch + redaction +
-//! tool registry (implementation-note-72).
+//! tool registry (implementation-note-82).
 //!
 //! This crate is the home for *behavior* applied to receipts:
 //!
@@ -9,7 +9,7 @@
 //! - [`ReceiptV2`] + [`verify_v2`] — the v2 receipt struct used by
 //!   `ember receipt verify` to route based on the on-disk `version` field.
 //! - [`SpawnWitness`] — body shape for `spawn.witness` Receipt v2 kind
-//!   (implementation-note-51, CRIT-7): the parent-persona dual
+//!   (implementation-note-58, CRIT-7): the parent-persona dual
 //!   signature that binds a spawned persona to its parent's authorization.
 //!
 //! v1 (`core_grant_types::grant_receipt::GrantReceipt`) is preserved for
@@ -67,7 +67,7 @@ impl ReceiptV2 {
     }
 }
 
-/// Body for `spawn.witness` Receipt v2 kind (implementation-note-51).
+/// Body for `spawn.witness` Receipt v2 kind (implementation-note-58).
 ///
 /// Binds a spawned persona to its parent's authorization: the parent persona
 /// signs `JCS(body)` with `parent_signature` excluded, then the issuer
@@ -79,7 +79,7 @@ impl ReceiptV2 {
 /// preventing unilateral persona fabrication.
 ///
 /// **bridge_ca_fingerprint_in_spawn_receipt** — Slice C (design component 3,
-/// implementation-note-73): the
+/// implementation-note-83): the
 /// [`Self::ca_fingerprint`] field binds the spawn to the daemon's
 /// SE-sealed Bridge CA (blake3-256 of the CA verifying-key bytes). Slice D
 /// compares the connecting client cert's issuer fingerprint against the
@@ -108,7 +108,7 @@ pub struct SpawnWitness {
     /// fingerprint. `[0u8; 32]` is the checkpoint for "fingerprint not
     /// asserted" — Slice D's verification path treats that as "skip the
     /// fingerprint comparison" rather than rejecting the receipt outright.
-    /// See design component 3 / implementation-note-74.
+    /// See design component 3 / implementation-note-84.
     #[serde(default)]
     pub ca_fingerprint: [u8; 32],
 }
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(w.ca_fingerprint, [0u8; 32]);
     }
 
-    /// implementation-note-73 — Slice C.
+    /// implementation-note-83 — Slice C.
     ///
     /// A SpawnWitness with a populated `ca_fingerprint` round-trips through
     /// serde JSON without losing or mutating the fingerprint bytes.

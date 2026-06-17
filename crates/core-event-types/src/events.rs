@@ -10,7 +10,16 @@ use core_types::{CanonicalEncode, Validate, ValidationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectKind {
+    Principal,
+    /// Compatibility wire alias for a self-parented Principal.
+    ///
+    /// New event emission should use [`SubjectKind::Principal`]. Keep parsing
+    /// this value so older signed envelopes continue to verify byte-for-byte.
     Root,
+    /// Compatibility wire alias for a scoped Principal.
+    ///
+    /// Product/domain vocabulary may still say "Persona", but protocol signer
+    /// and subject attribution should emit [`SubjectKind::Principal`].
     Persona,
     Device,
     Guardian,
@@ -27,6 +36,7 @@ pub enum SubjectKind {
 impl SubjectKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Principal => "principal",
             Self::Root => "root",
             Self::Persona => "persona",
             Self::Device => "device",
@@ -44,6 +54,7 @@ impl SubjectKind {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "principal" => Some(Self::Principal),
             "root" => Some(Self::Root),
             "persona" => Some(Self::Persona),
             "device" => Some(Self::Device),
@@ -57,6 +68,22 @@ impl SubjectKind {
             "credential-deposit" => Some(Self::CredentialDeposit),
             "unknown" => Some(Self::Unknown),
             _ => None,
+        }
+    }
+
+    pub fn is_principal_kind(self) -> bool {
+        matches!(self, Self::Principal | Self::Root | Self::Persona)
+    }
+
+    pub fn is_legacy_principal_alias(self) -> bool {
+        matches!(self, Self::Root | Self::Persona)
+    }
+
+    pub fn canonical_principal_kind(self) -> Self {
+        if self.is_principal_kind() {
+            Self::Principal
+        } else {
+            self
         }
     }
 }
@@ -75,10 +102,18 @@ impl EventSubject {
         }
     }
 
+    /// Build a legacy root-subject alias. Prefer [`Self::principal`] for new
+    /// protocol emission; this remains for parsing/back-compat test fixtures.
     pub fn root(root_id: impl Into<String>) -> Self {
         Self::new(SubjectKind::Root, root_id)
     }
 
+    pub fn principal(principal_id: impl Into<String>) -> Self {
+        Self::new(SubjectKind::Principal, principal_id)
+    }
+
+    /// Build a legacy persona-subject alias. Prefer [`Self::principal`] for
+    /// signer/subject attribution; Persona remains product/domain vocabulary.
     pub fn persona(persona_id: impl Into<String>) -> Self {
         Self::new(SubjectKind::Persona, persona_id)
     }
@@ -118,11 +153,21 @@ impl EventSubject {
     pub fn unknown(subject_id: impl Into<String>) -> Self {
         Self::new(SubjectKind::Unknown, subject_id)
     }
+
+    pub fn canonical_principal_alias(mut self) -> Self {
+        self.kind = self.kind.canonical_principal_kind();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
+    Principal,
+    /// Compatibility wire alias for Principal role at the self-parented root.
+    /// New signatures should emit [`KeyRole::Principal`].
     Root,
+    /// Compatibility wire alias for Principal role below the root. New
+    /// signatures should emit [`KeyRole::Principal`].
     Persona,
     Device,
     Guardian,
@@ -132,6 +177,7 @@ pub enum KeyRole {
 impl KeyRole {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Principal => "principal",
             Self::Root => "root",
             Self::Persona => "persona",
             Self::Device => "device",
@@ -142,12 +188,29 @@ impl KeyRole {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "principal" => Some(Self::Principal),
             "root" => Some(Self::Root),
             "persona" => Some(Self::Persona),
             "device" => Some(Self::Device),
             "guardian" => Some(Self::Guardian),
             "unknown" => Some(Self::Unknown),
             _ => None,
+        }
+    }
+
+    pub fn is_principal_role(self) -> bool {
+        matches!(self, Self::Principal | Self::Root | Self::Persona)
+    }
+
+    pub fn is_legacy_principal_alias(self) -> bool {
+        matches!(self, Self::Root | Self::Persona)
+    }
+
+    pub fn canonical_principal_role(self) -> Self {
+        if self.is_principal_role() {
+            Self::Principal
+        } else {
+            self
         }
     }
 }
@@ -160,6 +223,9 @@ pub struct SignerBinding {
 }
 
 impl SignerBinding {
+    /// Build a legacy root-signer alias. Prefer [`Self::principal`] for new
+    /// signatures; this remains so old call sites and fixtures can migrate
+    /// without losing parse compatibility.
     pub fn root(root_id: impl Into<String>, key_id: impl Into<String>) -> Self {
         Self {
             signer: EventSubject::root(root_id),
@@ -168,6 +234,19 @@ impl SignerBinding {
         }
     }
 
+    pub fn principal(
+        principal_id: impl Into<String>,
+        signing_device_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            signer: EventSubject::principal(principal_id),
+            key_id: signing_device_id.into(),
+            role: KeyRole::Principal,
+        }
+    }
+
+    /// Build a legacy persona-signer alias. Prefer [`Self::principal`] for new
+    /// signatures; Persona is product/domain vocabulary, not a signer universe.
     pub fn persona(persona_id: impl Into<String>, key_id: impl Into<String>) -> Self {
         Self {
             signer: EventSubject::persona(persona_id),
@@ -190,6 +269,12 @@ impl SignerBinding {
             key_id: key_id.into(),
             role: KeyRole::Guardian,
         }
+    }
+
+    pub fn canonical_principal_alias(mut self) -> Self {
+        self.signer = self.signer.canonical_principal_alias();
+        self.role = self.role.canonical_principal_role();
+        self
     }
 }
 
@@ -257,6 +342,231 @@ pub struct DeviceAddedEvent {
     pub label: String,
     pub initial_key: PublicKeyMaterial,
     pub initial_encryption_key: PublicKeyMaterial,
+}
+
+/// Key-custody class of a Device (design §Vocabulary). The class determines
+/// whether a signature on the Device can satisfy Operator Presence. It is a
+/// property of the **Device**, never the Persona.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyClass {
+    /// Software key, host-resident, unattended — the emberd keychain key.
+    /// Cannot satisfy Operator Presence.
+    Daemon,
+    /// Operator-held hardware key requiring per-use human presence, proven by a
+    /// vendor-rooted hardware attestation recorded at enrollment. The ONLY class
+    /// that satisfies Operator Presence.
+    Presence,
+    /// A separate authority (cloud KMS / HSM / second emberd) the daemon cannot
+    /// reach. Satisfies a co-authority requirement, not human presence.
+    CoAuthority,
+    /// Per-spawn container cert key (the design bridge-client mTLS key).
+    Container,
+    /// An off-host, operator-blessed **recovery recipient** (design §6): a key
+    /// whose private half lives provably off the host — e.g. a printed/exported
+    /// `age` recovery code in a drawer, or an air-gapped key. Its sole role is to
+    /// be a `KEK_s` recovery recipient so device loss never becomes identity loss
+    /// (finding C3). Distinct from [`Self::CoAuthority`]: it carries NO reachable
+    /// service and NO vendor attestation (the only proof is the operator-presence
+    /// signature on its enrollment), and distinct from [`Self::Presence`]: it is
+    /// NOT a live human-presence factor and is NEVER a root-authority signer (it
+    /// is enrolled BY an existing presence authority and only ever *decrypts*).
+    Recovery,
+}
+
+impl CustodyClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Daemon => "daemon",
+            Self::Presence => "presence",
+            Self::CoAuthority => "co-authority",
+            Self::Container => "container",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "daemon" => Some(Self::Daemon),
+            "presence" => Some(Self::Presence),
+            "co-authority" => Some(Self::CoAuthority),
+            "container" => Some(Self::Container),
+            "recovery" => Some(Self::Recovery),
+            _ => None,
+        }
+    }
+
+    /// Only `presence` satisfies Operator Presence (design §3).
+    pub fn satisfies_operator_presence(self) -> bool {
+        matches!(self, Self::Presence)
+    }
+
+    /// Classes whose custody is proven by a recorded, externally-reproducible
+    /// vendor/authority attestation statement (design §3). A daemon-class key
+    /// is the daemon itself (self-evident); a container key is the bridge CA's.
+    ///
+    /// NOTE (design §3, two-axis model): for a `presence` Device the statement
+    /// requirement is keyed on its [`AttestationTier`], not the custody class —
+    /// a `presence` Device at `AttestationTier::None` (the dev0 floor) rests on
+    /// the OOB anchor + the hardware presence gate and carries NO vendor chain.
+    /// This method remains the requirement for `co-authority` custody (whose
+    /// authority always records its own attestation).
+    pub fn requires_attestation(self) -> bool {
+        matches!(self, Self::CoAuthority)
+    }
+}
+
+/// The strength of the externally-reproducible attestation recorded for an
+/// enrolled Device (design §3, the two-axis custody model). **Orthogonal** to
+/// both [`CustodyClass`] and [`PresenceFactor`]: custody class says *what kind
+/// of authority* a Device carries, the presence factor says *how the use-time
+/// human gate is enforced*, and the attestation tier says *how strongly the
+/// Device's custody is proven to an INDEPENDENT verifier*.
+///
+/// Evaluated strictly independently of [`CustodyClass::satisfies_operator_presence`]
+/// — a higher tier NEVER upgrades a Device's custody class, and the tier NEVER
+/// substitutes for the per-op presence signature (it is an assurance band the
+/// authority gate layers on top, never a stand-in for a live tap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationTier {
+    /// No externally-reproducible attestation. The dev0 floor: a presence key
+    /// whose custody rests on the hardware presence gate (Property 1) + out-of-band
+    /// enrollment confirmation (Property 2b), NOT a re-verifiable vendor chain.
+    /// The only tier whose authority an independent verifier extends from the OOB
+    /// anchor alone (no statement to re-run).
+    None,
+    /// Genuine-app/device attestation (e.g. Apple App Attest): proves a genuine
+    /// signed build on genuine hardware emitted the enrollment, NOT that the
+    /// signing key's custody is hardware-presence-gated. A team0 membership /
+    /// anti-emulation **admission** signal ONLY — it MUST NEVER gate a G1 widening
+    /// op (a runtime-compromised genuine app can mint the binding over any key).
+    GenuineApp,
+    /// Vendor-rooted hardware attestation over the SIGNING key itself (e.g. YubiKey
+    /// PIV cert chain → pinned vendor root). The attested artifact IS the device
+    /// key; a software key cannot produce a passing chain. The team0 / high-assurance
+    /// tier; an independent verifier MUST re-run the statement before honoring it.
+    VendorHw,
+}
+
+impl AttestationTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::GenuineApp => "genuine_app",
+            Self::VendorHw => "vendor_hw",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "genuine_app" => Some(Self::GenuineApp),
+            "vendor_hw" => Some(Self::VendorHw),
+            _ => None,
+        }
+    }
+
+    /// Whether this tier requires a recorded, externally-reproducible attestation
+    /// statement (design §3). `None` rests on the OOB anchor; the higher tiers
+    /// MUST carry a statement the independent verifier re-runs before honoring it.
+    pub fn requires_statement(self) -> bool {
+        matches!(self, Self::GenuineApp | Self::VendorHw)
+    }
+}
+
+/// How a Device's **use-time human-presence gate** is enforced (design §3, the
+/// presence axis — distinct from the [`AttestationTier`] attestation axis). This
+/// is the property that anchors G1: a compromised daemon cannot synthesize the
+/// human factor. ALL presence factors are enforced **per-signature** (no auth
+/// reuse window); the variants differ only in how strong the factor is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceFactor {
+    /// No human gate — an unattended key (a `daemon`/`co-authority` Device). Cannot
+    /// satisfy Operator Presence.
+    Unattended,
+    /// The dev0 floor: a Secure-Enclave key gated by `.userPresence` (biometric
+    /// **or** device passcode), per-signature. NIST SP 800-63B multi-factor
+    /// cryptographic device — the SE key activated by something-you-know/are; the
+    /// passcode is SEP-verified via out-of-process secure UI the app cannot supply,
+    /// so a compromised non-root daemon cannot forge it. Portable to Macs without
+    /// biometric hardware.
+    UserPresence,
+    /// Stronger, where the hardware supports it: a Secure-Enclave key gated by
+    /// `.biometryCurrentSet` (biometry only, invalidated if the enrolled set
+    /// changes — defeats evil-maid biometric enrollment). The human factor is
+    /// hardware-unforgeable even by a root attacker. A high-assurance / team0 band
+    /// may require this where available.
+    Biometric,
+    /// An external hardware token requiring a physical touch (e.g. YubiKey). The
+    /// key never resides on the host at all.
+    HardwareTouch,
+}
+
+impl PresenceFactor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unattended => "unattended",
+            Self::UserPresence => "user_presence",
+            Self::Biometric => "biometric",
+            Self::HardwareTouch => "hardware_touch",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unattended" => Some(Self::Unattended),
+            "user_presence" => Some(Self::UserPresence),
+            "biometric" => Some(Self::Biometric),
+            "hardware_touch" => Some(Self::HardwareTouch),
+            _ => None,
+        }
+    }
+
+    /// Whether this factor is a genuine use-time human-presence gate (anything
+    /// but `Unattended`). Required for a `presence`-class Device (design §3).
+    pub fn is_human_present(self) -> bool {
+        !matches!(self, Self::Unattended)
+    }
+}
+
+/// A Device is enrolled with a proven key-custody class (design §1/§3). Unlike
+/// [`DeviceAddedEvent`] (which adds a `daemon`-class device whose key the daemon
+/// holds), enrollment records only the Device's **public** key plus the raw,
+/// externally-reproducible vendor attestation statement that proves its custody
+/// class. The daemon holds no private key for an enrolled `presence` Device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEnrolledEvent {
+    pub root_id: String,
+    pub device_id: String,
+    pub label: String,
+    /// The Device's signing public key (identity-binding: only this key's
+    /// signatures verify). For dev0 `presence` this is an ECDSA-key.
+    pub device_key: PublicKeyMaterial,
+    /// The Device's ECIES **recipient** public key — a key DISTINCT from
+    /// `device_key`, recorded as the Device's `active_encryption_key` so design
+    /// §4 presence-as-decryption can seal scope KEKs to it. macOS SE cannot
+    /// enforce sign-vs-decrypt usage on one key (see design §4 AC-3), so the
+    /// signing key MUST NOT double as the §4 recipient; enrollment provisions a
+    /// second SE key under `SeAccessPolicy::UserPresence` for this slot. Mirrors
+    /// `DeviceAddedEvent.initial_encryption_key`; for dev0 `presence` this is an
+    /// ECDH-(ECIES) key.
+    pub encryption_key: PublicKeyMaterial,
+    pub custody_class: CustodyClass,
+    /// The raw vendor-signed attestation statement (e.g. the YubiKey PIV
+    /// attestation cert chain, base64-DER). Stored verbatim so any party can
+    /// re-verify it against the binary-embedded vendor roots — never a
+    /// daemon-computed boolean. Required when `attestation_tier.requires_statement()`
+    /// (or for `co-authority` custody); absent for the `None`-tier dev0 floor.
+    pub attestation_statement: Option<String>,
+    /// The attestation strength this enrollment **claims** (design §3, two-axis
+    /// model). It is the *claimed* tier; an independent verifier ([`verify_chain`])
+    /// honors a Device at the tier it can PROVE by re-running `attestation_statement`,
+    /// never the claimed value — a claim above what the statement proves is refused,
+    /// closing tier-laundering. `None` (the dev0 floor) needs no statement.
+    pub attestation_tier: AttestationTier,
+    /// How this Device's use-time human-presence gate is enforced (design §3,
+    /// the presence axis). For a `presence` Device this MUST be a human factor
+    /// (`UserPresence` floor / `Biometric` / `HardwareTouch`), never `Unattended`.
+    pub presence_factor: PresenceFactor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,6 +971,7 @@ pub enum EventBody {
     RootKeyRotated(RootKeyRotatedEvent),
     RootRevoked(RootRevokedEvent),
     DeviceAdded(DeviceAddedEvent),
+    DeviceEnrolled(DeviceEnrolledEvent),
     DeviceKeyRotated(DeviceKeyRotatedEvent),
     DeviceEncryptionKeyRotated(DeviceEncryptionKeyRotatedEvent),
     DeviceRevoked(DeviceRevokedEvent),
@@ -705,6 +1016,7 @@ impl EventBody {
             Self::RootKeyRotated(_) => EventType::RootKeyRotated,
             Self::RootRevoked(_) => EventType::RootRevoked,
             Self::DeviceAdded(_) => EventType::DeviceAdded,
+            Self::DeviceEnrolled(_) => EventType::DeviceEnrolled,
             Self::DeviceKeyRotated(_) => EventType::DeviceKeyRotated,
             Self::DeviceEncryptionKeyRotated(_) => EventType::DeviceEncryptionKeyRotated,
             Self::DeviceRevoked(_) => EventType::DeviceRevoked,
@@ -745,21 +1057,22 @@ impl EventBody {
 
     pub fn subject(&self) -> EventSubject {
         match self {
-            Self::RootCreated(body) => EventSubject::root(body.root_id.clone()),
-            Self::RootKeyRotated(body) => EventSubject::root(body.root_id.clone()),
-            Self::RootRevoked(body) => EventSubject::root(body.root_id.clone()),
+            Self::RootCreated(body) => EventSubject::principal(body.root_id.clone()),
+            Self::RootKeyRotated(body) => EventSubject::principal(body.root_id.clone()),
+            Self::RootRevoked(body) => EventSubject::principal(body.root_id.clone()),
             Self::DeviceAdded(body) => EventSubject::device(body.device_id.clone()),
+            Self::DeviceEnrolled(body) => EventSubject::device(body.device_id.clone()),
             Self::DeviceKeyRotated(body) => EventSubject::device(body.device_id.clone()),
             Self::DeviceEncryptionKeyRotated(body) => EventSubject::device(body.device_id.clone()),
             Self::DeviceRevoked(body) => EventSubject::device(body.device_id.clone()),
             Self::DeviceFrozen(body) => EventSubject::device(body.device_id.clone()),
             Self::DeviceReplaced(body) => EventSubject::device(body.replaced_device_id.clone()),
-            Self::PersonaCreated(body) => EventSubject::persona(body.persona_id.clone()),
-            Self::PersonaKeyRotated(body) => EventSubject::persona(body.persona_id.clone()),
-            Self::PersonaRevoked(body) => EventSubject::persona(body.persona_id.clone()),
-            Self::TrustAttested(body) => EventSubject::persona(body.subject_persona_id.clone()),
-            Self::TrustRevoked(body) => EventSubject::persona(body.attester_persona_id.clone()),
-            Self::RecoveryPolicyCreated(body) => EventSubject::root(body.root_id.clone()),
+            Self::PersonaCreated(body) => EventSubject::principal(body.persona_id.clone()),
+            Self::PersonaKeyRotated(body) => EventSubject::principal(body.persona_id.clone()),
+            Self::PersonaRevoked(body) => EventSubject::principal(body.persona_id.clone()),
+            Self::TrustAttested(body) => EventSubject::principal(body.subject_persona_id.clone()),
+            Self::TrustRevoked(body) => EventSubject::principal(body.attester_persona_id.clone()),
+            Self::RecoveryPolicyCreated(body) => EventSubject::principal(body.root_id.clone()),
             Self::GuardianEnrolled(body) => EventSubject::guardian(body.guardian_id.clone()),
             Self::GuardianKeyRotated(body) => EventSubject::guardian(body.guardian_id.clone()),
             Self::RecoveryRequested(body) => {
@@ -783,9 +1096,11 @@ impl EventBody {
                 EventSubject::storage_relationship(body.relationship_id.clone())
             }
             Self::RelayShutdownNotice(body) => EventSubject::endpoint(body.relay_peer_id.clone()),
-            Self::MessageSent(body) => EventSubject::persona(body.sender_persona_id.clone()),
-            Self::ContentPublished(body) => EventSubject::persona(body.author_persona_id.clone()),
-            Self::DisclosureRevoked(body) => EventSubject::persona(body.revoker_persona_id.clone()),
+            Self::MessageSent(body) => EventSubject::principal(body.sender_persona_id.clone()),
+            Self::ContentPublished(body) => EventSubject::principal(body.author_persona_id.clone()),
+            Self::DisclosureRevoked(body) => {
+                EventSubject::principal(body.revoker_persona_id.clone())
+            }
             Self::GrantOfferCreated(body) => EventSubject::grant_offer(body.offer_id.clone()),
             Self::GrantOfferClaimed(body) => EventSubject::grant_offer(body.offer_id.clone()),
             Self::GrantOfferRevoked(body) => EventSubject::grant_offer(body.offer_id.clone()),
@@ -810,6 +1125,7 @@ impl EventBody {
             Self::RootKeyRotated(b) => Some(&b.root_id),
             Self::RootRevoked(b) => Some(&b.root_id),
             Self::DeviceAdded(b) => Some(&b.root_id),
+            Self::DeviceEnrolled(b) => Some(&b.root_id),
             Self::DeviceKeyRotated(b) => Some(&b.root_id),
             Self::DeviceEncryptionKeyRotated(b) => Some(&b.root_id),
             Self::DeviceRevoked(b) => Some(&b.root_id),
@@ -873,6 +1189,38 @@ impl EventBody {
                     "encryption_algorithm",
                     "encryption_public_key",
                 )?,
+            })),
+            "device-enrolled" => Ok(Self::DeviceEnrolled(DeviceEnrolledEvent {
+                root_id: required_field(&fields, "root_id")?,
+                device_id: required_field(&fields, "device_id")?,
+                label: required_field(&fields, "label")?,
+                device_key: parse_public_key_material(
+                    &fields,
+                    "key_id",
+                    "algorithm",
+                    "public_key",
+                )?,
+                encryption_key: parse_public_key_material(
+                    &fields,
+                    "encryption_key_id",
+                    "encryption_algorithm",
+                    "encryption_public_key",
+                )?,
+                custody_class: CustodyClass::parse(&required_field(&fields, "custody_class")?)
+                    .ok_or_else(|| ValidationError::new("invalid custody_class"))?,
+                attestation_statement: optional_non_empty_field(&fields, "attestation_statement"),
+                attestation_tier: AttestationTier::parse(
+                    optional_non_empty_field(&fields, "attestation_tier")
+                        .as_deref()
+                        .unwrap_or("none"),
+                )
+                .ok_or_else(|| ValidationError::new("invalid attestation_tier"))?,
+                presence_factor: PresenceFactor::parse(
+                    optional_non_empty_field(&fields, "presence_factor")
+                        .as_deref()
+                        .unwrap_or("unattended"),
+                )
+                .ok_or_else(|| ValidationError::new("invalid presence_factor"))?,
             })),
             "device-key-rotated" => Ok(Self::DeviceKeyRotated(DeviceKeyRotatedEvent {
                 root_id: required_field(&fields, "root_id")?,
@@ -1229,6 +1577,7 @@ pub enum EventType {
     RootKeyRotated,
     RootRevoked,
     DeviceAdded,
+    DeviceEnrolled,
     DeviceKeyRotated,
     DeviceEncryptionKeyRotated,
     DeviceRevoked,
@@ -1282,6 +1631,7 @@ impl EventType {
             Self::RootKeyRotated => "root_key_rotated",
             Self::RootRevoked => "root_revoked",
             Self::DeviceAdded => "device_added",
+            Self::DeviceEnrolled => "device_enrolled",
             Self::DeviceKeyRotated => "device_key_rotated",
             Self::DeviceEncryptionKeyRotated => "device_encryption_key_rotated",
             Self::DeviceRevoked => "device_revoked",
@@ -1335,6 +1685,7 @@ impl EventType {
             "root_key_rotated" => Some(Self::RootKeyRotated),
             "root_revoked" => Some(Self::RootRevoked),
             "device_added" => Some(Self::DeviceAdded),
+            "device_enrolled" => Some(Self::DeviceEnrolled),
             "device_key_rotated" => Some(Self::DeviceKeyRotated),
             "device_encryption_key_rotated" => Some(Self::DeviceEncryptionKeyRotated),
             "device_revoked" => Some(Self::DeviceRevoked),
@@ -1425,6 +1776,7 @@ impl EventType {
             Self::RootCreated
             | Self::RootRevoked
             | Self::DeviceAdded
+            | Self::DeviceEnrolled
             | Self::DeviceRevoked
             | Self::PersonaCreated
             | Self::PersonaRevoked => RetentionClass::Permanent,
@@ -1536,6 +1888,71 @@ impl Validate for DeviceAddedEvent {
         validate_size(&self.label, "device label", MAX_LABEL_BYTES)?;
         self.initial_key.validate()?;
         self.initial_encryption_key.validate()
+    }
+}
+
+impl Validate for DeviceEnrolledEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.root_id, "root id")?;
+        validate_non_empty(&self.device_id, "device id")?;
+        validate_non_empty(&self.label, "device label")?;
+        validate_size(&self.label, "device label", MAX_LABEL_BYTES)?;
+        self.device_key.validate()?;
+        self.encryption_key.validate()?;
+        // design §3 (two-axis model): the attestation STATEMENT requirement is
+        // keyed on the attestation TIER, not the custody class. A `presence` Device
+        // at `AttestationTier::None` (the dev0 floor) rests on the OOB anchor + the
+        // hardware presence gate and carries NO vendor chain; the `genuine_app` /
+        // `vendor_hw` tiers MUST carry the raw statement an independent verifier
+        // re-runs. `co-authority` custody always records its authority's attestation.
+        let statement_required = self.attestation_tier.requires_statement()
+            || self.custody_class == CustodyClass::CoAuthority;
+        if statement_required
+            && self
+                .attestation_statement
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(ValidationError::new(format!(
+                "custody class {} at attestation tier {} requires a recorded attestation statement",
+                self.custody_class.as_str(),
+                self.attestation_tier.as_str(),
+            )));
+        }
+        // An attestation tier above `None` describes a presence-Device assurance
+        // band; it is meaningless on a non-presence Device.
+        if self.attestation_tier != AttestationTier::None
+            && self.custody_class != CustodyClass::Presence
+        {
+            return Err(ValidationError::new(
+                "attestation tier above `none` is only valid for a presence Device",
+            ));
+        }
+        // design §3 (presence axis): a `presence` Device MUST carry a genuine
+        // use-time human-presence factor; conversely a non-presence Device is
+        // `unattended` (no human gate). Keeps the two axes coherent.
+        match self.custody_class {
+            CustodyClass::Presence if !self.presence_factor.is_human_present() => {
+                return Err(ValidationError::new(
+                    "a presence Device requires a human presence factor, not `unattended`",
+                ));
+            }
+            CustodyClass::Presence => {}
+            _ if self.presence_factor.is_human_present() => {
+                return Err(ValidationError::new(format!(
+                    "custody class {} must record an `unattended` presence factor",
+                    self.custody_class.as_str(),
+                )));
+            }
+            _ => {}
+        }
+        validate_optional_size(
+            self.attestation_statement.as_deref(),
+            "attestation statement",
+            MAX_SEALED_PAYLOAD_HEX_BYTES,
+        )
     }
 }
 
@@ -2046,6 +2463,7 @@ impl Validate for EventBody {
             Self::RootKeyRotated(body) => body.validate(),
             Self::RootRevoked(body) => body.validate(),
             Self::DeviceAdded(body) => body.validate(),
+            Self::DeviceEnrolled(body) => body.validate(),
             Self::DeviceKeyRotated(body) => body.validate(),
             Self::DeviceEncryptionKeyRotated(body) => body.validate(),
             Self::DeviceRevoked(body) => body.validate(),
@@ -2164,6 +2582,36 @@ impl CanonicalEncode for EventBody {
                         "encryption_public_key",
                         body.initial_encryption_key.public_key.clone(),
                     ),
+                ],
+            ),
+            Self::DeviceEnrolled(body) => canonical_record(
+                "device-enrolled",
+                &[
+                    ("root_id", body.root_id.clone()),
+                    ("device_id", body.device_id.clone()),
+                    ("label", body.label.clone()),
+                    ("key_id", body.device_key.key_id.clone()),
+                    ("algorithm", body.device_key.algorithm.as_str().to_string()),
+                    ("public_key", body.device_key.public_key.clone()),
+                    ("encryption_key_id", body.encryption_key.key_id.clone()),
+                    (
+                        "encryption_algorithm",
+                        body.encryption_key.algorithm.as_str().to_string(),
+                    ),
+                    (
+                        "encryption_public_key",
+                        body.encryption_key.public_key.clone(),
+                    ),
+                    ("custody_class", body.custody_class.as_str().to_string()),
+                    (
+                        "attestation_statement",
+                        body.attestation_statement.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "attestation_tier",
+                        body.attestation_tier.as_str().to_string(),
+                    ),
+                    ("presence_factor", body.presence_factor.as_str().to_string()),
                 ],
             ),
             Self::DeviceKeyRotated(body) => canonical_record(
@@ -2553,6 +3001,7 @@ impl_typed_event_canonical_encode!(RootCreatedEvent, RootCreated);
 impl_typed_event_canonical_encode!(RootKeyRotatedEvent, RootKeyRotated);
 impl_typed_event_canonical_encode!(RootRevokedEvent, RootRevoked);
 impl_typed_event_canonical_encode!(DeviceAddedEvent, DeviceAdded);
+impl_typed_event_canonical_encode!(DeviceEnrolledEvent, DeviceEnrolled);
 impl_typed_event_canonical_encode!(DeviceKeyRotatedEvent, DeviceKeyRotated);
 impl_typed_event_canonical_encode!(DeviceEncryptionKeyRotatedEvent, DeviceEncryptionKeyRotated);
 impl_typed_event_canonical_encode!(DeviceRevokedEvent, DeviceRevoked);
@@ -2773,6 +3222,86 @@ mod size_limit_tests {
             recipient_persona_id: "persona-b".into(),
             ciphertext_hex: "deadbeef".into(),
         }
+    }
+
+    #[test]
+    fn principal_signer_binding_is_canonical() {
+        let binding = SignerBinding::principal("principal-1", "device-1");
+        assert_eq!(binding.signer.kind, SubjectKind::Principal);
+        assert_eq!(binding.signer.subject_id, "principal-1");
+        assert_eq!(binding.key_id, "device-1");
+        assert_eq!(binding.role, KeyRole::Principal);
+        assert_eq!(
+            SubjectKind::parse("principal"),
+            Some(SubjectKind::Principal)
+        );
+        assert_eq!(KeyRole::parse("principal"), Some(KeyRole::Principal));
+
+        let encoded = String::from_utf8(binding.canonical_encode()).unwrap();
+        assert!(encoded.contains("signer_kind=principal"));
+        assert!(encoded.contains("role=principal"));
+    }
+
+    #[test]
+    fn legacy_root_and_persona_aliases_normalize_to_principal() {
+        let root = SignerBinding::root("root-1", "device-root").canonical_principal_alias();
+        assert_eq!(root.signer.kind, SubjectKind::Principal);
+        assert_eq!(root.signer.subject_id, "root-1");
+        assert_eq!(root.key_id, "device-root");
+        assert_eq!(root.role, KeyRole::Principal);
+
+        let persona =
+            SignerBinding::persona("persona-1", "device-persona").canonical_principal_alias();
+        assert_eq!(persona.signer.kind, SubjectKind::Principal);
+        assert_eq!(persona.signer.subject_id, "persona-1");
+        assert_eq!(persona.key_id, "device-persona");
+        assert_eq!(persona.role, KeyRole::Principal);
+
+        assert!(SubjectKind::Root.is_legacy_principal_alias());
+        assert!(SubjectKind::Persona.is_legacy_principal_alias());
+        assert_eq!(
+            SubjectKind::parse("root")
+                .unwrap()
+                .canonical_principal_kind(),
+            SubjectKind::Principal
+        );
+        assert_eq!(
+            KeyRole::parse("persona")
+                .unwrap()
+                .canonical_principal_role(),
+            KeyRole::Principal
+        );
+    }
+
+    #[test]
+    fn identity_subjects_emit_principal_kind() {
+        let root = EventBody::RootCreated(RootCreatedEvent {
+            root_id: "root-1".into(),
+            display_name: "Root".into(),
+            initial_key: PublicKeyMaterial {
+                key_id: "root-device".into(),
+                algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
+                public_key: "devpub:root-device".into(),
+            },
+        });
+        assert_eq!(root.subject(), EventSubject::principal("root-1"));
+
+        let persona = EventBody::PersonaCreated(PersonaCreatedEvent {
+            root_id: "root-1".into(),
+            persona_id: "persona-1".into(),
+            label: "Runtime".into(),
+            disclosure_profile: None,
+            survival_mode: SurvivalMode::Strict,
+            initial_key: PublicKeyMaterial {
+                key_id: "persona-device".into(),
+                algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
+                public_key: "devpub:persona-device".into(),
+            },
+        });
+        assert_eq!(persona.subject(), EventSubject::principal("persona-1"));
+
+        let message = EventBody::MessageSent(valid_message_sent());
+        assert_eq!(message.subject(), EventSubject::principal("persona-a"));
     }
 
     #[test]
@@ -3069,5 +3598,139 @@ mod trust_score_canonical_tests {
                 "decode_canonical must reject score={literal}, got Ok"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attestation_axes_tests {
+    use super::*;
+    use core_principals::KeyAlgorithm;
+
+    fn dev_key() -> PublicKeyMaterial {
+        PublicKeyMaterial {
+            key_id: "k-d2".into(),
+            algorithm: KeyAlgorithm::EcdsaP256,
+            public_key: "p256:04aa".into(),
+        }
+    }
+
+    // The §4 ECIES recipient key — DISTINCT from `dev_key` (sign != decrypt).
+    fn enc_key() -> PublicKeyMaterial {
+        PublicKeyMaterial {
+            key_id: "k-d2-ecies".into(),
+            algorithm: KeyAlgorithm::EcdsaP256,
+            public_key: "p256:04bb".into(),
+        }
+    }
+
+    fn enrolled(
+        custody: CustodyClass,
+        tier: AttestationTier,
+        factor: PresenceFactor,
+        statement: Option<&str>,
+    ) -> DeviceEnrolledEvent {
+        DeviceEnrolledEvent {
+            root_id: "root-1".into(),
+            device_id: "d2".into(),
+            label: "Backup".into(),
+            device_key: dev_key(),
+            encryption_key: enc_key(),
+            custody_class: custody,
+            attestation_statement: statement.map(str::to_string),
+            attestation_tier: tier,
+            presence_factor: factor,
+        }
+    }
+
+    #[test]
+    fn presence_tier_none_is_enrollable_without_a_statement() {
+        // The dev0 floor: a `.userPresence` SE key, custody proven by OOB + the
+        // hardware gate, carries NO vendor statement.
+        let e = enrolled(
+            CustodyClass::Presence,
+            AttestationTier::None,
+            PresenceFactor::UserPresence,
+            None,
+        );
+        assert!(
+            e.validate().is_ok(),
+            "tier=None presence must be enrollable"
+        );
+    }
+
+    #[test]
+    fn presence_vendor_hw_requires_a_statement() {
+        let missing = enrolled(
+            CustodyClass::Presence,
+            AttestationTier::VendorHw,
+            PresenceFactor::HardwareTouch,
+            None,
+        );
+        assert!(
+            missing.validate().is_err(),
+            "tier=VendorHw must require a recorded statement"
+        );
+        let present = enrolled(
+            CustodyClass::Presence,
+            AttestationTier::VendorHw,
+            PresenceFactor::HardwareTouch,
+            Some("vendor-chain"),
+        );
+        assert!(present.validate().is_ok(), "with a statement it is valid");
+    }
+
+    #[test]
+    fn presence_device_must_carry_a_human_factor() {
+        let e = enrolled(
+            CustodyClass::Presence,
+            AttestationTier::None,
+            PresenceFactor::Unattended,
+            None,
+        );
+        assert!(
+            e.validate().is_err(),
+            "a presence Device cannot be `unattended`"
+        );
+    }
+
+    #[test]
+    fn tier_above_none_is_rejected_on_non_presence_custody() {
+        // CoAuthority custody carries a statement but the attestation TIER axis is
+        // presence-specific — a vendor_hw tier on co-authority is incoherent.
+        let e = enrolled(
+            CustodyClass::CoAuthority,
+            AttestationTier::VendorHw,
+            PresenceFactor::Unattended,
+            Some("vendor-chain"),
+        );
+        assert!(
+            e.validate().is_err(),
+            "attestation tier above None is presence-only"
+        );
+    }
+
+    #[test]
+    fn canonical_roundtrip_preserves_both_axes() {
+        let body = EventBody::DeviceEnrolled(enrolled(
+            CustodyClass::Presence,
+            AttestationTier::VendorHw,
+            PresenceFactor::Biometric,
+            Some("vendor-chain"),
+        ));
+        let encoded = body.canonical_encode();
+        let reparsed =
+            EventBody::decode_canonical(&encoded).expect("device-enrolled must roundtrip");
+        match &reparsed {
+            EventBody::DeviceEnrolled(b) => {
+                assert_eq!(b.attestation_tier, AttestationTier::VendorHw);
+                assert_eq!(b.presence_factor, PresenceFactor::Biometric);
+            }
+            other => panic!("wrong body: {other:?}"),
+        }
+        assert_eq!(
+            encoded,
+            reparsed.canonical_encode(),
+            "canonical encoding must be idempotent across the new axes"
+        );
     }
 }

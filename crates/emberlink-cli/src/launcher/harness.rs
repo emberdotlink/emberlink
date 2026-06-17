@@ -4,6 +4,7 @@ use std::fmt;
 pub enum HarnessKind {
     Claude,
     Codex,
+    Cursor,
     Other,
 }
 
@@ -12,6 +13,7 @@ impl HarnessKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Cursor => "cursor",
             Self::Other => "other",
         }
     }
@@ -31,6 +33,7 @@ mod tests {
     fn display_matches_cli_strings() {
         assert_eq!(HarnessKind::Claude.to_string(), "claude");
         assert_eq!(HarnessKind::Codex.to_string(), "codex");
+        assert_eq!(HarnessKind::Cursor.to_string(), "cursor");
         assert_eq!(HarnessKind::Other.to_string(), "other");
     }
 }

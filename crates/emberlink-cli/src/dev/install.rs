@@ -5,6 +5,7 @@
 //! release build + signing, runtime binary install, manifest signing,
 //! launchctl bootstrap, and post-install verify.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use super::gh_app;
 use super::identity_root;
@@ -89,6 +90,29 @@ pub fn run() -> Result<(), String> {
     let changed = install_binaries::install_binaries(&runner, &build, &runtime.install_root)
         .map_err(|e| format!("phase 7 failed: {e}"))?;
     println!("  binaries copied: {} changed", changed.len());
+
+    // Phase 7b: install the `claude` shadow shim — bare `claude` inside a
+    // launcher-managed agent shell auto-routes through `ember claude-code`
+    // (implementation-note-419). The shim is the
+    // unconditional half of the hybrid; the opt-in shell-init wrap is
+    // prompted by the interactive install wizard.
+    // Anchor: dev_prod_parity_bare_claude_install_wiring_landed.
+    let shadow_dir = crate::launcher::core::resolve_shadow_dir();
+    let installed_ember = runtime.install_root.join("ember");
+    match install_binaries::install_claude_shadow_shim(&shadow_dir, &installed_ember) {
+        Ok(true) => println!(
+            "  claude shadow shim: written at {}",
+            shadow_dir.join("bin/claude").display(),
+        ),
+        Ok(false) => println!(
+            "  claude shadow shim: already up-to-date at {}",
+            shadow_dir.join("bin/claude").display(),
+        ),
+        Err(e) => {
+            eprintln!("  warning: claude shadow shim install failed: {e}");
+            completion_issues.push(format!("claude shadow shim install failed: {e}"));
+        }
+    }
 
     // Phase 8: generate + sign manifest with dev IdentityRoot.
     eprintln!("[ember dev install] phase 8: manifest generation + signing");

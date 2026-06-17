@@ -1,13 +1,45 @@
 //! Dev IdentityRoot key generation + Keychain stash.
 //!
 //! Per design Phase 4, phase 1 of `ember dev install`: mint an Ed25519
-//! keypair, write the private key to macOS Keychain at label
-//! `sh.emberlink.dev-identity-root`, print the public-key fingerprint.
+//! keypair, write the private key to macOS Keychain.
 //!
+//! ## Keychain layout — transitional (design amendment 2026-06-15)
+//!
+//! The v0.1-v0.2 `sh.emberlink.dev-identity-root` slot is being
+//! retired in favor of a unified Principal-rooted layout (one root
+//! Principal + workstation Durable Persona + operator-role Durable
+//! Persona) per design §"Amendment 2026-06-15 — IdentityRoot /
+//! Persona collapse into recursive Principal (v0.3.0)". The
+//! target-state slot for the workstation manifest-signing seed is
+//! [`crate::trust::principal_keychain::WORKSTATION_PERSONA_KEYCHAIN_LABEL`]
+//! (`sh.emberlink.persona.workstation.seed`).
+//!
+//! This module's readers honor the target-state label first and fall
+//! back to the legacy slot, so existing operator installs whose seed
+//! still lives at `sh.emberlink.dev-identity-root` keep working until
+//! [`crate::trust::principal_keychain::migrate_dual_ir_to_root_principal`]
+//! runs and consolidates the layout. The `ensure_*` writers write to
+//! the target slot only — new code never extends the dual-IR
+//! vocabulary as target architecture.
+//!
+//! Anchor: `identity_root_persona_keychain_consolidation_landed`.
+//!
+//! CLASSIFICATION: PUBLIC
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-pub const KEYCHAIN_LABEL: &str = "sh.emberlink.dev-identity-root";
+use crate::trust::principal_keychain::LEGACY_DEV_IR_KEYCHAIN_LABEL;
+
+/// **Transitional** legacy macOS Keychain label for the v0.1-v0.2 dev
+/// IdentityRoot. Restated here for backwards-compat with callers that
+/// import the symbol (the canonical home is
+/// [`crate::trust::principal_keychain::LEGACY_DEV_IR_KEYCHAIN_LABEL`]).
+/// New writers MUST NOT use this label —
+/// [`crate::trust::principal_keychain::WORKSTATION_PERSONA_KEYCHAIN_LABEL`]
+/// is the target-state slot.
+/// Anchor: `identity_root_persona_keychain_consolidation_landed`.
+pub const KEYCHAIN_LABEL: &str = LEGACY_DEV_IR_KEYCHAIN_LABEL;
+
 const KEYCHAIN_SERVICE: &str = "sh.emberlink";
 
 pub struct DevIdentityRootHandle {
@@ -101,6 +133,17 @@ pub fn read_existing_dev_identity_root() -> Result<Option<DevIdentityRootHandle>
 /// generating a new key when the canonical entry is absent.
 pub fn read_existing_dev_identity_root_signing_key() -> Result<Option<SigningKey>, String> {
     read_existing_signing_key()
+}
+
+/// Read the existing dev IdentityRoot pubkey as canonical 64-char lower-hex
+/// — the exact wire shape `ember_daemon::binary_manifest::parse_trust_roots`
+/// expects in the `EMBER_TRUST_ROOTS` env var.
+///
+/// Returns `Ok(None)` when no dev IdentityRoot is stashed in Keychain; the
+/// caller threads `None` through as an empty trust-roots string to preserve
+/// the legacy plist shape.
+pub fn read_existing_dev_identity_root_pubkey_hex() -> Result<Option<String>, String> {
+    Ok(read_existing_dev_identity_root()?.map(|handle| hex::encode(handle.public_key.to_bytes())))
 }
 
 /// Generate a fresh dev IdentityRoot keypair and stash the private key in

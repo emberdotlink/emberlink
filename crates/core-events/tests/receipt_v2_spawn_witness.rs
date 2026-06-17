@@ -1,5 +1,5 @@
 //! Receipt v2 `spawn.witness` body kind — round-trip + parent-signature
-//! verification tests. implementation-note-51 (CRIT-7 mitigation).
+//! verification tests. implementation-note-58 (CRIT-7 mitigation).
 //!
 //! These tests exercise the dual-signing model:
 //!   1. The parent persona signs `JCS(spawn.witness body excluding parent_signature)`,

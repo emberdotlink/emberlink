@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Edge CA primitives for emberd-internal mTLS — design Amendment 1 v3.
 //!
@@ -105,7 +106,7 @@ pub struct SpiffeIdentity {
 ///   `20260516-222000-container-identity` grill matrix) and is preserved
 ///   verbatim into [`SpiffeUri::Container::container_ref`].
 ///
-/// Anchor: `parse_spiffe_uri_container` — implementation-note-33.
+/// Anchor: `parse_spiffe_uri_container` — implementation-note-35.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpiffeUri {
     /// `spiffe://emberd/persona/<persona>/peer/<peer-hostname>` shape.
@@ -498,7 +499,7 @@ pub fn parse_spiffe_uri(uri: &str) -> Result<SpiffeIdentity, CaError> {
 /// or `/container/...`. Leaves room for future shapes (e.g. `/spawn/...` per
 /// design's spawn-uuid rename) — adding a variant here is purely additive.
 ///
-/// Anchor: `parse_spiffe_uri_container` — implementation-note-33.
+/// Anchor: `parse_spiffe_uri_container` — implementation-note-35.
 pub fn parse_spiffe_uri_container(uri: &str) -> Result<SpiffeUri, CaError> {
     // Reject URL-encoding up front, matching parse_spiffe_uri's invariant.
     if uri.contains('%') {
@@ -535,12 +536,13 @@ pub fn parse_spiffe_uri_container(uri: &str) -> Result<SpiffeUri, CaError> {
 
 // ─── Consolidated bridge-identity SAN parser ────────────────────────────────
 //
-// san_parser_consolidated_core_crypto_ca — implementation-note-34
+// san_parser_consolidated_core_crypto_ca — implementation-note-36
 //
 // Single entry point for extracting an agent/persona identity from a parsed
 // X.509 client cert's Subject Alternative Name extension. Replaces the
-// per-caller hand-rolled SAN walks previously living in
-// `ember_proxy::mtls::extract_agent_id_from_cert` (design component 2).
+// per-caller hand-rolled SAN walks previously living in the retired
+// `ember-proxy` crate's `mtls::extract_agent_id_from_cert` (design
+// component 2).
 //
 // Accepts two SAN URI grammars:
 //   1. `spiffe://emberd/persona/<persona>/peer/<peer-hostname>`
@@ -611,8 +613,8 @@ pub fn extract_bridge_identity(
 /// Parse `urn:emberlink:agent:<agent_id>` and return the agent ID portion.
 ///
 /// Returns `None` if the URI does not match the grammar. Mirrors the regex
-/// previously defined inline in `ember_proxy::mtls` so the two SAN parsers
-/// share a single grammar source of truth.
+/// previously defined inline in the retired `ember-proxy` crate's `mtls`
+/// module so the two SAN parsers share a single grammar source of truth.
 fn parse_emberlink_agent_urn(uri: &str) -> Option<String> {
     static URN_RE: OnceLock<Regex> = OnceLock::new();
     let re = URN_RE.get_or_init(|| {

@@ -3,7 +3,8 @@
 //! Type-only scaffolding for now. Histogram bucket constants, closed-set
 //! label newtypes, forbidden-field gate. The actual Prometheus exporter
 //! wiring lives in a downstream crate (`emberd-metrics` or similar) and
-//! consumes these primitives.
+//! consumes these primitives. Build-ahead with no consumer yet; the
+//! exporter wire-up is tracked as `implementation-note-73`.
 //!
 //! This crate is `no_std`-friendly in spirit (no I/O, no `tokio`, no
 //! native deps) so it compiles to `wasm32-unknown-unknown` per
@@ -82,6 +83,34 @@ impl OutcomeLabel {
             OutcomeLabel::Denied => "denied",
             OutcomeLabel::Errored => "errored",
             OutcomeLabel::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Host-authorization outcome for the proxy forward path (design increment 2).
+/// Closed set mirroring `proxy_forward_runtime`'s `authorize_forward_host`
+/// decision — `allow` plus the two fail-closed denials. Bounded so the
+/// `proxy_forward_host_authz_total{outcome}` series can never blow up cardinality
+/// and never carries a per-principal id (the egress-adjudication distribution is
+/// non-sensitive; the principal lives in the Receipt, not the label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyHostAuthzLabel {
+    /// Forward permitted to the destination host.
+    Allow,
+    /// Refused: destination host is not in the grant's `allowed_targets`.
+    DenyNotInAllowlist,
+    /// Refused: a generic-lane credential with no `allowed_targets` allowlist,
+    /// so the destination host would be unconstrained.
+    DenyGenericNoAllowlist,
+}
+
+impl ProxyHostAuthzLabel {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            ProxyHostAuthzLabel::Allow => "allow",
+            ProxyHostAuthzLabel::DenyNotInAllowlist => "deny_not_in_allowlist",
+            ProxyHostAuthzLabel::DenyGenericNoAllowlist => "deny_generic_no_allowlist",
         }
     }
 }
@@ -168,6 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn proxy_host_authz_label_stable_strings() {
+        assert_eq!(ProxyHostAuthzLabel::Allow.as_label(), "allow");
+        assert_eq!(
+            ProxyHostAuthzLabel::DenyNotInAllowlist.as_label(),
+            "deny_not_in_allowlist"
+        );
+        assert_eq!(
+            ProxyHostAuthzLabel::DenyGenericNoAllowlist.as_label(),
+            "deny_generic_no_allowlist"
+        );
+        // Closed set — every variant encodes to a bounded snake_case token.
+        for l in [
+            ProxyHostAuthzLabel::Allow,
+            ProxyHostAuthzLabel::DenyNotInAllowlist,
+            ProxyHostAuthzLabel::DenyGenericNoAllowlist,
+        ] {
+            let s = l.as_label();
+            assert!(!s.contains(' '));
+            assert!(s.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+        }
+    }
+
+    #[test]
     fn forbidden_gate_rejects_known_credential_prefixes() {
         assert_eq!(
             forbidden_label_value("ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
@@ -190,8 +242,11 @@ mod tests {
 
     #[test]
     fn forbidden_gate_rejects_pem_block() {
-        let pem = "\x2d----BEGIN PRIVATE KEY-----\nfoo\n-----END PRIVATE KEY-----";
-        assert_eq!(forbidden_label_value(pem), Some("pem_block"));
+        let pem = format!(
+            "{}PRIVATE KEY-----\nfoo\n{}PRIVATE KEY-----",
+            "-----BEGIN ", "-----END "
+        );
+        assert_eq!(forbidden_label_value(&pem), Some("pem_block"));
     }
 
     #[test]

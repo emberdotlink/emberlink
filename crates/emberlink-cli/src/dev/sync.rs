@@ -13,7 +13,7 @@
 //!   ember-daemon -p ember-construct`).
 //! - Step 2: content-hash diff (SHA-256) — detect which built binaries changed.
 //! - Step 3: copy changed binaries to the dev install root (code-signing is a
-//!   TODO stub; signing pipeline lands in implementation-note-488).
+//!   TODO stub; signing pipeline lands in implementation-note-420).
 //! - Step 4: re-generate and re-sign the dev manifest when synced binaries
 //!   changed.
 //! - Step 5: `launchctl kickstart -k system/sh.emberlink.daemon.dev` (skipped
@@ -25,6 +25,7 @@
 //!
 //! `dev_prod_parity_ember_dev_sync_landed`
 //!
+//! CLASSIFICATION: PUBLIC
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -246,10 +247,7 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
     );
 
     // --- Step 1: incremental cargo build ---
-    eprintln!(
-        "[dev sync] building {} …",
-        build_packages().join(", ")
-    );
+    eprintln!("[dev sync] building {} …", build_packages().join(", "));
     cargo_build(&workspace_root)?;
     eprintln!("[dev sync] build OK");
 
@@ -270,7 +268,7 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
         let changed = binary_changed(&built, &installed)?;
         if changed {
             // TODO(phase-2): run the dev IdentityRoot sign pipeline here
-            // (implementation-note-488 phase 6) before copying.
+            // (implementation-note-420 phase 6) before copying.
             eprintln!(
                 "[dev sync] {} changed — copying to {}",
                 artifact.binary_name,
@@ -462,7 +460,10 @@ mod tests {
 
     #[test]
     fn dev_sync_build_packages_include_cli_daemon_and_construct_package() {
-        assert_eq!(build_packages(), vec!["ember-construct", "ember-daemon", "emberlink-cli"]);
+        assert_eq!(
+            build_packages(),
+            vec!["ember-construct", "ember-daemon", "emberlink-cli"]
+        );
     }
 
     #[test]

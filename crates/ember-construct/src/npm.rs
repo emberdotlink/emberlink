@@ -27,6 +27,9 @@
 //! authoritative resolver. This keeps the shim deterministic on argv+env.
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 use std::env;
 
 const DEFAULT_REGISTRY: &str = "npmjs.org";
@@ -163,6 +166,138 @@ fn host_from_url(url: &str) -> String {
     }
 
     host_with_port.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// NpmFactory — construct-factory contract for the npm construct
+// ---------------------------------------------------------------------------
+
+static NPM_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/npm.toml"))
+            .expect("bundled npm.toml must be valid")
+    });
+
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    NPM_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key)
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+// Manifest-membership helper retained for parity with manifest_need_for_action; not yet wired.
+#[allow(dead_code)]
+fn action_in_manifest(action_key: &str) -> bool {
+    NPM_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .any(|a| a.key == action_key)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NpmFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmFactoryTarget {
+    pub provider: &'static str,
+    pub registry_host: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for NpmFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_npm_argv(argv)
+    }
+}
+
+impl TargetExtractor for NpmFactory {
+    type Target = NpmFactoryTarget;
+
+    fn target_for_argv(&self, action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let key = &action_key.0;
+        if key.starts_with("npm.publish.")
+            || key.starts_with("npm.install.")
+            || key.starts_with("npm.ci.")
+            || key.starts_with("npm.deprecate.")
+            || key.starts_with("npm.dist-tag.")
+        {
+            let host = registry_host(argv);
+            Some(NpmFactoryTarget {
+                provider: "npm",
+                registry_host: host,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl NeedTemplate for NpmFactory {
+    type Need = NpmFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(NpmFactoryNeed)
+    }
+}
+
+fn has_inline_auth_token(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|a| a.starts_with("--//") && a.contains(":_authToken="))
+}
+
+fn has_package_flag(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|a| a == "--package" || a.starts_with("--package="))
+        || argv.windows(2).any(|w| w[0] == "--pack-destination")
+}
+
+impl ConstructFactory for NpmFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        if key.0 == "npm.unpublish" {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if key.0.starts_with("npm.publish") {
+            if has_inline_auth_token(argv) {
+                return FactoryDisposition::UnsupportedFailClosed;
+            }
+            if has_package_flag(argv) {
+                return FactoryDisposition::PayloadAnalysisRequired;
+            }
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        if key.0.starts_with("npm.deprecate") || key.0.starts_with("npm.dist-tag") {
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        FactoryDisposition::Credentialless
+    }
 }
 
 #[cfg(test)]
@@ -389,5 +524,154 @@ mod tests {
             host_from_url("https://registry.example.com/?foo=bar"),
             "registry.example.com"
         );
+    }
+
+    // --- NpmFactory tests ---
+
+    #[test]
+    fn npm_factory_version_flag_is_credentialless() {
+        let f = NpmFactory;
+        let a = args(&["--version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn npm_factory_publish_is_resolver_required() {
+        clear_registry_env();
+        let f = NpmFactory;
+        let a = args(&["publish", "--registry", "https://registry.npmjs.org/"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn npm_factory_publish_package_is_payload_analysis() {
+        clear_registry_env();
+        let f = NpmFactory;
+        let a = args(&["publish", "--package", "pkg.tgz"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn npm_factory_publish_inline_auth_is_unsupported() {
+        clear_registry_env();
+        let f = NpmFactory;
+        let a = args(&["publish", "--//registry.npmjs.org/:_authToken=npm-token"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn npm_factory_unpublish_is_unsupported() {
+        let f = NpmFactory;
+        let a = args(&["unpublish", "mypkg@1.0.0"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn npm_factory_install_is_credentialless() {
+        clear_registry_env();
+        let f = NpmFactory;
+        let a = args(&["install", "lodash"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn npm_factory_run_script_is_credentialless() {
+        let f = NpmFactory;
+        let a = args(&["run", "build"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn npm_factory_deprecate_is_resolver_required() {
+        clear_registry_env();
+        let f = NpmFactory;
+        let a = args(&["deprecate", "mypkg@1.0.0", "use mypkg@2"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn npm_factory_pack_is_credentialless() {
+        let f = NpmFactory;
+        let a = args(&["pack"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn npm_factory_target_extraction_publish() {
+        clear_registry_env();
+        let f = NpmFactory;
+        let a = args(&["publish", "--registry", "https://npm.pkg.github.com/"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "npm");
+        assert_eq!(target.registry_host, "npm.pkg.github.com");
+    }
+
+    #[test]
+    fn npm_factory_target_extraction_run_script_returns_none() {
+        let f = NpmFactory;
+        let a = args(&["run", "build"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert!(f.target_for_argv(&key, &a).is_none());
+    }
+
+    #[test]
+    fn npm_factory_contract_runs_conformance_corpus() {
+        clear_registry_env();
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/npm/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/npm.toml"),
+        )
+        .expect("npm manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &NpmFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

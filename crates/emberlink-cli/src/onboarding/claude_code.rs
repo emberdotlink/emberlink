@@ -1,5 +1,5 @@
 //! `ember init --for claude` and `ember uninstall --for claude`
-//! orchestration (implementation-note-468).
+//! orchestration (implementation-note-439).
 //!
 //! Per design §2 / §3: a one-command first-run setup that wires Claude Code
 //! to the local ember daemon. This module is the orchestration layer — the
@@ -12,27 +12,28 @@
 //!      (idempotent — never overwrites an existing file).
 //!   3. Create a 24h grant from the template (idempotent — reuses an active
 //!      grant for the persona if one exists).
-//!   4. Patch `~/.claude/settings.json` to install the `ember-proxy hook`
-//!      PreToolUse hook (idempotent — see `settings_patch.rs`).
-//!   5. GitHub fallback guidance: keep the HTTPS/App lane as canonical.
+//!   4. GitHub fallback guidance: keep the HTTPS/App lane as canonical.
 //!      The degraded `github-pat` lane remains available later through
 //!      `ember vault add --name github-pat`, but init no longer captures
 //!      PATs interactively.
-//!   6. Print the next two commands per design §2:
+//!   5. Print the next two commands per design §2:
 //!      `ember claude` and `ember receipt show`.
 //!
-//! The uninstall flow reverses (4) by removing only the lines we added; the
-//! other artifacts (persona, grant, vault entry) are intentionally left in
-//! place because they may be in use by other tools.
+//! The brokered Claude session's `permissions.deny` overlay is authored
+//! per-Construct in each `construct.toml`'s `[settings_overlay]` block
+//! and unioned by the launcher into a fresh overlay `settings.json` in a
+//! relocated `CLAUDE_CONFIG_DIR` (V030-CLAUDE-OVERLAY). The operator's
+//! bare `~/.claude/settings.json` is never mutated by `ember init` or
+//! `ember uninstall`. Operators who ran the pre-V030 init flow may have
+//! residual deny entries in bare; those are harmless duplicates against
+//! the launcher overlay and can be removed by hand if desired.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::onboarding::settings_patch::{
-    PatchError, add_pretooluse_hook, has_pretooluse_hook, remove_pretooluse_hook,
-};
+use crate::binary::install_bundle::{BinaryInstallBundleArgs, BinaryInstallBundleOutput};
 
 /// Default 24-hour grant TTL per design §3.
 pub const DEFAULT_GRANT_TTL_SECS: u64 = 24 * 60 * 60;
@@ -55,11 +56,11 @@ pub fn gh_pat_later_command() -> String {
     format!("ember vault add --name {GH_PAT_VAULT_NAME}")
 }
 
-/// Embedded grant scope template (design §3 / γ). Sourced from
-/// `core-policy/src/templates/claude_code_default_v1.toml` so the template
-/// shipped with the binary always matches the policy crate's reference copy.
+/// Embedded grant scope template (design §3 / γ). The canonical default
+/// scope template lives alongside this onboarding code at
+/// `onboarding/templates/claude_code_default_v1.toml`.
 pub const CLAUDE_CODE_DEFAULT_TEMPLATE: &str =
-    include_str!("../../../core-policy/src/templates/claude_code_default_v1.toml");
+    include_str!("templates/claude_code_default_v1.toml");
 
 /// Errors raised by the cohort A orchestrator. Each variant maps to a
 /// non-zero exit code in `cmd_init` / `cmd_uninstall`.
@@ -73,8 +74,6 @@ pub enum InitError {
         #[source]
         source: io::Error,
     },
-    #[error("settings.json patch error: {0}")]
-    Patch(#[from] PatchError),
     #[error("settings.json json error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -99,7 +98,7 @@ pub fn default_settings_json_path() -> Result<PathBuf, InitError> {
 /// users who relied on per-host persona separation must now set
 /// `EMBER_PERSONA` explicitly or pass `-w <name>` to the launcher.
 ///
-/// implementation-note-505 anchor: routes
+/// implementation-note-436 anchor: routes
 /// through `default_persona_id_for_runtime` so launcher + init agree on
 /// the same persona-id shape.
 pub fn claude_code_persona_name() -> String {
@@ -114,6 +113,68 @@ pub fn claude_code_persona_name() -> String {
 /// through the installed product construct bundle rather than repo-local
 /// `target/...` artifacts.
 pub fn install_managed_prod_shadow_path() -> Result<PathBuf, String> {
+    install_managed_prod_shadow_path_inner()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedProdShadowInstall {
+    pub shadow_root: PathBuf,
+    pub operator_manifest_refresh: Option<BinaryInstallBundleOutput>,
+}
+
+pub fn install_managed_prod_shadow_path_with_manifest_repair()
+-> Result<ManagedProdShadowInstall, String> {
+    match install_managed_prod_shadow_path_inner() {
+        Ok(shadow_root) => Ok(ManagedProdShadowInstall {
+            shadow_root,
+            operator_manifest_refresh: None,
+        }),
+        Err(first_error) if should_refresh_operator_manifest_after_shadow_error(&first_error) => {
+            let home = home_dir().map_err(|e| e.to_string())?;
+            let args = BinaryInstallBundleArgs {
+                from_dir: ember_daemon::binary_manifest::bundled_install_dir(),
+                manifest_path: None,
+                publisher: "did:emberlink".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                staged_root: None,
+                identity_root_keypath: None,
+            };
+            let refresh =
+                crate::binary::install_bundle::binary_install_bundle(&args, &home).map_err(
+                    |repair_error| {
+                        format!(
+                            "{first_error}; attempted to refresh the operator binary manifest from the installed product bundle, but repair failed: {repair_error}"
+                        )
+                    },
+                )?;
+            let shadow_root = install_managed_prod_shadow_path_inner().map_err(|retry_error| {
+                format!(
+                    "{first_error}; refreshed operator binary manifest at {}, but retry failed: {retry_error}",
+                    refresh.manifest_path.display()
+                )
+            })?;
+            Ok(ManagedProdShadowInstall {
+                shadow_root,
+                operator_manifest_refresh: Some(refresh),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn should_refresh_operator_manifest_after_shadow_error(error: &str) -> bool {
+    [
+        "content pin verification failed",
+        "manifest content_pin",
+        "manifest entry lookup failed",
+        "manifest load failed",
+        "manifest signature/trust verification failed",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+fn install_managed_prod_shadow_path_inner() -> Result<PathBuf, String> {
     let shadow_root = home_dir()
         .map_err(|e| e.to_string())?
         .join(".ember")
@@ -124,8 +185,16 @@ pub fn install_managed_prod_shadow_path() -> Result<PathBuf, String> {
             "managed product construct bundle is incomplete: expected installed `ember-gh` and `ember-git`, not repo-built target artifacts".to_string(),
         );
     }
-    crate::launcher::path_shadow::install_path_shadow(&shadow_root, &specs)
-        .map_err(|e| format!("io error on {}: {e}", shadow_root.display()))?;
+    if let Some(verified) =
+        crate::launcher::claude_code::verify_construct_manifest_before_spawn(&specs)
+            .map_err(|e| format!("manifest trust gate on {}: {e}", shadow_root.display()))?
+    {
+        crate::launcher::claude_code::install_verified_path_shadow(&shadow_root, &verified)
+            .map_err(|e| format!("io error on {}: {e}", shadow_root.display()))?;
+    } else {
+        crate::launcher::path_shadow::install_path_shadow(&shadow_root, &specs)
+            .map_err(|e| format!("io error on {}: {e}", shadow_root.display()))?;
+    }
     Ok(shadow_root)
 }
 
@@ -136,7 +205,7 @@ fn home_dir() -> Result<PathBuf, InitError> {
 
 /// Public surface of [`home_dir`] used by the `cmd_migrate_path_shadow_layout`
 /// CLI handler so the binary doesn't have to depend on `dirs_next` directly.
-/// implementation-note-453.
+/// implementation-note-440.
 pub fn home_dir_for_migrate() -> Result<PathBuf, String> {
     home_dir().map_err(|e| e.to_string())
 }
@@ -159,76 +228,6 @@ pub fn write_grant_template_if_missing(path: &Path) -> Result<bool, InitError> {
         })?;
     }
     fs::write(path, CLAUDE_CODE_DEFAULT_TEMPLATE).map_err(|source| InitError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(true)
-}
-
-/// Read `~/.claude/settings.json` (creating an empty file if missing) and
-/// patch it to include our PreToolUse hook. Returns `true` if a write was
-/// made, `false` if the hook was already present.
-pub fn patch_claude_settings_file(path: &Path) -> Result<bool, InitError> {
-    if let Some(parent) = path.parent()
-        && !parent.exists()
-    {
-        fs::create_dir_all(parent).map_err(|source| InitError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let raw = if path.exists() {
-        fs::read_to_string(path).map_err(|source| InitError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-    } else {
-        String::new()
-    };
-    let mut value: serde_json::Value = if raw.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(&raw)?
-    };
-    if !value.is_object() {
-        return Err(PatchError::RootNotObject("non-object").into());
-    }
-    if has_pretooluse_hook(&value) {
-        return Ok(false);
-    }
-    let _wrote = add_pretooluse_hook(&mut value)?;
-    let serialized = serde_json::to_string_pretty(&value)?;
-    fs::write(path, serialized).map_err(|source| InitError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(true)
-}
-
-/// Reverse of `patch_claude_settings_file`: removes only our hook entry.
-/// Returns `true` if a write was made, `false` if our hook wasn't present
-/// (or the file didn't exist). Never modifies user-authored hooks.
-pub fn unpatch_claude_settings_file(path: &Path) -> Result<bool, InitError> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let raw = fs::read_to_string(path).map_err(|source| InitError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if raw.trim().is_empty() {
-        return Ok(false);
-    }
-    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
-    if !value.is_object() {
-        return Err(PatchError::RootNotObject("non-object").into());
-    }
-    let made_change = remove_pretooluse_hook(&mut value)?;
-    if !made_change {
-        return Ok(false);
-    }
-    let serialized = serde_json::to_string_pretty(&value)?;
-    fs::write(path, serialized).map_err(|source| InitError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -259,61 +258,100 @@ pub fn print_next_commands_with_launcher_boundary(
     posture: GitHubOnboardingPosture,
     launcher_boundary: Option<&LauncherBoundaryNote>,
 ) {
+    print_next_commands_with_launcher_boundary_and_ember_command(
+        posture,
+        launcher_boundary,
+        "ember",
+    );
+}
+
+pub fn print_next_commands_with_launcher_boundary_and_ember_command(
+    posture: GitHubOnboardingPosture,
+    launcher_boundary: Option<&LauncherBoundaryNote>,
+    ember_cmd: &str,
+) {
     print!(
         "{}",
-        next_commands_with_launcher_boundary_text(posture, launcher_boundary)
+        next_commands_with_launcher_boundary_text(posture, launcher_boundary, ember_cmd)
     );
 }
 
 fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
-    let mut lines = vec!["", "Next steps:"];
+    next_commands_text_with_ember_command(posture, "ember")
+}
+
+fn next_commands_text_with_ember_command(
+    posture: GitHubOnboardingPosture,
+    ember_cmd: &str,
+) -> String {
+    let mut lines = vec![String::new(), "Next steps:".to_string()];
     match posture {
         GitHubOnboardingPosture::AppConfiguredReal => {
-            lines.extend_from_slice(&[
-                "  ember claude             # launch Claude with this grant (recommended)",
-                "  ember receipt show       # see the audit trail of the grant",
-            ]);
+            lines.push(format!(
+                "  {ember_cmd} claude             # launch Claude with this grant (recommended)"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} receipt show       # see the audit trail of the grant"
+            ));
         }
         GitHubOnboardingPosture::PatConfigured => {
-            lines.extend_from_slice(&[
-                "  ember claude             # launch now on the degraded PAT lane",
-                "  ember github setup       # upgrade to the real App lane when ready",
-                "  ember receipt show       # see the audit trail of the grant",
-            ]);
+            lines.push(format!(
+                "  {ember_cmd} claude             # launch now on the degraded PAT lane"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} github setup       # upgrade to the real App lane when ready"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} receipt show       # see the audit trail of the grant"
+            ));
         }
         GitHubOnboardingPosture::AppBroken(_) => {
-            lines.extend_from_slice(&[
-                "  ember github setup       # repair or replace the local App credential triple",
-                "  ember github status      # confirm the App lane is healthy",
-                "  ember claude             # launch once GitHub is repaired",
-            ]);
+            lines.push(format!(
+                "  {ember_cmd} github setup       # repair or replace the local App credential triple"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} github status      # confirm the App lane is healthy"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} claude             # launch once GitHub is repaired"
+            ));
         }
         GitHubOnboardingPosture::AppConfiguredMock | GitHubOnboardingPosture::AppNotConfigured => {
-            lines.extend_from_slice(&[
-                "  ember github setup       # register PEM + App ID + installation URL/ID + slug",
-                "  ember github status      # confirm the App lane is ready",
-                "  ember claude             # launch once GitHub is configured",
-            ]);
+            lines.push(format!(
+                "  {ember_cmd} github setup       # register PEM + App ID + installation URL/ID + slug"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} github status      # confirm the App lane is ready"
+            ));
+            lines.push(format!(
+                "  {ember_cmd} claude             # launch once GitHub is configured"
+            ));
         }
     }
-    lines.extend_from_slice(&[
-        "",
-        "About the launcher",
-        "------------------",
-        "`ember claude` is the canonical v0.3.0 launcher. It opens a fresh session,",
-        "attaches a scoped grant, and keeps audit plus revocation on the supported path.",
-        "",
-        "Use that path first. Bare `claude` and headless automation remain advanced",
-        "surfaces, but they are intentionally outside the friendly default.",
-    ]);
+    lines.push(String::new());
+    lines.push("About the launcher".to_string());
+    lines.push("------------------".to_string());
+    lines.push(format!(
+        "`{ember_cmd} claude` is the canonical v0.3.0 launcher. It opens a fresh session,"
+    ));
+    lines.push(
+        "attaches a scoped grant, and keeps audit plus revocation on the supported path."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push(
+        "Use that path first. Bare `claude` and headless automation remain advanced".to_string(),
+    );
+    lines.push("surfaces, but they are intentionally outside the friendly default.".to_string());
     lines.join("\n") + "\n"
 }
 
 fn next_commands_with_launcher_boundary_text(
     posture: GitHubOnboardingPosture,
     launcher_boundary: Option<&LauncherBoundaryNote>,
+    ember_cmd: &str,
 ) -> String {
-    let mut out = next_commands_text(posture);
+    let mut out = next_commands_text_with_ember_command(posture, ember_cmd);
     if let Some(note) = launcher_boundary {
         out.push('\n');
         out.push_str("Host launcher boundary\n");
@@ -331,6 +369,13 @@ fn next_commands_with_launcher_boundary_text(
 /// `ember vault add --name github-pat`, but we do not teach that fallback as
 /// part of the first-run path when the App lane is simply not configured yet.
 pub fn render_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> String {
+    render_github_onboarding_guidance_with_ember_command(posture, "ember")
+}
+
+pub fn render_github_onboarding_guidance_with_ember_command(
+    posture: GitHubOnboardingPosture,
+    ember_cmd: &str,
+) -> String {
     let mut out = String::new();
     out.push('\n');
     out.push_str("GitHub access:\n");
@@ -338,17 +383,24 @@ pub fn render_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> St
     match posture {
         GitHubOnboardingPosture::AppConfiguredReal => {
             out.push_str("  Ready: GitHub App broker configured for the HTTPS/API lane.\n");
-            out.push_str("  `ember claude` will use short-lived installation tokens there.\n");
+            let _ = writeln!(
+                out,
+                "  `{ember_cmd} claude` will use short-lived installation tokens there."
+            );
         }
         GitHubOnboardingPosture::PatConfigured => {
             out.push_str("  Degraded PAT fallback is configured today.\n");
-            out.push_str("  Preferred fix: run `ember github setup` to move onto the App lane.\n");
+            let _ = writeln!(
+                out,
+                "  Preferred fix: run `{ember_cmd} github setup` to move onto the App lane."
+            );
             out.push_str("  Until then, gh/git will attribute through your GitHub identity.\n");
         }
         GitHubOnboardingPosture::AppConfiguredMock => {
             out.push_str("  Not ready: this daemon only has a mock GitHub broker right now.\n");
-            out.push_str(
-                "  Run `ember github setup` to register the real App credential triple.\n",
+            let _ = writeln!(
+                out,
+                "  Run `{ember_cmd} github setup` to register the real App credential triple."
             );
             out.push_str("  Have these ready: private key PEM, App ID, installation URL or ID, and App slug.\n");
             out.push_str("  The friendly v0.3.0 path is HTTPS/App first.\n");
@@ -356,14 +408,20 @@ pub fn render_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> St
         GitHubOnboardingPosture::AppBroken(detail) => {
             out.push_str("  Broken: this daemon has local GitHub authority configured, but it is not usable yet.\n");
             let _ = writeln!(out, "  Detail: {detail}");
-            out.push_str("  Repair path: run `ember github setup` again to replace or complete the credential triple.\n");
+            let _ = writeln!(
+                out,
+                "  Repair path: run `{ember_cmd} github setup` again to replace or complete the credential triple."
+            );
             out.push_str("  The friendly v0.3.0 path is HTTPS/App first.\n");
         }
         GitHubOnboardingPosture::AppNotConfigured => {
             out.push_str(
                 "  Not ready: this daemon does not have a real GitHub App broker configured yet.\n",
             );
-            out.push_str("  Run `ember github setup` to register the App credential triple.\n");
+            let _ = writeln!(
+                out,
+                "  Run `{ember_cmd} github setup` to register the App credential triple."
+            );
             out.push_str("  Have these ready: private key PEM, App ID, installation URL or ID, and App slug.\n");
             out.push_str("  The friendly v0.3.0 path is HTTPS/App first.\n");
         }
@@ -374,14 +432,24 @@ pub fn render_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> St
 
 /// Print GitHub onboarding guidance for the current posture.
 pub fn print_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> io::Result<()> {
-    eprint!("{}", render_github_onboarding_guidance(posture));
+    print_github_onboarding_guidance_with_ember_command(posture, "ember")
+}
+
+pub fn print_github_onboarding_guidance_with_ember_command(
+    posture: GitHubOnboardingPosture,
+    ember_cmd: &str,
+) -> io::Result<()> {
+    eprint!(
+        "{}",
+        render_github_onboarding_guidance_with_ember_command(posture, ember_cmd)
+    );
     Ok(())
 }
 
 /// Decide whether the autostart path should install a LaunchAgent / systemd
 /// user unit, or fall back to a raw `--background` daemon spawn.
 ///
-/// implementation-note-508: the LaunchAgent / systemd-user
+/// implementation-note-441: the LaunchAgent / systemd-user
 /// path is correct for the canonical "production user" install (single
 /// always-up daemon per login session) — but it baked an absolute `~/.ember/`
 /// path resolved against the operator's *real* HOME at install time, so an
@@ -421,7 +489,7 @@ pub fn supports_managed_daemon_install(
 
 /// Resolve the autostart liveness-wait timeout in seconds. Honors the
 /// `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` env override; falls back to a
-/// 10s default (raised from 5s in implementation-note-508
+/// 10s default (raised from 5s in implementation-note-441
 /// because first-time provisioning — vault.salt + daemon.db schema — can
 /// exceed 5s on slow disks).
 pub fn autostart_liveness_timeout_secs() -> u64 {
@@ -444,19 +512,17 @@ pub struct InitSummary {
     pub template_path: PathBuf,
     pub template_written: bool,
     pub settings_path: PathBuf,
-    pub settings_patched: bool,
     pub gh_pat_stored: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
     fn persona_name_uses_2_slot_default_shape() {
-        // implementation-note-505: the default
+        // implementation-note-436: the default
         // persona now follows the locked 2-slot Persona schema
         // (CONTEXT.md "Identity surface" §Persona ID schema) —
         // `claude-code-<context>` where `<context>` is `default` until
@@ -480,111 +546,6 @@ mod tests {
         // Second call no-ops (idempotent).
         let wrote_again = write_grant_template_if_missing(&path).unwrap();
         assert!(!wrote_again);
-    }
-
-    #[test]
-    fn patch_settings_creates_file_when_missing() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join(".claude").join("settings.json");
-        let wrote = patch_claude_settings_file(&path).unwrap();
-        assert!(wrote);
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(has_pretooluse_hook(&v));
-    }
-
-    #[test]
-    fn patch_settings_idempotent_second_call() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        let first = patch_claude_settings_file(&path).unwrap();
-        assert!(first);
-        let second = patch_claude_settings_file(&path).unwrap();
-        assert!(!second, "second call should no-op");
-    }
-
-    #[test]
-    fn patch_settings_preserves_existing_keys() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        let preexisting = serde_json::to_string_pretty(&json!({
-            "theme": "dark",
-            "model": "sonnet",
-            "permissions": {"allow": ["Bash(ls)"]}
-        }))
-        .unwrap();
-        fs::write(&path, &preexisting).unwrap();
-
-        let wrote = patch_claude_settings_file(&path).unwrap();
-        assert!(wrote);
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v.get("theme").and_then(|v| v.as_str()), Some("dark"));
-        assert_eq!(v.get("model").and_then(|v| v.as_str()), Some("sonnet"));
-        assert!(v.get("permissions").is_some());
-        assert!(has_pretooluse_hook(&v));
-    }
-
-    #[test]
-    fn unpatch_undoes_patch() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        // Empty file so the patch creates the only hook entry.
-        let _ = patch_claude_settings_file(&path).unwrap();
-        let removed = unpatch_claude_settings_file(&path).unwrap();
-        assert!(removed);
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // After removal, file is back to {}.
-        assert_eq!(v, json!({}));
-    }
-
-    #[test]
-    fn unpatch_preserves_user_hooks() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        let preexisting = serde_json::to_string_pretty(&json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"matcher": "Bash", "hooks": [
-                        {"type": "command", "command": "/usr/local/bin/my-hook"}
-                    ]}
-                ]
-            }
-        }))
-        .unwrap();
-        fs::write(&path, &preexisting).unwrap();
-
-        let _ = patch_claude_settings_file(&path).unwrap();
-        let removed = unpatch_claude_settings_file(&path).unwrap();
-        assert!(removed);
-
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // User's Bash hook is still there.
-        let pretooluse = v.pointer("/hooks/PreToolUse").unwrap().as_array().unwrap();
-        assert_eq!(pretooluse.len(), 1);
-        assert_eq!(
-            pretooluse[0].pointer("/hooks/0/command").unwrap().as_str(),
-            Some("/usr/local/bin/my-hook")
-        );
-    }
-
-    #[test]
-    fn unpatch_noop_when_file_missing() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("nonexistent.json");
-        let removed = unpatch_claude_settings_file(&path).unwrap();
-        assert!(!removed);
-    }
-
-    #[test]
-    fn unpatch_noop_when_hook_absent() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        fs::write(&path, "{}").unwrap();
-        let removed = unpatch_claude_settings_file(&path).unwrap();
-        assert!(!removed);
     }
 
     #[test]
@@ -632,12 +593,47 @@ mod tests {
     }
 
     #[test]
+    fn github_guidance_uses_explicit_repo_build_ember_command_when_provided() {
+        let app_ready = render_github_onboarding_guidance_with_ember_command(
+            GitHubOnboardingPosture::AppConfiguredReal,
+            "/home/operator/emberlink-example/target/debug/ember",
+        );
+        assert!(app_ready.contains(
+            "`/home/operator/emberlink-example/target/debug/ember claude` will use short-lived installation tokens there."
+        ));
+
+        let app_setup = render_github_onboarding_guidance_with_ember_command(
+            GitHubOnboardingPosture::AppNotConfigured,
+            "/home/operator/emberlink-example/target/debug/ember",
+        );
+        assert!(app_setup.contains(
+            "Run `/home/operator/emberlink-example/target/debug/ember github setup` to register the App credential triple."
+        ));
+    }
+
+    #[test]
     fn gh_pat_later_command_uses_real_vault_add_shape() {
         assert_eq!(
             gh_pat_later_command(),
             "ember vault add --name github-pat",
             "friendly fallback must use the real `vault add` CLI shape"
         );
+    }
+
+    #[test]
+    fn package_upgrade_manifest_errors_trigger_operator_manifest_refresh() {
+        assert!(should_refresh_operator_manifest_after_shadow_error(
+            "manifest trust gate on /Users/operator/.ember/shadow: construct manifest trust gate refused: content pin verification failed for ember-gh"
+        ));
+        assert!(should_refresh_operator_manifest_after_shadow_error(
+            "manifest trust gate on /Users/operator/.ember/shadow: construct manifest trust gate refused: manifest signature/trust verification failed"
+        ));
+        assert!(!should_refresh_operator_manifest_after_shadow_error(
+            "managed product construct bundle is incomplete"
+        ));
+        assert!(!should_refresh_operator_manifest_after_shadow_error(
+            "construct manifest trust gate refused: manifest entry ember-gh path /tmp/escape escapes trusted construct roots"
+        ));
     }
 
     #[test]
@@ -686,11 +682,9 @@ mod tests {
 
     #[test]
     fn next_commands_text_names_broken_app_lane_as_repair_path() {
-        let text = next_commands_text(
-            GitHubOnboardingPosture::AppBroken(
-                "github/apps/ember/install-123: partial credential triple".to_string(),
-            ),
-        );
+        let text = next_commands_text(GitHubOnboardingPosture::AppBroken(
+            "github/apps/ember/install-123: partial credential triple".to_string(),
+        ));
         assert!(text.contains("repair or replace the local App credential triple"));
         assert!(text.contains("confirm the App lane is healthy"));
         assert!(text.contains("launch once GitHub is repaired"));
@@ -704,13 +698,28 @@ mod tests {
                 detail: "/usr/local/bin/ember -> /usr/local/lib/ember.app/Contents/MacOS/ember (older than managed runtime surface: /usr/local/bin/emberd)".to_string(),
                 repair_guidance: "Repair the installed `ember` launcher path first: /usr/local/bin/ember is older than the managed daemon/construct binaries on this host. Reinstall the managed CLI artifact or release package so `/usr/local/bin/ember` matches the runtime surface. `sudo ember daemon install` refreshes daemon/runtime sidecars, but it does not rebuild `/usr/local/lib/ember.app`.".to_string(),
             }),
+            "ember",
         );
         assert!(text.contains("Host launcher boundary"));
         assert!(text.contains("Installed host launcher: /usr/local/bin/ember ->"));
         assert!(text.contains("does not rebuild `/usr/local/lib/ember.app`"));
     }
 
-    // ── implementation-note-509 tests ───────────────────────
+    #[test]
+    fn next_commands_text_uses_explicit_repo_build_ember_command_when_provided() {
+        let text = next_commands_with_launcher_boundary_text(
+            GitHubOnboardingPosture::AppConfiguredReal,
+            None,
+            "/home/operator/emberlink-example/target/debug/ember",
+        );
+        assert!(text.contains("/home/operator/emberlink-example/target/debug/ember claude"));
+        assert!(text.contains("/home/operator/emberlink-example/target/debug/ember receipt show"));
+        assert!(text.contains(
+            "`/home/operator/emberlink-example/target/debug/ember claude` is the canonical v0.3.0 launcher."
+        ));
+    }
+
+    // ── implementation-note-442 tests ───────────────────────
 
     /// Integration-level: init_for_claude_code_autostarts_daemon_when_not_running
     ///
@@ -732,7 +741,7 @@ mod tests {
         unimplemented!("run manually: ember daemon stop && ember init --for claude")
     }
 
-    // ── implementation-note-508 tests ───────────────────────
+    // ── implementation-note-441 tests ───────────────────────
 
     /// LaunchAgent/systemd path is appropriate for a default user HOME with
     /// no --config override.

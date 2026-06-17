@@ -1,7 +1,8 @@
 //! PATH-shadow directory installer for `ember claude` and analogous launchers.
 //!
+//! CLASSIFICATION: PUBLIC
 //!
-//! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-506).
+//! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-437).
 //! The launcher prepends `~/.ember/shadow/bin/` to the child process's PATH so that
 //! tool invocations like `gh pr create` transparently resolve to the ember-gh
 //! Construct binary rather than the system binary. This module populates the
@@ -37,12 +38,75 @@ pub fn shadow_bin_dir(shadow_dir: &Path) -> PathBuf {
     shadow_dir.join("bin")
 }
 
+pub(crate) fn shadow_tool_aliases(tool_name: &str) -> Vec<String> {
+    if tool_name.starts_with("ember-") {
+        Vec::new()
+    } else {
+        vec![format!("ember-{tool_name}")]
+    }
+}
+
+fn install_shadow_symlink(shim_path: &Path, target_binary: &Path) -> io::Result<()> {
+    match shim_path.symlink_metadata() {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            std::os::unix::fs::symlink(target_binary, shim_path).map_err(|e| {
+                io::Error::other(format!("create symlink {}: {e}", shim_path.display()))
+            })?;
+        }
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "stat {}: {e}",
+                shim_path.display()
+            )));
+        }
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                match std::fs::read_link(shim_path) {
+                    Ok(existing) if existing == target_binary => {
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        std::fs::remove_file(shim_path).map_err(|e| {
+                            io::Error::other(format!(
+                                "remove stale symlink {}: {e}",
+                                shim_path.display()
+                            ))
+                        })?;
+                        std::os::unix::fs::symlink(target_binary, shim_path).map_err(|e| {
+                            io::Error::other(format!("create symlink {}: {e}", shim_path.display()))
+                        })?;
+                    }
+                    Err(e) => {
+                        return Err(io::Error::other(format!(
+                            "read_link {}: {e}",
+                            shim_path.display()
+                        )));
+                    }
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "regular file already exists at shadow path {}; \
+                         remove it manually before installing the shim",
+                        shim_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Populate the `bin/` subdirectory of `shadow_dir` with symlinks described
 /// by `constructs`.
 ///
 /// - Creates `<shadow_dir>/bin/` (mode 0700) if it does not exist. Idempotent
 ///   if the directory already exists with the same mode.
 /// - For each [`ConstructSpec`], creates `<shadow_dir>/bin/<tool_name> -> target_binary`.
+///   For ambient tool names like `gh`, also creates the direct Construct alias
+///   `<shadow_dir>/bin/ember-gh -> target_binary`.
 ///   - If a symlink already points to the correct target: no-op.
 ///   - If a symlink exists with a different target: removes it and re-creates.
 ///   - If a regular file (or other non-symlink filesystem object) exists at the
@@ -63,65 +127,9 @@ pub fn install_path_shadow(shadow_dir: &Path, constructs: &[ConstructSpec]) -> i
     }
 
     for spec in constructs {
-        let shim_path = bin_dir.join(&spec.tool_name);
-
-        match shim_path.symlink_metadata() {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Nothing there — create the symlink.
-                std::os::unix::fs::symlink(&spec.target_binary, &shim_path).map_err(|e| {
-                    io::Error::other(format!("create symlink {}: {e}", shim_path.display()))
-                })?;
-            }
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "stat {}: {e}",
-                    shim_path.display()
-                )));
-            }
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    // Check if it already points to the right target.
-                    match std::fs::read_link(&shim_path) {
-                        Ok(existing) if existing == spec.target_binary => {
-                            // Already correct — no-op.
-                            continue;
-                        }
-                        Ok(_) => {
-                            // Wrong target — remove and re-create.
-                            std::fs::remove_file(&shim_path).map_err(|e| {
-                                io::Error::other(format!(
-                                    "remove stale symlink {}: {e}",
-                                    shim_path.display()
-                                ))
-                            })?;
-                            std::os::unix::fs::symlink(&spec.target_binary, &shim_path).map_err(
-                                |e| {
-                                    io::Error::other(format!(
-                                        "create symlink {}: {e}",
-                                        shim_path.display()
-                                    ))
-                                },
-                            )?;
-                        }
-                        Err(e) => {
-                            return Err(io::Error::other(format!(
-                                "read_link {}: {e}",
-                                shim_path.display()
-                            )));
-                        }
-                    }
-                } else {
-                    // Regular file or other non-symlink object — refuse to clobber.
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "regular file already exists at shadow path {}; \
-                             remove it manually before installing the shim",
-                            shim_path.display()
-                        ),
-                    ));
-                }
-            }
+        install_shadow_symlink(&bin_dir.join(&spec.tool_name), &spec.target_binary)?;
+        for alias in shadow_tool_aliases(&spec.tool_name) {
+            install_shadow_symlink(&bin_dir.join(alias), &spec.target_binary)?;
         }
     }
 
@@ -222,8 +230,7 @@ pub fn migrate_path_shadow_layout(
     if !any_old && had_new_layout {
         return Ok(MigrationOutcome::AlreadyMigrated);
     }
-    if !had_old_regular_file && !had_old_other_symlink && had_old_symlink_to_new && had_new_layout
-    {
+    if !had_old_regular_file && !had_old_other_symlink && had_old_symlink_to_new && had_new_layout {
         return Ok(MigrationOutcome::AlreadyMigratedSymlinksInPlace);
     }
 
@@ -324,6 +331,11 @@ mod tests {
         // Shim symlinks must be under bin/, not the shadow root.
         assert_eq!(std::fs::read_link(bin_dir.join("gh")).unwrap(), bin_a);
         assert_eq!(std::fs::read_link(bin_dir.join("git")).unwrap(), bin_b);
+        assert_eq!(std::fs::read_link(bin_dir.join("ember-gh")).unwrap(), bin_a);
+        assert_eq!(
+            std::fs::read_link(bin_dir.join("ember-git")).unwrap(),
+            bin_b
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `emberd` — trust broker daemon entry point.
 //!
@@ -16,6 +17,32 @@ use std::process;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
+    // `emberd print-install-manifest [--json]` — emit the authoritative macOS
+    // install set for the build/install lanes to consume. Handled before any
+    // logging/config setup so it works from a freshly-built binary in `target/`
+    // before an install exists. Currently only `--json` is supported.
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("print-install-manifest") => {
+            print!(
+                "{}",
+                ember_daemon::install_manifest::macos_install_set_json()
+            );
+            println!();
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        Some("se-probe") => {
+            process::exit(ember_daemon::se_probe::run());
+        }
+        #[cfg(not(target_os = "macos"))]
+        Some("se-probe") => {
+            eprintln!("se-probe is macOS-only (requires Secure Enclave)");
+            process::exit(1);
+        }
+        _ => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -24,7 +51,9 @@ fn main() {
         .json()
         .init();
 
-    // implementation-note-123: resolve a real on-disk config.
+    ember_daemon::infra::process_hardening::harden_process();
+
+    // implementation-note-122: resolve a real on-disk config.
     // EMBER_CONFIG env override → `~/.ember/config.toml` → loud-fail. No silent
     // `DaemonConfig::default()` fallback — that path was the May-12 25-hour
     // leaked-daemon root cause (silent inheritance of user-home socket binding
@@ -58,7 +87,7 @@ fn main() {
         process::exit(1);
     }
 
-    // emberd_sandbox_startup_probe (implementation-note-124).
+    // emberd_sandbox_startup_probe (implementation-note-123).
     // Verify the daemon is actually sandboxed before accepting connections.
     // WARN-by-default; EMBER_REQUIRE_SANDBOX=1 turns this into a refuse-to-start.
     if let Err(e) = ember_daemon::infra::runtime::check_sandbox_at_startup() {

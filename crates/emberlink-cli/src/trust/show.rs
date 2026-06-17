@@ -7,18 +7,18 @@
 //!
 //! Anchor: `trust_show_landed`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal as _, Write};
 use std::path::Path;
 
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// Decoded body of the `trust.show` RPC response. Fields mirror the
 /// daemon's `handle_trust_show` output. `posture` is the same
 /// `dev`/`prod` derivation that `trust.list` surfaces alongside the
 /// roots; including it here lets `show` render a self-contained block
 /// without a second RPC call.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustRootShowResponse {
     pub fingerprint_hex: String,
     /// `"release"` or `"operator"` (lowercase). Stable wire form.
@@ -44,6 +44,52 @@ pub enum TrustShowError {
     Io(String),
 }
 
+#[derive(Clone, Copy)]
+struct TrustShowTheme {
+    color: bool,
+}
+
+impl TrustShowTheme {
+    fn current() -> Self {
+        Self {
+            color: std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn title(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m{text}\x1b[0m")
+    }
+
+    fn heading(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m\x1b[38;2;217;106;29m{text}\x1b[0m")
+    }
+
+    fn label(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m{text}\x1b[0m")
+    }
+
+    fn badge(self, text: &str) -> String {
+        let code = match text.trim().to_ascii_lowercase().as_str() {
+            "prod" | "release" | "operator" => Some("\x1b[32m"),
+            "dev" => Some("\x1b[33m"),
+            _ => None,
+        };
+        match (self.color, code) {
+            (true, Some(code)) => format!("\x1b[1m{code}{text}\x1b[0m"),
+            _ => self.label(text),
+        }
+    }
+}
+
 /// Call `trust.show` against the daemon socket and parse the response.
 pub fn fetch_trust_show(
     socket_path: &Path,
@@ -63,19 +109,43 @@ pub fn parse_trust_show_response(body: &Value) -> Result<TrustRootShowResponse, 
 /// `key: value` listing that complements the tabular `trust list`
 /// output. Mirrors `ember_daemon::trust::introspect::render_trust_show_human`.
 pub fn render_human(resp: &TrustRootShowResponse) -> String {
+    let theme = TrustShowTheme::current();
     format!(
-        "Trust root:\n  Fingerprint: {fp}\n  Source:      {src}\n  Posture:     {posture}\n",
-        fp = resp.fingerprint_hex,
-        src = resp.source,
-        posture = resp.posture,
+        "{}\nDrill-down view for one active trust anchor.\n\n{}\n  {}: {}\n  {}: {}\n  {}: {}\n\n{}\n  {}\n    Return to the active trust-root set\n  {}\n    Verify a signed witness against this trust posture",
+        theme.title("Trust root"),
+        theme.heading("Current"),
+        theme.label("Fingerprint"),
+        resp.fingerprint_hex,
+        theme.label("Source"),
+        theme.badge(&resp.source),
+        theme.label("Posture"),
+        theme.badge(&resp.posture),
+        theme.heading("Next"),
+        theme.label("ember trust list"),
+        theme.label("ember receipt verify <id>"),
     )
 }
 
+/// Render the typed daemon response as stable machine-readable JSON.
+pub fn render_json(resp: &TrustRootShowResponse) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(resp)
+}
+
 /// Entry point for the `ember trust show <root-id>` subcommand.
-pub fn run(socket_path: &Path, root_id: &str) -> i32 {
+pub fn run(socket_path: &Path, root_id: &str, json_output: bool) -> i32 {
     match fetch_trust_show(socket_path, root_id) {
         Ok(resp) => {
-            print!("{}", render_human(&resp));
+            if json_output {
+                match render_json(&resp) {
+                    Ok(body) => println!("{body}"),
+                    Err(err) => {
+                        eprintln!("ember trust show: encode JSON output: {err}");
+                        return 2;
+                    }
+                }
+            } else {
+                println!("{}", render_human(&resp));
+            }
             0
         }
         Err(TrustShowError::DaemonUnavailable { socket, source }) => {
@@ -191,12 +261,28 @@ mod tests {
             posture: "prod".to_string(),
         };
         let out = render_human(&resp);
-        assert!(out.contains("Trust root:"));
+        assert!(out.contains("Trust root"));
+        assert!(out.contains("Drill-down view"));
+        assert!(out.contains("Current"));
         assert!(out.contains("Fingerprint:"));
         assert!(out.contains("Source:"));
         assert!(out.contains("Posture:"));
         assert!(out.contains(&"aa".repeat(32)));
         assert!(out.contains("release"));
         assert!(out.contains("prod"));
+        assert!(out.contains("ember trust list"));
+    }
+
+    #[test]
+    fn render_json_preserves_typed_response() {
+        let resp = TrustRootShowResponse {
+            fingerprint_hex: "aa".repeat(32),
+            source: "release".to_string(),
+            posture: "prod".to_string(),
+        };
+        let json: Value = serde_json::from_str(&render_json(&resp).unwrap()).unwrap();
+        assert_eq!(json["fingerprint_hex"], "aa".repeat(32));
+        assert_eq!(json["source"], "release");
+        assert_eq!(json["posture"], "prod");
     }
 }

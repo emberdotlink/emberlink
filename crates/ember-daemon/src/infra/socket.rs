@@ -20,7 +20,7 @@ compile_error!(
 );
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -57,8 +57,25 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// within a few seconds.
 const MIN_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAX_ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(5);
-static FALLBACK_DISPATCH_VAULT: Lazy<crate::infra::vault::Vault> =
-    Lazy::new(|| crate::infra::vault::Vault::new([0u8; 32]));
+
+pub type SharedPolicyEngine = Rc<RefCell<Rc<PolicyEngine>>>;
+
+pub fn new_shared_policy_engine(policy: PolicyEngine) -> SharedPolicyEngine {
+    Rc::new(RefCell::new(Rc::new(policy)))
+}
+
+pub(crate) fn snapshot_policy_engine(policy: &SharedPolicyEngine) -> Rc<PolicyEngine> {
+    let current = policy.borrow();
+    Rc::clone(&*current)
+}
+
+// design D6 — `Vault` is no longer `Sync` (its MEK fields became
+// `RefCell<[u8; 32]>` so `zero_scope` can wipe a scope in place), so the
+// dispatch placeholder can no longer be a process-global `static`. It is
+// only ever passed as the IGNORED `_vault` arg to
+// `dispatch_method_with_context` (which resolves the real live vault from
+// `DaemonStore`'s shared slot via `current_vault`), so it is constructed
+// fresh per dispatch below — a 32-zero-byte placeholder, negligible cost.
 
 /// Compute the next accept-error backoff delay given the previous delay.
 ///
@@ -73,6 +90,83 @@ fn compute_next_accept_delay(current: Duration) -> Duration {
     }
 }
 
+/// design §security-req-4: anti-starvation admission control.
+///
+/// The accept loop dispatches every connection via unbounded
+/// `spawn_local` onto the single-threaded `LocalSet`. A flood of slow
+/// connections from one operator-uid process therefore grows the task
+/// queue without bound and starves `emberd` (policy engine, expiry
+/// scheduler, dashboard) while the process is still "up" — the
+/// revocation-denial primitive the ADR's threat model calls out. The
+/// admission gate bounds (a) total concurrent connections and (b)
+/// concurrent connections per peer uid, so no single uid can saturate
+/// the executor and shut out other clients.
+///
+/// Single-threaded (`LocalSet`) state, so plain `Rc<RefCell<…>>` — no
+/// `Arc`/atomics. A connection holds an [`AdmissionGuard`] for its whole
+/// lifetime; the count decrements on drop (success, error, or panic).
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+const MAX_CONNECTIONS_PER_UID: usize = 32;
+
+#[derive(Default)]
+struct ConnectionAdmission {
+    total: usize,
+    per_uid: HashMap<u32, usize>,
+}
+
+/// Why a connection was refused admission — distinguishes a global flood
+/// (all clients affected) from one uid hogging its slice (only that uid
+/// affected), so the operator log says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionRejection {
+    GlobalLimit,
+    PerUidLimit,
+}
+
+impl ConnectionAdmission {
+    /// Try to admit one connection from `uid`. Returns a guard that
+    /// releases the slot on drop, or the reason it was refused.
+    fn try_admit(
+        admission: &Rc<RefCell<Self>>,
+        uid: u32,
+    ) -> Result<AdmissionGuard, AdmissionRejection> {
+        let mut a = admission.borrow_mut();
+        if a.total >= MAX_CONCURRENT_CONNECTIONS {
+            return Err(AdmissionRejection::GlobalLimit);
+        }
+        let uid_count = a.per_uid.get(&uid).copied().unwrap_or(0);
+        if uid_count >= MAX_CONNECTIONS_PER_UID {
+            return Err(AdmissionRejection::PerUidLimit);
+        }
+        a.total += 1;
+        a.per_uid.insert(uid, uid_count + 1);
+        Ok(AdmissionGuard {
+            admission: Rc::clone(admission),
+            uid,
+        })
+    }
+}
+
+/// RAII slot release for [`ConnectionAdmission`]. Dropped when the
+/// per-connection task ends, freeing the global + per-uid slot.
+struct AdmissionGuard {
+    admission: Rc<RefCell<ConnectionAdmission>>,
+    uid: u32,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut a = self.admission.borrow_mut();
+        a.total = a.total.saturating_sub(1);
+        if let Some(count) = a.per_uid.get_mut(&self.uid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                a.per_uid.remove(&self.uid);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SocketError {
     #[error("I/O error: {0}")]
@@ -81,14 +175,14 @@ pub enum SocketError {
     Bind(std::io::Error),
     #[error("socket path already bound")]
     AlreadyBound,
-    /// implementation-note-154 (CRIT-C): an inode already exists at the
+    /// implementation-note-235 (CRIT-C): an inode already exists at the
     /// per-agent socket path. Returned when the O_EXCL precondition under
     /// the parent-dir `flock()` fails, including the symlink-swap attack
     /// where a privileged container process pre-creates a symlink at the
     /// predictable path before emberd's permission check.
     #[error("per-agent socket path already exists: {0}")]
     AlreadyExists(PathBuf),
-    /// implementation-note-154: the UUID was previously tombstoned and
+    /// implementation-note-235: the UUID was previously tombstoned and
     /// is permanently retired. Tombstoning prevents agent-id recycling so
     /// a freshly-spawned agent cannot inherit a previous agent's grants
     /// or audit trail by replaying its UUID.
@@ -186,23 +280,47 @@ struct Notification<'a> {
 pub struct ErrorPayload {
     pub code: i32,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+impl ErrorPayload {
+    pub fn new(code: i32, message: String) -> Self {
+        let data = retry_after_ms_from_pool_exhausted_message(code, &message)
+            .map(|retry_after_ms| serde_json::json!({ "retry_after_ms": retry_after_ms }));
+        Self {
+            code,
+            message,
+            data,
+        }
+    }
+}
+
+fn retry_after_ms_from_pool_exhausted_message(code: i32, message: &str) -> Option<u64> {
+    if code != -32020 {
+        return None;
+    }
+    message
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("retry_after_ms="))
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 pub struct SocketListener {
     path: PathBuf,
     shutdown: watch::Receiver<bool>,
     store: Rc<crate::infra::store::DaemonStore>,
-    policy: Rc<PolicyEngine>,
+    policy: SharedPolicyEngine,
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     sessions_dir: Option<PathBuf>,
-    /// implementation-note-266: bound LLM proxy
+    /// implementation-note-229: bound LLM proxy
     /// URL populated after the proxy listener binds in runtime.rs, then
     /// plumbed into every connection's RequestContext via handle_connection.
     llm_proxy_url: Option<String>,
-    /// implementation-note-266: bound git proxy URL.
+    /// implementation-note-229: bound git proxy URL.
     git_proxy_url: Option<String>,
-    /// implementation-note-268 — integration
+    /// implementation-note-231 — integration
     /// tests in sibling crates (`emberlink-cli/tests/*.rs`) link against
     /// `ember-daemon` as cfg(not(test)), so the `cfg(test)` synthesis on
     /// `RequestContext::socket` does not fire. When this flag is set,
@@ -215,6 +333,10 @@ pub struct SocketListener {
     /// previously referenced it.
     /// Production callers never set this — the daemon binary leaves it false.
     test_mode_synthetic_presence_token: bool,
+    /// design §security-req-4: anti-starvation admission control. Bounds
+    /// total + per-uid concurrent connections so a flood from one
+    /// operator-uid process cannot starve the single-threaded `LocalSet`.
+    admission: Rc<RefCell<ConnectionAdmission>>,
 }
 
 impl SocketListener {
@@ -222,7 +344,7 @@ impl SocketListener {
         path: PathBuf,
         shutdown: watch::Receiver<bool>,
         store: Rc<crate::infra::store::DaemonStore>,
-        policy: Rc<PolicyEngine>,
+        policy: SharedPolicyEngine,
         rate_limiter: Rc<RefCell<RateLimiter>>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -237,6 +359,7 @@ impl SocketListener {
             llm_proxy_url: None,
             git_proxy_url: None,
             test_mode_synthetic_presence_token: false,
+            admission: Rc::new(RefCell::new(ConnectionAdmission::default())),
         }
     }
 
@@ -245,7 +368,7 @@ impl SocketListener {
     /// `RequestContext::socket_for_test` (mints a synthetic presence_token
     /// bound to the peer-cred uid) instead of `RequestContext::socket` (no
     /// presence_token under cfg(not(test))). Production code MUST NOT call
-    /// this — see the field docstring. implementation-note-347-
+    /// this — see the field docstring. implementation-note-311-
     /// PRE-EXISTING-FAILURES.
     pub fn with_test_mode_synthetic_presence_token(mut self, enabled: bool) -> Self {
         self.test_mode_synthetic_presence_token = enabled;
@@ -362,6 +485,33 @@ impl SocketListener {
                             }
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             info!("client connected");
+                            // design §security-req-4: admission gate. Refuse
+                            // (drop) the connection rather than queueing it
+                            // onto the single-threaded LocalSet once the
+                            // global or per-uid concurrency cap is hit — that
+                            // queue growth is exactly the starvation primitive.
+                            // The guard rides into the per-connection task and
+                            // releases the slot when the connection ends.
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            let admission_guard = match ConnectionAdmission::try_admit(
+                                &self.admission,
+                                peer_creds.uid,
+                            ) {
+                                Ok(guard) => guard,
+                                Err(reason) => {
+                                    warn!(
+                                        peer_uid = peer_creds.uid,
+                                        reason = ?reason,
+                                        max_total = MAX_CONCURRENT_CONNECTIONS,
+                                        max_per_uid = MAX_CONNECTIONS_PER_UID,
+                                        "connection admission limit reached, dropping connection"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                            let admission_guard: () = ();
                             let store = Rc::clone(&self.store);
                             let policy = Rc::clone(&self.policy);
                             let rate_limiter = Rc::clone(&self.rate_limiter);
@@ -399,20 +549,27 @@ impl SocketListener {
                             let peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal> = None;
                             let test_mode_synthetic_presence_token =
                                 self.test_mode_synthetic_presence_token;
-                            tokio::task::spawn_local(handle_connection(
-                                stream,
-                                store,
-                                policy,
-                                rate_limiter,
-                                events_tx,
-                                events_rx,
-                                peer_for_task,
-                                sessions_dir,
-                                llm_proxy_url,
-                                git_proxy_url,
-                                peer_cred_principal,
-                                test_mode_synthetic_presence_token,
-                            ));
+                            tokio::task::spawn_local(async move {
+                                // Hold the admission slot for the whole
+                                // connection; released on drop (success,
+                                // error, or panic) when this task ends.
+                                let _admission_guard = admission_guard;
+                                handle_connection(
+                                    stream,
+                                    store,
+                                    policy,
+                                    rate_limiter,
+                                    events_tx,
+                                    events_rx,
+                                    peer_for_task,
+                                    sessions_dir,
+                                    llm_proxy_url,
+                                    git_proxy_url,
+                                    peer_cred_principal,
+                                    test_mode_synthetic_presence_token,
+                                )
+                                .await
+                            });
                         }
                         Err(e) => {
                             // development milestone: exponential backoff. Without this
@@ -624,7 +781,7 @@ pub fn ensure_socket_perms(_path: &Path) -> Result<(), SocketError> {
 /// responsibility. `verify_peer_uid` is the existing wrapper that
 /// re-applies the strict uid-match on top of this function.
 ///
-/// implementation-note-348: Phase A design destination.
+/// implementation-note-312: Phase A design destination.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn read_peer_creds(stream: &UnixStream) -> Option<PeerCreds> {
     match stream.peer_cred() {
@@ -657,6 +814,13 @@ fn take_presence_token(
     }
 }
 
+// design priv-sep — `take_mtls_principal` (which extracted a wire-claimed
+// `_mtls_principal` JSON field on the shared UDS lane) is DELETED. That field
+// was the same-uid forgery hole: any UDS client could assert an arbitrary
+// persona/container by injecting it. The cert-derived principal now reaches the
+// daemon only inside `DispatchSource::Bridge`, stamped out-of-band by the
+// `ember-rpc` sibling over the dedicated rpc-forward UDS (SLICE 2).
+
 /// Verify that the peer of `stream` is running as the daemon's own euid.
 ///
 /// On Linux this uses `SO_PEERCRED`; on macOS tokio's `peer_cred()`
@@ -677,8 +841,15 @@ fn take_presence_token(
 /// the peer uid, the expected uid, and (when available) the peer pid.
 ///
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+// The happy-path caller `test_verify_peer_uid_accepts_self_connection` lives
+// in `crates/ember-daemon/tests/socket_io.rs` (T2 integration test) per
+// implementation-note-313 — that test exercises the same
+// kernel-attested uid invariant via `read_peer_creds`. This wrapper is kept
+// in-tree as the structural pairing for `verify_peer_uid_with` below; the
+// seam-based negative-path tests in this file still call `verify_peer_uid_with`.
+#[allow(dead_code)]
 fn verify_peer_uid(stream: &UnixStream) -> Option<PeerIdentity> {
-    // bridge_widening_removed (implementation-note-349):
+    // bridge_widening_removed (implementation-note-314):
     // design bridge widening removed; per-method authority gate from
     // Phase D (WebAuthn presence-token cache) is the replacement.
     verify_peer_uid_with(
@@ -737,7 +908,7 @@ where
 async fn handle_connection(
     stream: UnixStream,
     store: Rc<crate::infra::store::DaemonStore>,
-    policy: Rc<PolicyEngine>,
+    policy: SharedPolicyEngine,
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     mut events_rx: broadcast::Receiver<GrantEvent>,
@@ -779,6 +950,7 @@ async fn handle_connection(
                         error: Some(ErrorPayload {
                             code: -32600,
                             message: "Message too large".to_string(),
+                            data: None,
                         }),
                     };
                     if let Err(e) = write_response(&mut write_half, &resp).await {
@@ -797,6 +969,7 @@ async fn handle_connection(
                             error: Some(ErrorPayload {
                                 code: -32700,
                                 message: "Parse error".to_string(),
+                                data: None,
                             }),
                         };
                         if let Err(e) = write_response(&mut write_half, &resp).await {
@@ -813,6 +986,12 @@ async fn handle_connection(
                     mut params,
                 } = req;
                 let presence_token = take_presence_token(&mut params);
+                // design priv-sep — the wire-forgeable `_mtls_principal` JSON
+                // injection is gone. The UDS (`Socket`) lane never carries an
+                // mTLS principal; the cert-derived principal reaches the daemon
+                // only inside `DispatchSource::Bridge`, stamped by the
+                // `ember-rpc` sibling out-of-band (SLICE 2). Any `_mtls_principal`
+                // left in `params` by a UDS caller is inert — nothing reads it.
 
                 debug!(id = %id, method = %method, "dispatching request");
 
@@ -822,7 +1001,7 @@ async fn handle_connection(
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 let peer_for_ctx: Option<crate::infra::handler::PeerCred> = None;
 
-                // implementation-note-268: when
+                // implementation-note-231: when
                 // the listener was constructed with
                 // `with_test_mode_synthetic_presence_token(true)`, build via
                 // `socket_for_test` so external integration tests
@@ -843,7 +1022,7 @@ async fn handle_connection(
                 // (uid, pid, socket_path) triple.
                 ctx.peer_cred_principal = peer_cred_principal.clone();
 
-                // implementation-note-114 — dispatch_method_panic_recovered.
+                // implementation-note-112 — dispatch_method_panic_recovered.
                 //
                 // prior change shipped `recover_rpc_panic` as a sync
                 // `std::panic::catch_unwind` wrapper, but `catch_unwind` doesn't
@@ -861,17 +1040,54 @@ async fn handle_connection(
                 use std::panic::AssertUnwindSafe;
                 let dispatch_method_str = method.clone();
                 let dispatch_params_owned = params.clone();
+                // design D6 — ignored `_vault` placeholder (see note at the
+                // top of this module); the real live vault is resolved from
+                // the store's shared slot inside the dispatcher.
+                let fallback_dispatch_vault = crate::infra::vault::Vault::new([0u8; 32]);
+                let policy_snapshot = snapshot_policy_engine(&policy);
+                // design slice 4 wiring move-of-`ctx` predates the
+                // post-dispatch register_session finalize that still
+                // needs `ctx.sessions_dir`. Capture the PathBuf out
+                // before the dispatch consumes `ctx` so the finalize
+                // call below can reach it.
+                let post_dispatch_sessions_dir = ctx.sessions_dir.clone();
                 let dispatch_future = crate::infra::handler::dispatch_method_with_context(
                     &store,
-                    &FALLBACK_DISPATCH_VAULT,
-                    &policy,
+                    &fallback_dispatch_vault,
+                    policy_snapshot.as_ref(),
                     &rate_limiter,
                     Some(&events_tx),
                     ctx,
                     &method,
                     &params,
                 );
-                let dispatch_outcome = AssertUnwindSafe(dispatch_future).catch_unwind().await;
+                let mut dispatch_outcome = AssertUnwindSafe(dispatch_future).catch_unwind().await;
+                // design slice 4 — finalize the per-session endpoint group
+                // before the register response is sent. This strips private
+                // rollback metadata for every register_session and, when
+                // ssh_agent was requested, binds the async SSH bridge endpoint
+                // on the LocalSet that owns the main Rc<DaemonStore>. Any
+                // endpoint bind failure rolls back the whole group and turns
+                // the register_session result into an RPC error.
+                let register_finalize_error = if method == "register_session" {
+                    match &mut dispatch_outcome {
+                        Ok(Ok(result)) => {
+                            crate::infra::handlers::session::finalize_register_session_endpoint_group(
+                                Rc::clone(&store),
+                                post_dispatch_sessions_dir.clone(),
+                                result,
+                            )
+                            .await
+                            .err()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(err) = register_finalize_error {
+                    dispatch_outcome = Ok(Err(err));
+                }
                 let response = match dispatch_outcome {
                     Ok(Ok(result)) => Response {
                         id,
@@ -881,7 +1097,7 @@ async fn handle_connection(
                     Ok(Err((code, message))) => Response {
                         id,
                         result: None,
-                        error: Some(ErrorPayload { code, message }),
+                        error: Some(ErrorPayload::new(code, message)),
                     },
                     Err(panic_payload) => {
                         let panic_msg = panic_payload
@@ -915,6 +1131,7 @@ async fn handle_connection(
                             error: Some(ErrorPayload {
                                 code: -32603,
                                 message: format!("internal_panic_recovered: {panic_msg}"),
+                                data: None,
                             }),
                         }
                     }
@@ -979,7 +1196,7 @@ async fn write_notification(
     writer.write_all(&bytes).await
 }
 
-// ---- implementation-note-154 ------------------------------------------
+// ---- implementation-note-235 ------------------------------------------
 //
 // CRIT-1: a single shared daemon socket cannot distinguish two agents living
 // in different pid namespaces — `SO_PEERCRED.pid` is pid-namespace-relative,
@@ -1240,77 +1457,89 @@ pub fn tombstone_socket(uuid: Uuid) -> Result<(), SocketError> {
 
 #[cfg(test)]
 mod tests {
+    // T1 unit tests for `infra/socket.rs`. T2 integration tests that need a
+    // real Unix-socket listener / per-agent socket factory I/O were refiled
+    // to `crates/ember-daemon/tests/socket_io.rs` per
+    // `implementation-note-313`. The five families that stay
+    // in-tree are no-I/O: admission counters, `take_presence_token` parser,
+    // `verify_peer_uid_with` seam-based negative paths, `daemon_euid` sanity,
+    // `compute_next_accept_delay` sequence, `annotate_bind_error` branches,
+    // and `catch_unwind` panic-conversion. Anchor:
+    // `t1_tier_baseline_drained_part2`.
     use super::*;
     use std::time::Duration;
-    use tempfile::TempDir;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
-    fn make_store() -> Rc<crate::infra::store::DaemonStore> {
-        let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
-        Rc::new(store)
+    // design §security-req-4: the admission gate must (a) bound a single
+    // uid to MAX_CONNECTIONS_PER_UID, (b) bound the global total, (c)
+    // release slots when guards drop, and (d) report which limit tripped.
+    #[test]
+    fn admission_caps_per_uid_and_releases_on_drop() {
+        let admission = Rc::new(RefCell::new(ConnectionAdmission::default()));
+
+        // Fill uid 1000 to its per-uid cap.
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_UID {
+            guards.push(
+                ConnectionAdmission::try_admit(&admission, 1000).expect("under per-uid cap admits"),
+            );
+        }
+        // The next connection from the same uid is refused with PerUidLimit.
+        assert!(matches!(
+            ConnectionAdmission::try_admit(&admission, 1000),
+            Err(AdmissionRejection::PerUidLimit)
+        ));
+        // A different uid is still admitted (per-uid cap is per-uid).
+        let other = ConnectionAdmission::try_admit(&admission, 2000).expect("other uid admits");
+
+        // Dropping one of uid 1000's guards frees exactly one slot for it.
+        guards.pop();
+        let reentry = ConnectionAdmission::try_admit(&admission, 1000)
+            .expect("freed slot re-admits same uid");
+
+        drop(reentry);
+        drop(other);
+        drop(guards);
+        // All slots released → counters empty.
+        let a = admission.borrow();
+        assert_eq!(a.total, 0);
+        assert!(a.per_uid.is_empty());
     }
 
-    async fn start_listener(tmp: &TempDir) -> (PathBuf, watch::Sender<bool>) {
-        let path = tmp.path().join("ember.sock");
-        let (tx, rx) = watch::channel(false);
-        let store = make_store();
-        let policy = Rc::new(PolicyEngine::default());
-        let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-
-        // Three invariants the listener needs for OperatorPresence-class
-        // socket tests (create_persona, etc.) to pass the dispatch-time
-        // authority gates (prior change / #3822 / #3828). Methods that aren't
-        // OperatorPresence-classified (e.g. ping) are unaffected by either
-        // helper, so existing non-OP tests on the same `start_listener`
-        // still pass.
-        //
-        //   1. Daemon identity for mint_operator_presence_token
-        //      (idempotent; tempdir leaked since the singleton outlives
-        //      any one test).
-        //   2. presence::mark_unlocked so the unlocked-session gate
-        //      doesn't refuse with -32030.
-        //   3. with_test_mode_synthetic_presence_token(true) so every
-        //      accepted connection's RequestContext carries a synthetic
-        //      presence token (socket.rs:247).
-        let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
-        let _ = crate::infra::receipt::init_identity(id_dir.path());
-        std::mem::forget(id_dir);
-        crate::trust::presence::mark_unlocked();
-
-        let listener = SocketListener::new(path.clone(), rx, store, policy, rate_limiter)
-            .with_test_mode_synthetic_presence_token(true);
-        tokio::task::spawn_local(async move {
-            listener.run().await.unwrap();
-        });
-        // Give listener a moment to bind.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        (path, tx)
+    #[test]
+    fn admission_caps_global_total() {
+        let admission = Rc::new(RefCell::new(ConnectionAdmission::default()));
+        // Spread across many uids so the per-uid cap never trips first;
+        // ceil(MAX_CONCURRENT_CONNECTIONS / MAX_CONNECTIONS_PER_UID) uids
+        // are enough to reach the global cap.
+        let mut guards = Vec::new();
+        let mut uid = 0u32;
+        while guards.len() < MAX_CONCURRENT_CONNECTIONS {
+            for _ in 0..MAX_CONNECTIONS_PER_UID {
+                if guards.len() == MAX_CONCURRENT_CONNECTIONS {
+                    break;
+                }
+                guards.push(ConnectionAdmission::try_admit(&admission, uid).expect("admits"));
+            }
+            uid += 1;
+        }
+        // At the global cap, a fresh uid is refused with GlobalLimit.
+        assert!(matches!(
+            ConnectionAdmission::try_admit(&admission, 99999),
+            Err(AdmissionRejection::GlobalLimit)
+        ));
     }
 
-    async fn connect(
-        path: &PathBuf,
-    ) -> (
-        tokio::net::unix::OwnedWriteHalf,
-        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
-    ) {
-        let stream = UnixStream::connect(path).await.unwrap();
-        let (r, w) = stream.into_split();
-        (w, BufReader::new(r))
-    }
+    #[test]
+    fn pool_exhausted_error_payload_carries_retry_after_data() {
+        let payload = ErrorPayload::new(-32020, "pool_exhausted retry_after_ms=1500".to_string());
 
-    async fn send_recv(
-        w: &mut tokio::net::unix::OwnedWriteHalf,
-        r: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
-        msg: &str,
-    ) -> Response {
-        let mut line = msg.to_string();
-        line.push('\n');
-        w.write_all(line.as_bytes()).await.unwrap();
+        assert_eq!(
+            payload.data,
+            Some(serde_json::json!({ "retry_after_ms": 1500 }))
+        );
 
-        let mut resp_line = String::new();
-        r.read_line(&mut resp_line).await.unwrap();
-        serde_json::from_str(&resp_line).unwrap()
+        let other = ErrorPayload::new(-32003, "policy denied retry_after_ms=1500".to_string());
+        assert!(other.data.is_none());
     }
 
     fn test_presence_token(uid: u32) -> crate::auth::presence_token::PresenceToken {
@@ -1368,158 +1597,22 @@ mod tests {
         assert_eq!(params, serde_json::json!({"name": "socket-token-test"}));
     }
 
-    #[tokio::test]
-    async fn test_ping() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-                let (mut w, mut r) = connect(&path).await;
-
-                let req = r#"{"id":"1","method":"ping","params":null}"#;
-                let resp = send_recv(&mut w, &mut r, req).await;
-
-                assert_eq!(resp.id, "1");
-                assert!(resp.error.is_none());
-                let result = resp.result.unwrap();
-                assert_eq!(result["pong"], serde_json::json!(true));
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_unknown_method() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-                let (mut w, mut r) = connect(&path).await;
-
-                let req = r#"{"id":"2","method":"no_such_method"}"#;
-                let resp = send_recv(&mut w, &mut r, req).await;
-
-                assert_eq!(resp.id, "2");
-                assert!(resp.result.is_none());
-                let err = resp.error.unwrap();
-                assert_eq!(err.code, -32601);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_malformed_json() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-                let (mut w, mut r) = connect(&path).await;
-
-                let req = "not json at all\n";
-                w.write_all(req.as_bytes()).await.unwrap();
-
-                let mut resp_line = String::new();
-                r.read_line(&mut resp_line).await.unwrap();
-                let resp: Response = serde_json::from_str(&resp_line).unwrap();
-
-                assert!(resp.result.is_none());
-                let err = resp.error.unwrap();
-                assert_eq!(err.code, -32700);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_shutdown() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, tx) = start_listener(&tmp).await;
-
-                // Signal shutdown.
-                tx.send(true).unwrap();
-
-                // After shutdown the listener should stop accepting.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                let result = UnixStream::connect(&path).await;
-                assert!(
-                    result.is_err(),
-                    "expected connection refused after shutdown"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_connections() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-
-                let mut handles = vec![];
-                for i in 0..5u32 {
-                    let p = path.clone();
-                    handles.push(tokio::task::spawn_local(async move {
-                        let (mut w, mut r) = connect(&p).await;
-                        let req = format!(r#"{{"id":"{i}","method":"ping"}}"#);
-                        let resp = send_recv(&mut w, &mut r, &req).await;
-                        assert_eq!(resp.id, i.to_string());
-                        assert!(resp.error.is_none());
-                    }));
-                }
-                for h in handles {
-                    h.await.unwrap();
-                }
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_create_persona_returns_id() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-                let (mut w, mut r) = connect(&path).await;
-
-                let req = r#"{"id":"10","method":"create_persona","params":{"name":"test-agent"}}"#;
-                let resp = send_recv(&mut w, &mut r, req).await;
-
-                assert_eq!(resp.id, "10");
-                assert!(resp.error.is_none());
-                let result = resp.result.unwrap();
-                assert!(result["id"].as_str().unwrap().starts_with("persona-"));
-                assert_eq!(result["name"], serde_json::json!("test-agent"));
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_peer_uid_gate_accepts_same_uid() {
-        // development milestone: a client running as the daemon's own uid (the
-        // common case, and the only case CI can exercise) must be able to
-        // connect and complete a ping round-trip. This exercises the
-        // `verify_peer_uid` branch that returns `true`.
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-                let (mut w, mut r) = connect(&path).await;
-
-                let req = r#"{"id":"peer-uid","method":"ping"}"#;
-                let resp = send_recv(&mut w, &mut r, req).await;
-
-                assert_eq!(resp.id, "peer-uid");
-                assert!(resp.error.is_none());
-            })
-            .await;
+    #[test]
+    fn socket_lane_never_carries_an_mtls_principal() {
+        // design priv-sep (SLICE 1) — `take_mtls_principal` (which extracted a
+        // wire-claimed `_mtls_principal` JSON field on the shared UDS lane) is
+        // deleted. A `Socket`-sourced context has no field to hold a principal,
+        // so a cert-derived identity can ONLY arrive via
+        // `DispatchSource::Bridge`. Even if a UDS caller still puts an
+        // `_mtls_principal` object in `params`, it is inert and the dispatched
+        // context's `mtls_principal()` reads `None`. This is the type-level
+        // proof that the same-uid forgery is closed.
+        use crate::infra::handler::{PeerCred, RequestContext};
+        let ctx = RequestContext::socket(Some(PeerCred {
+            uid: 501,
+            pid: Some(1234),
+        }));
+        assert!(ctx.mtls_principal().is_none());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1535,127 +1628,15 @@ mod tests {
         assert_eq!(uid, expected);
     }
 
-    // ── read_peer_creds tests (implementation-note-348) ──────
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn read_peer_creds_returns_pid_uid_gid() {
-        // read_peer_creds must return the current process's own uid/gid/pid
-        // when called on a connected UnixStream pair from the same process.
-        // Uses a real socket pair — no injection needed because both ends
-        // are this process.
-        use tempfile::TempDir;
-        use tokio::net::UnixListener;
-        use tokio::task::LocalSet;
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let path = tmp.path().join("read_peer_creds_test.sock");
-                let listener = UnixListener::bind(&path).unwrap();
-
-                let connect_task = tokio::task::spawn_local({
-                    let path = path.clone();
-                    async move { tokio::net::UnixStream::connect(&path).await.unwrap() }
-                });
-
-                let (server_side, _) = listener.accept().await.unwrap();
-                let _client_side = connect_task.await.unwrap();
-
-                let expected_uid = unsafe { libc::geteuid() };
-                let expected_gid = unsafe { libc::getegid() };
-                let expected_pid = std::process::id() as i32;
-
-                let creds = read_peer_creds(&server_side)
-                    .expect("read_peer_creds must succeed on a same-process socket pair");
-
-                assert_eq!(
-                    creds.uid, expected_uid,
-                    "uid must match current process euid"
-                );
-                assert_eq!(
-                    creds.gid, expected_gid,
-                    "gid must match current process egid"
-                );
-                // pid may be None on BSD platforms that don't surface it in LOCAL_PEERCRED;
-                // when present it must match the current process.
-                if let Some(pid) = creds.pid {
-                    assert_eq!(
-                        pid, expected_pid,
-                        "pid must match current process id when present"
-                    );
-                }
-            })
-            .await;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn read_peer_creds_returns_some_on_valid_pair() {
-        // Contract test: read_peer_creds must return Some(_) for a connected
-        // socket pair. The kernel-anomaly (None) path cannot be exercised
-        // in normal unit tests without a mock socket, so this test asserts
-        // the happy-path type contract: Some is returned and all three fields
-        // are present at the struct level.
-        use tempfile::TempDir;
-        use tokio::net::UnixListener;
-        use tokio::task::LocalSet;
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let path = tmp.path().join("read_peer_creds_contract.sock");
-                let listener = UnixListener::bind(&path).unwrap();
-
-                let connect_task = tokio::task::spawn_local({
-                    let path = path.clone();
-                    async move { tokio::net::UnixStream::connect(&path).await.unwrap() }
-                });
-
-                let (server_side, _) = listener.accept().await.unwrap();
-                let _client_side = connect_task.await.unwrap();
-
-                let result = read_peer_creds(&server_side);
-                assert!(
-                    result.is_some(),
-                    "read_peer_creds must return Some for a real connected socket"
-                );
-                let creds = result.unwrap();
-                // Verify the struct carries all three fields at the type level.
-                let _: u32 = creds.uid;
-                let _: u32 = creds.gid;
-                let _: Option<i32> = creds.pid;
-            })
-            .await;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn test_verify_peer_uid_accepts_self_connection() {
-        // Direct unit test of `verify_peer_uid` using a real connected
-        // socket pair from the same process. Both ends are this process,
-        // so the peer uid must match the daemon euid.
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let path = tmp.path().join("peer_cred.sock");
-                let listener = UnixListener::bind(&path).unwrap();
-
-                let connect_task = tokio::task::spawn_local({
-                    let path = path.clone();
-                    async move { UnixStream::connect(&path).await.unwrap() }
-                });
-
-                let (server_side, _) = listener.accept().await.unwrap();
-                let _client_side = connect_task.await.unwrap();
-
-                let peer = verify_peer_uid(&server_side)
-                    .expect("self-connection must pass the same-uid gate");
-                assert_eq!(peer.uid, daemon_euid());
-            })
-            .await;
-    }
+    // ── read_peer_creds tests (implementation-note-312) ──────
+    //
+    // The two `read_peer_creds_*` integration tests and the
+    // `test_verify_peer_uid_accepts_self_connection` happy-path test were
+    // refiled to `crates/ember-daemon/tests/socket_io.rs` per
+    // `implementation-note-313` — they need a real
+    // `UnixListener` / `UnixStream` pair to exercise the kernel
+    // `SO_PEERCRED` / `LOCAL_PEERCRED` path. The seam-based negative
+    // tests below stay in-tree (no I/O).
 
     // ---- development milestone ----------------------------
     //
@@ -1809,27 +1790,6 @@ mod tests {
         assert_eq!(d_reset, MIN_ACCEPT_RETRY_DELAY);
     }
 
-    #[tokio::test]
-    async fn test_list_personas_empty() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let tmp = TempDir::new().unwrap();
-                let (path, _tx) = start_listener(&tmp).await;
-                let (mut w, mut r) = connect(&path).await;
-
-                let req = r#"{"id":"11","method":"list_personas","params":null}"#;
-                let resp = send_recv(&mut w, &mut r, req).await;
-
-                assert_eq!(resp.id, "11");
-                assert!(resp.error.is_none());
-                let result = resp.result.unwrap();
-                let arr = result.as_array().unwrap();
-                assert!(arr.is_empty());
-            })
-            .await;
-    }
-
     // ---- P69E.8b: annotate_bind_error -------------------------------
     //
     // Three branches: (1) AddrInUse on a TCP `host:port` shape gets the
@@ -1897,143 +1857,16 @@ mod tests {
         );
     }
 
-    // ---- implementation-note-154 ------------------------------------
+    // ---- implementation-note-235 ------------------------------------
     //
-    // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection.
-    // Both tests use the `_with` seam so we can drive the would-be-path
-    // deterministically: the production entry point generates a fresh
-    // UUIDv4, but a test cannot pre-create a symlink at an unknown path.
+    // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection
+    // tests and the per-agent socket happy-path test were refiled to
+    // `crates/ember-daemon/tests/socket_io.rs` per
+    // `implementation-note-313` — they need a real on-disk
+    // tempdir + a real `UnixListener::bind` to exercise the
+    // `create_per_agent_socket_with` O_EXCL + flock contract.
 
-    #[test]
-    fn create_per_agent_socket_refuses_symlink_swap() {
-        // CRIT-C: a privileged-enough container process may pre-create a
-        // symlink at the predictable per-agent socket path before emberd
-        // gets a chance to bind. The O_EXCL + flock contract must reject
-        // any pre-existing inode at the path — including symlinks —
-        // rather than overwrite or follow it.
-        let tmp = TempDir::new().unwrap();
-        let parent = tmp.path();
-        let uuid = Uuid::new_v4();
-        let socket_path = parent.join(format!("agent-{}.sock", uuid));
-
-        // Plant a symlink at the would-be path pointing at /tmp (a real
-        // path that exists). If the implementation followed the symlink
-        // it would either fail with a confusing EEXIST-on-target or, in
-        // a worst-case TOCTOU window, end up binding the socket at the
-        // wrong location entirely.
-        std::os::unix::fs::symlink("/tmp", &socket_path).unwrap();
-
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        let err = create_per_agent_socket_with(parent, uuid, uid, gid)
-            .expect_err("symlink at would-be path must reject");
-
-        match err {
-            SocketError::AlreadyExists(p) => {
-                assert_eq!(
-                    p, socket_path,
-                    "AlreadyExists must surface the colliding path"
-                );
-            }
-            other => panic!("expected SocketError::AlreadyExists on symlink-swap, got: {other:?}"),
-        }
-
-        // Symlink must still be present — we refused to touch it.
-        let meta = std::fs::symlink_metadata(&socket_path).unwrap();
-        assert!(
-            meta.file_type().is_symlink(),
-            "symlink must be untouched after refused create",
-        );
-    }
-
-    #[tokio::test]
-    async fn tombstone_prevents_uuid_recycling() {
-        // After tombstoning a UUID, attempts to create another socket
-        // with the same UUID must reject with `TombstonedUuid` so a
-        // recycled agent-id cannot inherit a previous agent's identity.
-        //
-        // tempdir_in("/tmp") matches the canonical SUN_LEN-safe pattern
-        // used elsewhere in the daemon (broker/spawn_helper_client.rs).
-        // macOS $TMPDIR resolves under /var/folders/<long>/T which
-        // overruns sockaddr_un's 104-byte path limit; binding then
-        // fails with `path must be shorter than SUN_LEN`.
-        let tmp = tempfile::Builder::new()
-            .prefix("ember-socket-test-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let parent = tmp.path();
-        let uuid = Uuid::new_v4();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-
-        // First create succeeds: tombstone table is empty for this UUID.
-        let (got_uuid, socket_path, listener) =
-            create_per_agent_socket_with(parent, uuid, uid, gid).expect("fresh UUID must bind");
-        assert_eq!(got_uuid, uuid);
-        assert!(socket_path.exists(), "socket inode must exist after create");
-        drop(listener);
-        // Remove the inode so the second attempt would otherwise succeed
-        // — proving the tombstone (not a stale inode) is doing the work.
-        std::fs::remove_file(&socket_path).unwrap();
-
-        // Tombstone the UUID.
-        tombstone_socket(uuid).expect("tombstone must succeed");
-
-        // Second create with the same UUID must reject with TombstonedUuid
-        // even though the inode is gone.
-        let err = create_per_agent_socket_with(parent, uuid, uid, gid)
-            .expect_err("recycled UUID must reject after tombstone");
-        match err {
-            SocketError::TombstonedUuid(u) => {
-                assert_eq!(u, uuid, "TombstonedUuid must surface the recycled UUID");
-            }
-            other => {
-                panic!("expected SocketError::TombstonedUuid on recycled UUID, got: {other:?}")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn create_per_agent_socket_happy_path_returns_listener() {
-        // Regression guard for the success path: a fresh UUID under a
-        // fresh tempdir binds, the socket exists at the returned path,
-        // and the listener accepts connections.
-        //
-        // tempdir_in("/tmp") — see SUN_LEN note on
-        // tombstone_prevents_uuid_recycling above.
-        let tmp = tempfile::Builder::new()
-            .prefix("ember-socket-test-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let parent = tmp.path();
-        let uuid = Uuid::new_v4();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-
-        let (got_uuid, socket_path, _listener) =
-            create_per_agent_socket_with(parent, uuid, uid, gid).expect("fresh path must bind");
-        assert_eq!(got_uuid, uuid);
-        assert!(
-            socket_path.starts_with(parent),
-            "socket path must live under parent dir",
-        );
-        assert!(
-            socket_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.starts_with("agent-") && s.ends_with(".sock"))
-                .unwrap_or(false),
-            "socket filename must match agent-<uuid>.sock shape",
-        );
-        let meta = std::fs::symlink_metadata(&socket_path).unwrap();
-        use std::os::unix::fs::FileTypeExt;
-        assert!(
-            meta.file_type().is_socket(),
-            "created inode must be a Unix socket",
-        );
-    }
-
-    // ─── implementation-note-114 ────────────────────
+    // ─── implementation-note-112 ────────────────────
     //
     // The dispatch-site wrapper in this file uses
     // `AssertUnwindSafe(future).catch_unwind().await` from

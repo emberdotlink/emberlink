@@ -142,7 +142,7 @@ impl McpServer {
     }
 
     /// Build a server with a pre-constructed daemon transport. Used by the
-    /// in-container mTLS bridge path (implementation-note-536)
+    /// in-container mTLS bridge path (implementation-note-485)
     /// where the transport is an `Mtls` variant rather than a UDS path.
     /// Same observability semantics as [`Self::with_daemon_socket`].
     pub fn with_daemon_transport(runtime: AgentRuntime, transport: DaemonTransport) -> Self {
@@ -269,6 +269,14 @@ impl McpServer {
                     DaemonTransportError::Protocol(s) => (format!("protocol: {s}"), -32002),
                     DaemonTransportError::DaemonError(s) => (format!("daemon: {s}"), -32004),
                     DaemonTransportError::UnknownTool(t) => (format!("unknown tool: {t}"), -32602),
+                    // design §Component 5 "Soft fail-closed at 90% TTL":
+                    // typed refusal surfaced as an MCP isError result so
+                    // the agent can see the cert is failing-to-refresh.
+                    DaemonTransportError::RefreshFailing => (
+                        "bridge cert refresh failing past 90% TTL band; new RPCs refused"
+                            .to_string(),
+                        -32001,
+                    ),
                 };
                 let _ = code;
                 JsonRpcResponse {

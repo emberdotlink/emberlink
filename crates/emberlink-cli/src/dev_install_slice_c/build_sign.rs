@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! design Phase 4 steps 5 + 6: cargo release build + code-sign.
 //!

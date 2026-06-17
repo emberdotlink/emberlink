@@ -8,6 +8,18 @@
 /// Prevents replay of captured requests.
 pub const FETCH_REQUEST_MAX_AGE_SECS: u64 = 300;
 
+fn signing_payload_v2(domain: &str, fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(domain.as_bytes());
+    out.push(b'\n');
+    for field in fields {
+        let len = u64::try_from(field.len()).expect("field length exceeds u64");
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
 /// Request to fetch credential data authorized by a grant.
 /// The requester proves grant ownership by signing a canonical payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,14 +37,20 @@ pub struct CredentialFetchRequest {
 
 impl CredentialFetchRequest {
     /// Canonical signing payload: deterministic byte sequence that the requester
-    /// signs and the relay/issuer verifies. Uses pipe-delimited fields to prevent
-    /// ambiguity from field concatenation.
+    /// signs and the relay/issuer verifies. Version 2 uses length-prefixed
+    /// fields so principal-controlled identifiers cannot shift field boundaries.
     pub fn signing_payload(&self) -> Vec<u8> {
-        format!(
-            "emberlink:credential-fetch:1|{}|{}|{}|{}|{}",
-            self.grant_id, self.credential_id, self.requester_id, self.timestamp, self.nonce,
+        let timestamp = self.timestamp.to_string();
+        signing_payload_v2(
+            "emberlink:credential-fetch:2",
+            &[
+                self.grant_id.as_bytes(),
+                self.credential_id.as_bytes(),
+                self.requester_id.as_bytes(),
+                timestamp.as_bytes(),
+                self.nonce.as_bytes(),
+            ],
         )
-        .into_bytes()
     }
 }
 
@@ -55,15 +73,17 @@ impl CredentialFetchResponse {
     pub fn signing_payload(&self) -> Vec<u8> {
         // Include block count but not block contents (signature covers the envelope,
         // encryption covers the data).
-        format!(
-            "emberlink:credential-response:1|{}|{}|{}|{}|{}",
-            self.grant_id,
-            self.credential_id,
-            self.recipient_id,
-            self.request_nonce,
-            self.encrypted_blocks.len(),
+        let block_count = self.encrypted_blocks.len().to_string();
+        signing_payload_v2(
+            "emberlink:credential-response:2",
+            &[
+                self.grant_id.as_bytes(),
+                self.credential_id.as_bytes(),
+                self.recipient_id.as_bytes(),
+                self.request_nonce.as_bytes(),
+                block_count.as_bytes(),
+            ],
         )
-        .into_bytes()
     }
 }
 
@@ -95,15 +115,18 @@ pub struct CredentialDeposit {
 impl CredentialDeposit {
     /// Canonical signing payload for the issuer.
     pub fn signing_payload(&self) -> Vec<u8> {
-        format!(
-            "emberlink:credential-deposit:1|{}|{}|{}|{}|{}",
-            self.grant_id,
-            self.credential_id,
-            self.issuer_id,
-            self.expires_at,
-            self.encrypted_blocks.len(),
+        let expires_at = self.expires_at.to_string();
+        let block_count = self.encrypted_blocks.len().to_string();
+        signing_payload_v2(
+            "emberlink:credential-deposit:2",
+            &[
+                self.grant_id.as_bytes(),
+                self.credential_id.as_bytes(),
+                self.issuer_id.as_bytes(),
+                expires_at.as_bytes(),
+                block_count.as_bytes(),
+            ],
         )
-        .into_bytes()
     }
 }
 
@@ -120,11 +143,10 @@ pub struct CredentialRevocation {
 impl CredentialRevocation {
     /// Canonical signing payload for the issuer.
     pub fn signing_payload(&self) -> Vec<u8> {
-        format!(
-            "emberlink:credential-revoke:1|{}|{}",
-            self.grant_id, self.issuer_id,
+        signing_payload_v2(
+            "emberlink:credential-revoke:2",
+            &[self.grant_id.as_bytes(), self.issuer_id.as_bytes()],
         )
-        .into_bytes()
     }
 }
 
@@ -149,7 +171,7 @@ mod tests {
         let p1 = deposit.signing_payload();
         let p2 = deposit.signing_payload();
         assert_eq!(p1, p2);
-        assert!(String::from_utf8_lossy(&p1).starts_with("emberlink:credential-deposit:1|"));
+        assert!(String::from_utf8_lossy(&p1).starts_with("emberlink:credential-deposit:2\n"));
     }
 
     #[test]
@@ -165,7 +187,7 @@ mod tests {
         let p1 = req.signing_payload();
         let p2 = req.signing_payload();
         assert_eq!(p1, p2);
-        assert!(String::from_utf8_lossy(&p1).starts_with("emberlink:credential-fetch:1|"));
+        assert!(String::from_utf8_lossy(&p1).starts_with("emberlink:credential-fetch:2\n"));
     }
 
     #[test]
@@ -179,6 +201,86 @@ mod tests {
         let p1 = rev.signing_payload();
         let p2 = rev.signing_payload();
         assert_eq!(p1, p2);
-        assert!(String::from_utf8_lossy(&p1).starts_with("emberlink:credential-revoke:1|"));
+        assert!(String::from_utf8_lossy(&p1).starts_with("emberlink:credential-revoke:2\n"));
+    }
+
+    #[test]
+    fn credential_fetch_request_pipe_fields_do_not_collide() {
+        let a = CredentialFetchRequest {
+            grant_id: "grant|cred".into(),
+            credential_id: "id".into(),
+            requester_id: "requester".into(),
+            requester_signature: "ignored".into(),
+            timestamp: 100,
+            nonce: "nonce".into(),
+        };
+        let b = CredentialFetchRequest {
+            grant_id: "grant".into(),
+            credential_id: "cred|id".into(),
+            requester_id: "requester".into(),
+            requester_signature: "ignored".into(),
+            timestamp: 100,
+            nonce: "nonce".into(),
+        };
+        assert_ne!(a.signing_payload(), b.signing_payload());
+    }
+
+    #[test]
+    fn credential_fetch_response_pipe_fields_do_not_collide() {
+        let a = CredentialFetchResponse {
+            grant_id: "grant|cred".into(),
+            credential_id: "id".into(),
+            recipient_id: "recipient".into(),
+            encrypted_blocks: vec![],
+            issuer_signature: "ignored".into(),
+            request_nonce: "nonce".into(),
+        };
+        let b = CredentialFetchResponse {
+            grant_id: "grant".into(),
+            credential_id: "cred|id".into(),
+            recipient_id: "recipient".into(),
+            encrypted_blocks: vec![],
+            issuer_signature: "ignored".into(),
+            request_nonce: "nonce".into(),
+        };
+        assert_ne!(a.signing_payload(), b.signing_payload());
+    }
+
+    #[test]
+    fn credential_deposit_pipe_fields_do_not_collide() {
+        let a = CredentialDeposit {
+            grant_id: "grant|cred".into(),
+            credential_id: "id".into(),
+            encrypted_blocks: vec![],
+            issuer_id: "issuer".into(),
+            issuer_signature: "ignored".into(),
+            expires_at: 1700000000,
+        };
+        let b = CredentialDeposit {
+            grant_id: "grant".into(),
+            credential_id: "cred|id".into(),
+            encrypted_blocks: vec![],
+            issuer_id: "issuer".into(),
+            issuer_signature: "ignored".into(),
+            expires_at: 1700000000,
+        };
+        assert_ne!(a.signing_payload(), b.signing_payload());
+    }
+
+    #[test]
+    fn credential_revocation_pipe_fields_do_not_collide() {
+        let a = CredentialRevocation {
+            grant_id: "grant|issuer".into(),
+            issuer_id: "id".into(),
+            issuer_signature: "ignored".into(),
+            reason: None,
+        };
+        let b = CredentialRevocation {
+            grant_id: "grant".into(),
+            issuer_id: "issuer|id".into(),
+            issuer_signature: "ignored".into(),
+            reason: None,
+        };
+        assert_ne!(a.signing_payload(), b.signing_payload());
     }
 }

@@ -1,5 +1,5 @@
 //! Integration tests for `ember broker {issue, revoke, list}`
-//! (implementation-note-485).
+//! (implementation-note-414).
 //!
 //! Each test spawns a real `ember-daemon` socket listener on a temp
 //! `UnixStream` path with a `MockBroker`-backed registry installed (the
@@ -32,25 +32,72 @@
 //!    That keeps tests parallel-safe without forcing `--test-threads=1`.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
 use ember_daemon::broker::handler::{BrokerRegistry, install_registry};
-use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::rate_limit::RateLimiter;
-use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::socket::{SocketListener, new_shared_policy_engine};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+    ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
 use emberlink_cli::broker::{
     BrokerCliError, BrokerCmd, GlobalOpts, RegisterProvider, broker_command,
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
+
+fn lock_test_process() -> std::sync::MutexGuard<'static, ()> {
+    let guard = ember_daemon::PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ember_daemon::trust::presence::reset_for_tests();
+    guard
+}
+
+fn short_tempdir() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("ember-cli-")
+        .tempdir_in("/tmp")
+        .or_else(|_| TempDir::new())
+        .expect("tempdir")
+}
+
+fn fake_private_key_pem() -> String {
+    format!(
+        "{}PRIVATE KEY-----\nnot-a-real-key\n{}PRIVATE KEY-----\n",
+        "-----BEGIN ", "-----END "
+    )
+}
+
+fn wait_for_socket(socket_path: &Path, startup_rx: mpsc::Receiver<String>) {
+    // Keep listener readiness at the socket seam: if startup exits before
+    // binding, report that error instead of hiding it behind a poll timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !socket_path.exists() && std::time::Instant::now() < deadline {
+        match startup_rx.try_recv() {
+            Ok(error) => panic!(
+                "socket listener for {} exited before binding: {error}",
+                socket_path.display()
+            ),
+            Err(mpsc::TryRecvError::Disconnected) => panic!(
+                "socket listener thread for {} exited before binding",
+                socket_path.display()
+            ),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket_path.exists(),
+        "socket {} never appeared within 10s",
+        socket_path.display()
+    );
+}
 
 /// Install the broker registry once per test process. The `MockBroker`
 /// answers `broker_issue` / `broker_revoke` deterministically; we don't
@@ -77,7 +124,7 @@ fn ensure_registry_installed() {
 fn permissive_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: "credential.access.*".to_string(),
+            action: ActionSelector::named("credential.access.*"),
             risk: RiskLevel::Low,
             requirement: ApprovalRequirement::Auto,
             tier: None,
@@ -104,6 +151,7 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
 
     let socket_path = tmp.path().join(format!("{name}.sock"));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (startup_tx, startup_rx) = mpsc::channel();
     let path_for_thread = socket_path.clone();
 
     std::thread::spawn(move || {
@@ -121,28 +169,24 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(permissive_policy());
+            let policy = new_shared_policy_engine(permissive_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault; // hold until end of scope: set_vault is the wire now
             let listener =
                 SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter)
                     .with_test_mode_synthetic_presence_token(true);
-            let _ = listener.run().await;
+            match listener.run().await {
+                Ok(()) => {
+                    let _ = startup_tx.send("listener returned Ok".to_string());
+                }
+                Err(error) => {
+                    let _ = startup_tx.send(format!("{error:?}"));
+                }
+            }
         });
     });
 
-    // Wait for the socket file to appear (the listener binds inside
-    // the spawned task — busy-wait is fine, the bind completes in
-    // milliseconds).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !socket_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        socket_path.exists(),
-        "socket {} never appeared",
-        socket_path.display()
-    );
+    wait_for_socket(&socket_path, startup_rx);
 
     (socket_path, shutdown_tx)
 }
@@ -153,56 +197,6 @@ fn opts(socket_path: &std::path::Path) -> GlobalOpts {
     }
 }
 
-fn spawn_listener_with_real_unlock(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
-    let socket_path = tmp.path().join(format!("{name}.sock"));
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let path_for_thread = socket_path.clone();
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
-            let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
-            let _ = ember_daemon::infra::receipt::init_identity(id_dir.path());
-            std::mem::forget(id_dir);
-
-            let config_root = tempfile::tempdir().expect("tempdir for daemon config");
-            let config = DaemonConfig::for_test(config_root.path());
-            let vault = Rc::new(
-                Vault::open_from_config(&config).expect("runtime vault open from config"),
-            );
-            let store = Rc::new(DaemonStore::open_in_memory().unwrap());
-            store.set_vault(Rc::clone(&vault));
-            ember_daemon::trust::presence::register_store(Rc::clone(&store));
-            ember_daemon::infra::interactive_unlock::register_config(config);
-
-            let policy = Rc::new(permissive_policy());
-            let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-            let _vault = vault;
-            let _config_root = config_root;
-            let listener =
-                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
-            let _ = listener.run().await;
-        });
-    });
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !socket_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        socket_path.exists(),
-        "socket {} never appeared",
-        socket_path.display()
-    );
-
-    (socket_path, shutdown_tx)
-}
-
 fn spawn_listener_without_presence(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
     ensure_registry_installed();
     let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
@@ -211,6 +205,7 @@ fn spawn_listener_without_presence(tmp: &TempDir, name: &str) -> (PathBuf, watch
 
     let socket_path = tmp.path().join(format!("{name}.sock"));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (startup_tx, startup_rx) = mpsc::channel();
     let path_for_thread = socket_path.clone();
 
     std::thread::spawn(move || {
@@ -224,29 +219,23 @@ fn spawn_listener_without_presence(tmp: &TempDir, name: &str) -> (PathBuf, watch
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(permissive_policy());
+            let policy = new_shared_policy_engine(permissive_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault;
-            let listener = SocketListener::new(
-                path_for_thread,
-                shutdown_rx,
-                store,
-                policy,
-                rate_limiter,
-            );
-            let _ = listener.run().await;
+            let listener =
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
+            match listener.run().await {
+                Ok(()) => {
+                    let _ = startup_tx.send("listener returned Ok".to_string());
+                }
+                Err(error) => {
+                    let _ = startup_tx.send(format!("{error:?}"));
+                }
+            }
         });
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !socket_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        socket_path.exists(),
-        "socket {} never appeared",
-        socket_path.display()
-    );
+    wait_for_socket(&socket_path, startup_rx);
 
     (socket_path, shutdown_tx)
 }
@@ -260,17 +249,25 @@ fn spawn_listener_without_presence(tmp: &TempDir, name: &str) -> (PathBuf, watch
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_issue_valid_scope_returns_brokered_credential() {
-    let tmp = TempDir::new().unwrap();
+    let _guard = lock_test_process();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener(&tmp, "issue-ok");
 
     // --json suppresses pretty-print; the daemon round-trip is what we
-    // actually want to verify here.
+    // actually want to verify here. design BKR-1: native scope is no longer a
+    // caller input — the daemon derives it. We mint against `anthropic` (the
+    // derive-gated provider whose native scope is a daemon-synthesized label);
+    // the `scope_json` below is accepted by the CLI but ignored by the daemon.
     let cmd = BrokerCmd::Issue {
-        provider: "cloudflare".to_string(),
-        scope_json: r#"{"zone":"emberlink.dev","permissions":["dns:edit"]}"#.to_string(),
+        provider: "anthropic".to_string(),
+        scope_json: r#"{"name":"cli-round-trip"}"#.to_string(),
         ttl: "15m".to_string(),
-        reason: "implementation-note-530issue-test".to_string(),
+        reason: "implementation-note-473issue-test".to_string(),
         json: true,
     };
     let res = broker_command(cmd, opts(&socket));
@@ -280,7 +277,7 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
     // active list. We re-issue via the same registry (shared); filter
     // by reason substring so parallel tests don't pollute the count.
     let probe = BrokerCmd::List {
-        provider: Some("cloudflare".to_string()),
+        provider: Some("anthropic".to_string()),
         tier: None,
         task_id: Some("issue-test".to_string()),
         active_only: true,
@@ -293,8 +290,13 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_issue_missing_scope_json_errors() {
-    let tmp = TempDir::new().unwrap();
+    let _guard = lock_test_process();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener(&tmp, "issue-bad-scope");
 
     let cmd = BrokerCmd::Issue {
@@ -317,8 +319,13 @@ fn broker_issue_missing_scope_json_errors() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_revoke_idempotent_on_unknown_id() {
-    let tmp = TempDir::new().unwrap();
+    let _guard = lock_test_process();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener(&tmp, "revoke-unknown");
 
     let cmd = BrokerCmd::Revoke {
@@ -337,8 +344,13 @@ fn broker_revoke_idempotent_on_unknown_id() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_list_filters_by_provider() {
-    let tmp = TempDir::new().unwrap();
+    let _guard = lock_test_process();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener(&tmp, "list-filter");
 
     // Seed: issue one Cloudflare and one Anthropic materialization so
@@ -383,13 +395,18 @@ fn broker_list_filters_by_provider() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_list_active_only_excludes_expired() {
+    let _guard = lock_test_process();
     // The CLI filter drops rows whose `expires_at` is in the past. We
     // test this at the unit layer (with hand-built rows) because the
     // mock broker only issues live credentials and we don't want to
     // sleep through TTLs in CI. Here we just verify the wire path
     // works end-to-end with `--active-only`.
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener(&tmp, "list-active");
 
     let _ = broker_command(
@@ -419,13 +436,14 @@ fn broker_list_active_only_excludes_expired() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_list_without_presence_returns_guidance_not_raw_authority_error() {
-    let _guard = ember_daemon::PROCESS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    ember_daemon::trust::presence::reset_for_tests();
+    let _guard = lock_test_process();
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener_without_presence(&tmp, "list-guidance");
 
     let err = broker_command(
@@ -454,6 +472,7 @@ fn broker_list_without_presence_returns_guidance_not_raw_authority_error() {
 
 #[test]
 fn broker_socket_unreachable_returns_clear_error() {
+    let _guard = lock_test_process();
     let bad_socket = PathBuf::from("/tmp/ember-broker-cli-test-DOES-NOT-EXIST.sock");
     if bad_socket.exists() {
         let _ = std::fs::remove_file(&bad_socket);
@@ -491,16 +510,17 @@ fn broker_socket_unreachable_returns_clear_error() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
 fn broker_register_github_reuses_shared_presence_bootstrap() {
-    let tmp = TempDir::new().unwrap();
+    let _guard = lock_test_process();
+    let tmp = short_tempdir();
     let (socket, shutdown) = spawn_listener(&tmp, "register-github");
 
     let pem_path = tmp.path().join("app.pem");
-    std::fs::write(
-        &pem_path,
-        "\x2d----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
-    )
-    .unwrap();
+    std::fs::write(&pem_path, fake_private_key_pem()).unwrap();
 
     let cmd = BrokerCmd::Register {
         provider: RegisterProvider::Github {
@@ -538,23 +558,24 @@ fn broker_register_github_reuses_shared_presence_bootstrap() {
 }
 
 #[test]
-fn broker_register_github_round_trips_against_real_socket_unlock_flow() {
-    let _guard = ember_daemon::PROCESS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    ember_daemon::trust::presence::reset_for_tests();
-    // SAFETY: serialized by PROCESS_TEST_LOCK for this test process.
-    unsafe { std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1") };
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "local macOS sandbox forbids fake daemon UDS bind"
+)]
+fn broker_register_github_real_socket_fails_closed_without_presence() {
+    let _guard = lock_test_process();
 
-    let tmp = TempDir::new().unwrap();
-    let (socket, shutdown) = spawn_listener_with_real_unlock(&tmp, "register-github-real");
+    // design slice 4 C: the forgeable native/managed vault-unlock ceremony that
+    // `register_github`'s up-front `vault_unlock` used to ride is retired. With no
+    // operator presence (locked §4 window, no presence token), the credential-
+    // writing register flow MUST fail closed — it must NOT silently persist the GH
+    // App private key without presence. The operator opens the window separately
+    // with `ember vault se-unlock` (one Touch ID tap).
+    let tmp = short_tempdir();
+    let (socket, shutdown) = spawn_listener_without_presence(&tmp, "register-github-no-presence");
 
     let pem_path = tmp.path().join("app.pem");
-    std::fs::write(
-        &pem_path,
-        "\x2d----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
-    )
-    .unwrap();
+    std::fs::write(&pem_path, fake_private_key_pem()).unwrap();
 
     let cmd = BrokerCmd::Register {
         provider: RegisterProvider::Github {
@@ -568,29 +589,25 @@ fn broker_register_github_round_trips_against_real_socket_unlock_flow() {
         },
     };
 
-    let res = broker_command(cmd, opts(&socket));
-    assert!(
-        res.is_ok(),
-        "register github should succeed against the real socket unlock flow, got {res:?}"
+    // Must fail closed (an authority / guidance / RPC error) rather than silently
+    // write the credential without presence. We do NOT pin the deleted ceremony's
+    // guidance strings — only that the write fails and is not a benign
+    // already-exists / argument error masquerading as success.
+    let err = broker_command(cmd, opts(&socket)).expect_err(
+        "register without operator presence must fail closed, not write the credential",
     );
-
-    let result = emberlink_cli::call_daemon_method(
-        &socket,
-        "vault_get",
-        &serde_json::json!({
-            "name": "github/apps/ember-engine/install-126782716/app-id"
-        }),
-    )
-    .expect("registered app id should be readable from the vault");
-    assert_eq!(
-        result.get("value").and_then(|v| v.as_str()),
-        Some("3491890"),
-        "registered app id must survive the real socket unlock flow"
+    assert!(
+        matches!(
+            err,
+            BrokerCliError::Guidance(_)
+                | BrokerCliError::DaemonRpc { .. }
+                | BrokerCliError::Protocol(_)
+                | BrokerCliError::Io(_)
+        ),
+        "register must fail closed at the authority/RPC boundary without presence; got {err:?}"
     );
 
     let _ = shutdown.send(true);
-    // SAFETY: serialized by PROCESS_TEST_LOCK for this test process.
-    unsafe { std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT") };
     ember_daemon::trust::presence::reset_for_tests();
 }
 

@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-166 — per-spawn ephemeral uid pool for
+//! implementation-note-139 — per-spawn ephemeral uid pool for
 //! credentialed `broker_exec` children. Closes Finding 14 (refuse to
 //! spawn a child as the daemon's own uid) and the
 //! `/proc/<pid>/environ` side-channel between two concurrent broker_exec
@@ -21,7 +22,7 @@
 //!
 //! ## Allocation strategy
 //!
-//! Strategy (b) from the implementation-note-166 brief —
+//! Strategy (b) from the implementation-note-139 brief —
 //! **per-spawn ephemeral uid checked out from a pre-provisioned pool**.
 //! The installer provisions the pool uids at `ember daemon install`
 //! time (`ember-spawn-0` … `ember-spawn-N`) and the daemon checks one
@@ -48,8 +49,8 @@
 //!    `uids = [10010, 10011, …]` + `gid = 10010` and installs the pool
 //!    via [`init_uid_pool`].
 //! 2. `handle_broker_exec` calls [`UidPool::checkout`] before any spawn
-//!    decision. Pool empty → `-32011`. Allocated uid == daemon uid →
-//!    `-32010` (Finding 14 refusal).
+//!    decision. Pool exhausted → retryable `-32020`; pool empty or absent
+//!    → `-32021`; allocated uid == daemon uid → `-32020` Finding 14 refusal.
 //! 3. The fork+execve path (both non-PTY and forkpty) calls
 //!    [`UidLease::uid`] / [`UidLease::gid`] in the child branch and
 //!    `setresgid` / `setresuid` before `execvpe`.
@@ -61,22 +62,32 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Process-global uid pool installed at daemon startup. `None` ⇒
 /// `[daemon.spawn_pool]` was absent from config ⇒ broker_exec must
-/// refuse with `-32011` to avoid the silent-regression-to-daemon-uid
+/// refuse with `-32021` to avoid the silent-regression-to-daemon-uid
 /// posture.
 static UID_POOL: OnceLock<Option<Arc<UidPool>>> = OnceLock::new();
+
+fn record_pool_slot_telemetry(capacity: usize, occupied: usize) {
+    let capacity = capacity.min(u32::MAX as usize) as u32;
+    let occupied = occupied.min(u32::MAX as usize) as u32;
+
+    // design Component 8's operator-reserved tier is not implemented in the
+    // current allocator, so reserve-hit stays false until that admission layer
+    // owns the decision.
+    crate::telemetry::measurement::record_pool_slot_sample("dev0", capacity, occupied, false);
+}
 
 /// Install the process-global uid pool. Called by runtime startup
 /// after `DaemonConfig::load`. Subsequent calls panic to make
 /// double-install (a configuration bug) loud.
 ///
 /// Pass `None` when `[daemon.spawn_pool]` is absent in config — this
-/// records the "pool not configured" state so [`checkout`] returns
-/// the `-32011` error variant instead of "pool empty".
+/// records the "pool not configured" state so broker_exec surfaces
+/// `-32021` instead of silently falling back to the daemon uid.
 pub fn init_uid_pool(config: Option<SpawnPoolConfig>) {
     let pool = config.map(|cfg| {
         // design Component 2 — modern-Linux subuid path. When the
         // config carries `subuid_range_start` + `subuid_range_slots`
-        // (provisioned by implementation-note-190), populate
+        // (provisioned by implementation-note-167), populate
         // the pool from the range and mark it as subuid-shaped so
         // the broker_exec handler routes through the clone3 +
         // newuidmap path. Otherwise the legacy design system-user
@@ -109,7 +120,7 @@ pub fn init_uid_pool(config: Option<SpawnPoolConfig>) {
 /// (`target_uid == daemon_uid`) refusal so the test path can spawn
 /// children without provisioning real separate uids.
 ///
-/// implementation-note-166 — test seam. Production callers
+/// implementation-note-139 — test seam. Production callers
 /// MUST never invoke this; the test_mode flag inside the resulting
 /// pool is the only escape valve from the Finding-14 refusal and
 /// the production install path never sets it.
@@ -277,7 +288,8 @@ pub struct SpawnPoolConfig {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidAllocError {
     /// The pool was provisioned but every uid is currently in use.
-    /// Caller should surface `-32011` "spawn pool exhausted".
+    /// Caller should surface retryable `-32020` with structured
+    /// `retry_after_ms` metadata.
     #[error("uid pool exhausted (all {capacity} uids in use)")]
     PoolExhausted { capacity: usize },
     /// The pool config was provisioned but with an empty uid list —
@@ -442,6 +454,12 @@ impl UidPool {
             }
         };
         inner.in_use.insert(spawn_id.to_string(), uid);
+        let capacity = inner.capacity;
+        let occupied = inner.in_use.len();
+        drop(inner);
+
+        record_pool_slot_telemetry(capacity, occupied);
+
         Ok(UidLease {
             uid,
             gid: self.gid,
@@ -464,13 +482,20 @@ impl UidPool {
                 return;
             }
         };
+        let mut sample = None;
         if let Some(uid) = inner.in_use.remove(spawn_id) {
             inner.available.push(uid);
+            sample = Some((inner.capacity, inner.in_use.len()));
         } else {
             tracing::warn!(
                 spawn_id = %spawn_id,
                 "uid_alloc::release: spawn_id not found in in_use map (double-release?)"
             );
+        }
+        drop(inner);
+
+        if let Some((capacity, occupied)) = sample {
+            record_pool_slot_telemetry(capacity, occupied);
         }
     }
 
@@ -618,6 +643,65 @@ mod tests {
         // After Drop the uid is back in the pool.
         let _lease2 = pool.checkout("spawn-2").expect("second after drop");
         assert_eq!(pool.available_count(), 0);
+    }
+
+    #[test]
+    fn checkout_and_release_record_pool_slot_samples_when_enabled() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("telemetry tempdir");
+        crate::telemetry::measurement::set_output_dir(Some(dir.path().to_path_buf()));
+        crate::telemetry::measurement::enable_collection();
+
+        struct TelemetryReset;
+        impl Drop for TelemetryReset {
+            fn drop(&mut self) {
+                let _ = crate::telemetry::measurement::disable_collection_and_purge();
+                crate::telemetry::measurement::set_output_dir(None);
+            }
+        }
+        let _reset = TelemetryReset;
+
+        let pool = Arc::new(UidPool::new(
+            vec![21001, 21002, 21003, 21004, 21005, 21006, 21007],
+            21001,
+        ));
+        {
+            let _lease = pool.checkout("telemetry-spawn").expect("checkout");
+            assert_eq!(pool.in_use_count(), 1);
+        }
+        assert_eq!(pool.in_use_count(), 0);
+
+        let path = crate::telemetry::measurement::current_status().active_daily_path;
+        let raw = std::fs::read_to_string(path).expect("telemetry written");
+        let mut samples = vec![];
+        for line in raw.lines() {
+            let row: crate::telemetry::measurement::SampleRow =
+                serde_json::from_str(line).expect("telemetry row");
+            let crate::telemetry::measurement::SampleRow::PoolSlotSample {
+                cohort,
+                capacity,
+                occupied,
+                operator_reserve_hit,
+                ..
+            } = row
+            else {
+                continue;
+            };
+            if capacity != 7 {
+                continue;
+            }
+            assert_eq!(cohort, "dev0");
+            assert!(!operator_reserve_hit);
+            samples.push(occupied);
+        }
+
+        assert_eq!(
+            samples,
+            vec![1, 0],
+            "checkout and release should record pool occupancy"
+        );
     }
 
     #[test]

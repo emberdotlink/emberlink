@@ -1,7 +1,16 @@
 //! ember_rpc_phase_c_mtls_listener_wired
+//! bridge_listener_force_close_at_not_after_landed
 //!
 //! Phase C — the actual mTLS listener (design component 1 + design
 //! amendment). Replaces the Phase B `bail!`-only scaffold in `run()`.
+//!
+//! The listener records each accepted connection's client-cert `not_after` at
+//! handshake and force-closes the connection at the deadline with a typed
+//! [`CONNECTION_EXPIRED_ERROR_CODE`] (`-32099`) JSON-RPC error envelope.
+//! Legitimate clients refresh ahead of `not_after` via the client-pull refresh
+//! path and present the fresh cert on the next connection. The per-tier cert
+//! TTL knobs (`dev0` 24h, `team0`/`ent0` 4h) become the real upper bound on
+//! authenticated-connection lifetime — what operators expect.
 //!
 //! # Architecture (Phase C scope)
 //!
@@ -13,25 +22,24 @@
 //!                          ├─► gate_method (lib.rs::gate_method)
 //!                          │
 //!                          ├─► [DenyPlaintextBearing] → write policy-denied response, close
-//!                          └─► [AllowForward] → write phase-c-stub response, close
-//!                                               (Phase D will replace this with the
-//!                                                actual bincode forward to emberd core)
+//!                          └─► [AllowForward] → forward JSON-RPC over local UDS,
+//!                                               return upstream response
 //! ```
 //!
 //! # What this file is NOT
 //!
-//! - Not the bincode forward path (Phase D). `AllowForward` writes a stub
-//!   response today; Phase D replaces it with a `core-fd-pass`-free UDS
-//!   dial to emberd core that re-encodes the JSON-RPC as typed bincode.
-//! - Not SPIFFE SAN extraction. The TLS handshake validates the cert
-//!   chain against the configured CA; identity-extraction (parsing the
-//!   `spiffe://emberd/persona/<p>` SAN) is deferred to Phase D where the
-//!   forward wire carries an opaque identity claim. Phase C ships
-//!   "transport is locked"; Phase D ships "identity threads through."
+//! - Not authorization. The listener validates the bridge client's
+//!   persona/container identity from the cert SANs (fail closed on a
+//!   malformed SAN), but emberd core owns policy, grant, and
+//!   session-runtime decisions. Per design priv-sep (SLICE 1) the
+//!   wire-forgeable `_mtls_principal` JSON injection is DELETED; the
+//!   cert-derived principal is carried out-of-band (SLICE 2 wires the
+//!   typed frame over the dedicated rpc-forward UDS as
+//!   `DispatchSource::Bridge`).
 //! - Not the SE-sealed CA load path. ember-rpc reads cert + key + CA
 //!   from operator-configured PEM paths. The emberd-side cert-minter
 //!   that writes those files is a separate task (the brief flags it as
-//!   `implementation-note-115`, M-size).
+//!   `implementation-note-113`, M-size).
 //!
 //! Security invariants enforced here:
 //! - `WebPkiClientVerifier::builder` REQUIRES a client cert; rustls refuses
@@ -52,16 +60,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use core_crypto::ca::{SpiffeUri, extract_bridge_identity, parse_spiffe_uri_container};
+use core_personas::MtlsPrincipal;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
+use x509_parser::certificate::X509Certificate;
+use x509_parser::prelude::FromDer;
 
 use crate::{JsonRpcRequest, PolicyDecision, build_policy_denied_response, gate_method};
 
@@ -117,6 +129,21 @@ const RATE_LIMITER_SWEEP_PERIOD: Duration = Duration::from_secs(30);
 /// pathological nesting (e.g. `[[[...]]]` 1 MiB deep) post-parse.
 const MAX_JSON_NESTING_DEPTH: usize = 32;
 
+/// JSON-RPC error code emitted when the per-connection cert `not_after`
+/// deadline fires before the connection closes naturally.
+///
+/// M12 of design: legitimate clients have already refreshed their cert
+/// (the client-pull refresh fires at 50% / 75% / 90% / 99% TTL); a
+/// connection that reaches this code path is either holding a stale
+/// cert it failed to refresh or is an attacker that has no path to
+/// refresh. Either way the listener writes this typed error and closes.
+///
+/// The numeric value lives in the JSON-RPC 2.0 server-error implementation-
+/// defined band (-32099..-32000); the canonical message prefix
+/// `connection-expired:` lets clients distinguish a cert-deadline close
+/// from generic upstream-forward failures (-32000).
+pub const CONNECTION_EXPIRED_ERROR_CODE: i64 = -32099;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -148,10 +175,10 @@ pub enum ListenerError {
 ///
 /// - `server_cert_path` / `server_key_path` — ember-rpc's own server
 ///   identity, presented during the TLS handshake. Minted by emberd
-///   core (sibling task `implementation-note-115`).
+///   core (sibling task `implementation-note-113`).
 /// - `ca_cert_path` — the bridge CA cert used for client-auth
-///   verification. emberd publishes this as `<data_dir>/bridge_ca.pub`
-///   per `implementation-note-328`.
+///   verification. emberd publishes this as `<data_dir>/bridge_ca.pem`
+///   per `implementation-note-365`.
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
     pub listen_addr: std::net::SocketAddr,
@@ -284,14 +311,66 @@ fn json_exceeds_depth(value: &serde_json::Value, remaining: usize) -> bool {
 
 /// Validate the JSON-RPC envelope's `id` per JSON-RPC 2.0 §4: only
 /// string, number, or null are permitted. Objects/arrays are rejected
-/// — they'd otherwise enable bandwidth-amp via the echo in the
-/// phase-c-stub response (**HIGH-2 fix**).
+/// — they'd otherwise enable bandwidth-amp via the echoed `id` in
+/// error / forwarded responses (**HIGH-2 fix**).
 fn id_is_well_formed(id: &serde_json::Value) -> bool {
     matches!(
         id,
         serde_json::Value::Null | serde_json::Value::Number(_) | serde_json::Value::String(_)
     )
 }
+
+/// Extract the client cert's `not_after` as a Unix timestamp (seconds).
+///
+/// Used by the per-connection force-close deadline logic (M12 of design).
+/// `WebPkiClientVerifier` has already validated the chain at handshake;
+/// reading `not_after` here is for our own deadline timer, not a
+/// trust check.
+fn extract_cert_not_after_secs(cert_der: &[u8]) -> Result<i64, String> {
+    let (_, cert) =
+        X509Certificate::from_der(cert_der).map_err(|e| format!("parse client cert: {e}"))?;
+    Ok(cert.validity().not_after.timestamp())
+}
+
+fn extract_mtls_principal(cert_der: &[u8]) -> Result<MtlsPrincipal, String> {
+    let (_, cert) =
+        X509Certificate::from_der(cert_der).map_err(|e| format!("parse client cert: {e}"))?;
+    let identity =
+        extract_bridge_identity(&cert).map_err(|e| format!("extract bridge identity: {e}"))?;
+    let san_ext = cert
+        .subject_alternative_name()
+        .map_err(|e| format!("parse SAN extension: {e}"))?
+        .ok_or_else(|| "missing SAN extension".to_string())?;
+
+    let mut container_id = identity.container_id;
+    for gn in &san_ext.value.general_names {
+        if let x509_parser::extensions::GeneralName::URI(uri) = gn
+            && let Ok(SpiffeUri::Container { container_ref }) = parse_spiffe_uri_container(uri)
+        {
+            container_id = Some(container_ref);
+            break;
+        }
+    }
+
+    let container_id =
+        container_id.ok_or_else(|| "bridge client cert missing container SAN".to_string())?;
+    let fingerprint = blake3::hash(cert_der);
+    let mut cert_fingerprint = [0u8; 32];
+    cert_fingerprint.copy_from_slice(fingerprint.as_bytes());
+
+    Ok(MtlsPrincipal {
+        persona_id: identity.persona_id,
+        container_id,
+        cert_fingerprint,
+    })
+}
+
+// design priv-sep (SLICE 1) — `attach_mtls_principal` (which injected the
+// cert-derived principal as a `_mtls_principal` JSON field into the forwarded
+// request) is DELETED. That field was wire-forgeable by any same-uid UDS
+// client. The principal is now carried out-of-band; SLICE 2 wires the typed
+// frame over the dedicated rpc-forward UDS. `extract_mtls_principal` is
+// retained — the listener still validates the cert SAN (fail closed).
 
 // ---------------------------------------------------------------------------
 // Per-source-IP rate limiter — simple token bucket
@@ -460,12 +539,13 @@ impl Listener {
                 };
 
                 let acceptor = acceptor.clone();
+                let handler_config = config.clone();
                 tokio::spawn(async move {
                     // Hold the permit for the lifetime of the handler.
                     // Dropped on return (success, error, or panic via
                     // tokio's task-cancellation cleanup).
                     let _permit = permit;
-                    handle_connection(acceptor, stream, peer_addr).await;
+                    handle_connection(handler_config, acceptor, stream, peer_addr).await;
                 });
             }
         });
@@ -479,6 +559,7 @@ impl Listener {
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
+    config: ListenerConfig,
     acceptor: TlsAcceptor,
     stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -508,26 +589,174 @@ async fn handle_connection(
         }
     };
 
-    // Confirm the peer presented at least one cert. `WebPkiClientVerifier`
-    // enforces this at handshake — the check here is belt-and-suspenders
-    // so a rustls behavior change can't silently widen the surface.
-    {
+    // Confirm the peer presented at least one cert, extract the cert-derived
+    // bridge principal (SPIFFE SAN), and capture the cert `not_after` for the
+    // per-connection force-close deadline (M12 of design).
+    //
+    // `WebPkiClientVerifier` enforces a valid chain at handshake; this
+    // additionally rejects a malformed/absent SAN (fail closed, belt-and-
+    // suspenders against a rustls behavior change silently widening the
+    // surface).
+    //
+    // design priv-sep (SLICE 2a) — extract the cert-derived principal and
+    // forward it OUT-OF-BAND in the typed frame ([`crate::frame`]), NOT as a
+    // JSON `_mtls_principal` field (that wire-forgeable injection was deleted
+    // in SLICE 1). emberd core re-validates the SAN shape daemon-side before
+    // trusting it (the sibling is untrusted).
+    let (mtls_principal, cert_not_after_secs) = {
         let (_, server_conn) = tls_stream.get_ref();
         match server_conn.peer_certificates() {
             Some(certs) if !certs.is_empty() => {
-                debug!(
-                    %peer_addr,
-                    chain_len = certs.len(),
-                    "listener: peer cert chain present"
-                );
+                let principal = match extract_mtls_principal(certs[0].as_ref()) {
+                    Ok(principal) => {
+                        debug!(
+                            %peer_addr,
+                            chain_len = certs.len(),
+                            persona_id = %principal.persona_id,
+                            container_id = %principal.container_id,
+                            "listener: peer cert chain present"
+                        );
+                        principal
+                    }
+                    Err(e) => {
+                        warn!(
+                            %peer_addr,
+                            error = %e,
+                            "listener: failed to resolve bridge client principal"
+                        );
+                        return;
+                    }
+                };
+                let not_after = match extract_cert_not_after_secs(certs[0].as_ref()) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(
+                            %peer_addr,
+                            error = %e,
+                            "listener: failed to read client cert not_after"
+                        );
+                        return;
+                    }
+                };
+                (principal, not_after)
             }
             _ => {
                 warn!(%peer_addr, "listener: no peer cert after handshake (rustls invariant violated)");
                 return;
             }
         }
-    }
+    };
 
+    // M12 of design — per-connection force-close deadline.
+    //
+    // Convert the cert `not_after` (Unix seconds) into a `tokio::time::Instant`
+    // relative to the current wallclock. The deadline future fires at most
+    // `not_after - now` from now; if the cert is already expired (e.g. clock
+    // skew or stale cert reaching here despite handshake), we treat the
+    // deadline as already-fired (Duration::ZERO).
+    let deadline_sleep = build_not_after_deadline(cert_not_after_secs);
+
+    let (read_half, mut write_half) = tokio::io::split(tls_stream);
+
+    // Wrap the per-connection work (read frame, validate, route, respond) in
+    // a `tokio::select!` against the cert deadline. The inner future owns the
+    // read half but only borrows `write_half`; if the deadline wins, we keep
+    // the write half here to emit the typed `ConnectionExpired` JSON-RPC
+    // error envelope before shutting down.
+    tokio::pin!(deadline_sleep);
+
+    tokio::select! {
+        // Bias toward inner so an already-complete frame doesn't race a
+        // simultaneously-fired deadline into emitting both responses.
+        biased;
+        _ = process_one_frame(
+            &config,
+            &mtls_principal,
+            read_half,
+            &mut write_half,
+            peer_addr,
+        ) => {
+            // Normal completion: inner wrote whatever response it owed and
+            // shut down `write_half`. Nothing further to do.
+        }
+        _ = &mut deadline_sleep => {
+            info!(
+                %peer_addr,
+                cert_not_after_secs,
+                persona_id = %mtls_principal.persona_id,
+                container_id = %mtls_principal.container_id,
+                "listener: cert not_after deadline reached; force-closing connection (M12 design)"
+            );
+            let resp = build_connection_expired_response(cert_not_after_secs);
+            let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
+            bytes.push(b'\n');
+            if let Err(e) = write_half.write_all(&bytes).await {
+                debug!(
+                    %peer_addr,
+                    error = %e,
+                    "listener: write ConnectionExpired failed (peer likely already gone)"
+                );
+            }
+            let _ = write_half.shutdown().await;
+        }
+    }
+}
+
+/// Build the per-connection deadline sleep from the cert `not_after`
+/// Unix-seconds timestamp.
+///
+/// Uses wallclock (`SystemTime::now()`) to compute the delta, then converts
+/// to a `tokio::time::Sleep` future via `Instant::now() + delta`. Past-
+/// deadline yields `Duration::ZERO` so the future fires on the next poll.
+fn build_not_after_deadline(not_after_secs: i64) -> tokio::time::Sleep {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let remaining_secs = not_after_secs.saturating_sub(now).max(0) as u64;
+    let delta = Duration::from_secs(remaining_secs);
+    tokio::time::sleep_until(tokio::time::Instant::now() + delta)
+}
+
+/// Build the JSON-RPC error envelope written when the per-connection
+/// `not_after` deadline fires. Carries the canonical `connection-expired:`
+/// prefix so clients can distinguish a cert-deadline close from generic
+/// `-32000` upstream-forward failures (per [design] M12).
+///
+/// `id` is `null` — by the time the deadline fires, the listener may not
+/// have read (or fully parsed) the in-flight request, so there is no
+/// envelope id to echo back.
+fn build_connection_expired_response(not_after_secs: i64) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": CONNECTION_EXPIRED_ERROR_CODE,
+            "message": format!(
+                "connection-expired: client cert not_after={} reached; reconnect with refreshed cert (design)",
+                not_after_secs
+            ),
+        },
+        "id": serde_json::Value::Null,
+    })
+}
+
+/// Inner per-connection worker: read one bounded JSON-RPC frame, run the
+/// validation gates, route through the policy gate, write the response,
+/// and shut down `write_half`.
+///
+/// Factored out of [`handle_connection`] so the outer scope can race this
+/// future against the cert `not_after` deadline via `tokio::select!`. The
+/// inner future owns the read half but only borrows `write_half`; if the
+/// outer deadline wins, the outer scope still owns the writer and uses it
+/// to emit a typed `ConnectionExpired` error envelope.
+async fn process_one_frame(
+    config: &ListenerConfig,
+    mtls_principal: &MtlsPrincipal,
+    read_half: tokio::io::ReadHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    write_half: &mut tokio::io::WriteHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    peer_addr: std::net::SocketAddr,
+) {
     // Read ONE bounded JSON-RPC frame. Cap at MAX_FRAME_BYTES (CRIT-1
     // fix); apply FRAME_READ_TIMEOUT so post-handshake slow-loris is
     // also defeated.
@@ -543,7 +772,6 @@ async fn handle_connection(
     // `\n` (which the smoke tests + the bridge-cli ping client both
     // honor). Cap-without-newline produces a truncated read that
     // fails the JSON-RPC parse downstream and returns a -32700.
-    let (read_half, mut write_half) = tokio::io::split(tls_stream);
     let mut bounded = BufReader::new(read_half.take(MAX_FRAME_BYTES));
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let read_result =
@@ -591,6 +819,7 @@ async fn handle_connection(
             let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
             bytes.push(b'\n');
             let _ = write_half.write_all(&bytes).await;
+            let _ = write_half.shutdown().await;
             return;
         }
     };
@@ -613,6 +842,7 @@ async fn handle_connection(
         let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
         bytes.push(b'\n');
         let _ = write_half.write_all(&bytes).await;
+        let _ = write_half.shutdown().await;
         return;
     }
 
@@ -633,6 +863,7 @@ async fn handle_connection(
         let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
         bytes.push(b'\n');
         let _ = write_half.write_all(&bytes).await;
+        let _ = write_half.shutdown().await;
         return;
     }
 
@@ -654,6 +885,7 @@ async fn handle_connection(
         let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
         bytes.push(b'\n');
         let _ = write_half.write_all(&bytes).await;
+        let _ = write_half.shutdown().await;
         return;
     }
 
@@ -673,30 +905,16 @@ async fn handle_connection(
             serde_json::to_vec(&resp).unwrap_or_default()
         }
         PolicyDecision::AllowForward => {
-            // Phase C stub. Phase D replaces this with a real bincode
-            // forward over `config.forward_uds` to emberd core. The
-            // stub shape lets clients verify the gate-allow path
-            // round-trips end-to-end without requiring the Phase D
-            // emberd-side consumer.
-            //
-            // **HIGH-2 fix**: don't echo the method name back. The
-            // method-name echo was a method-existence oracle and an
-            // amplification vector. The round-trip is verified by
-            // receiving ANY successful response.
+            // design priv-sep (SLICE 2a) — forward the validated request to
+            // emberd core over the dedicated rpc-forward UDS as a typed frame
+            // ([`crate::frame`]) carrying the cert-derived principal out-of-band.
             info!(
                 %peer_addr,
                 method = %req.method,
-                "listener: allow-forward (phase-c-stub; Phase D wires real forward)"
+                forward_uds = %config.forward_uds.display(),
+                "listener: allow-forward via upstream rpc UDS (typed frame)"
             );
-            let resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": {
-                    "forwarded": false,
-                    "reason": "phase-c-stub",
-                },
-                "id": req.id,
-            });
-            serde_json::to_vec(&resp).unwrap_or_default()
+            forward_allowed_request(config, &req, mtls_principal).await
         }
     };
 
@@ -708,6 +926,118 @@ async fn handle_connection(
     let _ = write_half.shutdown().await;
 }
 
+fn build_forward_error_response(req: &JsonRpcRequest, message: String) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": -32000,
+            "message": format!("bridge-forward failed: {message}"),
+        },
+        "id": req.id.clone(),
+    }))
+    .unwrap_or_default()
+}
+
+async fn forward_allowed_request(
+    config: &ListenerConfig,
+    req: &JsonRpcRequest,
+    principal: &MtlsPrincipal,
+) -> Vec<u8> {
+    let mut stream = match UnixStream::connect(&config.forward_uds).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!(
+                forward_uds = %config.forward_uds.display(),
+                error = %e,
+                "listener: upstream UDS connect failed"
+            );
+            return build_forward_error_response(
+                req,
+                format!("connect {}: {e}", config.forward_uds.display()),
+            );
+        }
+    };
+
+    // design priv-sep (SLICE 2a) — emit the hand-rolled typed frame: the
+    // cert-derived principal (persona/container/cert_fingerprint) rides
+    // out-of-band in the header, the JSON-RPC request is the opaque inner
+    // payload. emberd core re-validates and stamps `DispatchSource::Bridge`.
+    let payload = match serde_json::to_vec(req) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(error = %e, "listener: failed to serialize forwarded JSON-RPC request");
+            return build_forward_error_response(req, format!("serialize request: {e}"));
+        }
+    };
+    let frame = match crate::frame::encode(
+        &principal.cert_fingerprint,
+        &principal.persona_id,
+        &principal.container_id,
+        &payload,
+    ) {
+        Ok(frame) => frame,
+        Err(e) => {
+            warn!(error = %e, "listener: failed to encode bridge frame");
+            return build_forward_error_response(req, format!("frame encode: {e}"));
+        }
+    };
+    if let Err(e) = stream.write_all(&frame).await {
+        warn!(
+            forward_uds = %config.forward_uds.display(),
+            error = %e,
+            "listener: upstream UDS write failed"
+        );
+        return build_forward_error_response(
+            req,
+            format!("write {}: {e}", config.forward_uds.display()),
+        );
+    }
+    // Half-close the write half so emberd core reads exactly one frame to EOF,
+    // then read the newline-delimited JSON response on the still-open read half.
+    if let Err(e) = stream.shutdown().await {
+        warn!(
+            forward_uds = %config.forward_uds.display(),
+            error = %e,
+            "listener: upstream UDS write-shutdown failed"
+        );
+        return build_forward_error_response(
+            req,
+            format!("shutdown {}: {e}", config.forward_uds.display()),
+        );
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    match reader.read_line(&mut response_line).await {
+        Ok(0) => {
+            warn!(
+                forward_uds = %config.forward_uds.display(),
+                "listener: upstream UDS closed before responding"
+            );
+            build_forward_error_response(req, "upstream closed without a response".to_string())
+        }
+        Ok(_) => match serde_json::from_str::<serde_json::Value>(response_line.trim_end()) {
+            Ok(value) => serde_json::to_vec(&value).unwrap_or_default(),
+            Err(e) => {
+                warn!(
+                    forward_uds = %config.forward_uds.display(),
+                    error = %e,
+                    "listener: upstream UDS returned invalid JSON"
+                );
+                build_forward_error_response(req, format!("invalid upstream JSON: {e}"))
+            }
+        },
+        Err(e) => {
+            warn!(
+                forward_uds = %config.forward_uds.display(),
+                error = %e,
+                "listener: upstream UDS read failed"
+            );
+            build_forward_error_response(req, format!("read {}: {e}", config.forward_uds.display()))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -715,6 +1045,10 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
     use std::time::Duration;
 
     #[test]
@@ -852,6 +1186,138 @@ mod tests {
         assert!(
             limiter.allow(ip_b),
             "second IP's bucket must be independent of first IP's drain"
+        );
+    }
+
+    #[test]
+    fn connection_expired_response_has_canonical_shape() {
+        let resp = build_connection_expired_response(1_700_000_000);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["error"]["code"], CONNECTION_EXPIRED_ERROR_CODE);
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.starts_with("connection-expired:"),
+            "message must start with canonical prefix; got {msg}"
+        );
+        assert!(
+            msg.contains("1700000000"),
+            "message must echo the cert not_after seconds; got {msg}"
+        );
+        // id is always null — the deadline path may fire before/during
+        // request parse so there is no envelope id to echo back.
+        assert!(resp["id"].is_null(), "id must be null; got {}", resp["id"]);
+    }
+
+    // JSON-RPC 2.0 implementation-defined server-error band per §5.1 is
+    // -32099..-32000; the canonical force-close code MUST live inside
+    // this band so generic JSON-RPC clients classify it as a server
+    // error rather than a generic protocol error. Static assertion —
+    // compile-time check beats a runtime assert (clippy: const-value).
+    const _: () = {
+        assert!(
+            CONNECTION_EXPIRED_ERROR_CODE >= -32099 && CONNECTION_EXPIRED_ERROR_CODE <= -32000,
+            "ConnectionExpired error code must live in JSON-RPC server-error band [-32099, -32000]"
+        );
+    };
+
+    #[tokio::test]
+    async fn build_not_after_deadline_in_past_yields_immediate_fire() {
+        // A `not_after` already in the past — the deadline future must
+        // be ready essentially immediately (we won't hold a connection
+        // past its expiry).
+        let past_not_after = 0_i64; // 1970-01-01
+        let sleep = build_not_after_deadline(past_not_after);
+        assert!(
+            sleep.deadline() <= tokio::time::Instant::now(),
+            "past not_after must produce a deadline at or before now"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_not_after_deadline_future_within_expected_window() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_secs() as i64;
+        // 100 seconds in the future.
+        let sleep = build_not_after_deadline(now + 100);
+        let deadline = sleep.deadline();
+        let now_inst = tokio::time::Instant::now();
+        assert!(
+            deadline > now_inst,
+            "future not_after must produce a deadline after now"
+        );
+        let delta = deadline.saturating_duration_since(now_inst);
+        assert!(
+            delta <= Duration::from_secs(101) && delta >= Duration::from_secs(99),
+            "future not_after must produce a deadline ~100s out (got {:?})",
+            delta
+        );
+    }
+
+    #[test]
+    fn extract_cert_not_after_secs_matches_cert_validity() {
+        use time::OffsetDateTime;
+        let mut params = CertificateParams::new(vec![]).expect("cert params");
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "client");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        // Bind a deterministic not_after we can read back: 1_900_000_000 (2030-ish).
+        let expected_not_after: i64 = 1_900_000_000;
+        params.not_before =
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("not_before epoch");
+        params.not_after =
+            OffsetDateTime::from_unix_timestamp(expected_not_after).expect("not_after epoch");
+        let key_pair = KeyPair::generate().expect("keypair");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+
+        let parsed = extract_cert_not_after_secs(cert.der().as_ref())
+            .expect("not_after extraction succeeds");
+        assert_eq!(
+            parsed, expected_not_after,
+            "extract_cert_not_after_secs must match cert validity not_after"
+        );
+    }
+
+    #[test]
+    fn extract_mtls_principal_reads_urn_and_container_sans() {
+        let mut params = CertificateParams::new(vec![]).expect("cert params");
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "client");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.subject_alt_names = vec![
+            SanType::URI(
+                "urn:emberlink:agent:clientpersona"
+                    .try_into()
+                    .expect("urn IA5"),
+            ),
+            SanType::URI(
+                "spiffe://emberd/persona/clientpersona"
+                    .try_into()
+                    .expect("persona IA5"),
+            ),
+            SanType::URI(
+                "spiffe://emberd/container/sess-test"
+                    .try_into()
+                    .expect("container IA5"),
+            ),
+        ];
+        let key_pair = KeyPair::generate().expect("keypair");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+
+        let principal = extract_mtls_principal(cert.der().as_ref()).expect("mtls principal");
+        assert_eq!(principal.persona_id, "clientpersona");
+        assert_eq!(principal.container_id, "sess-test");
+        assert_eq!(
+            principal.cert_fingerprint,
+            *blake3::hash(cert.der().as_ref()).as_bytes()
         );
     }
 }

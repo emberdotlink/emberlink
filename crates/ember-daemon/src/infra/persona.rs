@@ -13,7 +13,7 @@
 //!
 //! Anchor: `personas_client_cert_columns_landed`.
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use core_crypto::grant_chain::RootKeyPair;
 use core_crypto::{LocalKeyPair, LocalKeySigner};
 use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
@@ -25,9 +25,15 @@ use uuid::Uuid;
 use x509_parser::prelude::FromDer;
 
 use crate::infra::store::{DaemonStore, StoreError};
-use crate::infra::vault::Vault;
+use crate::infra::vault::{SealedEnvelope, Vault};
+use crate::trust::grant::GrantInfo;
 
-/// implementation-note-298 — RAII wrapper around a heap-allocated
+pub(crate) struct PersonaRootKeyMaterial {
+    pub public_hex: String,
+    pub secret_hex: String,
+}
+
+/// implementation-note-225 — RAII wrapper around a heap-allocated
 /// secret byte buffer that pins its backing pages in physical memory via
 /// `mlock(2)`. The Drop impl calls `munlock(2)` to release the pin.
 ///
@@ -142,8 +148,26 @@ impl Drop for MlockedSecret {
     }
 }
 
-/// Encrypt a persona's Ed25519 secret string via the attached vault and
-/// return `(nonce_blob, ciphertext_blob)` for SQLite storage.
+/// design Part B — purpose-bound AAD identifier for a persona-secret
+/// sealed blob: `b"persona-secret:" || persona_id`. Folded into BOTH the
+/// DEK-wrap AAD and the payload AAD so a persona's sealed secret cannot be
+/// spliced onto a different persona row (or a different purpose). Stable
+/// wire format — never change without an AAD version bump.
+///
+/// `pub(crate)` so the design D5 MEK-rotation re-wrap (vault.rs) can rebuild
+/// the exact same AAD when it unwraps each persona-secret DEK under the old
+/// Interactive MEK and re-wraps it under the new one.
+pub(crate) fn persona_secret_aad_id(persona_id: &str) -> Vec<u8> {
+    let mut id = b"persona-secret:".to_vec();
+    id.extend_from_slice(persona_id.as_bytes());
+    id
+}
+
+/// Encrypt a persona's Ed25519 secret string via the attached vault under
+/// the MEK→DEK envelope (design Part B) and return a [`SealedEnvelope`]
+/// whose four components are stored across the `personas` columns. The MEK
+/// no longer directly encrypts the secret — a per-persona DEK does, and the
+/// DEK is wrapped under the Interactive MEK with the persona-bound AAD.
 ///
 /// Plaintext is the prefixed form (`ed25519-secret:<hex>`) — we encrypt
 /// the string as-is so the read path can strip the prefix and hand the
@@ -152,22 +176,57 @@ fn seal_persona_secret(
     vault: &Vault,
     persona_id: &str,
     secret: &str,
-) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+) -> Result<SealedEnvelope, StoreError> {
     vault
-        .seal(secret.as_bytes())
+        .seal(
+            crate::infra::vault::ValueClass::AuthorityBearing,
+            &persona_secret_aad_id(persona_id),
+            secret.as_bytes(),
+        )
         .map_err(|e| StoreError::Vault(format!("encrypt persona '{persona_id}' secret: {e}")))
+}
+
+/// design Part B — reconstruct a [`SealedEnvelope`] from the four
+/// `personas` columns. Envelope-only: a row missing ANY of the four
+/// components pre-dates the Part B migration and is NOT silently decrypted
+/// under the MEK (mirrors the credential `get` discipline) — it returns a
+/// clear `StoreError::InvalidInput`. New rows always populate all four.
+fn persona_sealed_envelope(
+    persona_id: &str,
+    nonce: Option<Vec<u8>>,
+    ciphertext: Option<Vec<u8>>,
+    dek_nonce: Option<Vec<u8>>,
+    wrapped_dek: Option<Vec<u8>>,
+) -> Result<SealedEnvelope, StoreError> {
+    match (nonce, ciphertext, dek_nonce, wrapped_dek) {
+        (Some(payload_nonce), Some(ciphertext), Some(dek_nonce), Some(wrapped_dek)) => {
+            Ok(SealedEnvelope {
+                payload_nonce,
+                ciphertext,
+                dek_nonce,
+                wrapped_dek,
+            })
+        }
+        _ => Err(StoreError::InvalidInput(format!(
+            "persona '{persona_id}' private key is not enveloped (missing wrapped-DEK \
+             columns); run the design Part B migration one-shot before reading"
+        ))),
+    }
 }
 
 fn open_persona_secret(
     vault: &Vault,
     persona_id: &str,
-    nonce: &[u8],
-    ciphertext: &[u8],
+    env: &SealedEnvelope,
 ) -> Result<String, StoreError> {
     let plaintext = vault
-        .open(nonce, ciphertext)
+        .open(
+            crate::infra::vault::ValueClass::AuthorityBearing,
+            &persona_secret_aad_id(persona_id),
+            env,
+        )
         .map_err(|e| StoreError::Vault(format!("decrypt persona '{persona_id}' secret: {e}")))?;
-    String::from_utf8(plaintext).map_err(|_| {
+    String::from_utf8(plaintext.to_vec()).map_err(|_| {
         StoreError::Vault(format!(
             "decrypted persona '{persona_id}' secret is not valid UTF-8"
         ))
@@ -181,18 +240,26 @@ pub struct PersonaInfo {
     pub public_key: String,
     pub created_at: String,
     pub status: String,
-    /// implementation-note-66 — container identity this
+    /// implementation-note-74 — container identity this
     /// persona was minted for. `None` for personas created via the
     /// legacy `create_persona` path (no container binding); `Some` for
     /// workload personas created via `create_agent_persona`. Used by
     /// the reconciler to refuse a duplicate spawn into the same
     /// container slot when the daemon restarts mid-spawn.
     pub container_id: Option<String>,
-    /// implementation-note-66 — parent grant this persona's
+    /// implementation-note-74 — parent grant this persona's
     /// attenuated child grant was delegated from. Lets the reconciler
     /// and receipt pipeline correlate "which agent runs under whose
     /// authority" without walking the grant chain.
     pub parent_grant_id: Option<String>,
+}
+
+/// Persisted client-cert state for an design bridge persona.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaClientCertState {
+    pub fingerprint_hex: String,
+    pub not_after_unix: i64,
+    pub refresh_seq: u32,
 }
 
 impl DaemonStore {
@@ -210,13 +277,23 @@ impl DaemonStore {
                 "create_persona requires a live vault but no vault is attached".to_string(),
             )
         })?;
-        let (nonce, ciphertext) = seal_persona_secret(&vault, &id, &kp.private_key)?;
+        let env = seal_persona_secret(&vault, &id, &kp.private_key)?;
         self.conn().execute(
             "INSERT INTO personas \
                 (id, name, public_key, private_key_nonce, \
-                 private_key_ciphertext, created_at, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
-            rusqlite::params![id, name, kp.public_key, nonce, ciphertext, created_at],
+                 private_key_ciphertext, private_key_dek_nonce, \
+                 private_key_wrapped_dek, created_at, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active')",
+            rusqlite::params![
+                id,
+                name,
+                kp.public_key,
+                env.payload_nonce,
+                env.ciphertext,
+                env.dek_nonce,
+                env.wrapped_dek,
+                created_at
+            ],
         )?;
 
         Ok(PersonaInfo {
@@ -230,7 +307,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-66 — phase 1 of the atomic
+    /// implementation-note-74 — phase 1 of the atomic
     /// `create_agent_persona` two-phase commit. Inserts a workload
     /// persona row with `status = 'enrolling'` and binds it to the
     /// supplied `container_id` + `parent_grant_id`.
@@ -255,7 +332,7 @@ impl DaemonStore {
         container_id: &str,
         parent_grant_id: &str,
     ) -> Result<PersonaInfo, StoreError> {
-        // implementation-note-66 CRIT-4 — refuse a second
+        // implementation-note-74 CRIT-4 — refuse a second
         // spawn into a container slot that already has an enrolling
         // OR active persona bound to it. The check is racy in the
         // multi-thread sense, but the daemon's single-threaded
@@ -291,19 +368,22 @@ impl DaemonStore {
                 "create_agent_persona requires a live vault but no vault is attached".to_string(),
             )
         })?;
-        let (nonce, ciphertext) = seal_persona_secret(&vault, &id, &kp.private_key)?;
+        let env = seal_persona_secret(&vault, &id, &kp.private_key)?;
         self.conn().execute(
             "INSERT INTO personas \
                 (id, name, public_key, private_key_nonce, \
-                 private_key_ciphertext, created_at, status, \
+                 private_key_ciphertext, private_key_dek_nonce, \
+                 private_key_wrapped_dek, created_at, status, \
                  container_id, parent_grant_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'enrolling', ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'enrolling', ?9, ?10)",
             rusqlite::params![
                 id,
                 name,
                 kp.public_key,
-                nonce,
-                ciphertext,
+                env.payload_nonce,
+                env.ciphertext,
+                env.dek_nonce,
+                env.wrapped_dek,
                 created_at,
                 container_id,
                 parent_grant_id
@@ -321,7 +401,55 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-66 — phase 2 of the two-phase
+    /// Runtime-persona phase 1 for design. Inserts a child persona row in
+    /// `enrolling` state, records the delegating parent grant, but does not
+    /// bind the persona to any container identity.
+    pub fn create_runtime_persona_enrolling(
+        &self,
+        name: &str,
+        parent_grant_id: &str,
+    ) -> Result<PersonaInfo, StoreError> {
+        let id = format!("persona-{}", Uuid::new_v4());
+        let kp = core_crypto::generate_local_key_pair("persona", &id);
+        let created_at = Utc::now().to_rfc3339();
+
+        let vault = self.vault().ok_or_else(|| {
+            StoreError::Vault(
+                "create_runtime_persona requires a live vault but no vault is attached".to_string(),
+            )
+        })?;
+        let env = seal_persona_secret(&vault, &id, &kp.private_key)?;
+        self.conn().execute(
+            "INSERT INTO personas \
+                (id, name, public_key, private_key_nonce, \
+                 private_key_ciphertext, private_key_dek_nonce, \
+                 private_key_wrapped_dek, created_at, status, parent_grant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'enrolling', ?9)",
+            rusqlite::params![
+                id,
+                name,
+                kp.public_key,
+                env.payload_nonce,
+                env.ciphertext,
+                env.dek_nonce,
+                env.wrapped_dek,
+                created_at,
+                parent_grant_id
+            ],
+        )?;
+
+        Ok(PersonaInfo {
+            id,
+            name: name.to_string(),
+            public_key: kp.public_key.clone(),
+            created_at,
+            status: "enrolling".to_string(),
+            container_id: None,
+            parent_grant_id: Some(parent_grant_id.to_string()),
+        })
+    }
+
+    /// implementation-note-74 — phase 2 of the two-phase
     /// commit. Flips a persona row from `enrolling` to `active`. The
     /// transition is gated on the row currently being in `enrolling`
     /// state: a row that has already been activated, revoked, or never
@@ -360,7 +488,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-66 — reconciler entry point. Look
+    /// implementation-note-74 — reconciler entry point. Look
     /// up an enrolling persona by its bound `container_id`. The
     /// reconciler calls this before spawning into a container slot;
     /// a `Some(_)` return means a previous spawn attempt crashed
@@ -460,13 +588,22 @@ impl DaemonStore {
     /// Returns `StoreError::NotFound` if the persona does not exist and
     /// `StoreError::InvalidInput` if the stored key material cannot be
     /// parsed as Ed25519 (e.g. DB corruption or a future algorithm switch).
-    pub fn persona_root_keypair(&self, persona_id: &str) -> Result<RootKeyPair, StoreError> {
-        type PersonaKeyRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+    pub(crate) fn persona_root_key_material(
+        &self,
+        persona_id: &str,
+    ) -> Result<PersonaRootKeyMaterial, StoreError> {
+        type PersonaKeyRow = (
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
         let row: Option<PersonaKeyRow> = self
             .conn()
             .query_row(
-                "SELECT public_key, private_key_nonce, \
-                        private_key_ciphertext \
+                "SELECT public_key, private_key_nonce, private_key_ciphertext, \
+                        private_key_dek_nonce, private_key_wrapped_dek \
                  FROM personas WHERE id = ?1",
                 rusqlite::params![persona_id],
                 |row| {
@@ -474,6 +611,8 @@ impl DaemonStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<Vec<u8>>>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
@@ -482,22 +621,16 @@ impl DaemonStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let (public_key, nonce, ciphertext) = row.ok_or(StoreError::NotFound)?;
+        let (public_key, nonce, ciphertext, dek_nonce, wrapped_dek) =
+            row.ok_or(StoreError::NotFound)?;
 
-        let (n, ct) = match (nonce, ciphertext) {
-            (Some(n), Some(ct)) => (n, ct),
-            _ => {
-                return Err(StoreError::InvalidInput(format!(
-                    "persona '{persona_id}' has no vault-sealed private key"
-                )));
-            }
-        };
+        let env = persona_sealed_envelope(persona_id, nonce, ciphertext, dek_nonce, wrapped_dek)?;
         let vault = self.vault().ok_or_else(|| {
             StoreError::Vault(format!(
                 "persona '{persona_id}' secret is vault-sealed but no vault is attached"
             ))
         })?;
-        let secret_plain = open_persona_secret(&vault, persona_id, &n, &ct)?;
+        let secret_plain = open_persona_secret(&vault, persona_id, &env)?;
 
         // Both halves are prefixed per `core_crypto::LocalKeyPair`
         // (`ed25519:<hex>` and `ed25519-secret:<hex>`). Strip the prefix
@@ -514,7 +647,20 @@ impl DaemonStore {
                     "persona '{persona_id}' private key missing 'ed25519-secret:' prefix"
                 ))
             })?;
+        // Validate before returning so callers never persist malformed root
+        // material into a grant-scoped lease blob.
         RootKeyPair::from_hex(public_hex, secret_hex).map_err(|e| {
+            StoreError::InvalidInput(format!("persona '{persona_id}' root key invalid: {e}"))
+        })?;
+        Ok(PersonaRootKeyMaterial {
+            public_hex: public_hex.to_string(),
+            secret_hex: secret_hex.to_string(),
+        })
+    }
+
+    pub fn persona_root_keypair(&self, persona_id: &str) -> Result<RootKeyPair, StoreError> {
+        let material = self.persona_root_key_material(persona_id)?;
+        RootKeyPair::from_hex(material.public_hex, material.secret_hex).map_err(|e| {
             StoreError::InvalidInput(format!("persona '{persona_id}' root key invalid: {e}"))
         })
     }
@@ -528,12 +674,18 @@ impl DaemonStore {
     /// `LocalKeyPair` format — the same format the store uses for all persona
     /// key material.
     pub fn persona_signer(&self, persona_id: &str) -> Result<LocalKeySigner, StoreError> {
-        type PersonaKeyRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+        type PersonaKeyRow = (
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
         let row: Option<PersonaKeyRow> = self
             .conn()
             .query_row(
-                "SELECT public_key, private_key_nonce, \
-                        private_key_ciphertext \
+                "SELECT public_key, private_key_nonce, private_key_ciphertext, \
+                        private_key_dek_nonce, private_key_wrapped_dek \
                  FROM personas WHERE id = ?1",
                 rusqlite::params![persona_id],
                 |row| {
@@ -541,6 +693,8 @@ impl DaemonStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<Vec<u8>>>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
@@ -549,22 +703,16 @@ impl DaemonStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let (public_key, nonce, ciphertext) = row.ok_or(StoreError::NotFound)?;
+        let (public_key, nonce, ciphertext, dek_nonce, wrapped_dek) =
+            row.ok_or(StoreError::NotFound)?;
 
-        let (n, ct) = match (nonce, ciphertext) {
-            (Some(n), Some(ct)) => (n, ct),
-            _ => {
-                return Err(StoreError::InvalidInput(format!(
-                    "persona '{persona_id}' has no vault-sealed private key"
-                )));
-            }
-        };
+        let env = persona_sealed_envelope(persona_id, nonce, ciphertext, dek_nonce, wrapped_dek)?;
         let vault = self.vault().ok_or_else(|| {
             StoreError::Vault(format!(
                 "persona '{persona_id}' secret is vault-sealed but no vault is attached"
             ))
         })?;
-        let secret_plain = open_persona_secret(&vault, persona_id, &n, &ct)?;
+        let secret_plain = open_persona_secret(&vault, persona_id, &env)?;
 
         // Both public_key and secret_plain are already in prefixed form:
         //   public_key  = "ed25519:<hex>"
@@ -580,7 +728,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-298 — return the persona's raw 32-byte
+    /// implementation-note-225 — return the persona's raw 32-byte
     /// Ed25519 seed bytes after decrypting via the attached vault.
     ///
     /// Used by [`agent_persona_two_phase_commit`] to wrap the generated
@@ -592,17 +740,25 @@ impl DaemonStore {
     /// write, container-binding uniqueness check) remain the source of
     /// truth.
     fn persona_secret_bytes(&self, persona_id: &str) -> Result<Vec<u8>, StoreError> {
-        type PersonaKeyRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+        type PersonaKeyRow = (
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
         let row: Option<PersonaKeyRow> = self
             .conn()
             .query_row(
-                "SELECT private_key_nonce, private_key_ciphertext \
+                "SELECT private_key_nonce, private_key_ciphertext, \
+                        private_key_dek_nonce, private_key_wrapped_dek \
                  FROM personas WHERE id = ?1",
                 rusqlite::params![persona_id],
                 |row| {
                     Ok((
                         row.get::<_, Option<Vec<u8>>>(0)?,
                         row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
                     ))
                 },
             )
@@ -611,21 +767,14 @@ impl DaemonStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let (nonce, ciphertext) = row.ok_or(StoreError::NotFound)?;
-        let (n, ct) = match (nonce, ciphertext) {
-            (Some(n), Some(ct)) => (n, ct),
-            _ => {
-                return Err(StoreError::InvalidInput(format!(
-                    "persona '{persona_id}' has no vault-sealed private key"
-                )));
-            }
-        };
+        let (nonce, ciphertext, dek_nonce, wrapped_dek) = row.ok_or(StoreError::NotFound)?;
+        let env = persona_sealed_envelope(persona_id, nonce, ciphertext, dek_nonce, wrapped_dek)?;
         let vault = self.vault().ok_or_else(|| {
             StoreError::Vault(format!(
                 "persona '{persona_id}' secret is vault-sealed but no vault is attached"
             ))
         })?;
-        let secret_plain = open_persona_secret(&vault, persona_id, &n, &ct)?;
+        let secret_plain = open_persona_secret(&vault, persona_id, &env)?;
         let secret_hex = secret_plain
             .strip_prefix("ed25519-secret:")
             .ok_or_else(|| {
@@ -654,7 +803,43 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-304 — atomically
+    /// Retire a default runtime persona whose sealed key material can no
+    /// longer be opened, freeing its stable name for immediate re-enrollment.
+    pub fn retire_persona_for_reenroll(
+        &self,
+        id: &str,
+        expected_name: &str,
+    ) -> Result<String, StoreError> {
+        let existing = self.get_persona(id)?;
+        if existing.name != expected_name {
+            return Err(StoreError::InvalidInput(format!(
+                "persona '{id}' has name '{}', expected '{expected_name}'",
+                existing.name
+            )));
+        }
+
+        let suffix: String = id
+            .strip_prefix("persona-")
+            .unwrap_or(id)
+            .chars()
+            .take(8)
+            .collect();
+        let retired_name = format!("{expected_name}-retired-{suffix}");
+        let count = self.conn().execute(
+            "UPDATE personas SET name = ?1, status = 'revoked' WHERE id = ?2 AND name = ?3",
+            rusqlite::params![retired_name, id, expected_name],
+        )?;
+        if count == 0 {
+            return Err(StoreError::NotFound);
+        }
+        self.conn().execute(
+            "UPDATE grants SET status = 'revoked' WHERE persona_id = ?1 AND status = 'active'",
+            rusqlite::params![id],
+        )?;
+        Ok(retired_name)
+    }
+
+    /// implementation-note-283 — atomically
     /// increment a persona's `client_cert_refresh_seq` and return the
     /// post-increment value.
     ///
@@ -711,7 +896,117 @@ impl DaemonStore {
         }
     }
 
-    /// implementation-note-305 — return the ancestry chain for a
+    /// Read the bridge client-cert columns for a persona.
+    ///
+    /// `refresh_cert` treats an empty fingerprint / zero `not_after` as a
+    /// legacy pre-pinning row and refuses refresh rather than lazily trusting a
+    /// newly supplied cert. That policy is locked in the M3 handler.
+    pub fn get_persona_client_cert_state(
+        &self,
+        persona_id: &str,
+    ) -> Result<PersonaClientCertState, StoreError> {
+        let result = self.conn().query_row(
+            "SELECT client_cert_fingerprint, client_cert_not_after, \
+                    client_cert_refresh_seq \
+             FROM personas WHERE id = ?1",
+            rusqlite::params![persona_id],
+            |row| {
+                let refresh_seq = row.get::<_, i64>(2)?;
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, refresh_seq))
+            },
+        );
+        match result {
+            Ok((fingerprint_hex, not_after_unix, refresh_seq)) => {
+                let refresh_seq = u32::try_from(refresh_seq).map_err(|_| {
+                    StoreError::InvalidInput(format!(
+                        "persona '{persona_id}' client_cert_refresh_seq out of u32 range: {refresh_seq}"
+                    ))
+                })?;
+                Ok(PersonaClientCertState {
+                    fingerprint_hex,
+                    not_after_unix,
+                    refresh_seq,
+                })
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::NotFound),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
+    }
+
+    /// design M3 refresh UPDATE: atomically replace the pinned client-cert
+    /// fingerprint, replace `not_after`, increment `client_cert_refresh_seq`,
+    /// and return the post-increment sequence.
+    ///
+    /// This is intentionally one SQL statement so observers never see a fresh
+    /// fingerprint with an old sequence, or a bumped sequence without the cert
+    /// columns that made that sequence meaningful.
+    pub fn replace_persona_client_cert_for_refresh(
+        &self,
+        persona_id: &str,
+        fingerprint_hex: &str,
+        not_after_unix: i64,
+    ) -> Result<u32, StoreError> {
+        let result = self.conn().query_row(
+            "UPDATE personas SET client_cert_fingerprint = ?1, \
+                 client_cert_not_after = ?2, \
+                 client_cert_refresh_seq = client_cert_refresh_seq + 1 \
+             WHERE id = ?3 RETURNING client_cert_refresh_seq",
+            rusqlite::params![fingerprint_hex, not_after_unix, persona_id],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(v) => u32::try_from(v).map_err(|_| {
+                StoreError::InvalidInput(format!(
+                    "persona '{persona_id}' client_cert_refresh_seq out of u32 range: {v}"
+                ))
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::NotFound),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
+    }
+
+    /// implementation-note-228 — atomically write the
+    /// `client_cert_fingerprint` (blake3-hex of leaf cert DER, per design
+    /// §Component 2 / §"Persona table columns") and `client_cert_not_after`
+    /// (Unix seconds) on the persona row.
+    ///
+    /// Writes both columns in a single UPDATE so an observer never sees a
+    /// row whose fingerprint is set but whose `not_after` is stale (or vice
+    /// versa). Idempotent — a second call with the same persona overwrites
+    /// the same columns; this is the same atomic-replace semantics design
+    /// §Component 7 §"Atomicity — option (a) immediate replace" specifies
+    /// for the refresh path (and the same UPDATE shape the future
+    /// `refresh_cert` handler will issue).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::NotFound` if no persona row exists with the given
+    ///   `persona_id` (mirrors `increment_refresh_seq`'s mapping of
+    ///   `QueryReturnedNoRows` to `NotFound`).
+    /// - `StoreError::Sqlite` for any other underlying rusqlite error.
+    ///
+    /// Anchor: `spawn_time_cert_write_landed`.
+    pub fn set_persona_client_cert(
+        &self,
+        persona_id: &str,
+        fingerprint_hex: &str,
+        not_after_unix: i64,
+    ) -> Result<(), StoreError> {
+        let result = self.conn().query_row(
+            "UPDATE personas SET client_cert_fingerprint = ?1, \
+             client_cert_not_after = ?2 \
+             WHERE id = ?3 RETURNING id",
+            rusqlite::params![fingerprint_hex, not_after_unix, persona_id],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::NotFound),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
+    }
+
+    /// implementation-note-284 — return the ancestry chain for a
     /// persona starting with the persona itself, then its parent, then the
     /// parent's parent, up to `MAX_PARENT_PERSONA_CHAIN_HOPS` ancestors total
     /// (per design §Component 6 — practical chains are 3 links).
@@ -787,19 +1082,19 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-305 — hop cap for `parent_persona_chain`.
+/// implementation-note-284 — hop cap for `parent_persona_chain`.
 /// design §Component 6 expects practical chains of three links
 /// (root → orchestrator → worker). The cap is also the cycle-safety
 /// fallback — see `parent_persona_chain_handles_cycle_safely`.
 pub const MAX_PARENT_PERSONA_CHAIN_HOPS: usize = 3;
 
-/// implementation-note-298 — atomic enroll → delegate → activate
+/// implementation-note-225 — atomic enroll → delegate → activate
 /// wrapper that mlocks the new persona's secret-key bytes for the
 /// duration of the commit.
 ///
 /// This is the single transactional entry-point that composes the
 /// already-shipped three-phase primitives from
-/// implementation-note-66:
+/// implementation-note-74:
 ///
 /// 1. [`DaemonStore::create_agent_persona_enrolling`] — phase 1 (insert
 ///    enrolling row, bind container slot).
@@ -834,7 +1129,7 @@ pub const MAX_PARENT_PERSONA_CHAIN_HOPS: usize = 3;
 /// `PersonaInfo`. In practice the daemon attaches one vault for the
 /// entire process lifetime; the explicit arg is for documentation +
 /// future-proofing against per-call vault rotation.
-/// implementation-note-298 — compute a child TTL bounded by the
+/// implementation-note-225 — compute a child TTL bounded by the
 /// parent's remaining lifetime.
 ///
 /// Returns `Some(seconds)` capped at the parent's remaining lifetime
@@ -924,7 +1219,223 @@ pub fn agent_persona_two_phase_commit(
     Ok(activated)
 }
 
-/// implementation-note-164 scaffold — thin wrapper over the
+/// Runtime-persona equivalent of the agent two-phase commit.
+///
+/// The returned tuple is `(runtime_persona, runtime_grant)`.
+pub fn runtime_persona_two_phase_commit(
+    store: &DaemonStore,
+    durable_persona_name: &str,
+    parent_grant_id: &str,
+    child_scope: &str,
+    child_ttl_secs: u64,
+    github_needs: Option<&[String]>,
+) -> Result<(PersonaInfo, GrantInfo), StoreError> {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let short_suffix = &suffix[..8];
+    let name = format!("runtime-{durable_persona_name}-{short_suffix}");
+
+    let enrolling = store.create_runtime_persona_enrolling(&name, parent_grant_id)?;
+    let secret_bytes = store.persona_secret_bytes(&enrolling.id)?;
+    let _locked = MlockedSecret::new(secret_bytes).map_err(|e| {
+        StoreError::Vault(format!(
+            "mlock runtime persona '{}' secret pages: {e}",
+            enrolling.id
+        ))
+    })?;
+
+    let runtime_grant = match github_needs {
+        // BKR-4c standing-grant lane: when the session selected a delegation
+        // template, mint the runtime grant carrying the parent's statements
+        // with the github authority statement(s) narrowed to the template-
+        // derived enumerated capabilities (`github:<object>:<verb>`), replacing
+        // the broad `github:*` ceiling the legacy lane mirrors. Statement-level
+        // rewriting requires the chain-mirroring path, not the scope-string
+        // `delegate_grant_full` projection — so a template always routes here.
+        Some(needs) => mirror_composite_parent_grant_to_runtime_persona(
+            store,
+            parent_grant_id,
+            &enrolling.id,
+            child_ttl_secs,
+            Some(needs),
+        )?,
+        None => match store.delegate_grant_full(
+            parent_grant_id,
+            &enrolling.id,
+            child_scope,
+            Some(child_ttl_secs),
+            None,
+        ) {
+            Ok(grant) => grant,
+            Err(StoreError::InvalidInput(message))
+                if message.contains("scope diverges from signed chain") =>
+            {
+                mirror_composite_parent_grant_to_runtime_persona(
+                    store,
+                    parent_grant_id,
+                    &enrolling.id,
+                    child_ttl_secs,
+                    None,
+                )?
+            }
+            Err(other) => return Err(other),
+        },
+    };
+    store.activate_persona(&enrolling.id)?;
+    let activated = store.get_persona(&enrolling.id)?;
+    Ok((activated, runtime_grant))
+}
+
+/// Rewrite a parent block's statements for the BKR-4c standing-grant lane:
+/// every statement carrying a `github:*`-family action is replaced by one
+/// enumerated statement per `github_needs` entry (`github:<object>:<verb>`),
+/// preserving the original statement's resource selector, budget, conditions,
+/// and `can_delegate` facet. Non-github statements (credential custody, session
+/// `llm:generate`, time) pass through untouched.
+///
+/// An empty `github_needs` drops github authority entirely — a template that
+/// scoped no github actions yields a runtime grant with no github statement,
+/// so `need ⊆ grant` fails closed for every github action (absent-allow deny).
+/// Enumerated (never `github:*`) per the apex-not-`*` invariant (design §6).
+fn narrow_github_statements(
+    statements: Vec<core_grant_types::Statement>,
+    github_needs: &[String],
+) -> Vec<core_grant_types::Statement> {
+    let mut out = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        let is_github = stmt.actions.iter().any(|a| a.starts_with("github:"));
+        if !is_github {
+            out.push(stmt);
+            continue;
+        }
+        for (i, need) in github_needs.iter().enumerate() {
+            out.push(core_grant_types::Statement {
+                sid: format!("{}-need-{i}", stmt.sid),
+                resource_type: stmt.resource_type,
+                actions: vec![need.clone()],
+                resource: stmt.resource.clone(),
+                budget: stmt.budget.clone(),
+                usage: stmt.usage.clone(),
+                conditions: stmt.conditions.clone(),
+                can_delegate: stmt.can_delegate.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn mirror_composite_parent_grant_to_runtime_persona(
+    store: &DaemonStore,
+    parent_grant_id: &str,
+    child_persona_id: &str,
+    child_ttl_secs: u64,
+    github_needs: Option<&[String]>,
+) -> Result<GrantInfo, StoreError> {
+    let parent_chain = store.get_access_grant(parent_grant_id)?;
+    if parent_chain.blocks.len() != 1 {
+        return Err(StoreError::InvalidInput(
+            "runtime persona mirroring only supports single-block parent grants".into(),
+        ));
+    }
+
+    let parent_flat = store.get_grant(parent_grant_id)?;
+    let max_depth = parent_flat
+        .max_delegation_depth
+        .ok_or_else(|| StoreError::InvalidInput("parent does not allow delegation".into()))?;
+    if max_depth == 0 {
+        return Err(StoreError::InvalidInput("delegation depth exceeded".into()));
+    }
+
+    let now = Utc::now();
+    let requested_expiry_epoch = (now + Duration::seconds(child_ttl_secs as i64))
+        .timestamp()
+        .max(0) as u64;
+    let parent_expiry_epoch = parent_chain.blocks[0].block.expires_at;
+    let effective_expiry_epoch = parent_expiry_epoch
+        .map(|parent| parent.min(requested_expiry_epoch))
+        .or(Some(requested_expiry_epoch));
+
+    let mut child_block = parent_chain.blocks[0].block.clone();
+    child_block.expires_at = effective_expiry_epoch;
+    if let Some(needs) = github_needs {
+        // BKR-4c: narrow the mirrored github authority to the template's
+        // enumerated capabilities before signing the child chain.
+        child_block.statements =
+            narrow_github_statements(std::mem::take(&mut child_block.statements), needs);
+    }
+    child_block.issued_by = child_persona_id.to_string();
+
+    // design §2 — establish the child grant's authority-to-act: mint its live
+    // lease, seal its persona root under that lease, and sign block-0 through the
+    // lease. The recovered root is the same persona root, so the block-0
+    // signature is identical to the prior raw `sign_block_zero_with`; the lease
+    // is the gate the proxy's `has_live_lease` check requires. WITHOUT this, a
+    // template / `--delegated` session (which always routes here) minted a grant
+    // with NO lease and every model-auth request 403'd `no_live_lease`. This
+    // makes the mirror path lease-symmetric with the other two grant-creation
+    // paths (`create_grant_with_budget_inner`, `delegate_grant_full`).
+    let child_grant_id = format!("grant-{}", Uuid::new_v4());
+    let lease_expires_at = effective_expiry_epoch
+        .and_then(|epoch| chrono::DateTime::<Utc>::from_timestamp(epoch as i64, 0));
+    let child_signed = store.mint_lease_and_lease_sign_block_zero(
+        &child_grant_id,
+        child_persona_id,
+        &parent_flat.scope,
+        lease_expires_at,
+        &child_block,
+        now,
+        "runtime composite mirror",
+    )?;
+
+    // Any failure after the lease is minted must drop it (fail-closed — never a
+    // dangling lease without a persisted grant row).
+    let persist = (|| -> Result<GrantInfo, StoreError> {
+        let created_at_epoch = now.timestamp().max(0) as u64;
+        let created_at = now.to_rfc3339();
+        let expires_at = effective_expiry_epoch.map(|epoch| {
+            chrono::DateTime::<Utc>::from_timestamp(epoch as i64, 0)
+                .expect("runtime mirrored grant expiry must be representable")
+                .to_rfc3339()
+        });
+        let budget_json = parent_flat
+            .budget
+            .as_ref()
+            .map(|budget| serde_json::to_string(budget).expect("Budget serializes"));
+        let child_access_grant = core_grants::chain::access_grant_envelope(
+            &child_grant_id,
+            child_persona_id,
+            &parent_flat.credential_name,
+            "active",
+            child_signed,
+            created_at_epoch,
+        );
+        let blocks_json = crate::trust::grant::access_grant_blocks_to_json(&child_access_grant)?;
+        crate::trust::grant::validate_blocks_json_caps(&child_access_grant, &blocks_json)?;
+        store.conn().execute(
+            "INSERT INTO grants (id, persona_id, credential_name, scope, ttl_secs, created_at, expires_at, status, parent_grant_id, max_delegation_depth, budget_json, blocks_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                child_grant_id,
+                child_persona_id,
+                parent_flat.credential_name,
+                parent_flat.scope,
+                Some(child_ttl_secs as i64),
+                created_at,
+                expires_at,
+                parent_grant_id,
+                max_depth.saturating_sub(1) as i64,
+                budget_json,
+                blocks_json,
+            ],
+        )?;
+        store.get_grant(&child_grant_id)
+    })();
+    if persist.is_err() {
+        store.leases().drop_lease(&child_grant_id);
+    }
+    persist
+}
+
+/// implementation-note-161 scaffold — thin wrapper over the
 /// existing two-phase commit + spawn machinery for the `broker.mint_sub_persona`
 /// RPC adapter. Real implementation wires `agent_persona_two_phase_commit`
 /// with a parent-persona lookup and scope attenuation.
@@ -932,7 +1443,9 @@ pub fn agent_persona_two_phase_commit(
 /// # TODO
 ///
 /// Wire the actual two-phase commit + spawn here once
-/// implementation-note-164 follow-up lands. The real body:
+/// implementation-note-161 follow-up lands. Until then this
+/// scaffold must fail closed instead of panicking on the public
+/// `broker.mint_sub_persona` RPC path. The real body:
 ///   1. Resolve `parent_persona_id` to its active grant.
 ///   2. Call `agent_persona_two_phase_commit(store, vault, child_label, grant_id)`.
 ///   3. Attenuate child grant scope to `scope` parameter.
@@ -943,9 +1456,104 @@ pub async fn mint_sub_persona(
     scope: &str,
 ) -> Result<String, StoreError> {
     let _ = (parent_persona_id, child_label, scope);
-    unimplemented!(
-        "two-phase commit + spawn wiring TBD - implementation-note-164 scaffold"
-    )
+    Err(StoreError::InvalidInput(
+        concat!(
+            "broker.mint_sub_persona is fail-closed: ",
+            "two-phase commit + spawn wiring is not implemented ",
+            "(implementation-note-161)"
+        )
+        .to_string(),
+    ))
+}
+
+/// implementation-note-228 — error returned by
+/// [`pin_persona_client_cert_from_pem`].
+///
+/// Distinct from [`StoreError`] so the bindings handler can decide its
+/// own posture (fail-soft vs propagate) per-variant: PEM/DER parse
+/// failures are a daemon-mint contract violation worth logging loudly,
+/// while [`PinClientCertError::Store`] surfaces the underlying UPDATE
+/// failure unchanged.
+#[derive(Debug)]
+pub enum PinClientCertError {
+    /// PEM did not decode to a single x509 certificate.
+    Pem(String),
+    /// DER decoded but the cert body did not parse.
+    Der(String),
+    /// Cert's `not_after` is before the Unix epoch (negative timestamp).
+    /// Treat as a contract violation — the mint helper never produces
+    /// these, so a positive result here means a corrupted CA path.
+    NotAfterBeforeEpoch(i64),
+    /// Underlying SQLite UPDATE failure or NotFound from
+    /// [`DaemonStore::set_persona_client_cert`].
+    Store(StoreError),
+}
+
+impl std::fmt::Display for PinClientCertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pem(msg) => write!(f, "client cert PEM decode failed: {msg}"),
+            Self::Der(msg) => write!(f, "client cert DER decode failed: {msg}"),
+            Self::NotAfterBeforeEpoch(ts) => {
+                write!(f, "client cert not_after is before Unix epoch: {ts}")
+            }
+            Self::Store(e) => write!(f, "persona cert UPDATE failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PinClientCertError {}
+
+impl From<StoreError> for PinClientCertError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// implementation-note-228 — parse a freshly-minted
+/// client cert PEM, compute its blake3-hex fingerprint + Unix `not_after`,
+/// and atomically write both into the persona row via
+/// [`DaemonStore::set_persona_client_cert`].
+///
+/// Returns the computed `(fingerprint_hex, not_after_unix)` so the caller
+/// can include them in audit/log lines without re-parsing.
+///
+/// PEM→DER parsing mirrors [`read_cert_not_after`] in
+/// `infra/runtime.rs`: `x509_parser::pem::parse_x509_pem` then
+/// `X509Certificate::from_der`. Fingerprint shape is blake3 of the leaf
+/// cert DER, hex-lower — locks the column to design §Component 2
+/// §"Persona table columns" so the M3 `refresh_cert` handler reads what
+/// this writes.
+///
+/// Anchor: `spawn_time_cert_write_landed`.
+pub fn pin_persona_client_cert_from_pem(
+    store: &DaemonStore,
+    persona_id: &str,
+    client_cert_pem: &str,
+) -> Result<(String, i64), PinClientCertError> {
+    let (fingerprint_hex, not_after_ts) =
+        client_cert_fingerprint_and_not_after_from_pem(client_cert_pem)?;
+    store.set_persona_client_cert(persona_id, &fingerprint_hex, not_after_ts)?;
+    Ok((fingerprint_hex, not_after_ts))
+}
+
+/// Parse a client-cert PEM and return `(blake3_der_hex, not_after_unix)`.
+///
+/// Shared by spawn-time pinning and the refresh path so the persona column
+/// shape stays identical across initial enrollment and cert rotation.
+pub fn client_cert_fingerprint_and_not_after_from_pem(
+    client_cert_pem: &str,
+) -> Result<(String, i64), PinClientCertError> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(client_cert_pem.as_bytes())
+        .map_err(|e| PinClientCertError::Pem(e.to_string()))?;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&pem.contents)
+        .map_err(|e| PinClientCertError::Der(e.to_string()))?;
+    let not_after_ts = cert.tbs_certificate.validity.not_after.timestamp();
+    if not_after_ts < 0 {
+        return Err(PinClientCertError::NotAfterBeforeEpoch(not_after_ts));
+    }
+    let fingerprint_hex = hex::encode(blake3::hash(&pem.contents).as_bytes());
+    Ok((fingerprint_hex, not_after_ts))
 }
 
 /// design §Component 3 — operator-launched bridge-client cert TTL check.
@@ -1118,6 +1726,60 @@ mod tests {
     }
 
     #[test]
+    fn retire_persona_for_reenroll_frees_name_and_revokes_grants() {
+        let (store, _vault) = store_with_vault();
+        let created = store.create_persona("agent-recover").unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO grants (id, persona_id, credential_name, scope, created_at, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+                rusqlite::params![
+                    "grant-recover",
+                    created.id,
+                    "credential/test",
+                    "scope/test",
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+
+        let retired_name = store
+            .retire_persona_for_reenroll(&created.id, "agent-recover")
+            .unwrap();
+        assert!(retired_name.starts_with("agent-recover-retired-"));
+
+        let retired = store.get_persona(&created.id).unwrap();
+        assert_eq!(retired.status, "revoked");
+        assert_eq!(retired.name, retired_name);
+
+        let grant_status: String = store
+            .conn()
+            .query_row(
+                "SELECT status FROM grants WHERE id = ?1",
+                rusqlite::params!["grant-recover"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grant_status, "revoked");
+
+        let replacement = store.create_persona("agent-recover").unwrap();
+        assert_ne!(replacement.id, created.id);
+        assert_eq!(replacement.name, "agent-recover");
+        assert_eq!(replacement.status, "active");
+    }
+
+    #[test]
+    fn retire_persona_for_reenroll_rejects_name_mismatch() {
+        let (store, _vault) = store_with_vault();
+        let created = store.create_persona("agent-original").unwrap();
+        let err = store
+            .retire_persona_for_reenroll(&created.id, "agent-other")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[test]
     fn revoke_nonexistent_persona_returns_not_found() {
         let (store, _vault) = store_with_vault();
         let result = store.revoke_persona("persona-does-not-exist");
@@ -1125,7 +1787,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-304 —
+    // implementation-note-283 —
     // `increment_refresh_seq` atomic counter on personas.
     // ------------------------------------------------------------------
 
@@ -1212,7 +1874,9 @@ mod tests {
             .run_until(async {
                 let (store, _vault) = store_with_vault();
                 let store = Rc::new(store);
-                let persona = store.create_persona("agent-refresh-seq-concurrent").unwrap();
+                let persona = store
+                    .create_persona("agent-refresh-seq-concurrent")
+                    .unwrap();
 
                 const N: u32 = 256;
                 let mut handles = Vec::with_capacity(N as usize);
@@ -1269,6 +1933,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: Vec::new(),
+                can_delegate: None,
             }],
             nbf: None,
             expires_at: None,
@@ -1335,6 +2000,94 @@ mod tests {
         assert_eq!(format!("ed25519:{}", rk.public_hex()), created.public_key);
     }
 
+    /// design Part B — the persona secret is enveloped: the MEK no longer
+    /// directly encrypts it. The new wrapped-DEK columns are populated, and
+    /// a cross-persona splice (moving one persona's four sealed components
+    /// onto another persona's row) fails the persona-bound wrap AAD even
+    /// though both rows are sealed under the same Interactive MEK.
+    #[test]
+    fn persona_secret_enveloped_and_splice_proof() {
+        let (store, _vault) = store_with_vault();
+        let a = store.create_persona("persona-a").unwrap();
+        let b = store.create_persona("persona-b").unwrap();
+
+        // Both rows carry all four envelope components.
+        type Cols = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        let (n, ct, dn, wd): Cols = store
+            .conn()
+            .query_row(
+                "SELECT length(private_key_nonce), length(private_key_ciphertext), \
+                        length(private_key_dek_nonce), length(private_key_wrapped_dek) \
+                 FROM personas WHERE id = ?1",
+                rusqlite::params![a.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(n, Some(24), "payload nonce");
+        assert!(ct.unwrap_or(0) > 16, "payload ciphertext+tag");
+        assert_eq!(dn, Some(24), "dek nonce");
+        assert_eq!(wd, Some(32 + 16), "wrapped dek (32-byte DEK + 16-byte tag)");
+
+        // Splice persona-a's sealed components onto persona-b's row.
+        let (an, act, adn, awd): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = store
+            .conn()
+            .query_row(
+                "SELECT private_key_nonce, private_key_ciphertext, \
+                        private_key_dek_nonce, private_key_wrapped_dek \
+                 FROM personas WHERE id = ?1",
+                rusqlite::params![a.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE personas SET private_key_nonce = ?1, private_key_ciphertext = ?2, \
+                                     private_key_dek_nonce = ?3, private_key_wrapped_dek = ?4 \
+                 WHERE id = ?5",
+                rusqlite::params![an, act, adn, awd, b.id],
+            )
+            .unwrap();
+
+        // Reading persona-b now fails: the DEK was wrapped with persona-a's
+        // AAD (`persona-secret:<a.id>`); persona-b's read rebuilds the AAD
+        // from its own id, so the AEAD tag rejects the unwrap.
+        let err = store.persona_root_keypair(&b.id).unwrap_err();
+        match err {
+            StoreError::Vault(msg) => assert!(
+                msg.contains("decrypt persona") && msg.contains("dek unwrap failed"),
+                "expected a dek-unwrap AEAD failure on the cross-persona splice, got: {msg}"
+            ),
+            other => panic!("expected StoreError::Vault(dek unwrap failed), got {other:?}"),
+        }
+    }
+
+    /// design Part B — envelope-only: a persona row missing the wrapped-DEK
+    /// columns (a pre-Part-B row) is NOT silently decrypted under the MEK; the
+    /// read path errors loud and points at the migration one-shot.
+    #[test]
+    fn persona_pre_envelope_row_errors_clearly() {
+        let (store, _vault) = store_with_vault();
+        let created = store.create_persona("legacy-persona").unwrap();
+        // Null out the wrapped-DEK columns to model a pre-Part-B row.
+        store
+            .conn()
+            .execute(
+                "UPDATE personas SET private_key_dek_nonce = NULL, \
+                                     private_key_wrapped_dek = NULL WHERE id = ?1",
+                rusqlite::params![created.id],
+            )
+            .unwrap();
+        let err = store.persona_root_keypair(&created.id).unwrap_err();
+        match err {
+            StoreError::InvalidInput(msg) => assert!(
+                msg.contains("not enveloped"),
+                "expected a 'not enveloped' error, got: {msg}"
+            ),
+            other => panic!("expected StoreError::InvalidInput(not enveloped), got {other:?}"),
+        }
+    }
+
     #[test]
     fn create_persona_without_vault_is_rejected() {
         // V0: bare in-memory store has no vault. create_persona must fail
@@ -1382,7 +2135,7 @@ mod tests {
 
     #[test]
     fn separate_store_connections_each_need_vault_attached() {
-        // implementation-note-108 follow-up — regression for the dashboard task
+        // implementation-note-107 follow-up — regression for the dashboard task
         // opening its own DaemonStore connection and never calling
         // set_vault. Two stores against the same on-disk DB are independent
         // RefCell<Option<Rc<Vault>>> handles — each must attach the vault
@@ -1425,7 +2178,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-66 — two-phase commit lifecycle.
+    // implementation-note-74 — two-phase commit lifecycle.
     // ------------------------------------------------------------------
 
     #[test]
@@ -1516,7 +2269,7 @@ mod tests {
 
     #[test]
     fn enrolling_persona_for_container_blocks_reconciler_spawn() {
-        // implementation-note-66 acceptance criterion —
+        // implementation-note-74 acceptance criterion —
         // simulate emberd restart mid-spawn: create a persona in
         // `enrolling` state (phase 1 committed) but never activate
         // (phase 3 lost to crash). The reconciler's lookup must
@@ -1566,7 +2319,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-298 — mlock + two-phase commit.
+    // implementation-note-225 — mlock + two-phase commit.
     // ------------------------------------------------------------------
 
     /// Mint a parent grant suitable for delegation by
@@ -1637,6 +2390,33 @@ mod tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_persona_two_phase_commit_mints_a_live_lease_on_the_mirror_path() {
+        // Regression (design §2): the BKR-4c mirror path — which EVERY
+        // template / `--delegated` session routes through (github_needs=Some) —
+        // must mint a live lease for the runtime grant. Before the fix it
+        // signed block-0 with the raw root and minted NO lease, so the proxy's
+        // `has_live_lease` gate returned false and every model-auth (LLM)
+        // request 403'd `no_live_lease` / `authority_lapsed`.
+        let (store, _vault) = store_with_vault();
+        let parent_grant_id = mint_delegatable_parent_grant(&store);
+
+        let (_persona, runtime_grant) = runtime_persona_two_phase_commit(
+            &store,
+            "claude-code-default",
+            &parent_grant_id,
+            "claude-code-default-v1",
+            3600,
+            Some(&["github:contents:read".to_string()]),
+        )
+        .expect("runtime two-phase commit (mirror path) succeeds");
+
+        assert!(
+            store.leases().has_live_lease(&runtime_grant.id, Utc::now()),
+            "the mirror-path runtime grant must hold a live lease (else the proxy 403s no_live_lease)"
+        );
     }
 
     #[test]
@@ -1753,7 +2533,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-305 — parent_persona_chain helper.
+    // implementation-note-284 — parent_persona_chain helper.
     // ------------------------------------------------------------------
 
     /// Build a three-generation ancestry: root persona A with grant g_a,

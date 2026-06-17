@@ -60,7 +60,7 @@ use crate::infra::vault::{
 ///
 /// Mutex (not RwLock) because the read path also writes on first hit and the
 /// contention is negligible (a handful of vault opens per daemon lifetime).
-/// Per implementation-note-372: cache values are wrapped in
+/// Per implementation-note-326: cache values are wrapped in
 /// `Zeroizing<String>` so the unwrapped passphrase is overwritten when the
 /// cache entry is dropped (test reset, daemon shutdown, lock-then-clear
 /// flows). The HashMap key is the (service, account) identity tuple — those
@@ -116,7 +116,17 @@ fn assert_se_safe(service: &str) -> Result<(), String> {
 ///
 /// Cached per (service, account) for the process lifetime — first call may
 /// prompt; subsequent calls return immediately.
-pub fn get_password_user_presence(service: &str, account: &str) -> Result<Option<String>, String> {
+///
+/// **N6-deeper:** the unwrapped passphrase is returned as `Zeroizing<String>`
+/// so the heap allocation overwrites itself on drop. Callers MUST consume the
+/// returned value via the `Zeroizing` wrapper (Deref to `String`) and not
+/// re-bind into a bare `String` local — the bare-String form is reserved for
+/// the third-party `security_framework` boundary and the `Zeroizing` wrap is
+/// applied in the same expression as the boundary call below.
+pub fn get_password_user_presence(
+    service: &str,
+    account: &str,
+) -> Result<Option<Zeroizing<String>>, String> {
     // Session cache fast path — avoids re-prompting for biometric within the
     // same daemon process.
     {
@@ -124,10 +134,10 @@ pub fn get_password_user_presence(service: &str, account: &str) -> Result<Option
             .lock()
             .expect("vault_macos session cache poisoned");
         if let Some(cached) = cache.get(&(service.to_string(), account.to_string())) {
-            // Zeroizing<String> derefs to String; clone the inner value out so
-            // the caller's String drops normally and only the cache copy zeros
-            // when the entry itself is dropped.
-            return Ok(Some((**cached).clone()));
+            // Clone the cached `Zeroizing<String>` directly — both the cached
+            // entry and the returned copy will zero their heap allocations on
+            // drop, so no bare-String intermediate exists.
+            return Ok(Some(cached.clone()));
         }
     }
 
@@ -139,15 +149,18 @@ pub fn get_password_user_presence(service: &str, account: &str) -> Result<Option
     let opts = PasswordOptions::new_generic_password(service, account);
     match generic_password(opts) {
         Ok(bytes) => {
-            let p = String::from_utf8(bytes)
-                .map_err(|e| format!("vault_macos: passphrase utf8: {e}"))?;
+            // Wrap at the third-party boundary: `String::from_utf8` is the
+            // first expression that materializes the unwrapped passphrase on
+            // the heap. Wrap it in `Zeroizing` in the same expression so the
+            // bare `String` never lives in a longer-lived local.
+            let p = Zeroizing::new(
+                String::from_utf8(bytes)
+                    .map_err(|e| format!("vault_macos: passphrase utf8: {e}"))?,
+            );
             let mut cache = SESSION_CACHE
                 .lock()
                 .expect("vault_macos session cache poisoned");
-            cache.insert(
-                (service.to_string(), account.to_string()),
-                Zeroizing::new(p.clone()),
-            );
+            cache.insert((service.to_string(), account.to_string()), p.clone());
             Ok(Some(p))
         }
         Err(e) => {
@@ -177,7 +190,7 @@ pub fn get_password_user_presence(service: &str, account: &str) -> Result<Option
 /// immediately-following auto-unseal read.
 ///
 /// Note: if an entry already exists with a different SAC (e.g. from a
-/// pre-implementation-note-117 daemon that used `USER_PRESENCE`), the
+/// pre-implementation-note-115 daemon that used `USER_PRESENCE`), the
 /// underlying API replaces it with the new SAC-wrapped version. This is the
 /// documented one-shot upgrade path. Existing entries that pre-date this
 /// branch are NOT migrated automatically — they continue to function under
@@ -207,7 +220,7 @@ pub fn set_password_user_presence(
 
     // Pre-populate the session cache so the immediate read-back doesn't
     // double-prompt the user. Wrap the passphrase in `Zeroizing` so the
-    // cached copy is overwritten on drop (implementation-note-35 C3).
+    // cached copy is overwritten on drop (implementation-note-37 C3).
     let mut cache = SESSION_CACHE
         .lock()
         .expect("vault_macos session cache poisoned");
@@ -240,7 +253,7 @@ pub fn delete_password(service: &str, account: &str) -> Result<(), String> {
 
 /// Test-only: clear the in-process session cache. Lets unit AND integration
 /// tests assert the "first read prompts, second read doesn't" cache behaviour
-/// without needing a fresh process. Per implementation-note-372 the
+/// without needing a fresh process. Per implementation-note-326 the
 /// `_for_tests` suffix has been dropped — production lock paths now also
 /// call this fn (hard-lock semantics drop both the in-memory MEK and the
 /// SE-wrapped session cache).

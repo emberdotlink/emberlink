@@ -1,23 +1,23 @@
 //! `ember trust list` — call the daemon's `trust.list` JSON-RPC and
 //! render the operator-visible trust-set snapshot.
 //!
-//! Per design §Component 2 / implementation-note-334. Read-only
+//! Per design §Component 2 / implementation-note-461. Read-only
 //! query (`AuthorityClass::ConnectOnly` on the daemon side); the
 //! returned snapshot was assembled at startup so the CLI sees exactly
 //! the trust set the daemon would verify against if a manifest reached
 //! it right now.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal as _, Write};
 use std::path::Path;
 
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// One row in the daemon's startup trust snapshot. Mirrors
 /// `ember_daemon::binary_manifest::TrustRootRecord` on the wire; the
 /// CLI side redefines the type instead of cross-depending on the
 /// daemon crate (CLI should not link against the daemon's internals).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustRootView {
     pub fingerprint_hex: String,
     /// `"release"` or `"operator"` (lowercase). Stable wire form.
@@ -28,7 +28,7 @@ pub struct TrustRootView {
 /// is the same flag the daemon stamps onto Receipts; surfacing it
 /// alongside the roots lets the CLI render "prod" vs "dev" posture in
 /// one line.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrustListResponse {
     pub roots: Vec<TrustRootView>,
     pub dev_mode_active: bool,
@@ -49,6 +49,59 @@ pub enum TrustListError {
     Protocol(String),
     #[error("I/O error: {0}")]
     Io(String),
+}
+
+#[derive(Clone, Copy)]
+struct TrustRenderTheme {
+    color: bool,
+}
+
+impl TrustRenderTheme {
+    fn current() -> Self {
+        Self {
+            color: std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn title(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m{text}\x1b[0m")
+    }
+
+    fn heading(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m\x1b[38;2;217;106;29m{text}\x1b[0m")
+    }
+
+    fn table_heading(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m{text}\x1b[0m")
+    }
+
+    fn command(self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        format!("\x1b[1m{text}\x1b[0m")
+    }
+
+    fn badge(self, text: &str) -> String {
+        let code = match text.trim().to_ascii_lowercase().as_str() {
+            "prod" | "release" | "operator" => Some("\x1b[32m"),
+            "dev" => Some("\x1b[33m"),
+            _ => None,
+        };
+        match (self.color, code) {
+            (true, Some(code)) => format!("\x1b[1m{code}{text}\x1b[0m"),
+            _ => self.command(text),
+        }
+    }
 }
 
 /// Call `trust.list` against the daemon socket and parse the response.
@@ -76,41 +129,90 @@ pub fn parse_trust_list_response(body: &Value) -> Result<TrustListResponse, Trus
 /// CLI-side so the daemon doesn't grow a string-formatting surface for
 /// every operator-display field.
 pub fn render_human(resp: &TrustListResponse) -> String {
+    let theme = TrustRenderTheme::current();
     let mut out = String::new();
     if resp.roots.is_empty() {
+        out.push_str(&theme.title("Trust roots"));
+        out.push('\n');
         out.push_str(
-            "no trust roots loaded — daemon was opened without startup verification \
-             (the daemon may have started before the manifest path was set, or it is \
-             running in an in-memory test mode)\n",
+            "No trust roots are loaded right now; startup verification is not active on this daemon.\n\n",
         );
-        return out;
+        out.push_str(&theme.heading("Next"));
+        out.push('\n');
+        out.push_str(&format!(
+            "  {}\n    Inspect the current machine posture before relying on local verification\n",
+            theme.command("ember doctor")
+        ));
+        out.push_str(&format!(
+            "  {}\n    Read how trust roots and receipt verification fit together\n",
+            theme.command("ember explain trust")
+        ));
+        return out.trim_end().to_string();
     }
     let posture = if resp.dev_mode_active { "dev" } else { "prod" };
+    out.push_str(&theme.title("Trust roots"));
+    out.push('\n');
     out.push_str(&format!(
-        "Trust posture: {} ({} root{}, dev_mode_active = {})\n",
-        posture,
-        resp.roots.len(),
-        if resp.roots.len() == 1 { "" } else { "s" },
-        resp.dev_mode_active,
+        "{} posture with {} active.\n",
+        theme.badge(posture),
+        if resp.roots.len() == 1 {
+            "1 trust root".to_string()
+        } else {
+            format!("{} trust roots", resp.roots.len())
+        }
+    ));
+    out.push('\n');
+    out.push_str(&theme.heading("Current set"));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {:<12} {}\n",
+        theme.table_heading("SOURCE"),
+        theme.table_heading("FINGERPRINT")
     ));
     for (i, r) in resp.roots.iter().enumerate() {
-        let source_label = match r.source.as_str() {
-            "release" => "release ",
-            "operator" => "operator",
-            other => other,
-        };
-        out.push_str(&format!("  [{i}] {source_label}  {}\n", r.fingerprint_hex));
+        let _ = i;
+        out.push_str(&format!(
+            "  {:<12} {}\n",
+            theme.badge(&r.source),
+            r.fingerprint_hex
+        ));
     }
-    out
+    out.push('\n');
+    out.push_str(&theme.heading("Inspect"));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}\n    Drill into one root by full fingerprint or unique prefix\n",
+        theme.command("ember trust show <fingerprint>")
+    ));
+    out.push_str(&format!(
+        "  {}\n    Verify a signed witness against the active trust roots\n",
+        theme.command("ember receipt verify <id>")
+    ));
+    out.trim_end().to_string()
+}
+
+/// Render the typed daemon response as stable machine-readable JSON.
+pub fn render_json(resp: &TrustListResponse) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(resp)
 }
 
 /// Entry point for the `ember trust list` subcommand. Calls the daemon,
 /// prints the rendered block to stdout. Returns a non-zero exit code on
 /// any error (socket unreachable, RPC failure, malformed response).
-pub fn run(socket_path: &Path) -> i32 {
+pub fn run(socket_path: &Path, json_output: bool) -> i32 {
     match fetch_trust_list(socket_path) {
         Ok(resp) => {
-            print!("{}", render_human(&resp));
+            if json_output {
+                match render_json(&resp) {
+                    Ok(body) => println!("{body}"),
+                    Err(err) => {
+                        eprintln!("ember trust list: encode JSON output: {err}");
+                        return 2;
+                    }
+                }
+            } else {
+                println!("{}", render_human(&resp));
+            }
             0
         }
         Err(TrustListError::DaemonUnavailable { socket, source }) => {
@@ -217,7 +319,9 @@ mod tests {
             dev_mode_active: false,
         };
         let out = render_human(&resp);
-        assert!(out.contains("no trust roots loaded"));
+        assert!(out.contains("Trust roots"));
+        assert!(out.contains("No trust roots are loaded"));
+        assert!(out.contains("ember doctor"));
     }
 
     #[test]
@@ -230,9 +334,10 @@ mod tests {
             dev_mode_active: false,
         };
         let out = render_human(&resp);
-        assert!(out.contains("Trust posture: prod (1 root"));
-        assert!(out.contains("dev_mode_active = false"));
-        assert!(out.contains("release "));
+        assert!(out.contains("prod posture with 1 trust root active."));
+        assert!(out.contains("Current set"));
+        assert!(out.contains("release"));
+        assert!(out.contains("ember trust show <fingerprint>"));
     }
 
     #[test]
@@ -251,7 +356,31 @@ mod tests {
             dev_mode_active: true,
         };
         let out = render_human(&resp);
-        assert!(out.contains("Trust posture: dev (2 roots"));
-        assert!(out.contains("dev_mode_active = true"));
+        assert!(out.contains("dev posture with 2 trust roots active."));
+        assert!(out.contains("release"));
+        assert!(out.contains("operator"));
+        assert!(out.contains(&"aa".repeat(32)));
+        assert!(out.contains(&"bb".repeat(32)));
+    }
+
+    #[test]
+    fn render_json_preserves_typed_response() {
+        let resp = TrustListResponse {
+            roots: vec![
+                TrustRootView {
+                    fingerprint_hex: "aa".repeat(32),
+                    source: "release".to_string(),
+                },
+                TrustRootView {
+                    fingerprint_hex: "bb".repeat(32),
+                    source: "operator".to_string(),
+                },
+            ],
+            dev_mode_active: true,
+        };
+        let json: Value = serde_json::from_str(&render_json(&resp).unwrap()).unwrap();
+        assert_eq!(json["dev_mode_active"], true);
+        assert_eq!(json["roots"][0]["source"], "release");
+        assert_eq!(json["roots"][1]["fingerprint_hex"], "bb".repeat(32));
     }
 }

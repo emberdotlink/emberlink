@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Shared test-helper module. Per cargo integration-test convention,
 //! files under `tests/common/` are loaded into a sibling test crate via

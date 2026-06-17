@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! Pins implementation-note-413 acceptance: dropping a
+//! Pins implementation-note-372 acceptance: dropping a
 //! `TestDaemonHandle` reaps the wrapped child via SIGTERM (with SIGKILL
 //! fallback) so a panicking test cannot leak the spawned daemon process.
 

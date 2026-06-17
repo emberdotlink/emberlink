@@ -15,6 +15,11 @@
     <string>_ember_dev</string>
     <key>KeepAlive</key>
     <true/>
+    <!-- design §security-req-5: throttle restart cadence so a crash-loop
+         (or an induced one) cannot become a restart storm. launchd's
+         default is 10s; we set it explicitly to document the intent. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardErrorPath</key>
     <string>{{STDERR_PATH}}</string>
     <key>EnvironmentVariables</key>

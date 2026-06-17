@@ -13,6 +13,7 @@ pub const LEGACY_MANAGED_WORKTREE_ROOT_BASENAME: &str = ".claude";
 const SESSION_META_FILE: &str = ".agent-session";
 const LIVE_META_FILE: &str = ".agent-live";
 const DEFAULT_BASE_REF: &str = "origin/main";
+pub const WORKSPACE_REF_ENV: &str = "EMBER_WORKSPACE_REF";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
@@ -76,23 +77,29 @@ pub fn primary_worktrees_dir(repo_root: &Path) -> PathBuf {
         .join(WORKTREE_DIR_BASENAME)
 }
 
+fn configured_worktrees_dir(repo_root: &Path) -> PathBuf {
+    if let Ok(root) = std::env::var("EMBER_MANAGED_WORKTREE_ROOT")
+        && !root.trim().is_empty()
+    {
+        return repo_root.join(root).join(WORKTREE_DIR_BASENAME);
+    }
+    primary_worktrees_dir(repo_root)
+}
+
 pub fn worktrees_dir(repo_root: &Path) -> PathBuf {
-    let primary = primary_worktrees_dir(repo_root);
-    if primary.exists() {
-        return primary;
-    }
-
-    let legacy = legacy_worktrees_dir(repo_root);
-    if legacy.exists() {
-        return legacy;
-    }
-
-    primary
+    configured_worktrees_dir(repo_root)
 }
 
 pub fn runtime_id_for_worktree(worktree_path: &Path) -> String {
     let hash = blake3::hash(worktree_path.to_string_lossy().as_bytes());
     format!("rt-{}", &hex::encode(hash.as_bytes())[..8])
+}
+
+pub fn workspace_ref_for_worktree(worktree_path: &Path) -> String {
+    format!(
+        "managed_worktree:{}",
+        runtime_id_for_worktree(worktree_path)
+    )
 }
 
 pub fn worktree_path_for_session(repo_root: &Path, session_name: &str) -> io::Result<PathBuf> {
@@ -103,7 +110,19 @@ pub fn worktree_path_for_session(repo_root: &Path, session_name: &str) -> io::Re
             format!("session name '{session_name}' slugified to empty"),
         ));
     }
-    Ok(worktrees_dir(repo_root).join(slug))
+    let configured = worktrees_dir(repo_root).join(&slug);
+    if configured.exists() {
+        return Ok(configured);
+    }
+
+    if std::env::var_os("EMBER_MANAGED_WORKTREE_ROOT").is_none() {
+        let legacy = legacy_worktrees_dir(repo_root).join(&slug);
+        if legacy.exists() {
+            return Ok(legacy);
+        }
+    }
+
+    Ok(configured)
 }
 
 pub fn git_current_branch(path: &Path) -> io::Result<String> {
@@ -149,15 +168,19 @@ pub fn resolve_repo_root() -> io::Result<PathBuf> {
     let show_toplevel = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
 
     let output = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()?;
     if !output.status.success() {
         return Ok(show_toplevel);
     }
     let git_common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if git_common_dir.file_name().is_some_and(|name| name == ".git") {
+    if git_common_dir
+        .file_name()
+        .is_some_and(|name| name == ".git")
+    {
         Ok(git_common_dir
             .parent()
+            .filter(|path| !path.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or(show_toplevel))
     } else {
@@ -211,12 +234,14 @@ pub fn live_meta_path(worktree_path: &Path) -> PathBuf {
 
 pub fn write_session_meta(meta: &SessionMetadata) -> io::Result<()> {
     let runtime_id = runtime_id_for_worktree(&meta.worktree_path);
+    let workspace_ref = workspace_ref_for_worktree(&meta.worktree_path);
     std::fs::write(
         session_meta_path(&meta.worktree_path),
         format!(
-            "session_name: {}\nruntime_id: {}\nbranch: {}\nharness: {}\npurpose: {}\ncreated_at: {}\nbase_ref: {}\nworktree_path: {}\n",
+            "session_name: {}\nruntime_id: {}\nworkspace_ref: {}\nbranch: {}\nharness: {}\npurpose: {}\ncreated_at: {}\nbase_ref: {}\nworktree_path: {}\n",
             meta.session_name,
             runtime_id,
+            workspace_ref,
             meta.branch,
             meta.harness,
             meta.purpose,
@@ -378,6 +403,7 @@ fn parse_harness(value: Option<&str>) -> HarnessKind {
     match value.unwrap_or("other") {
         "claude" => HarnessKind::Claude,
         "codex" => HarnessKind::Codex,
+        "cursor" => HarnessKind::Cursor,
         _ => HarnessKind::Other,
     }
 }
@@ -385,4 +411,167 @@ fn parse_harness(value: Option<&str>) -> HarnessKind {
 fn pid_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as i32, 0) };
     rc == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CwdGuard {
+        cwd: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn set(path: &Path) -> Self {
+            let cwd = std::env::current_dir().expect("capture cwd");
+            std::env::set_current_dir(path).expect("set cwd");
+            Self { cwd }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.cwd);
+        }
+    }
+
+    struct ManagedWorktreeRootEnvGuard(Option<String>);
+
+    impl ManagedWorktreeRootEnvGuard {
+        fn capture() -> Self {
+            Self(std::env::var("EMBER_MANAGED_WORKTREE_ROOT").ok())
+        }
+    }
+
+    impl Drop for ManagedWorktreeRootEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("EMBER_MANAGED_WORKTREE_ROOT", value),
+                    None => std::env::remove_var("EMBER_MANAGED_WORKTREE_ROOT"),
+                }
+            }
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git -C {} {} failed with {}\nstdout:\n{}\nstderr:\n{}",
+            repo.display(),
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_seed_commit(repo: &Path) {
+        run_git(repo, &["init", "-q", "-b", "main"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Ember Test"]);
+        std::fs::write(repo.join("README.md"), "seed\n").expect("write readme");
+        run_git(repo, &["add", "README.md"]);
+        run_git(repo, &["commit", "-qm", "seed"]);
+    }
+
+    #[test]
+    fn resolve_repo_root_returns_repo_root_when_common_dir_is_relative_dot_git() {
+        let _guard = crate::PROCESS_ENV_CWD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_seed_commit(repo.path());
+        run_git(repo.path(), &["checkout", "--detach", "HEAD"]);
+        let _cwd = CwdGuard::set(repo.path());
+
+        let resolved = resolve_repo_root().expect("resolve repo root");
+
+        assert_eq!(
+            resolved.canonicalize().expect("canonical resolved"),
+            repo.path().canonicalize().expect("canonical repo"),
+            "relative .git common-dir must not resolve to an empty clone source"
+        );
+        assert!(
+            !resolved.as_os_str().is_empty(),
+            "repo root must never be an empty path"
+        );
+    }
+
+    #[test]
+    fn resolve_repo_root_returns_primary_root_from_linked_worktree() {
+        let _guard = crate::PROCESS_ENV_CWD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().expect("tempdir");
+        write_seed_commit(repo.path());
+        let linked = tempfile::tempdir().expect("linked tempdir");
+        let linked_path = linked.path().join("linked-worktree");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked_path.to_str().expect("utf8 linked path"),
+                "HEAD",
+            ],
+        );
+        let _cwd = CwdGuard::set(&linked_path);
+
+        let resolved = resolve_repo_root().expect("resolve repo root");
+
+        assert_eq!(
+            resolved.canonicalize().expect("canonical resolved"),
+            repo.path().canonicalize().expect("canonical repo"),
+            "linked worktrees must clone Sandvault sessions from the primary repo root"
+        );
+    }
+
+    #[test]
+    fn worktree_path_for_session_prefers_primary_root_for_new_sessions() {
+        let _guard = ManagedWorktreeRootEnvGuard::capture();
+        unsafe {
+            std::env::remove_var("EMBER_MANAGED_WORKTREE_ROOT");
+        }
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".claude/worktrees")).expect("legacy root");
+
+        let path = worktree_path_for_session(repo.path(), "dogfood-surface-proof").expect("path");
+        assert_eq!(
+            path,
+            repo.path().join(".ember/worktrees/dogfood-surface-proof")
+        );
+    }
+
+    #[test]
+    fn workspace_ref_for_worktree_uses_managed_worktree_namespace() {
+        let path = PathBuf::from(".ember/worktrees/yankee");
+        assert_eq!(
+            workspace_ref_for_worktree(&path),
+            format!("managed_worktree:{}", runtime_id_for_worktree(&path))
+        );
+    }
+
+    #[test]
+    fn worktree_path_for_session_preserves_existing_legacy_session_path() {
+        let _guard = ManagedWorktreeRootEnvGuard::capture();
+        unsafe {
+            std::env::remove_var("EMBER_MANAGED_WORKTREE_ROOT");
+        }
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let legacy = repo.path().join(".claude/worktrees/dogfood-surface-proof");
+        std::fs::create_dir_all(&legacy).expect("legacy session path");
+
+        let path = worktree_path_for_session(repo.path(), "dogfood-surface-proof").expect("path");
+        assert_eq!(path, legacy);
+    }
 }

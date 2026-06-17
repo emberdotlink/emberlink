@@ -1,4 +1,5 @@
 //! presence_token_module_skeleton_landed
+//! CLASSIFICATION: PUBLIC
 //!
 //! Phase D presence-token cache + cohort A authority semantics.
 //!
@@ -25,7 +26,7 @@
 //! A minimal local abstraction that supports both sign and verify in a single
 //! trait object.  `core_crypto::Signer` only exposes `sign` + `public_key`; a
 //! full consolidation (re-exporting from `core-crypto`) is tracked in
-//! `implementation-note-122`.
+//! `implementation-note-121`.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -168,7 +169,7 @@ pub enum AuthError {
 ///
 /// `core_crypto::Signer` only exposes `sign` and `public_key`; a full
 /// consolidation that makes this trait redundant is tracked in
-/// `implementation-note-122`.
+/// `implementation-note-121`.
 pub trait DaemonSigner {
     fn sign(&self, msg: &[u8]) -> Bytes;
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;

@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use chrono::{DateTime, Duration, Utc};
 use core_events::receipt::{TerminationAuthority, TerminationReason};
+use core_state::sessions::{SessionMeta, SessionStore};
 use tracing::{info, warn};
 
 use crate::infra::claim_journal::{
@@ -15,13 +16,17 @@ use crate::infra::receipt::{
 };
 use crate::infra::store::DaemonStore;
 use crate::session::lifecycle::DaemonPersonaSigner;
-use core_state::sessions::SessionStore;
-
 /// How long after a session's grant `created_at` before TTL backstop fires.
 const GRANT_TTL: Duration = Duration::hours(24);
 
 /// How long a launcher PID must be dead before the orphan sweep closes the session.
 const ORPHAN_GRACE: Duration = Duration::minutes(5);
+
+#[derive(Debug, Clone)]
+struct HeartbeatDiagnostics {
+    last_heartbeat_at: DateTime<Utc>,
+    pid_alive_at_check: bool,
+}
 
 /// Check whether a process with the given PID is still alive.
 ///
@@ -34,12 +39,38 @@ fn pid_alive(pid: u32) -> bool {
 
 /// Derive the sessions directory from the data directory.
 ///
-/// Convention: `~/.ember/data/` → `~/.ember/sessions/`. We walk up one level
-/// from `data_dir` and append `sessions/`. If the parent is unavailable we
-/// fall back to `data_dir/../sessions` which is the same path on a standard
-/// install.
+/// Per design (operator-locked 2026-06-14) `data_dir == state_root` —
+/// the legacy `~/.ember/data/` split is collapsed (see
+/// `crate::paths::DaemonPaths::system()`), so sessions live as a direct
+/// child of `data_dir`, NOT as a sibling.
+///
+/// macOS prod: `/Library/Application Support/Emberlink/sessions/`.
+/// Linux prod: `/var/lib/ember/sessions/`.
+/// For test fixtures using `DaemonPaths::for_test(tmp)`, same shape:
+/// `tmp/sessions/`.
+///
+/// The pre-design convention walked `data_dir.parent()` (which assumed
+/// `data_dir = <root>/data/` and sessions was a sibling at `<root>/sessions/`).
+/// That walk-up now escapes the state-root tree on prod hosts —
+/// `parent("/Library/Application Support/Emberlink") = "/Library/Application Support"`
+/// — and `create_dir` there returns EPERM because the daemon owns nothing
+/// at that level, plus the sandbox profile only allowlists the state root.
 pub fn sessions_dir_from_data(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.parent().unwrap_or(data_dir).join("sessions")
+    data_dir.join("sessions")
+}
+
+fn heartbeat_diagnostics_for_session(
+    sessions_dir: &Path,
+    session: &SessionMeta,
+    pid_alive_at_check: bool,
+) -> HeartbeatDiagnostics {
+    let session_dir = sessions_dir.join(&session.session_id);
+    let last_heartbeat_at =
+        crate::session::heartbeat::read_heartbeat(&session_dir).unwrap_or(session.started_at);
+    HeartbeatDiagnostics {
+        last_heartbeat_at,
+        pid_alive_at_check,
+    }
 }
 
 /// Background task: heartbeat + TTL session watcher.
@@ -88,16 +119,7 @@ pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
                         age_secs = age.num_seconds(),
                         "session watcher: orphaned session — closing"
                     );
-                    // Orphan close: use HeartbeatLost (launcher PID gone).
-                    close_session(
-                        &session_store,
-                        &store,
-                        session_id,
-                        &session.grant_id,
-                        "heartbeat-orphan",
-                        TerminationReason::HeartbeatLost,
-                        &sessions_dir,
-                    );
+                    close_session_heartbeat_orphan(&session_store, &store, &session, &sessions_dir);
                     continue;
                 }
             }
@@ -149,6 +171,7 @@ pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
                     "ttl-expired",
                     TerminationReason::TtlExpired,
                     &sessions_dir,
+                    None,
                 );
             }
         }
@@ -178,6 +201,7 @@ pub fn close_session_ttl_expiry(
         "ttl-expired",
         TerminationReason::TtlExpired,
         sessions_dir,
+        None,
     );
 }
 
@@ -186,7 +210,7 @@ pub fn close_session_ttl_expiry(
 /// with `TerminationReason::CleanExit` so test code does not need access to
 /// the private `close_session` signature.
 ///
-/// implementation-note-390: clean_exit MUST NOT revoke
+/// implementation-note-341: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 pub fn close_session_clean_exit(
     session_store: &SessionStore,
@@ -203,6 +227,29 @@ pub fn close_session_clean_exit(
         "clean-exit",
         TerminationReason::CleanExit,
         sessions_dir,
+        None,
+    );
+}
+
+/// Public entry point for tests and callers that need to directly trigger the
+/// orphan-sweep close path. The signed Receipt uses `HeartbeatLost` and carries
+/// the same heartbeat diagnostics as the canonical heartbeat watcher path.
+pub fn close_session_heartbeat_orphan(
+    session_store: &SessionStore,
+    daemon_store: &DaemonStore,
+    session: &SessionMeta,
+    sessions_dir: &Path,
+) {
+    let diagnostics = heartbeat_diagnostics_for_session(sessions_dir, session, false);
+    close_session(
+        session_store,
+        daemon_store,
+        &session.session_id,
+        &session.grant_id,
+        "heartbeat-orphan",
+        TerminationReason::HeartbeatLost,
+        sessions_dir,
+        Some(diagnostics),
     );
 }
 
@@ -216,7 +263,7 @@ pub fn close_session_clean_exit(
 ///
 /// # Grant revocation policy
 ///
-/// implementation-note-390: clean_exit MUST NOT revoke
+/// implementation-note-341: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 ///
 /// Grant revocation is performed ONLY for:
@@ -234,6 +281,8 @@ pub fn close_session_clean_exit(
 /// initialised (test harness, pre-startup paths), this function logs a
 /// warning and continues — the session still gets closed and the audit row
 /// still lands so operators see the transition.
+// Session-teardown plumbing signature — structurally many params (stores, ids, reason, paths, diagnostics).
+#[allow(clippy::too_many_arguments)]
 fn close_session(
     session_store: &SessionStore,
     daemon_store: &DaemonStore,
@@ -242,18 +291,35 @@ fn close_session(
     reason: &str,
     termination_reason: TerminationReason,
     sessions_dir: &std::path::Path,
+    heartbeat_diagnostics: Option<HeartbeatDiagnostics>,
 ) {
     // Evaluate revocation policy before moving termination_reason into the Receipt.
     //
-    // implementation-note-390: clean_exit MUST NOT revoke
+    // implementation-note-341: clean_exit MUST NOT revoke
     // the grant — multiple sessions per 24h grant is the contract.
     let should_revoke = !matches!(termination_reason, TerminationReason::CleanExit);
+    let meta = session_store.read(session_id).ok().flatten();
+    let remaining_attachments = meta
+        .as_ref()
+        .map(|session| session_store.count_other_open_attachments(session))
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let is_runtime_attachment = meta
+        .as_ref()
+        .is_some_and(|session| session.is_runtime_attachment());
+    let terminate_runtime = is_runtime_attachment && remaining_attachments == 0;
+    let runtime_kept_alive = is_runtime_attachment && remaining_attachments > 0;
 
     // 1. Emit a signed v2 cohort-A Receipt before mutating state so the
     //    audit trail is complete even on partial failure.
     //    v2_receipt_coverage_audit_v030_2026_05_09: extend Receipt to TTL/revoke per M3 follow-up
-    let claim_summary =
-        summarize_session_scope_best_effort(daemon_store, session_id, "session_watcher::close_session");
+    let claim_summary = summarize_session_scope_best_effort(
+        daemon_store,
+        session_id,
+        "session_watcher::close_session",
+    );
     if let Some(identity) = current_identity() {
         let signer = DaemonPersonaSigner::new(identity);
         let issue_result = if let Some(summary) = claim_summary.as_ref() {
@@ -264,9 +330,13 @@ fn close_session(
                 TerminationAuthority::DaemonPersona,
                 &identity.pubkey_hex(),
                 Some(TerminationMeta {
-                    reason: termination_reason,
-                    last_heartbeat_at: None,
-                    pid_alive_at_check: None,
+                    reason: termination_reason.clone(),
+                    last_heartbeat_at: heartbeat_diagnostics
+                        .as_ref()
+                        .map(|d| d.last_heartbeat_at.to_rfc3339()),
+                    pid_alive_at_check: heartbeat_diagnostics
+                        .as_ref()
+                        .map(|d| d.pid_alive_at_check),
                 }),
                 &signer,
             )
@@ -278,9 +348,13 @@ fn close_session(
                 TerminationAuthority::DaemonPersona,
                 &identity.pubkey_hex(),
                 Some(TerminationMeta {
-                    reason: termination_reason,
-                    last_heartbeat_at: None,
-                    pid_alive_at_check: None,
+                    reason: termination_reason.clone(),
+                    last_heartbeat_at: heartbeat_diagnostics
+                        .as_ref()
+                        .map(|d| d.last_heartbeat_at.to_rfc3339()),
+                    pid_alive_at_check: heartbeat_diagnostics
+                        .as_ref()
+                        .map(|d| d.pid_alive_at_check),
                 }),
                 &signer,
             )
@@ -333,18 +407,39 @@ fn close_session(
         return;
     }
     let _ = crate::infra::interactive_unlock::release_session_pin(session_id);
-    let claim_summary = close_session_scope_best_effort(
-        daemon_store,
-        session_id,
-        "session_watcher::close_session",
-    )
-    .or(claim_summary);
-
+    let claim_summary =
+        close_session_scope_best_effort(daemon_store, session_id, "session_watcher::close_session")
+            .or(claim_summary);
     // 3. Revoke the broker grant — cascades to children.
     //
     // Revoke only on terminal/dirty termination reasons (see policy at top of
     // function). CleanExit leaves the grant Active.
-    if should_revoke && let Err(e) = daemon_store.revoke_grant(grant_id) {
+    if should_revoke && terminate_runtime {
+        if let Some(meta) = meta.as_ref()
+            && let Err(e) = daemon_store.revoke_persona(&meta.persona)
+        {
+            match e {
+                crate::infra::store::StoreError::NotFound => {
+                    warn!(
+                        session_id = %session_id,
+                        runtime_persona_id = %meta.persona,
+                        "session watcher: runtime persona absent at close — likely already terminal"
+                    );
+                }
+                other => {
+                    warn!(
+                        session_id = %session_id,
+                        runtime_persona_id = %meta.persona,
+                        error = %other,
+                        "session watcher: failed to revoke runtime persona"
+                    );
+                }
+            }
+        }
+    } else if should_revoke
+        && !is_runtime_attachment
+        && let Err(e) = daemon_store.revoke_grant(grant_id)
+    {
         match e {
             crate::infra::store::StoreError::NotFound => {
                 warn!(
@@ -364,20 +459,23 @@ fn close_session(
         }
     }
 
-    let mut details = format!("session_id={session_id} grant_id={grant_id}");
+    let mut details = format!(
+        "session_id={session_id} grant_id={grant_id} remaining_attachments={remaining_attachments} runtime_terminated={terminate_runtime} runtime_kept_alive={runtime_kept_alive}"
+    );
+    if let Some(diagnostics) = heartbeat_diagnostics.as_ref() {
+        details.push_str(&format!(
+            " last_heartbeat_at={} pid_alive_at_check={}",
+            diagnostics.last_heartbeat_at.to_rfc3339(),
+            diagnostics.pid_alive_at_check
+        ));
+    }
     if let Some(summary) = claim_summary.as_ref() {
         details.push(' ');
         details.push_str(&close_summary_audit_fields(summary));
     }
 
     // 4. Audit-log the transition.
-    if let Err(e) = daemon_store.log_event(
-        None,
-        "session.closed",
-        None,
-        reason,
-        Some(&details),
-    ) {
+    if let Err(e) = daemon_store.log_event(None, "session.closed", None, reason, Some(&details)) {
         warn!(
             session_id = %session_id,
             reason = %reason,
@@ -390,15 +488,15 @@ fn close_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use core_events::receipt::{ClaudeCodeBody, ReceiptEnvelope};
-    use core_state::sessions::SessionMeta;
-    use tempfile::TempDir;
     use crate::infra::claim_journal::{
         AuditEvidenceInput, ClaimJournal, ClaimScopeKind, ScopeRef, SqliteClaimJournal,
         SuccessfulClaimInput,
     };
+    use chrono::Utc;
     use core_events::receipt::ClaimKind;
+    use core_events::receipt::{ClaudeCodeBody, ReceiptEnvelope};
+    use core_state::sessions::SessionMeta;
+    use tempfile::TempDir;
 
     #[test]
     fn close_session_clean_exit_releases_interactive_unlock_pin() {
@@ -415,11 +513,14 @@ mod tests {
         let meta = SessionMeta {
             session_id: "sess_watch_test".to_string(),
             persona: "persona_test".to_string(),
+            durable_persona: None,
             grant_id: "grant_test".to_string(),
+            caller_binding_id: None,
             started_at: Utc::now(),
             launcher_pid: std::process::id(),
-            workflow_id: None,
-            workflow_template: None,
+            authority_strict: false,
+            delegation_id: None,
+            delegation_template: None,
         };
         session_store.create(&meta).expect("create session meta");
         assert!(
@@ -463,16 +564,19 @@ mod tests {
         let meta = SessionMeta {
             session_id: "sess_claim_journal_close".to_string(),
             persona: "persona_test".to_string(),
+            durable_persona: None,
             grant_id: "grant_test".to_string(),
+            caller_binding_id: None,
             started_at: Utc::now(),
             launcher_pid: std::process::id(),
-            workflow_id: None,
-            workflow_template: None,
+            authority_strict: false,
+            delegation_id: None,
+            delegation_template: None,
         };
         session_store.create(&meta).expect("create session meta");
 
         let scope = ScopeRef {
-            kind: ClaimScopeKind::Session,
+            kind: ClaimScopeKind::AuthorityLane,
             id: meta.session_id.clone(),
         };
         journal
@@ -483,6 +587,10 @@ mod tests {
                     occurred_at: "2026-05-22T12:00:00Z".to_string(),
                     claim_kind: ClaimKind::CredentialVended,
                     tool: "Claude".to_string(),
+                    action_ref: None,
+                    runner_class: None,
+                    execution_domain: None,
+                    materialization_class: None,
                     input_hash: "h1".to_string(),
                     input_redacted: serde_json::json!({"cmd": "deploy"}),
                     resolved: serde_json::json!({"allowed": true}),
@@ -494,8 +602,9 @@ mod tests {
                         details: Some("session-scoped".to_string()),
                     },
                     persona_id: Some(meta.persona.clone()),
+                    grant_id: None,
                     device_id: Some("device-test".to_string()),
-                    workflow_id: None,
+                    delegation_id: None,
                     materialization_id: Some("materialization-1".to_string()),
                     credential_name: Some("anthropic".to_string()),
                 },
@@ -522,12 +631,8 @@ mod tests {
             .expect("claim journal scope row");
         assert_eq!(status, "closed");
 
-        let receipt_bytes = std::fs::read(
-            sessions_dir
-                .join(&meta.session_id)
-                .join("receipt.json"),
-        )
-        .expect("receipt written");
+        let receipt_bytes = std::fs::read(sessions_dir.join(&meta.session_id).join("receipt.json"))
+            .expect("receipt written");
         let receipt: ReceiptEnvelope =
             serde_json::from_slice(&receipt_bytes).expect("receipt envelope parses");
         let body: ClaudeCodeBody =
@@ -537,5 +642,109 @@ mod tests {
         assert_eq!(body.base.claim_segment_summaries.len(), 1);
         assert!(!body.base.claim_history_merkle_root.is_empty());
         assert!(!body.base.permits_merkle_root.is_empty());
+    }
+
+    #[test]
+    fn close_session_ttl_expiry_keeps_runtime_alive_while_sibling_attachment_remains() {
+        let sessions_root = TempDir::new().expect("temp sessions root");
+        let sessions_dir = sessions_root.path().to_path_buf();
+        let session_store = SessionStore::new(sessions_dir.clone());
+        let daemon_store = DaemonStore::open_in_memory().expect("in-memory daemon store");
+
+        let runtime_persona = daemon_store
+            .create_persona("runtime-watcher-persona")
+            .expect("create runtime persona");
+        let runtime_grant = daemon_store
+            .create_grant(&runtime_persona.id, "github-token", "repo:read", Some(3600))
+            .expect("create runtime grant");
+
+        let attachment_a = SessionMeta {
+            session_id: "sess-runtime-a".to_string(),
+            persona: runtime_persona.id.clone(),
+            durable_persona: Some("persona-durable".to_string()),
+            grant_id: runtime_grant.id.clone(),
+            caller_binding_id: Some("binding-runtime-1".to_string()),
+            started_at: Utc::now(),
+            launcher_pid: std::process::id(),
+            authority_strict: false,
+            delegation_id: None,
+            delegation_template: None,
+        };
+        let attachment_b = SessionMeta {
+            session_id: "sess-runtime-b".to_string(),
+            persona: runtime_persona.id.clone(),
+            durable_persona: Some("persona-durable".to_string()),
+            grant_id: runtime_grant.id.clone(),
+            caller_binding_id: Some("binding-runtime-1".to_string()),
+            started_at: Utc::now(),
+            launcher_pid: std::process::id() + 1,
+            authority_strict: false,
+            delegation_id: None,
+            delegation_template: None,
+        };
+
+        session_store
+            .create(&attachment_a)
+            .expect("create attachment a");
+        session_store
+            .create(&attachment_b)
+            .expect("create attachment b");
+
+        close_session_ttl_expiry(
+            &session_store,
+            &daemon_store,
+            &attachment_a.session_id,
+            &attachment_a.grant_id,
+            &sessions_dir,
+        );
+
+        assert!(
+            session_store
+                .read(&attachment_b.session_id)
+                .expect("read sibling attachment")
+                .is_some(),
+            "sibling attachment must remain open"
+        );
+        assert_eq!(
+            daemon_store
+                .get_grant(&runtime_grant.id)
+                .expect("runtime grant still queryable")
+                .status,
+            "active",
+            "ttl-expiring one attachment must not revoke the shared runtime grant"
+        );
+        assert_eq!(
+            daemon_store
+                .get_persona(&runtime_persona.id)
+                .expect("runtime persona still queryable")
+                .status,
+            "active",
+            "ttl-expiring one attachment must not revoke the shared runtime persona"
+        );
+
+        close_session_ttl_expiry(
+            &session_store,
+            &daemon_store,
+            &attachment_b.session_id,
+            &attachment_b.grant_id,
+            &sessions_dir,
+        );
+
+        assert_eq!(
+            daemon_store
+                .get_grant(&runtime_grant.id)
+                .expect("runtime grant still queryable")
+                .status,
+            "revoked",
+            "ttl-expiring the last attachment must revoke the runtime grant"
+        );
+        assert_eq!(
+            daemon_store
+                .get_persona(&runtime_persona.id)
+                .expect("runtime persona still queryable")
+                .status,
+            "revoked",
+            "ttl-expiring the last attachment must revoke the runtime persona"
+        );
     }
 }

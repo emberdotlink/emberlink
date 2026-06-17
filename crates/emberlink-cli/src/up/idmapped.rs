@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! idmapped bind-mount detection and spec rendering for per-agent worktrees.
 //!
@@ -14,7 +15,7 @@
 //!   OrbStack any 2024+ version (Docker-compat layer, handles transparently)
 //!
 //! Older runtimes fall back to `safe.directory` + chown-on-flush per
-//! `implementation-note-525`.
+//! `implementation-note-466`.
 
 use std::path::Path;
 

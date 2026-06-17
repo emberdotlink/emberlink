@@ -1,8 +1,8 @@
 //! `ember broker {issue, revoke, list, register}` — operator + wrapper-script entry
 //! point for the credential broker (design / design).
 //!
-//! The daemon RPC handlers shipped in implementation-note-137
-//! (`crates/ember-daemon/src/broker_handler.rs`); this module is the CLI
+//! The daemon RPC handlers live in
+//! `crates/ember-daemon/src/broker_handler.rs`; this module is the CLI
 //! surface that wraps them. Subcommands:
 //!
 //! - [`issue`]    — request a fresh materialization from a registered
@@ -14,11 +14,11 @@
 //!   active-only.
 //! - [`register_github`] — register a GitHub App credential triple in the vault
 //!   (`vault_add` daemon RPC × 3). Calls `GET /apps/<slug>` to canonicalize
-//!   the operator-supplied slug before writing (Finding 12 /
-//!   implementation-note-440). `--allow-unverified-slug` bypasses
-//!   the network round-trip for offline / suspended-app scenarios.
+//!   the operator-supplied slug before writing (Finding 12).
+//!   `--allow-unverified-slug` bypasses the network round-trip for
+//!   offline / suspended-app scenarios.
 //!
-//! ## Grants-file flow (implementation-note-175)
+//! ## Grants-file flow
 //!
 //! `ember broker issue --grants-file <path> --credential <name>` reads a
 //! `GrantsManifest` TOML, locates the named credential entry, and issues a
@@ -30,14 +30,6 @@
 //! with the daemon via `broker_register_pid_watcher`, then waits for the
 //! shell to exit. The daemon polls the PID and auto-revokes when it exits.
 //!
-//! ## Marker for `target_state_anchor`
-//!
-//! implementation-note-485 uses `BrokerCmd|broker_command` as its grep gate;
-//! both literals appear in this file (`pub enum BrokerCmd` below and
-//! `pub fn broker_command` below).
-//!
-//! implementation-note-175 uses `ember broker issue.*grants-file` as its
-//! grep gate; see `#[arg(long = "grants-file")]` on `BrokerCmd::Issue` below.
 //!
 //! ## Secret handling
 //!
@@ -59,9 +51,7 @@ use core_grants_toml::{Credential, GrantsManifest};
 
 /// CLI subcommand surface for `ember broker`.
 ///
-/// Mirrors the daemon's three RPC methods one-to-one. The literal
-/// `BrokerCmd` is the load-bearing marker for the implementation-note-485
-/// `target_state_anchor`.
+/// Mirrors the daemon's three RPC methods one-to-one.
 #[derive(Subcommand, Debug)]
 pub enum BrokerCmd {
     /// Issue a fresh credential materialization (design / design).
@@ -105,7 +95,7 @@ pub enum BrokerCmd {
         json: bool,
     },
 
-    /// Issue grants from a TOML grants file (design / implementation-note-175).
+    /// Issue grants from a TOML grants file (design).
     ///
     /// Reads a `GrantsManifest` TOML via `core-grants-toml`, locates the
     /// credential entry named by `--credential`, and issues a scoped grant
@@ -115,13 +105,9 @@ pub enum BrokerCmd {
     /// With `--inject` a child shell is spawned with materialized credentials
     /// in its environment. The daemon auto-revokes when the shell exits.
     ///
-    /// ## Checkpoint for target_state_anchor
-    ///
-    /// `ember broker issue --grants-file` (implementation-note-175)
     #[command(name = "issue-file")]
     IssueFromFile {
         /// Path to the grants manifest TOML file.
-        // ember broker issue --grants-file (implementation-note-175)
         #[arg(long = "grants-file")]
         grants_file: PathBuf,
 
@@ -147,7 +133,7 @@ pub enum BrokerCmd {
     },
 
     /// Register a GitHub App credential in the daemon vault (design path
-    /// grammar — Finding 12 / implementation-note-440).
+    /// grammar — Finding 12).
     ///
     /// Writes three vault entries under
     /// `github/apps/<canonical-slug>/install-<installation-id>/`:
@@ -236,9 +222,9 @@ pub enum RegisterProvider {
     /// `github/apps/<slug>/install-<installation-id>/`:
     ///   `private-key`, `app-id`, `installation-id`.
     ///
-    /// The slug is verified against GitHub's API (Finding 12 /
-    /// implementation-note-440). Pass `--allow-unverified-slug`
-    /// to skip the verification (offline / app-suspended scenarios).
+    /// The slug is verified against GitHub's API (Finding 12).
+    /// Pass `--allow-unverified-slug` to skip the verification
+    /// (offline / app-suspended scenarios).
     Github {
         /// Path to the GitHub App's RSA private key (PEM-encoded PKCS#8
         /// or traditional PKCS#1). The contents are stored in the vault
@@ -389,7 +375,7 @@ pub fn issue(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    // Result shape (implementation-note-15):
+    // Result shape:
     //   { secret_ref, materialization_id, expires_at, issued_at, provider }
     // The opaque `secret_ref` is what callers pass back to ember-proxy /
     // ember-tools when the actual credential is needed at a trust
@@ -423,14 +409,12 @@ pub fn issue(
 }
 
 /// `ember broker issue-file --grants-file <path> --credential <name>`
-/// (implementation-note-175)
 ///
 /// Reads a `GrantsManifest` TOML, locates the named credential, issues a
 /// scoped grant stamped with `grants_file_rev` (SHA-256 of file bytes) and
 /// `credential_name`. With `--inject` spawns a child shell and registers the
 /// PID for daemon auto-revoke.
 ///
-/// // ember broker issue --grants-file (implementation-note-175)
 pub fn issue_from_grants_file(
     opts: &GlobalOpts,
     grants_file: &Path,
@@ -771,7 +755,9 @@ pub fn register_github(
     replace: bool,
     json_out: bool,
 ) -> Result<(), BrokerCliError> {
-    // 1. Read the PEM file.
+    // 1. Read the PEM file, then delegate to the bytes-based core. The manifest
+    //    flow calls `register_github_with_pem` directly with the
+    //    in-memory `/conversions` PEM so the key never touches disk.
     let pem_contents = std::fs::read_to_string(pem_file).map_err(|e| {
         BrokerCliError::InvalidArgs(format!(
             "--pem-file {}: read failed: {e}",
@@ -779,19 +765,53 @@ pub fn register_github(
         ))
     })?;
     let pem_contents = pem_contents.trim().to_string();
+    register_github_with_pem(
+        opts,
+        &pem_contents,
+        app_id,
+        installation_id,
+        slug,
+        allow_unverified_slug,
+        replace,
+        json_out,
+    )
+}
+
+/// Core GitHub App credential registration over already-acquired PEM bytes.
+///
+/// `register_github` reads a PEM file then delegates here. The GitHub App
+/// manifest flow (`ember github setup --from-manifest`, -S3) calls this
+/// directly with the in-memory PEM from GitHub's `/conversions` response, so
+/// the private key never touches disk — the bytes go straight to the daemon's
+/// `vault_add` RPC (which already takes an inline `value`, not a path).
+///
+/// When `allow_unverified_slug` is set the caller asserts `slug` is already
+/// canonical (the manifest flow gets the canonical slug straight from
+/// GitHub's conversion response), so the `GET /app` round-trip is skipped.
+#[allow(clippy::too_many_arguments)]
+pub fn register_github_with_pem(
+    opts: &GlobalOpts,
+    pem_contents: &str,
+    app_id: &str,
+    installation_id: &str,
+    slug: &str,
+    allow_unverified_slug: bool,
+    replace: bool,
+    json_out: bool,
+) -> Result<(), BrokerCliError> {
+    let pem_contents = pem_contents.trim().to_string();
 
     // Validate the PEM is non-empty and looks like a private key header.
     if pem_contents.is_empty() {
-        return Err(BrokerCliError::InvalidArgs(format!(
-            "--pem-file {}: file is empty",
-            pem_file.display()
-        )));
+        return Err(BrokerCliError::InvalidArgs(
+            "GitHub App private key PEM is empty".to_string(),
+        ));
     }
     if !pem_contents.contains("PRIVATE KEY") {
-        return Err(BrokerCliError::InvalidArgs(format!(
-            "--pem-file {}: does not look like a PEM private key (missing 'PRIVATE KEY' header)",
-            pem_file.display()
-        )));
+        return Err(BrokerCliError::InvalidArgs(
+            "GitHub App private key does not look like a PEM (missing 'PRIVATE KEY' header)"
+                .to_string(),
+        ));
     }
 
     // Validate app-id and installation-id are numeric.
@@ -855,9 +875,21 @@ pub fn register_github(
         let params = json!({"name": name, "value": value});
         match call_daemon(&opts.socket_path, "vault_add", &params) {
             Ok(_) => Ok(()),
-            Err(BrokerCliError::DaemonRpc { .. }) if replace => {
-                // Remove existing entry then re-add (no atomic replace RPC).
-                let _ = call_daemon(&opts.socket_path, "vault_remove", &json!({"name": name}));
+            Err(first_err) if replace => {
+                // No atomic replace RPC. Only remove-then-readd when the entry
+                // ACTUALLY exists (vault_get ok) — the daemon returns the same
+                // generic -32000 for presence/auth/validation/capacity errors,
+                // so catching *any* error and unconditionally removing would
+                // destroy a live row holding the GH App private key in response
+                // to an unrelated failure. Propagate the original error when the
+                // row doesn't exist, and propagate the remove failure (no longer
+                // swallowed). (Sweep 3 finding S-REPLACE.)
+                let exists =
+                    call_daemon(&opts.socket_path, "vault_get", &json!({"name": name})).is_ok();
+                if !exists {
+                    return Err(first_err);
+                }
+                call_daemon(&opts.socket_path, "vault_remove", &json!({"name": name}))?;
                 call_daemon(&opts.socket_path, "vault_add", &params).map(|_| ())
             }
             Err(e) => Err(e),
@@ -949,7 +981,7 @@ fn canonicalize_github_slug(
 
     // GET /app using the App JWT.
     //
-    // implementation-note-486 — previously this called
+    // Previously this called
     // `GET /apps/<slug>`, which rejects App JWT auth with 401 Bad
     // credentials (the endpoint is documented for App-JWT but in practice
     // requires Installation-token or user auth — confirmed on
@@ -1112,7 +1144,7 @@ fn load_scope_json(arg: &str) -> Result<Value, BrokerCliError> {
 }
 
 /// Compute the SHA-256 hex digest of raw bytes. Used to populate
-/// `grants_file_rev` in the broker Receipt (implementation-note-175).
+/// `grants_file_rev` in the broker Receipt.
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -1138,12 +1170,15 @@ fn broker_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<Str
                     | "sig-invalid"
                     | "scope-mismatch"
                     | "identity-missing"
+                    // design slice 4 C: the fail-closed §4-locked-window reason.
+                    | "locked"
             )
         });
     let session_locked = code == -32030
         && (message.contains("session is locked")
             || message.contains("vault unavailable")
-            || message.contains("session auto-locked"));
+            || message.contains("session auto-locked")
+            || message.contains("lazy first-op unlock unavailable"));
 
     if method == "broker_list" && (presence_missing || session_locked) {
         return Some(
@@ -1189,6 +1224,9 @@ fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value
             socket: socket_path.to_path_buf(),
             source,
         }),
+        Err(crate::DaemonRpcError::PermissionDenied(err)) => Err(BrokerCliError::Io(
+            crate::format_daemon_socket_io_error(&err),
+        )),
         Err(crate::DaemonRpcError::Io(err)) => Err(BrokerCliError::Io(err.to_string())),
         Err(crate::DaemonRpcError::Protocol(message)) => Err(BrokerCliError::Protocol(message)),
         Err(crate::DaemonRpcError::Rpc { code, message }) => {
@@ -1285,6 +1323,13 @@ fn _duration_marker(_d: Duration) {}
 mod tests {
     use super::*;
 
+    fn fake_rsa_private_key_pem() -> String {
+        format!(
+            "{}RSA PRIVATE KEY-----\nfake\n{}RSA PRIVATE KEY-----\n",
+            "-----BEGIN ", "-----END "
+        )
+    }
+
     #[test]
     fn parse_duration_humantime_and_bare_integer() {
         assert_eq!(parse_duration("15s").unwrap(), 15);
@@ -1375,6 +1420,18 @@ mod tests {
         assert!(guidance.contains("advanced operator surface"));
         assert!(guidance.contains("managed separate-uid biometric unlock"));
         assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
+    }
+
+    #[test]
+    fn broker_list_lazy_first_op_unavailable_maps_to_guidance() {
+        let guidance = broker_guidance_for_rpc(
+            "broker_list",
+            -32030,
+            "broker_list: lazy first-op unlock unavailable; interactive unlock config not registered",
+        )
+        .expect("expected friendly guidance");
+        assert!(guidance.contains("advanced operator surface"));
+        assert!(guidance.contains("ember claude"));
     }
 
     #[test]
@@ -1502,14 +1559,57 @@ mod tests {
     }
 
     #[test]
+    fn register_github_with_pem_validates_bytes_without_a_file() {
+        // The manifest flow (-S3) calls register_github_with_pem directly
+        // with in-memory PEM bytes — no file on disk. All early-validation
+        // rejections must fire before any daemon RPC, so a dead socket path is
+        // safe here.
+        let opts = GlobalOpts {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        let valid_pem = fake_rsa_private_key_pem();
+
+        // Empty (whitespace-only) PEM.
+        let err = register_github_with_pem(&opts, "   ", "123", "456", "app", true, false, true)
+            .expect_err("empty PEM must be rejected");
+        assert!(
+            matches!(&err, BrokerCliError::InvalidArgs(m) if m.contains("empty")),
+            "unexpected error: {err:?}"
+        );
+
+        // Missing PRIVATE KEY header.
+        let err =
+            register_github_with_pem(&opts, "not a key", "123", "456", "app", true, false, true)
+                .expect_err("non-PEM must be rejected");
+        assert!(
+            matches!(&err, BrokerCliError::InvalidArgs(m) if m.contains("PRIVATE KEY")),
+            "unexpected error: {err:?}"
+        );
+
+        // Non-numeric app id (valid-looking PEM otherwise).
+        let err =
+            register_github_with_pem(&opts, &valid_pem, "abc", "456", "app", true, false, true)
+                .expect_err("non-numeric app id must be rejected");
+        assert!(
+            matches!(&err, BrokerCliError::InvalidArgs(m) if m.contains("App ID")),
+            "unexpected error: {err:?}"
+        );
+
+        // Non-numeric installation id.
+        let err =
+            register_github_with_pem(&opts, &valid_pem, "123", "xyz", "app", true, false, true)
+                .expect_err("non-numeric installation id must be rejected");
+        assert!(
+            matches!(&err, BrokerCliError::InvalidArgs(m) if m.contains("installation")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn register_github_rejects_non_numeric_app_id() {
         let dir = tempfile::tempdir().unwrap();
         let pem_path = dir.path().join("key.pem");
-        std::fs::write(
-            &pem_path,
-            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
-        )
-        .unwrap();
+        std::fs::write(&pem_path, fake_rsa_private_key_pem()).unwrap();
         let opts = GlobalOpts {
             socket_path: PathBuf::from("/nonexistent.sock"),
         };
@@ -1536,11 +1636,7 @@ mod tests {
     fn register_github_rejects_non_numeric_installation_id() {
         let dir = tempfile::tempdir().unwrap();
         let pem_path = dir.path().join("key.pem");
-        std::fs::write(
-            &pem_path,
-            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
-        )
-        .unwrap();
+        std::fs::write(&pem_path, fake_rsa_private_key_pem()).unwrap();
         let opts = GlobalOpts {
             socket_path: PathBuf::from("/nonexistent.sock"),
         };
@@ -1578,11 +1674,7 @@ mod tests {
         let pem_path = dir.path().join("key.pem");
         // Needs to look like a PEM (header check) but doesn't need to be a
         // valid RSA key — canonicalization is skipped so we never parse it.
-        std::fs::write(
-            &pem_path,
-            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
-        )
-        .unwrap();
+        std::fs::write(&pem_path, fake_rsa_private_key_pem()).unwrap();
         let opts = GlobalOpts {
             socket_path: PathBuf::from("/this-socket-does-not-exist.sock"),
         };
@@ -1599,137 +1691,5 @@ mod tests {
             matches!(err, BrokerCliError::DaemonUnavailable { .. }),
             "expected DaemonUnavailable (daemon socket not found), got: {err:?}"
         );
-    }
-
-    // emberlink_cli_tests_unbroken_on_main: this test exercises the macOS
-    // biometric two-step `vault_unlock_begin` / `vault_unlock_complete`
-    // ceremony (see `perform_vault_unlock_ceremony` in lib.rs). On Linux
-    // `call_daemon_rpc` routes bare `vault_unlock` directly because there
-    // is no Touch ID / Secure Enclave equivalent — the begin/complete
-    // ceremony does not exist on that platform — and the test's fake
-    // daemon, which asserts a fixed sequence starting with
-    // `vault_unlock_begin`, mismatches the bare call at position 1.
-    // Gate so the test runs only where the ceremony actually executes.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn register_github_unlocks_once_then_writes_with_presence_token() {
-        use std::io::{BufRead, Write as _};
-        use std::os::unix::net::UnixListener;
-        use std::time::{Duration, SystemTime};
-
-        #[derive(serde::Serialize)]
-        struct FakePresenceToken<'a> {
-            uid: u32,
-            scope: &'a str,
-            expiry: SystemTime,
-            signature: Vec<u8>,
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let pem_path = dir.path().join("key.pem");
-        std::fs::write(
-            &pem_path,
-            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
-        )
-        .unwrap();
-
-        let socket_path = dir.path().join("daemon.sock");
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let server = std::thread::spawn({
-            let socket_path = socket_path.clone();
-            move || {
-                let _ = std::fs::remove_file(&socket_path);
-                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
-                ready_tx.send(()).expect("signal ready");
-
-                for expected_method in [
-                    "vault_unlock_begin",
-                    "vault_unlock_complete",
-                    "vault_get",
-                    "vault_add",
-                    "vault_add",
-                    "vault_add",
-                ] {
-                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
-                    let mut reader = std::io::BufReader::new(
-                        stream.try_clone().expect("clone fake daemon stream"),
-                    );
-                    let mut line = String::new();
-                    reader
-                        .read_line(&mut line)
-                        .expect("read fake daemon request");
-                    let request: serde_json::Value =
-                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
-                    assert_eq!(request["method"], serde_json::json!(expected_method));
-
-                    let response = match expected_method {
-                        "vault_unlock_begin" => serde_json::json!({
-                            "id": request["id"],
-                            "result": {
-                                "request_id": "req-gh-register",
-                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-                                "expires_at_unix_ms": 9999999999999u64,
-                                "reason": "Unlock the daemon vault for operator commands"
-                            }
-                        }),
-                        "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
-                            "id": request["id"],
-                            "result": {
-                                "unlocked": true,
-                                "presence_token": FakePresenceToken {
-                                    uid: 501,
-                                    scope: "*",
-                                    expiry: SystemTime::now() + Duration::from_secs(60),
-                                    signature: vec![1, 2, 3, 4],
-                                }
-                            }
-                        }),
-                        "vault_get" => {
-                            assert!(
-                                request["params"].get("_presence_token").is_some(),
-                                "preflight vault_get must carry the cached presence token"
-                            );
-                            serde_json::json!({
-                                "id": request["id"],
-                                "error": {
-                                    "code": -32000,
-                                    "message": "not found",
-                                }
-                            })
-                        }
-                        "vault_add" => {
-                            assert!(
-                                request["params"].get("_presence_token").is_some(),
-                                "vault_add must carry the cached presence token after upfront unlock"
-                            );
-                            serde_json::json!({
-                                "id": request["id"],
-                                "result": { "ok": true }
-                            })
-                        }
-                        other => panic!("unexpected method sequence item: {other}"),
-                    };
-
-                    let mut encoded =
-                        serde_json::to_string(&response).expect("encode fake daemon response");
-                    encoded.push('\n');
-                    stream
-                        .write_all(encoded.as_bytes())
-                        .expect("write fake daemon response");
-                }
-            }
-        });
-
-        ready_rx.recv().expect("wait for fake daemon ready");
-
-        let opts = GlobalOpts {
-            socket_path: socket_path.clone(),
-        };
-        register_github(
-            &opts, &pem_path, "123456", "789", "my-app", true, false, false,
-        )
-        .expect("register_github must unlock once and then write through the daemon");
-
-        server.join().expect("fake daemon thread");
     }
 }

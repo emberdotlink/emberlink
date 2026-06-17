@@ -1,6 +1,7 @@
+//! CLASSIFICATION: PUBLIC
 //! T2 integration test: `ember persona create` round-trips through daemon RPC.
 //!
-//! implementation-note-478 — under design
+//! implementation-note-481 — under design
 //! separate-uid posture (daemon uid ≠ operator uid) the CLI can no longer
 //! open the daemon's SQLite DB directly. All persona verbs must go through
 //! the JSON-RPC socket. This test exercises the create → list → revoke path
@@ -22,11 +23,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ember_daemon::infra::rate_limit::RateLimiter;
-use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::socket::{SocketListener, new_shared_policy_engine};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+    ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -34,7 +35,7 @@ use tokio::sync::watch;
 fn permissive_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: "credential.access.*".to_string(),
+            action: ActionSelector::named("credential.access.*"),
             risk: RiskLevel::Low,
             requirement: ApprovalRequirement::Auto,
             tier: None,
@@ -69,7 +70,7 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(permissive_policy());
+            let policy = new_shared_policy_engine(permissive_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault; // hold until end of scope: set_vault is the wire now
             let listener =

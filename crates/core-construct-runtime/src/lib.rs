@@ -1,21 +1,15 @@
-//! core-construct-runtime — shared boilerplate for per-Construct shims.
+//! Shared runtime for policy-classified Construct shims.
 //!
-//! Per design §1, every Construct binary (e.g. `ember-gh`, `ember-git`,
-//! `ember-kubectl`) follows the same lifecycle:
-//!
-//! 1. **env-detect** — if the session env var is absent, the production
-//!    `run_construct_full` path fails closed for classified credential-bearing
-//!    actions and only passthrough-execs unclassified/read-only verbs.
-//!    (`run_construct` keeps the older stub-mode direct-passthrough contract.)
-//! 2. **classify** — turn argv into a stable `ActionKey` for policy lookup.
-//! 3. **broker.resolve** — ask the daemon for a credential lease (stubbed).
-//! 4. **broker.exec** — invoke the wrapped binary with the lease (stubbed).
-//! 5. Return the child's `ExitCode`.
-//!
-//! This crate is the seam that lets each Construct's `main.rs` stay 10–20
-//! lines: the caller wires up an argv classifier and a `ConstructSpec`, and
-//! `run_construct` does the rest.
+//! Each shim classifies an action, asks the daemon to resolve its bounded
+//! authority, executes the wrapped tool, and preserves the child's exit status.
+//! This crate also hosts the manifest, preflight, permission-gap, and layout
+//! contracts shared by those public runtime surfaces.
 
+pub mod factory;
+pub mod layout;
+pub mod manifest;
+pub mod permission_gaps;
+pub mod preflight;
 pub mod pty_bridge;
 pub mod rpc;
 pub mod runtime;
@@ -93,6 +87,59 @@ pub trait ConstructConfig: ClassifyArgv {
     /// in the `broker_exec` RPC (e.g. `["GH_TOKEN", "GITHUB_TOKEN"]`).
     fn env_passthrough(&self) -> &'static [&'static str];
 
+    /// Optional factory disposition hook.
+    ///
+    /// Legacy Constructs return `None` and keep the existing classifier
+    /// compatibility behavior. Factory-aligned Constructs return an explicit
+    /// disposition so the runtime can separate scrubbed `credentialless`
+    /// execution from legacy `classify=None` passthrough and fail closed on
+    /// resolver/payload/unsupported shapes.
+    fn factory_disposition(
+        &self,
+        _action_key: Option<&ActionKey>,
+        _argv: &[String],
+    ) -> Option<factory::FactoryDisposition> {
+        None
+    }
+
+    /// Optional trusted-resolver hook. Mirrors
+    /// [`factory::ConstructFactory::resolve_target_from_environment`] at the
+    /// per-construct config layer the runtime actually drives.
+    ///
+    /// Called from [`runtime::run_construct_full`] when the factory
+    /// disposition is `ResolverRequired`. A `Some` return value supplies a
+    /// synthesized argv with the env-derived target injected as an explicit
+    /// flag; the runtime then re-runs classify/disposition on the synthesized
+    /// argv and threads it through the broker_exec RPC. `None` falls through
+    /// to the existing `ResolverRequired` refusal with the operator-facing
+    /// "trusted resolver evidence is required" message.
+    ///
+    /// Per-construct configs delegate to their `ConstructFactory` impl.
+    /// Default: `None`.
+    fn resolve_target_from_environment(
+        &self,
+        _action_key: Option<&ActionKey>,
+        _argv: &[String],
+        _cwd: &std::path::Path,
+    ) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Provider credential env/config keys removed from the direct exec
+    /// environment for factory `credentialless` actions.
+    fn credentialless_env_scrub(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Provider env values pinned for factory `credentialless` actions.
+    ///
+    /// Use this for provider defaults that would otherwise discover ambient
+    /// host credentials from implicit config files or metadata services after
+    /// credential variables have been removed.
+    fn credentialless_env_set(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// Translate emberlink-shaped argv into the wrapped tool's native argv.
     ///
     /// Default implementation is identity — the construct's argv reaches the
@@ -112,7 +159,7 @@ pub trait ConstructConfig: ClassifyArgv {
     /// classify=None bypass) do NOT translate — those branches exit the shim
     /// contract entirely. The fix for emberlink-flag passthrough in those
     /// branches is to eliminate the bypass (e.g. broker.exec default per
-    /// implementation-note-17 step 3), not to add
+    /// implementation-note-21 step 3), not to add
     /// translation here.
     ///
     /// Anchor: `construct_config_translate_argv_hook_landed`.
@@ -120,8 +167,3 @@ pub trait ConstructConfig: ClassifyArgv {
         argv.to_vec()
     }
 }
-
-pub mod layout;
-pub mod manifest;
-pub mod permission_gaps;
-pub mod preflight;

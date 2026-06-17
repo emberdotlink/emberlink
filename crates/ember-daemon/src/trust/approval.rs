@@ -1,7 +1,8 @@
-// implementation-note-11
+// implementation-note-14
 use chrono::Utc;
 use core_approval::ApprovalOutcome as CoreApprovalOutcome;
 use core_approval::{ApprovalLifecycle, LifecycleError, RequestId, SubmitMetadata};
+use core_event_types::ActionSelector;
 use core_grant_types::approval::RequestedScope;
 use core_grant_types::{Budget, GrantProposal, Statement, Usage};
 use rusqlite::OptionalExtension;
@@ -11,6 +12,30 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 use crate::infra::store::{DaemonStore, StoreError};
+
+fn record_decision_only_jit_latency(
+    resolution_kind: &str,
+    created_at: &str,
+    resolved_at: &str,
+    outcome: crate::telemetry::measurement::JitOutcome,
+) {
+    if resolution_kind != ApprovalResolutionKind::DecisionOnly.as_str() {
+        return;
+    }
+
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return;
+    };
+    let Ok(resolved) = chrono::DateTime::parse_from_rfc3339(resolved_at) else {
+        return;
+    };
+    let latency = resolved.signed_duration_since(created);
+    let Ok(latency) = latency.to_std() else {
+        return;
+    };
+
+    crate::telemetry::measurement::record_jit_latency("dev0", latency, outcome);
+}
 
 // ---------------------------------------------------------------------------
 // DaemonApprovalStore — Phase B adapter implementing ApprovalLifecycle
@@ -85,7 +110,7 @@ impl ApprovalLifecycle for DaemonApprovalStore {
             metadata.risk_level.as_str()
         };
 
-        // implementation-note-10 — pass
+        // implementation-note-13 — pass
         // the five grant-shaping fields through to the inner writer so they
         // survive the approval queue and the resolver can re-stamp them on
         // the minted grant.
@@ -257,7 +282,7 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
         // in that impl for the metadata/action/risk fallback rationale.
         // approval_notify_fields_persisted: thread the four NOTIF-1 fields
         // through to submit_approval_inner so get_approval returns them.
-        // implementation-note-10 — also
+        // implementation-note-13 — also
         // thread the five grant-shaping fields through so the resolver can
         // re-stamp them on the minted grant.
         let scope_str = scope.capability.clone();
@@ -409,6 +434,7 @@ fn access_grant_to_core_grants(ag: &core_grant_types::AccessGrant) -> core_grant
         }
         core_grant_types::GrantStatus::Paused => core_grants::GrantState::Paused,
         core_grant_types::GrantStatus::Revoked
+        | core_grant_types::GrantStatus::Abandoned
         | core_grant_types::GrantStatus::Expired
         | core_grant_types::GrantStatus::ExhaustedByBudget => core_grants::GrantState::Revoked,
     };
@@ -481,7 +507,7 @@ pub struct ApprovalRequestInfo {
     pub target_summary: Option<String>,
     pub target_url: Option<String>,
     pub agent_framework: Option<String>,
-    /// implementation-note-233 — composite envelope statements (3-statement
+    /// implementation-note-210 — composite envelope statements (3-statement
     /// credential+session+time bundle minted by `ember sandbox run`)
     /// serialized as JSON when set. Surfaces as a single approval entry
     /// (NOT three) so the dashboard can render all three statements as
@@ -562,6 +588,32 @@ pub enum ApprovalOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalResolutionKind {
+    Grant,
+    DecisionOnly,
+}
+
+impl ApprovalResolutionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::DecisionOnly => "decision_only",
+        }
+    }
+}
+
+pub(crate) const APPROVAL_BINDING_UNUSED_TTL_SECS: i64 = 300;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ApprovalBindingRecord {
+    pub attachment_id: String,
+    pub caller_binding_id: String,
+    pub attachment_endpoint_token_sha256: String,
+    pub execution_contract_digest: String,
+    pub invocation_digest: String,
+}
+
 impl DaemonStore {
     pub fn submit_approval(
         &self,
@@ -588,7 +640,7 @@ impl DaemonStore {
         )
     }
 
-    /// implementation-note-233 — submit ONE approval entry that bundles a 3-statement
+    /// implementation-note-210 — submit ONE approval entry that bundles a 3-statement
     /// composite envelope (credential + session + time). On `Approved` the
     /// resolver mints a single composite grant whose `blocks_json` is
     /// overwritten with the supplied statement list (matching the shape
@@ -659,6 +711,7 @@ impl DaemonStore {
                 budget: sp.budget.clone(),
                 usage: Usage::default(),
                 conditions: sp.conditions.clone(),
+                can_delegate: None,
             })
             .collect();
 
@@ -759,7 +812,234 @@ impl DaemonStore {
         )
     }
 
-    /// implementation-note-10 — inner
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_decision_only_approval(
+        &self,
+        persona_id: &str,
+        credential_name: &str,
+        scope: &str,
+        action: &str,
+        risk_level: &str,
+        tool_name: Option<String>,
+        target_host: Option<String>,
+        target_url: Option<String>,
+        agent_framework: Option<String>,
+    ) -> Result<ApprovalRequestInfo, StoreError> {
+        self.submit_approval_inner_with_fields_and_resolution_kind(
+            persona_id,
+            credential_name,
+            scope,
+            None,
+            action,
+            risk_level,
+            None,
+            tool_name,
+            target_host,
+            target_url,
+            agent_framework,
+            None,
+            GrantShapeFields::default(),
+            ApprovalResolutionKind::DecisionOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_decision_only_approval_binding(
+        &self,
+        persona_id: &str,
+        credential_name: &str,
+        scope: &str,
+        action: &str,
+        risk_level: &str,
+        tool_name: Option<String>,
+        target_host: Option<String>,
+        target_url: Option<String>,
+        agent_framework: Option<String>,
+        binding: &ApprovalBindingRecord,
+    ) -> Result<ApprovalRequestInfo, StoreError> {
+        let approval = self.submit_decision_only_approval(
+            persona_id,
+            credential_name,
+            scope,
+            action,
+            risk_level,
+            tool_name,
+            target_host,
+            target_url,
+            agent_framework,
+        )?;
+        let binding_json = serde_json::to_string(binding)
+            .map_err(|e| StoreError::InvalidInput(format!("approval binding serialize: {e}")))?;
+        self.conn().execute(
+            "UPDATE approval_requests SET approval_binding_json = ?1 WHERE id = ?2",
+            rusqlite::params![binding_json, approval.id],
+        )?;
+        Ok(approval)
+    }
+
+    pub(crate) fn find_matching_approval_binding(
+        &self,
+        persona_id: &str,
+        action: &str,
+        binding: &ApprovalBindingRecord,
+    ) -> Result<Option<ApprovalRequestInfo>, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, status, reason, resolved_at, created_at, approval_binding_json \
+             FROM approval_requests \
+             WHERE persona_id = ?1 AND action = ?2 AND resolution_kind = 'decision_only' \
+               AND approval_binding_json IS NOT NULL \
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![persona_id, action], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, status, _reason, resolved_at, created_at, binding_json) = row?;
+            let stored: ApprovalBindingRecord =
+                serde_json::from_str(&binding_json).map_err(|e| {
+                    StoreError::InvalidInput(format!("approval binding deserialize for {id}: {e}"))
+                })?;
+            if stored != *binding {
+                continue;
+            }
+
+            if status == "approved"
+                && self.expire_unused_approval_binding_if_stale(
+                    &id,
+                    resolved_at.as_deref().or(Some(created_at.as_str())),
+                )?
+            {
+                return Ok(None);
+            }
+
+            return match status.as_str() {
+                "pending" | "approved" => self.get_approval(&id).map(Some),
+                _ => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn consume_approval_binding(
+        &self,
+        approval_id: &str,
+        binding: &ApprovalBindingRecord,
+    ) -> Result<bool, StoreError> {
+        let (status, resolved_at, created_at, binding_json): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = self.conn().query_row(
+            "SELECT status, resolved_at, created_at, approval_binding_json \
+             FROM approval_requests WHERE id = ?1",
+            rusqlite::params![approval_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let Some(binding_json) = binding_json else {
+            return Ok(false);
+        };
+        let stored: ApprovalBindingRecord = serde_json::from_str(&binding_json).map_err(|e| {
+            StoreError::InvalidInput(format!(
+                "approval binding deserialize for {approval_id}: {e}"
+            ))
+        })?;
+        if stored != *binding {
+            return Ok(false);
+        }
+        if status != "approved" {
+            return Ok(false);
+        }
+        if self.expire_unused_approval_binding_if_stale(
+            approval_id,
+            resolved_at.as_deref().or(Some(created_at.as_str())),
+        )? {
+            return Ok(false);
+        }
+        let used_at = Utc::now().to_rfc3339();
+        let updated = self.conn().execute(
+            "UPDATE approval_requests \
+             SET status = 'consumed', reason = 'approval_binding_consumed', approval_binding_used_at = ?1 \
+             WHERE id = ?2 AND status = 'approved' AND approval_binding_used_at IS NULL",
+            rusqlite::params![used_at, approval_id],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn invalidate_approval_bindings_for_attachment(
+        &self,
+        attachment_id: &str,
+        reason: &str,
+    ) -> Result<usize, StoreError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, approval_binding_json \
+             FROM approval_requests \
+             WHERE approval_binding_json IS NOT NULL \
+               AND approval_binding_used_at IS NULL \
+               AND status IN ('pending', 'approved')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let resolved_at = Utc::now().to_rfc3339();
+        let mut invalidated = 0usize;
+        for row in rows {
+            let (id, binding_json) = row?;
+            let binding: ApprovalBindingRecord =
+                serde_json::from_str(&binding_json).map_err(|e| {
+                    StoreError::InvalidInput(format!("approval binding deserialize for {id}: {e}"))
+                })?;
+            if binding.attachment_id != attachment_id {
+                continue;
+            }
+            invalidated += self.conn().execute(
+                "UPDATE approval_requests \
+                 SET status = 'invalidated', reason = ?1, resolved_at = ?2 \
+                 WHERE id = ?3 AND approval_binding_used_at IS NULL \
+                   AND status IN ('pending', 'approved')",
+                rusqlite::params![reason, resolved_at, id],
+            )?;
+        }
+        Ok(invalidated)
+    }
+
+    fn expire_unused_approval_binding_if_stale(
+        &self,
+        approval_id: &str,
+        approved_at: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let Some(approved_at) = approved_at else {
+            return Ok(false);
+        };
+        let approved_at = chrono::DateTime::parse_from_rfc3339(approved_at)
+            .map_err(|e| {
+                StoreError::InvalidInput(format!(
+                    "approval binding parse timestamp for {approval_id}: {e}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        let expired_after =
+            approved_at + chrono::Duration::seconds(APPROVAL_BINDING_UNUSED_TTL_SECS);
+        if Utc::now() < expired_after {
+            return Ok(false);
+        }
+        let updated = self.conn().execute(
+            "UPDATE approval_requests \
+             SET status = 'expired_unused', reason = 'approval_binding_expired_unused' \
+             WHERE id = ?1 AND status = 'approved' AND approval_binding_used_at IS NULL",
+            rusqlite::params![approval_id],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// implementation-note-13 — inner
     /// approval-row writer that persists the five grant-shaping fields the
     /// `create_grant` socket call previously dropped on the floor when policy
     /// required approval. The resolver re-applies them to the freshly-minted
@@ -780,6 +1060,42 @@ impl DaemonStore {
         agent_framework: Option<String>,
         skill_ref: Option<String>,
         grant_shape: GrantShapeFields,
+    ) -> Result<ApprovalRequestInfo, StoreError> {
+        self.submit_approval_inner_with_fields_and_resolution_kind(
+            persona_id,
+            credential_name,
+            scope,
+            ttl_secs,
+            action,
+            risk_level,
+            composite_statements,
+            tool_name,
+            target_host,
+            target_url,
+            agent_framework,
+            skill_ref,
+            grant_shape,
+            ApprovalResolutionKind::Grant,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_approval_inner_with_fields_and_resolution_kind(
+        &self,
+        persona_id: &str,
+        credential_name: &str,
+        scope: &str,
+        ttl_secs: Option<u64>,
+        action: &str,
+        risk_level: &str,
+        composite_statements: Option<Vec<Statement>>,
+        tool_name: Option<String>,
+        target_host: Option<String>,
+        target_url: Option<String>,
+        agent_framework: Option<String>,
+        skill_ref: Option<String>,
+        grant_shape: GrantShapeFields,
+        resolution_kind: ApprovalResolutionKind,
     ) -> Result<ApprovalRequestInfo, StoreError> {
         let id = format!("approval-{}", Uuid::new_v4());
         let created_at = Utc::now().to_rfc3339();
@@ -805,12 +1121,12 @@ impl DaemonStore {
             "INSERT INTO approval_requests \
              (id, persona_id, credential_name, scope, ttl_secs, action, risk_level, status, created_at, \
               composite_statements_json, composite_statements_hash, \
-              tool_name, target_host, target_url, agent_framework, skill_ref, \
+              tool_name, target_host, target_url, agent_framework, skill_ref, resolution_kind, \
               max_delegation_depth, max_uses_per_hour, allowed_hours_start, \
               allowed_hours_end, allowed_targets, budget_json, \
               max_children_per_day, auto_delegate_scope_template) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             rusqlite::params![
                 id,
                 persona_id,
@@ -827,6 +1143,7 @@ impl DaemonStore {
                 target_url,
                 agent_framework,
                 skill_ref,
+                resolution_kind.as_str(),
                 grant_shape.max_delegation_depth.map(|v| v as i64),
                 grant_shape.max_uses_per_hour.map(|v| v as i64),
                 grant_shape.allowed_hours_start.map(|v| v as i64),
@@ -937,7 +1254,7 @@ impl DaemonStore {
     }
 
     /// Resolve an approval request with optional biometric attestation
-    /// metadata (implementation-note-237).
+    /// metadata (implementation-note-201).
     ///
     /// `biometric` records whether the approval was gated by a hardware
     /// biometric on the operator's device (Touch ID via LocalAuthentication
@@ -995,7 +1312,7 @@ impl DaemonStore {
             committed: false,
         };
 
-        // implementation-note-233 — composite approvals stash their 3-statement envelope
+        // implementation-note-210 — composite approvals stash their 3-statement envelope
         // alongside the legacy single-statement fields, so the SELECT row
         // shape grew. Aliased to keep clippy happy.
         // REVIEW2-F2 — also fetch composite_statements_hash for integrity
@@ -1019,6 +1336,8 @@ impl DaemonStore {
             Option<String>, // budget_json
             Option<i64>,    // max_children_per_day
             Option<String>, // auto_delegate_scope_template
+            String,         // resolution_kind
+            String,         // created_at
         );
 
         // Fetch all columns we need (including status) in a single query.
@@ -1031,7 +1350,8 @@ impl DaemonStore {
                  composite_statements_json, composite_statements_hash, status, \
                  max_delegation_depth, max_uses_per_hour, allowed_hours_start, \
                  allowed_hours_end, allowed_targets, budget_json, \
-                 max_children_per_day, auto_delegate_scope_template \
+                 max_children_per_day, auto_delegate_scope_template, \
+                 resolution_kind, created_at \
                  FROM approval_requests WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
@@ -1052,6 +1372,8 @@ impl DaemonStore {
                         row.get(13)?,
                         row.get(14)?,
                         row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
                     ))
                 },
             )
@@ -1074,6 +1396,8 @@ impl DaemonStore {
             budget_json_raw,
             max_children_per_day_raw,
             auto_delegate_scope_template_raw,
+            resolution_kind,
+            created_at,
         ) = row.ok_or(StoreError::NotFound)?;
 
         let grant_shape = GrantShapeFields {
@@ -1137,7 +1461,38 @@ impl DaemonStore {
 
         match outcome {
             ApprovalOutcome::Approved => {
-                // implementation-note-233 — for composite approvals the row is created
+                if resolution_kind == ApprovalResolutionKind::DecisionOnly.as_str() {
+                    self.conn().execute(
+                        "UPDATE approval_requests SET status = 'approved', resolved_at = ?1 WHERE id = ?2",
+                        rusqlite::params![resolved_at, id],
+                    )?;
+                    let _ = self.log_event(
+                        Some(&persona_id),
+                        "approval.approved",
+                        Some(&credential_name),
+                        "approved",
+                        Some(
+                            &serde_json::json!({
+                                "approval_id": id,
+                                "grant_id": serde_json::Value::Null,
+                                "biometric": biometric,
+                                "credential_id": credential_id,
+                                "resolution_kind": resolution_kind,
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    record_decision_only_jit_latency(
+                        &resolution_kind,
+                        &created_at,
+                        &resolved_at,
+                        crate::telemetry::measurement::JitOutcome::Approve,
+                    );
+                    self.conn().execute_batch("COMMIT")?;
+                    tx_guard.committed = true;
+                    return Ok(());
+                }
+                // implementation-note-210 — for composite approvals the row is created
                 // with scope "*" because the typed child statements
                 // (Credential / Session / Time) overwrite `blocks_json`
                 // immediately below; the flat `scope` column is a
@@ -1180,7 +1535,7 @@ impl DaemonStore {
 
                 self.apply_grant_shape_to_grant(&grant.id, &grant_shape)?;
 
-                // implementation-note-233 — when the approval bundles a composite envelope,
+                // implementation-note-210 — when the approval bundles a composite envelope,
                 // overwrite the freshly-minted single-statement grant's
                 // blocks_json with the canonical 3-statement composite chain.
                 // Mirrors the path the CLI sandbox-run handler used to take
@@ -1207,7 +1562,7 @@ impl DaemonStore {
                             "ttl_secs": ttl_secs,
                             "source": "approval",
                             "composite": composite_statements.is_some(),
-                            // implementation-note-237 — `biometric=true` indicates the
+                            // implementation-note-201 — `biometric=true` indicates the
                             // approval was attested by a hardware biometric on
                             // the operator's device (Touch ID via
                             // LocalAuthentication on the macOS CLI, or
@@ -1221,7 +1576,7 @@ impl DaemonStore {
                         .to_string(),
                     ),
                 );
-                // implementation-note-237 — also emit a dedicated `approval.approved`
+                // implementation-note-201 — also emit a dedicated `approval.approved`
                 // event so downstream auditors can filter on the approval
                 // beat without parsing `grant.issued` semantics.
                 let _ = self.log_event(
@@ -1251,7 +1606,7 @@ impl DaemonStore {
                      reason = ?2 WHERE id = ?3",
                     rusqlite::params![resolved_at, reason, id],
                 )?;
-                // implementation-note-237 — record the biometric posture on denial too
+                // implementation-note-201 — record the biometric posture on denial too
                 // so an auditor can distinguish "human rejected with TouchID"
                 // from "untouched timeout".
                 let _ = self.log_event(
@@ -1269,8 +1624,19 @@ impl DaemonStore {
                         .to_string(),
                     ),
                 );
+                record_decision_only_jit_latency(
+                    &resolution_kind,
+                    &created_at,
+                    &resolved_at,
+                    crate::telemetry::measurement::JitOutcome::Deny,
+                );
             }
             ApprovalOutcome::Narrowed { new_scope } => {
+                if resolution_kind == ApprovalResolutionKind::DecisionOnly.as_str() {
+                    return Err(StoreError::InvalidInput(
+                        "decision-only approvals do not support narrowed resolution".to_string(),
+                    ));
+                }
                 // approval_outcome_scope_subset_check — Per adversarial-
                 // review 2026-05-19 CRIT-5. The variant is named
                 // "Narrowed"; the contract is narrowing only. Without this
@@ -1324,6 +1690,11 @@ impl DaemonStore {
                 scope: narrow_scope,
                 expires_at,
             } => {
+                if resolution_kind == ApprovalResolutionKind::DecisionOnly.as_str() {
+                    return Err(StoreError::InvalidInput(
+                        "decision-only approvals do not support always resolution".to_string(),
+                    ));
+                }
                 // Resolve the effective scope: narrowed if provided, original otherwise.
                 let effective_scope = narrow_scope.as_deref().unwrap_or(&scope);
                 // approval_outcome_scope_subset_check — Per adversarial-
@@ -1354,7 +1725,7 @@ impl DaemonStore {
                 // Create the standing grant so future matching requests auto-approve.
                 self.create_standing_grant(
                     &persona_id,
-                    &action,
+                    &ActionSelector::named(&action),
                     effective_scope,
                     expires_at.as_deref(),
                 )?;
@@ -1489,7 +1860,7 @@ impl DaemonStore {
             .ok_or(StoreError::NotFound)
     }
 
-    /// implementation-note-233 — overwrite a freshly-minted single-statement grant's
+    /// implementation-note-210 — overwrite a freshly-minted single-statement grant's
     /// `blocks_json` with the canonical 3-statement composite chain.
     ///
     /// Mirrors the path `ember sandbox run` previously took inline (signing
@@ -1652,7 +2023,7 @@ impl DaemonStore {
         Ok(count)
     }
 
-    /// implementation-note-228 — operator-initiated dismiss of a pending
+    /// implementation-note-195 — operator-initiated dismiss of a pending
     /// approval card. Sets status to `dismissed`, records an `approval.dismissed`
     /// audit event, and returns. Does NOT fire a desktop notification (the operator
     /// is already looking at the dashboard). Only `pending` rows can be dismissed;
@@ -1897,6 +2268,180 @@ mod tests {
     }
 
     #[test]
+    fn decision_only_approval_approved_does_not_mint_grant() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let req = store
+            .submit_decision_only_approval(
+                &pid,
+                "clearbit",
+                "payment_attempt:attempt-1",
+                "payment:charge",
+                "high",
+                Some("payment:charge".to_string()),
+                Some("clearbit".to_string()),
+                None,
+                Some("payment".to_string()),
+            )
+            .unwrap();
+
+        store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
+
+        let resolved = store.get_approval(&req.id).unwrap();
+        assert_eq!(resolved.status, "approved");
+        assert!(resolved.result_grant_id.is_none());
+        assert!(store.list_grants().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decision_only_approval_resolution_records_jit_latency_when_enabled() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("telemetry tempdir");
+        crate::telemetry::measurement::set_output_dir(Some(dir.path().to_path_buf()));
+        crate::telemetry::measurement::enable_collection();
+
+        struct TelemetryReset;
+        impl Drop for TelemetryReset {
+            fn drop(&mut self) {
+                let _ = crate::telemetry::measurement::disable_collection_and_purge();
+                crate::telemetry::measurement::set_output_dir(None);
+            }
+        }
+        let _reset = TelemetryReset;
+
+        let store = setup();
+        let pid = persona_id(&store);
+        let created_at = (chrono::Utc::now() - chrono::Duration::milliseconds(250)).to_rfc3339();
+
+        let approved = store
+            .submit_decision_only_approval(
+                &pid,
+                "git.push",
+                "approval_binding:att-test:invocation-1",
+                "git.push",
+                "high",
+                Some("git.push".to_string()),
+                None,
+                None,
+                Some("construct".to_string()),
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE approval_requests SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![created_at, approved.id],
+            )
+            .unwrap();
+        store
+            .resolve_approval(&approved.id, &ApprovalOutcome::Approved)
+            .unwrap();
+
+        let denied = store
+            .submit_decision_only_approval(
+                &pid,
+                "git.push",
+                "approval_binding:att-test:invocation-2",
+                "git.push",
+                "high",
+                Some("git.push".to_string()),
+                None,
+                None,
+                Some("construct".to_string()),
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE approval_requests SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![created_at, denied.id],
+            )
+            .unwrap();
+        store
+            .resolve_approval(
+                &denied.id,
+                &ApprovalOutcome::Denied {
+                    reason: "operator denied".to_string(),
+                },
+            )
+            .unwrap();
+
+        let path = crate::telemetry::measurement::current_status().active_daily_path;
+        let raw = std::fs::read_to_string(path).expect("telemetry written");
+        let mut outcomes = vec![];
+        for line in raw.lines() {
+            let row: crate::telemetry::measurement::SampleRow =
+                serde_json::from_str(line).expect("telemetry row");
+            let crate::telemetry::measurement::SampleRow::JitLatency {
+                cohort,
+                latency_ms,
+                outcome,
+                ..
+            } = row
+            else {
+                continue;
+            };
+            assert_eq!(cohort, "dev0");
+            assert!(
+                latency_ms >= 100,
+                "latency should reflect queued approval age, got {latency_ms}ms"
+            );
+            outcomes.push(outcome);
+        }
+        assert_eq!(
+            outcomes,
+            vec![
+                crate::telemetry::measurement::JitOutcome::Approve,
+                crate::telemetry::measurement::JitOutcome::Deny
+            ]
+        );
+    }
+
+    #[test]
+    fn attachment_local_approval_bindings_invalidate_on_close_signal() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let binding = ApprovalBindingRecord {
+            attachment_id: "att-test".to_string(),
+            caller_binding_id: "binding-test".to_string(),
+            attachment_endpoint_token_sha256: sha256_hex("endpoint-token"),
+            execution_contract_digest: "contract-digest".to_string(),
+            invocation_digest: "invocation-digest".to_string(),
+        };
+        let req = store
+            .submit_decision_only_approval_binding(
+                &pid,
+                "git.push",
+                "approval_binding:att-test:invocation-digest",
+                "git.push",
+                "high",
+                Some("git.push".to_string()),
+                None,
+                None,
+                Some("construct".to_string()),
+                &binding,
+            )
+            .unwrap();
+        store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
+
+        let invalidated = store
+            .invalidate_approval_bindings_for_attachment("att-test", "attachment_closed")
+            .unwrap();
+        assert_eq!(invalidated, 1);
+        assert_eq!(
+            store.get_approval(&req.id).unwrap().status,
+            "invalidated",
+            "approved-but-unused binding must be invalidated on attachment close"
+        );
+    }
+
+    #[test]
     fn list_pending_excludes_resolved() {
         let store = setup();
         let pid = persona_id(&store);
@@ -2019,7 +2564,10 @@ mod tests {
         let standing = store.list_standing_grants().unwrap();
         assert_eq!(standing.len(), 1);
         assert_eq!(standing[0].persona_id, pid);
-        assert_eq!(standing[0].action_pattern, "credential.access.github-token");
+        assert_eq!(
+            standing[0].action_selector,
+            ActionSelector::named("credential.access.github-token")
+        );
         assert_eq!(standing[0].scope, "read");
         assert_eq!(standing[0].expires_at.as_deref(), Some(expires_at.as_str()));
     }
@@ -2108,7 +2656,10 @@ mod tests {
         let standing = store.list_standing_grants().unwrap();
         assert_eq!(standing.len(), 1);
         assert_eq!(standing[0].scope, "read");
-        assert_eq!(standing[0].action_pattern, "credential.access.github-token");
+        assert_eq!(
+            standing[0].action_selector,
+            ActionSelector::named("credential.access.github-token")
+        );
     }
 
     #[test]
@@ -2233,7 +2784,7 @@ mod tests {
         assert_eq!(still_pending.status, "pending");
     }
 
-    // --- implementation-note-233 — composite-grant approval flow ---
+    // --- implementation-note-210 — composite-grant approval flow ---
 
     fn demo_three_statements(credential: &str) -> Vec<Statement> {
         use core_grant_types::{Budget, ResourceSelector, ResourceType, Usage};
@@ -2249,6 +2800,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
             Statement {
                 sid: "s1-session".to_string(),
@@ -2263,6 +2815,7 @@ mod tests {
                 }),
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
             Statement {
                 sid: "s2-time".to_string(),
@@ -2275,6 +2828,7 @@ mod tests {
                 }),
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
         ]
     }
@@ -2995,6 +3549,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
             Statement {
                 sid: "s1-read".into(),
@@ -3006,6 +3561,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
             Statement {
                 sid: "s2-time".into(),
@@ -3015,6 +3571,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
         ]
     }
@@ -3116,6 +3673,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
             Statement {
                 sid: "s1".into(),
@@ -3127,6 +3685,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             },
         ];
 
@@ -3172,6 +3731,7 @@ mod tests {
             budget: None,
             usage: Usage::default(),
             conditions: vec![],
+            can_delegate: None,
         }];
         let child_block = core_grant_types::Block {
             statements: admin_child,
@@ -3226,6 +3786,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
+                can_delegate: None,
             }],
             nbf: None,
             expires_at: None,
@@ -3270,6 +3831,7 @@ mod tests {
                 ..Default::default()
             },
             conditions: vec![],
+            can_delegate: None,
         }];
 
         let bound = crate::trust::attenuation::compute_statements_union_bound(&only);
@@ -3285,7 +3847,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-228: dismiss_approval ---
+    // --- implementation-note-195: dismiss_approval ---
 
     #[test]
     fn dismiss_pending_approval_sets_status_dismissed() {
@@ -3445,7 +4007,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-403: T1 unit tests ---
+    // --- implementation-note-354: T1 unit tests ---
 
     /// T1: submit_approval_inner persists tool_name, target_host, target_url,
     /// and agent_framework; get_approval reads them back (not None).
@@ -3569,7 +4131,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-403: T2 round-trip via ApprovalLifecycle ---
+    // --- implementation-note-354: T2 round-trip via ApprovalLifecycle ---
 
     /// T2: SubmitMetadata carries notify fields → DaemonApprovalStoreRef persists them →
     /// get_approval returns them. This is the seam that was broken before this task.
@@ -3766,7 +4328,7 @@ mod tests {
         assert_eq!(
             pending.max_delegation_depth,
             Some(3),
-            "max_delegation_depth must round-trip via the approval row (the load-bearing implementation-note-256 regression)"
+            "max_delegation_depth must round-trip via the approval row (the load-bearing implementation-note-274 regression)"
         );
         assert_eq!(pending.max_uses_per_hour, Some(50));
         assert_eq!(pending.allowed_hours_start, Some(9));

@@ -1,6 +1,6 @@
 //! Operator-facing vault I/O — `ember vault list/get/put/export/import`.
 //!
-//! Per implementation-note-458 this module hosts the testable
+//! Per implementation-note-470 this module hosts the testable
 //! core of the new `ember vault` subcommands (sub-piece E of design).
 //! The argv-parsing surface lives in `bin/ember.rs`; the binary forwards
 //! into these helpers so they can be exercised from T2 integration tests
@@ -128,7 +128,7 @@ pub fn decode_import_envelope(
                 name: entry.name.clone(),
                 source,
             })?;
-        out.push((entry.name.clone(), plaintext));
+        out.push((entry.name.clone(), plaintext.to_vec()));
     }
     Ok(out)
 }
@@ -161,6 +161,8 @@ pub mod testing {
         pub from_downloads: bool,
         #[arg(long)]
         pub metadata: Option<String>,
+        #[arg(long)]
+        pub require_biometric: bool,
     }
 }
 

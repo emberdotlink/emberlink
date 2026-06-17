@@ -196,6 +196,8 @@ pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
 
 #[cfg(test)]
 mod tests {
+    //! T2: heartbeat unit tests use temporary session directories.
+
     use super::*;
     use chrono::TimeZone;
     use tempfile::TempDir;

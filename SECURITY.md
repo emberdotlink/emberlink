@@ -1,5 +1,6 @@
 # Security Policy
 
+
 ## Supported versions
 
 | Release line | Status | Security fixes |
@@ -8,7 +9,7 @@
 | `0.2.x` and earlier | End-of-life | No — please upgrade to 0.3.x |
 | Unreleased `main` | Development | Best-effort, not under SLA |
 
-Per design (v0.3.0 ship boundary), the curated public source mirror may open before `v0.3.0`, `v0.3.0` remains a friendly preview to a small named cohort, and `v0.3.1` is the first public supported build. The same disclosure policy applies across that prerelease line.
+Per the v0.3.0 release boundary, the curated public source mirror may open before `v0.3.0`, `v0.3.0` remains a friendly preview to a small named cohort, and `v0.3.1` is the first public supported build. The same disclosure policy applies across that prerelease line.
 
 ## Reporting a Vulnerability
 
@@ -172,7 +173,7 @@ Release artifacts on [`emberdotlink/emberlink`](https://github.com/emberdotlink/
 
 **What this means for verification:**
 
-- **Minisign signatures** are the canonical install-time trust anchor. The public-key body is embedded in `web/sh/install.sh`. Minisign is independent of any GitHub identity — it attests that the artifact was signed by the holder of the Emberlink release private key (custody: operator-owned hardware + 1Password backup).
+- **Minisign signatures** are the canonical install-time trust anchor. The public-key body is embedded in `web/sh/install.sh`. Minisign is independent of any GitHub identity — it attests that the artifact was signed by the holder of the Emberlink release private key (custody: maintainer-held hardware + password-manager backup).
 
 - **Cosign keyless signatures** carry a Fulcio certificate whose `Subject` claim names the WORKFLOW ORIGIN: `repo:emberdotlink/emberlink-dev:ref:refs/tags/<tag>`, NOT `emberdotlink/emberlink`. This is intentional. The dev repo is where security-lane code review happens (CODEOWNERS-gated paths, audit pipeline, signed-commit policy); the public repo is a publication artifact, not a CI surface. Cosign verifiers MUST use the dev-repo identity regex (the `verify-blob` command above already does).
 

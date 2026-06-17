@@ -221,7 +221,7 @@ pub fn lease_credential(
         grant_id: info.id,
         persona_id: info.persona_id,
         credential_name: info.credential_name,
-        credential,
+        credential: credential.to_vec(),
         expires_at,
         caller_tag: caller_tag.to_string(),
     })

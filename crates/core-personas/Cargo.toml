@@ -10,3 +10,8 @@ core-types = { path = "../core-types" }
 core-principals = { path = "../core-principals" }
 core-event-types = { path = "../core-event-types" }
 
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

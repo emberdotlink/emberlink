@@ -1,8 +1,9 @@
 // Event authorization matrix — see module docs in this file for the
 // per-event-kind decision logic.
 use core_crypto::PublicKey;
-use core_event_types::{EventBody, KeyRole, SignerBinding, SubjectKind};
+use core_event_types::{CustodyClass, EventBody, KeyRole, SignerBinding, SubjectKind};
 use core_events::EventEnvelope;
+use core_principals::PublicKeyMaterial;
 use core_types::ValidationError;
 
 use crate::{
@@ -70,19 +71,34 @@ impl IdentityAuthorizer {
         // malformed audit trails never land.
         check_signer_subject_coherence(&event.signer_binding, &event.body)?;
         match &event.body {
-            // .1a M-4: RootCreated is unconditionally allowed at the
-            // authorize layer — a root is self-asserting and nothing in state
-            // yet binds its authority. Squatting risk: a first-to-sync peer
-            // can pre-emptively assert `root_id = X` with their own pubkey
-            // before the real root's creation event arrives. Recovery posture
-            // is out-of-band: the real operator must pick a fresh root_id and
-            // prove custody through a side channel (signed statement, DNS,
-            // verified human identity). We additionally enforce pubkey-material
-            // uniqueness across roots below so a second RootCreated using the
-            // same pubkey as an existing root is rejected — this limits the
-            // blast radius of key-material collisions but does not prevent the
-            // squatting pattern itself.
+            // RootCreated is self-asserting — nothing in state yet binds its
+            // authority. Two structural guards apply (design §2 / AC-1):
+            //
+            // 1. **Self-root invariant (signer == initial_key).** A Root genesis is
+            //    accepted by an external `verify_chain` ONLY if the signing key IS
+            //    the recorded founding `initial_key`. The append-time signature
+            //    check alone binds signature↔signer, NOT signer↔initial_key, so
+            //    without this guard the authority layer would accept a genesis
+            //    whose materialized `active_key` names a key that never signed it —
+            //    local state an independent verifier would reject. This is the
+            //    structurally-complete home for the guard `operator_identity`'s
+            //    `check_genesis_self_root` enforces at the daemon layer; binding it
+            //    here makes the property hold for ALL genesis paths (daemon
+            //    self-root, operator OOB, any in-process builder) by construction.
+            //    (Named follow-up from the #5079 / #5082 adversarial reviews.)
+            // 2. **Cross-root pubkey uniqueness.** A second RootCreated reusing an
+            //    existing root's pubkey is rejected — it bounds the blast radius of
+            //    key-material collisions. (Squatting on a fresh `root_id` with the
+            //    signer's own key is still possible; recovery is out-of-band: the
+            //    real operator picks a fresh root_id and proves custody through a
+            //    side channel.)
             EventBody::RootCreated(body) => {
+                if signer_pk.0 != body.initial_key.public_key {
+                    return Err(ValidationError::unauthorized(
+                        "root genesis signer key does not match the recorded initial_key \
+                         (self-root invariant — an external verify_chain would reject)",
+                    ));
+                }
                 for existing in state.roots_current.values() {
                     if existing.root_id != body.root_id
                         && existing.active_key.public_key == body.initial_key.public_key
@@ -102,6 +118,12 @@ impl IdentityAuthorizer {
                 authorize_root_key(&event.signer_binding, signer_pk, &body.root_id, state)
             }
             EventBody::DeviceAdded(body) => {
+                authorize_root_key(&event.signer_binding, signer_pk, &body.root_id, state)
+            }
+            EventBody::DeviceEnrolled(body) => {
+                // Enrollment binds a presence/co-authority Device to the
+                // operator's root; the root signs it (design §5). The
+                // attestation chain is verified at enroll-time in the daemon.
                 authorize_root_key(&event.signer_binding, signer_pk, &body.root_id, state)
             }
             EventBody::PersonaCreated(body) => {
@@ -493,6 +515,42 @@ impl Authorizer for IdentityAuthorizer {
     // with `sanitize_authorize_error` for public-facing error surfaces.
 }
 
+/// True iff `signer_binding.key_id` AND `signer_public_key` both match `key` —
+/// the same two-part binding (key-id string + pubkey material) the root/device
+/// authorization has always required. Both halves are checked so a forged
+/// `key_id` against someone else's pubkey (or vice versa) cannot pass.
+fn key_material_matches(
+    key: &PublicKeyMaterial,
+    signer_binding: &SignerBinding,
+    signer_public_key: &PublicKey,
+) -> bool {
+    key.key_id == signer_binding.key_id && key.public_key == signer_public_key.0
+}
+
+/// Authorize a root-level operation (design §2/§5 — **Model C**, root authority
+/// is a *set of devices*, not a single key).
+///
+/// A root-level event is authorized when its signer is **either**:
+/// - the root's founding `active_key` (the genesis / current root key); **or**
+/// - any **active `presence`-class Device** enrolled under the root.
+///
+/// This is the device-set generalization of the original single-root-key rule:
+/// the daemon root is the N=1 case (its sole authority is its `active_key` —
+/// the daemon-Device), the operator root is N≥2 (first + backup YubiKeys), so a
+/// lost key is recoverable from any surviving presence Device without the daemon
+/// ever holding an operator key. `co-authority`-class devices are deliberately
+/// NOT root-authoritative here (that is a team0+ lane with its own policy).
+///
+/// **Recovery↔takeover duality (intended, not a bug).** Every root-level op —
+/// including `RootKeyRotated`, `RootRevoked`, and revoking a *sibling* Device —
+/// is admitted from any active presence Device. This is *required* for C's core
+/// guarantee: recovering from a lost/compromised founding key means a surviving
+/// Device must be able to rotate it away and revoke it. The same capability lets
+/// a single compromised presence Device take over the root — the irreducible
+/// cost of 1-of-N. At dev0 the operator physically holds both their own keys
+/// (each tap is a per-use presence proof), so this is accepted; the multi-human
+/// threat is addressed at team0+ by the M-of-N guardian threshold (design §6),
+/// NOT by carving root-mutation ops out here (which would re-break recovery).
 fn authorize_root_key(
     signer_binding: &SignerBinding,
     signer_public_key: &PublicKey,
@@ -509,23 +567,32 @@ fn authorize_root_key(
             root_id
         )));
     }
-    if root.active_key.key_id != signer_binding.key_id {
-        return Err(ValidationError::unauthorized(format!(
-            "signer key {} does not match active root key for {}",
-            signer_binding.key_id, root_id
-        )));
+
+    // Branch 1: the root's own founding key (covers the daemon root, N=1, and
+    // every existing single-key root — unchanged behavior).
+    if key_material_matches(&root.active_key, signer_binding, signer_public_key) {
+        return Ok(());
     }
-    // Signer-pubkey binding: bind the signer's public-key material to the stored active key.
-    // Without this, a peer signing a well-formed event with their own pubkey but
-    // a forged `signer_binding.key_id = "<victim-key-id>"` would pass the string
-    // match above and impersonate the victim root in the sync path.
-    if root.active_key.public_key != signer_public_key.0 {
-        return Err(ValidationError::unauthorized(format!(
-            "signer public key does not match active root key material for {}",
-            root_id
-        )));
+
+    // Branch 2 (Model C): an active presence-class Device enrolled under this
+    // root. Membership requires BOTH key-id and pubkey-material match against a
+    // device whose recorded custody class is `presence` (attestation-proven at
+    // enroll time) and whose status is Active (revoked/frozen devices cannot
+    // authorize).
+    let is_active_presence_device = state.devices_current.values().any(|device| {
+        device.root_id == root_id
+            && device.status == DeviceStatus::Active
+            && device.custody_class == CustodyClass::Presence
+            && key_material_matches(&device.active_key, signer_binding, signer_public_key)
+    });
+    if is_active_presence_device {
+        return Ok(());
     }
-    Ok(())
+
+    Err(ValidationError::unauthorized(format!(
+        "signer {} is neither the root key nor an active presence Device for root {}",
+        signer_binding.key_id, root_id
+    )))
 }
 
 fn authorize_device_key(
@@ -663,6 +730,51 @@ fn authorize_persona_key(
     Ok(())
 }
 
+/// Read-only predicate: is `public_key` the active signing key of an **Active
+/// persona** rooted under an **Active** `root_id`?
+///
+/// This is the stable read interface the broker capability lane (BKR-4
+/// grant-chain-walk) consumes to confirm that the persona which signed a
+/// delegation block is still a live, root-anchored principal — *without*
+/// touching the Model-C `verify_chain` (that is the identity lane's surface;
+/// BKR walks the grant chain only). It composes the same `personas_current`
+/// active-key + root-ownership + status checks `authorize_persona_key` /
+/// `authorize_root_key` enforce, but as a boolean query rather than an
+/// event-authorization decision.
+///
+/// **Match semantics.** Keyed on the public-key *material* (`PublicKeyMaterial.
+/// public_key`, the cryptographic identity), not on the `key_id` label: a grant
+/// block carries the signer's pubkey, not the enrolling persona's `key_id`, and
+/// a pubkey is 1:1 with a persona's active key, so the pubkey alone is the
+/// sound membership test. (Contrast `authorize_persona_key`, which binds *both*
+/// halves because it is validating a presented signature, not testing set
+/// membership.)
+///
+/// **Root status is load-bearing.** A persona under a *revoked* root is NOT
+/// active here even if its own `status` is still `Active` — a revoked root has
+/// no authority to delegate, so its personas must not read as valid. Returns
+/// `false` for an unknown/revoked root, an unknown/revoked persona, or a pubkey
+/// that is not any persona's active key under the root. Never panics; fail-closed.
+pub fn is_active_persona_key_under_root(
+    state: &MaterializedState,
+    root_id: &str,
+    public_key: &str,
+) -> bool {
+    // The root itself must be Active — a revoked root's personas carry no authority.
+    let root_active = state
+        .roots_current
+        .get(root_id)
+        .is_some_and(|r| r.status == RootStatus::Active);
+    if !root_active {
+        return false;
+    }
+    state.personas_current.values().any(|persona| {
+        persona.root_id == root_id
+            && persona.status == PersonaStatus::Active
+            && persona.active_key.public_key == public_key
+    })
+}
+
 /// .1a L-1: transform an internal authorize error into a public-facing
 /// error message that does not echo subject-existence / freeze / key-mismatch
 /// state to the caller. Internal callers continue to receive the detailed
@@ -731,20 +843,34 @@ fn check_time_window(
 /// pass through):
 /// * RootCreated / RootKeyRotated / RootRevoked / RecoveryPolicyCreated /
 ///   RecoveryRequested / GuardianEnrolled / DeviceAdded / PersonaCreated /
-///   DeviceReplaced / Storage*: signer is a root → `signer.subject_id ==
-///   body.root_id`.
+///   DeviceReplaced / Storage*: signer is the root principal →
+///   `signer.subject_id == body.root_id`.
 /// * DeviceKeyRotated / DeviceEncryptionKeyRotated / DeviceRevoked /
 ///   DeviceFrozen / RelayHintUpdated / EndpointRotated: signer is a device
 ///   → `signer.subject_id == body.device_id`.
 /// * TrustAttested / TrustRevoked / MessageSent / ContentPublished /
 ///   DisclosureRevoked / GrantOffer* / BadgeIssued / BadgeRevoked /
-///   BadgeDisputed / CredentialDeposited / CredentialRevoked: signer is a
-///   persona → `signer.subject_id == body.<the relevant persona id>`.
+///   BadgeDisputed / CredentialDeposited / CredentialRevoked: signer is the
+///   persona principal → `signer.subject_id == body.<the relevant persona id>`.
 ///
 /// RecoveryApproved / RecoveryContested / RecoveryRejected / RecoveryExecuted
 /// use the request's root_id; we allow any subject kind on those branches
 /// and defer to the body-specific checks. Same for RelayShutdownNotice (the
 /// signer may be any device backing the endpoint).
+fn signer_is_root_principal(binding: &SignerBinding, expected_id: &str) -> bool {
+    matches!(
+        binding.signer.kind,
+        SubjectKind::Principal | SubjectKind::Root
+    ) && binding.signer.subject_id == expected_id
+}
+
+fn signer_is_persona_principal(binding: &SignerBinding, expected_id: &str) -> bool {
+    matches!(
+        binding.signer.kind,
+        SubjectKind::Principal | SubjectKind::Persona
+    ) && binding.signer.subject_id == expected_id
+}
+
 fn check_signer_subject_coherence(
     binding: &SignerBinding,
     body: &EventBody,
@@ -760,156 +886,135 @@ fn check_signer_subject_coherence(
     };
     match body {
         EventBody::RootCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::RootKeyRotated(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::RootRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::DeviceAdded(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
+            }
+        }
+        EventBody::DeviceEnrolled(b) => {
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::PersonaCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::RecoveryPolicyCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::RecoveryRequested(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::GuardianEnrolled(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::DeviceReplaced(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::StorageRelationshipCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::StorageLedgerUpdated(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
         EventBody::StorageManifestPublished(b) => {
-            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
-                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            if !signer_is_root_principal(binding, &b.root_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.root_id));
             }
         }
-        // Events where the signer is a persona: the binding subject must be
-        // the relevant persona id from the body.
+        // Events where the signer is a persona principal: the binding subject
+        // must be the relevant persona id from the body.
         EventBody::TrustAttested(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.attester_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.attester_persona_id));
+            if !signer_is_persona_principal(binding, &b.attester_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.attester_persona_id));
             }
         }
         EventBody::TrustRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.attester_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.attester_persona_id));
+            if !signer_is_persona_principal(binding, &b.attester_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.attester_persona_id));
             }
         }
         EventBody::MessageSent(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.sender_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.sender_persona_id));
+            if !signer_is_persona_principal(binding, &b.sender_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.sender_persona_id));
             }
         }
         EventBody::ContentPublished(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.author_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.author_persona_id));
+            if !signer_is_persona_principal(binding, &b.author_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.author_persona_id));
             }
         }
         EventBody::DisclosureRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.revoker_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.revoker_persona_id));
+            if !signer_is_persona_principal(binding, &b.revoker_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.revoker_persona_id));
             }
         }
         EventBody::GrantOfferCreated(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.issuer_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.issuer_persona_id));
+            if !signer_is_persona_principal(binding, &b.issuer_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.issuer_persona_id));
             }
         }
         EventBody::GrantOfferClaimed(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.recipient_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.recipient_persona_id));
+            if !signer_is_persona_principal(binding, &b.recipient_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.recipient_persona_id));
             }
         }
         EventBody::GrantOfferRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.issuer_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.issuer_persona_id));
+            if !signer_is_persona_principal(binding, &b.issuer_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.issuer_persona_id));
             }
         }
         EventBody::BadgeIssued(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.issuer_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.issuer_persona_id));
+            if !signer_is_persona_principal(binding, &b.issuer_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.issuer_persona_id));
             }
         }
         EventBody::BadgeRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.revoker_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.revoker_persona_id));
+            if !signer_is_persona_principal(binding, &b.revoker_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.revoker_persona_id));
             }
         }
         EventBody::BadgeDisputed(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.disputer_persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.disputer_persona_id));
+            if !signer_is_persona_principal(binding, &b.disputer_persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.disputer_persona_id));
             }
         }
         EventBody::CredentialDeposited(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.issuer_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.issuer_id));
+            if !signer_is_persona_principal(binding, &b.issuer_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.issuer_id));
             }
         }
         EventBody::CredentialRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.revoker_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.revoker_id));
+            if !signer_is_persona_principal(binding, &b.revoker_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.revoker_id));
             }
         }
         // Device-as-signer events: the binding subject must be the
@@ -946,8 +1051,7 @@ fn check_signer_subject_coherence(
         // root OR the subject device/persona — we accept either and let the
         // per-branch authorize check enforce the rest.
         EventBody::DeviceRevoked(b) => {
-            let matches_root =
-                binding.signer.kind == SubjectKind::Root && binding.signer.subject_id == b.root_id;
+            let matches_root = signer_is_root_principal(binding, &b.root_id);
             let matches_device = binding.signer.kind == SubjectKind::Device
                 && binding.signer.subject_id == b.device_id;
             if !matches_root && !matches_device {
@@ -955,8 +1059,7 @@ fn check_signer_subject_coherence(
             }
         }
         EventBody::DeviceFrozen(b) => {
-            let matches_root =
-                binding.signer.kind == SubjectKind::Root && binding.signer.subject_id == b.root_id;
+            let matches_root = signer_is_root_principal(binding, &b.root_id);
             let matches_device = binding.signer.kind == SubjectKind::Device
                 && binding.signer.subject_id == b.device_id;
             if !matches_root && !matches_device {
@@ -964,19 +1067,15 @@ fn check_signer_subject_coherence(
             }
         }
         EventBody::PersonaRevoked(b) => {
-            let matches_root =
-                binding.signer.kind == SubjectKind::Root && binding.signer.subject_id == b.root_id;
-            let matches_persona = binding.signer.kind == SubjectKind::Persona
-                && binding.signer.subject_id == b.persona_id;
+            let matches_root = signer_is_root_principal(binding, &b.root_id);
+            let matches_persona = signer_is_persona_principal(binding, &b.persona_id);
             if !matches_root && !matches_persona {
-                return Err(mismatch(SubjectKind::Persona, &b.persona_id));
+                return Err(mismatch(SubjectKind::Principal, &b.persona_id));
             }
         }
         EventBody::PersonaKeyRotated(b) => {
-            if binding.signer.kind != SubjectKind::Persona
-                || binding.signer.subject_id != b.persona_id
-            {
-                return Err(mismatch(SubjectKind::Persona, &b.persona_id));
+            if !signer_is_persona_principal(binding, &b.persona_id) {
+                return Err(mismatch(SubjectKind::Principal, &b.persona_id));
             }
         }
         // GuardianKeyRotated: root OR guardian may sign; skip subject binding
@@ -998,10 +1097,11 @@ fn check_signer_subject_coherence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_crypto::{DOMAIN_EVENT, FixtureSigner, Signer as _, Verifier as _};
+    use core_crypto::{DOMAIN_EVENT, FixtureSigner, Signer as _};
     use core_event_types::{
-        DeviceFrozenEvent, DeviceRevokedEvent, EventBody, PersonaRevokedEvent, RootCreatedEvent,
-        SignerBinding,
+        AttestationTier, CustodyClass, DeviceAddedEvent, DeviceFrozenEvent, DeviceRevokedEvent,
+        EventBody, MessageSentEvent, PersonaCreatedEvent, PersonaRevokedEvent, PresenceFactor,
+        RootCreatedEvent, RootKeyRotatedEvent, SignerBinding,
     };
     use core_events::EventEnvelope;
     use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
@@ -1064,6 +1164,10 @@ mod tests {
                 active_encryption_key: make_enc_key("device-a"),
                 status: DeviceStatus::Active,
                 replacement_device_id: None,
+                custody_class: CustodyClass::Daemon,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::Unattended,
             },
         );
         state.devices_current.insert(
@@ -1076,6 +1180,10 @@ mod tests {
                 active_encryption_key: make_enc_key("device-b"),
                 status: DeviceStatus::Active,
                 replacement_device_id: None,
+                custody_class: CustodyClass::Daemon,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::Unattended,
             },
         );
         state.personas_current.insert(
@@ -1105,7 +1213,300 @@ mod tests {
         state
     }
 
+    // ── is_active_persona_key_under_root (BKR-4 read interface) ──
+
+    #[test]
+    fn active_persona_key_under_its_own_root_is_true() {
+        let state = two_root_state();
+        let key = make_key("key-persona-a").public_key;
+        assert!(is_active_persona_key_under_root(&state, "root-a", &key));
+    }
+
+    #[test]
+    fn persona_key_under_a_different_root_is_false() {
+        // persona-a's key is NOT a persona key under root-b (no cross-root leak).
+        let state = two_root_state();
+        let key = make_key("key-persona-a").public_key;
+        assert!(!is_active_persona_key_under_root(&state, "root-b", &key));
+    }
+
+    #[test]
+    fn revoked_persona_key_is_false() {
+        let mut state = two_root_state();
+        state.personas_current.get_mut("persona-a").unwrap().status = PersonaStatus::Revoked;
+        let key = make_key("key-persona-a").public_key;
+        assert!(!is_active_persona_key_under_root(&state, "root-a", &key));
+    }
+
+    #[test]
+    fn persona_under_revoked_root_is_false() {
+        // Root status is load-bearing: a revoked root's still-Active persona
+        // carries no authority and must not read as valid.
+        let mut state = two_root_state();
+        state.roots_current.get_mut("root-a").unwrap().status = RootStatus::Revoked;
+        let key = make_key("key-persona-a").public_key;
+        assert!(
+            !is_active_persona_key_under_root(&state, "root-a", &key),
+            "a persona under a revoked root must not read as active"
+        );
+    }
+
+    #[test]
+    fn unknown_root_and_unknown_key_are_false() {
+        let state = two_root_state();
+        let key = make_key("key-persona-a").public_key;
+        assert!(!is_active_persona_key_under_root(&state, "root-zzz", &key));
+        assert!(!is_active_persona_key_under_root(
+            &state,
+            "root-a",
+            "not-a-real-pubkey"
+        ));
+    }
+
+    #[test]
+    fn root_key_and_device_key_are_not_persona_keys() {
+        // The predicate is persona-scoped: a root key or a device key under the
+        // root is NOT an active persona key.
+        let state = two_root_state();
+        let root_key = make_key("key-root-a").public_key;
+        let device_key = make_key("key-device-a").public_key;
+        assert!(!is_active_persona_key_under_root(
+            &state, "root-a", &root_key
+        ));
+        assert!(!is_active_persona_key_under_root(
+            &state,
+            "root-a",
+            &device_key
+        ));
+    }
+
+    #[test]
+    fn principal_binding_authorizes_root_level_operation() {
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-principal-root",
+            EventBody::DeviceAdded(DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-new".into(),
+                label: "New Device".into(),
+                initial_key: make_key("key-device-new"),
+                initial_encryption_key: make_enc_key("device-new"),
+            }),
+            SignerBinding::principal("root-a", "key-root-a"),
+        );
+
+        auth.authorize_raw(&event, &state, 0)
+            .expect("canonical Principal root signer should authorize root-level event");
+    }
+
+    #[test]
+    fn principal_binding_authorizes_persona_level_operation() {
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-principal-persona",
+            EventBody::MessageSent(MessageSentEvent {
+                message_id: "msg-principal".into(),
+                sender_persona_id: "persona-a".into(),
+                recipient_persona_id: "persona-b".into(),
+                ciphertext_hex: "00".into(),
+            }),
+            SignerBinding::principal("persona-a", "key-persona-a"),
+        );
+
+        auth.authorize_raw(&event, &state, 0)
+            .expect("canonical Principal child signer should authorize persona-level event");
+    }
+
     // ── 16.1: Cross-root revoke/freeze must be rejected ──
+
+    // --- Model C: root authority = founding key OR active presence Device ---
+
+    /// Root "op" with a founding key plus two active `presence` Devices (the
+    /// operator's first + backup YubiKeys) and one `daemon`-class Device.
+    fn presence_root_state() -> MaterializedState {
+        let mut state = MaterializedState::default();
+        state.roots_current.insert(
+            "op".into(),
+            RootRecord {
+                root_id: "op".into(),
+                display_name: "Operator".into(),
+                active_key: make_key("key-root-op"),
+                status: RootStatus::Active,
+            },
+        );
+        let mut add_device = |id: &str, key: &str, custody: CustodyClass, status: DeviceStatus| {
+            state.devices_current.insert(
+                id.into(),
+                DeviceRecord {
+                    root_id: "op".into(),
+                    device_id: id.into(),
+                    label: id.into(),
+                    active_key: make_key(key),
+                    active_encryption_key: make_enc_key(id),
+                    status,
+                    replacement_device_id: None,
+                    custody_class: custody,
+                    attestation_statement: if custody == CustodyClass::Presence {
+                        Some("att".into())
+                    } else {
+                        None
+                    },
+                    attestation_tier: AttestationTier::None,
+                    presence_factor: if custody == CustodyClass::Presence {
+                        PresenceFactor::UserPresence
+                    } else {
+                        PresenceFactor::Unattended
+                    },
+                },
+            );
+        };
+        add_device("d1", "key-d1", CustodyClass::Presence, DeviceStatus::Active);
+        add_device("d2", "key-d2", CustodyClass::Presence, DeviceStatus::Active);
+        add_device("dd", "key-dd", CustodyClass::Daemon, DeviceStatus::Active);
+        state
+    }
+
+    fn persona_created_under_op(persona_id: &str, signed_by_key: &str) -> EventEnvelope {
+        make_event(
+            "evt-c",
+            EventBody::PersonaCreated(PersonaCreatedEvent {
+                root_id: "op".into(),
+                persona_id: persona_id.into(),
+                label: "P".into(),
+                disclosure_profile: None,
+                survival_mode: SurvivalMode::Strict,
+                initial_key: make_key(&format!("{persona_id}-key")),
+            }),
+            // Root-level op: subject is the root; the *key* is whichever device
+            // (or the founding key) signs for it.
+            SignerBinding::root("op", signed_by_key),
+        )
+    }
+
+    #[test]
+    fn c_founding_root_key_authorizes_root_op() {
+        // N=1 / regression: the root's own founding key still authorizes.
+        let state = presence_root_state();
+        let event = persona_created_under_op("p1", "key-root-op");
+        assert!(IdentityAuthorizer.authorize_raw(&event, &state, 0).is_ok());
+    }
+
+    #[test]
+    fn c_active_presence_device_authorizes_root_op() {
+        // The crux of Model C: an enrolled presence Device that is NOT the
+        // founding key may authorize a root-level op (so a lost first key is
+        // recoverable from the backup).
+        let state = presence_root_state();
+        let event = persona_created_under_op("p1", "key-d2");
+        assert!(
+            IdentityAuthorizer.authorize_raw(&event, &state, 0).is_ok(),
+            "an active presence Device must authorize root-level ops"
+        );
+    }
+
+    #[test]
+    fn c_daemon_class_device_denied_root_authority() {
+        // Only `presence`-class Devices carry root authority; a `daemon`-class
+        // Device (even active, under the root) must NOT.
+        let state = presence_root_state();
+        let event = persona_created_under_op("p1", "key-dd");
+        assert!(
+            IdentityAuthorizer.authorize_raw(&event, &state, 0).is_err(),
+            "daemon-class device must not get root authority"
+        );
+    }
+
+    #[test]
+    fn c_revoked_presence_device_loses_root_authority() {
+        let mut state = presence_root_state();
+        state.devices_current.get_mut("d1").unwrap().status = DeviceStatus::Revoked;
+        let event = persona_created_under_op("p1", "key-d1");
+        assert!(
+            IdentityAuthorizer.authorize_raw(&event, &state, 0).is_err(),
+            "a revoked presence device must not authorize root-level ops"
+        );
+    }
+
+    #[test]
+    fn c_presence_device_of_other_root_denied() {
+        // A presence Device enrolled under a *different* root must not authorize
+        // ops on this root (cross-root).
+        let mut state = presence_root_state();
+        state.roots_current.insert(
+            "other".into(),
+            RootRecord {
+                root_id: "other".into(),
+                display_name: "Other".into(),
+                active_key: make_key("key-root-other"),
+                status: RootStatus::Active,
+            },
+        );
+        state.devices_current.insert(
+            "x1".into(),
+            DeviceRecord {
+                root_id: "other".into(),
+                device_id: "x1".into(),
+                label: "x1".into(),
+                active_key: make_key("key-x1"),
+                active_encryption_key: make_enc_key("x1"),
+                status: DeviceStatus::Active,
+                replacement_device_id: None,
+                custody_class: CustodyClass::Presence,
+                attestation_statement: Some("att".into()),
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::UserPresence,
+            },
+        );
+        let event = persona_created_under_op("p1", "key-x1");
+        assert!(
+            IdentityAuthorizer.authorize_raw(&event, &state, 0).is_err(),
+            "a presence device of another root must not authorize this root's ops"
+        );
+    }
+
+    #[test]
+    fn c_presence_device_may_rotate_root_key_for_recovery() {
+        // Recovery↔takeover duality (INTENDED): a surviving presence Device must
+        // be able to rotate the founding key away from a lost/compromised one.
+        // The op is takeover-shaped but it IS the recovery primitive — denying
+        // it would re-break Model C's "either survivor recovers". ALLOWED.
+        let state = presence_root_state();
+        let event = make_event(
+            "evt-rkt",
+            EventBody::RootKeyRotated(RootKeyRotatedEvent {
+                root_id: "op".into(),
+                previous_key_id: "key-root-op".into(),
+                new_key: make_key("key-root-op-v2"),
+            }),
+            SignerBinding::root("op", "key-d1"),
+        );
+        assert!(
+            IdentityAuthorizer.authorize_raw(&event, &state, 0).is_ok(),
+            "a surviving presence Device must be able to rotate the root key (recovery)"
+        );
+    }
+
+    #[test]
+    fn c_presence_device_may_revoke_a_sibling_device_for_recovery() {
+        // Recovery: d1 revokes the lost/compromised sibling d2. ALLOWED (the
+        // 1-of-N model — any active presence Device can revoke another).
+        let state = presence_root_state();
+        let event = make_event(
+            "evt-rev",
+            EventBody::DeviceRevoked(DeviceRevokedEvent {
+                root_id: "op".into(),
+                device_id: "d2".into(),
+                reason: "lost".into(),
+            }),
+            SignerBinding::root("op", "key-d1"),
+        );
+        assert!(
+            IdentityAuthorizer.authorize_raw(&event, &state, 0).is_ok(),
+            "a presence Device must be able to revoke a sibling device (recovery)"
+        );
+    }
 
     #[test]
     fn cross_root_device_revoke_rejected() {
@@ -1616,8 +2017,8 @@ mod tests {
             .authorize_raw(&event, &state, 0)
             .expect_err("authorize must reject envelope whose signer pubkey ≠ stored active key");
         assert!(
-            err.to_string().contains("public key"),
-            "error should mention pubkey material mismatch: {err}"
+            err.to_string().contains("presence Device"),
+            "error should explain the signer is not a root-authority key/device: {err}"
         );
     }
 
@@ -1795,6 +2196,10 @@ mod tests {
                 active_encryption_key: make_enc_key("device-a2"),
                 status: DeviceStatus::Active,
                 replacement_device_id: None,
+                custody_class: CustodyClass::Daemon,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::Unattended,
             },
         );
         let auth = IdentityAuthorizer;
@@ -1829,6 +2234,10 @@ mod tests {
                 active_encryption_key: make_enc_key("device-a2"),
                 status: DeviceStatus::Active,
                 replacement_device_id: None,
+                custody_class: CustodyClass::Daemon,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::Unattended,
             },
         );
         let auth = IdentityAuthorizer;
@@ -2078,19 +2487,24 @@ mod tests {
             .unwrap()
             .active_key
             .clone();
+        // Sign with root-a's key so the event passes the self-root invariant
+        // (signer == initial_key) and the COLLISION guard is what rejects it —
+        // otherwise the self-root check would fire first. (This models an attacker
+        // who actually holds root-a's key; the collision guard stops the squat
+        // regardless.)
         let event = make_event(
             "evt-collide-root",
             EventBody::RootCreated(core_event_types::RootCreatedEvent {
                 root_id: "root-c".into(),
                 display_name: "Colliding".into(),
                 initial_key: core_principals::PublicKeyMaterial {
-                    key_id: "key-root-c".into(),
+                    key_id: "key-root-a".into(),
                     algorithm: core_principals::KeyAlgorithm::Ed25519,
                     // Reuse root-a's public key material.
                     public_key: existing_pubkey_material.public_key.clone(),
                 },
             }),
-            SignerBinding::root("root-c", "key-root-c"),
+            SignerBinding::root("root-c", "key-root-a"),
         );
         let err = auth
             .authorize_raw(&event, &state, 0)
@@ -2098,6 +2512,37 @@ mod tests {
         assert!(
             err.to_string().contains("collides with existing root"),
             "error should mention collision: {err}"
+        );
+    }
+
+    #[test]
+    fn root_created_with_signer_mismatched_initial_key_rejected() {
+        // design self-root invariant: a RootCreated whose recorded `initial_key`
+        // is key A but whose signing key is B (a valid B-signature) must be
+        // rejected at the authority layer, so local materialized state can never
+        // name an active_key an external verify_chain would reject. Pre-fix this
+        // was accepted (RootCreated only ran the cross-root collision check).
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        // initial_key = key-root-c, but the event is signed by key-root-d.
+        let event = make_event(
+            "evt-root-signer-mismatch",
+            EventBody::RootCreated(core_event_types::RootCreatedEvent {
+                root_id: "root-c".into(),
+                display_name: "Mismatch".into(),
+                initial_key: make_key("key-root-c"),
+            }),
+            SignerBinding::root("root-c", "key-root-d"),
+        );
+        let err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("RootCreated signed by a key other than initial_key must be rejected");
+        assert!(
+            err.to_string().contains("self-root invariant")
+                || err
+                    .to_string()
+                    .contains("does not match the recorded initial_key"),
+            "error should name the self-root invariant: {err}"
         );
     }
 
@@ -2467,7 +2912,7 @@ mod tests {
             .authorize_raw(&event, &state, 0)
             .expect_err("forged pubkey must fail");
         assert_eq!(raw_err.kind, core_types::ValidationErrorKind::Unauthorized);
-        assert!(raw_err.to_string().contains("public key"));
+        assert!(raw_err.to_string().contains("presence Device"));
 
         let sanitized_err = auth
             .authorize(&event, &state, 0)
@@ -2476,7 +2921,7 @@ mod tests {
             sanitized_err.kind,
             core_types::ValidationErrorKind::Unauthorized
         );
-        assert!(!sanitized_err.to_string().contains("public key"));
+        assert!(!sanitized_err.to_string().contains("presence Device"));
         assert!(sanitized_err.to_string().contains("unauthorized"));
     }
 

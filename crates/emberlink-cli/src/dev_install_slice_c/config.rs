@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! design Phase 4 runtime-config seam for `ember dev install`.
 //!
@@ -134,24 +135,15 @@ mod tests {
         let rendered = render_dev_config(&runtime);
 
         assert!(
-            rendered.contains(&format!(
-                "socket_dir = \"{}\"",
-                runtime.run_dir.display()
-            )),
+            rendered.contains(&format!("socket_dir = \"{}\"", runtime.run_dir.display())),
             "socket_dir must point at worktree-scoped run dir"
         );
         assert!(
-            rendered.contains(&format!(
-                "data_dir = \"{}\"",
-                runtime.data_dir.display()
-            )),
+            rendered.contains(&format!("data_dir = \"{}\"", runtime.data_dir.display())),
             "data_dir must point at worktree-scoped data dir"
         );
         assert!(
-            rendered.contains(&format!(
-                "pid_file = \"{}\"",
-                runtime.pid_file.display()
-            )),
+            rendered.contains(&format!("pid_file = \"{}\"", runtime.pid_file.display())),
             "pid_file must be worktree-scoped"
         );
         assert!(
@@ -170,11 +162,11 @@ mod tests {
     #[test]
     fn sync_dev_runtime_files_writes_config_and_policy() {
         let tmp = TempDir::new().unwrap();
-        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        let runtime =
+            derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
         let synced = sync_dev_runtime_files_with(&runtime).expect("sync runtime files");
 
-        let config_text =
-            fs::read_to_string(&synced.config_path).expect("read dev config");
+        let config_text = fs::read_to_string(&synced.config_path).expect("read dev config");
         assert!(
             config_text.contains("# ember dev install — managed dev daemon config"),
             "managed config header missing"
@@ -186,8 +178,7 @@ mod tests {
         assert!(synced.run_dir.exists(), "run dir must be created");
         assert!(synced.vault_dir.exists(), "vault dir must be created");
 
-        let policy_text =
-            fs::read_to_string(&synced.policy_file).expect("read dev policy");
+        let policy_text = fs::read_to_string(&synced.policy_file).expect("read dev policy");
         assert!(
             policy_text.contains("default_requirement = \"required\""),
             "default policy seed missing"

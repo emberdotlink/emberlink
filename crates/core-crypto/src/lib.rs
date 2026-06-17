@@ -3,7 +3,7 @@
 // the sealed `SecureRandom` trait — only true on non-wasm32 targets. Gate
 // the modules and their re-exports off the wasm32 path so the ember-ext
 // browser extension + the website's /verify-receipt.html WASM module build.
-// Daemon binaries (ember-daemon, emberlink-cli, ember-proxy) keep full
+// Daemon binaries (ember-daemon, emberlink-cli) keep full
 // access on their native targets.
 pub mod backup_envelope;
 #[cfg(not(target_arch = "wasm32"))]
@@ -45,7 +45,7 @@ use hkdf::Hkdf;
 use getrandom::fill as os_fill;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 // Domain separator constants.
 //
@@ -59,17 +59,27 @@ pub const DOMAIN_GRANT_CHAIN: &[u8] = b"emberlink/v1/grant-chain";
 pub const DOMAIN_PRESENTATION: &[u8] = b"emberlink/v1/presentation";
 pub const DOMAIN_RECOVERY: &[u8] = b"emberlink/v1/recovery";
 
-/// Sign `payload` under `signer` with a domain prefix.
+/// The exact bytes fed to the signing primitive by [`sign_with_context`]:
+/// `ctx || b"||" || payload`. The `b"||"` separator ensures that no choice of
+/// `ctx` and `payload` can produce the same byte sequence as a different
+/// `(ctx2, payload2)` pair.
 ///
-/// The actual bytes fed to the signing primitive are `ctx || b"||" || payload`.
-/// The `b"||"` separator ensures that no choice of `ctx` and `payload` can
-/// produce the same byte sequence as a different `(ctx2, payload2)` pair.
-pub fn sign_with_context(ctx: &[u8], signer: &(impl Signer + ?Sized), payload: &[u8]) -> Signature {
+/// Exposed so an **out-of-band signer** (e.g. an operator's Secure Enclave /
+/// YubiKey, which signs raw bytes via the platform API rather than through the
+/// [`Signer`] trait) can reproduce the EXACT message the daemon verifier checks,
+/// without re-deriving — and silently diverging from — the domain-separation
+/// construction. design §5 OOB enrollment / presence signing.
+pub fn context_message(ctx: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(ctx.len() + 2 + payload.len());
     msg.extend_from_slice(ctx);
     msg.extend_from_slice(b"||");
     msg.extend_from_slice(payload);
-    signer.sign(&msg)
+    msg
+}
+
+/// Sign `payload` under `signer` with a domain prefix (see [`context_message`]).
+pub fn sign_with_context(ctx: &[u8], signer: &(impl Signer + ?Sized), payload: &[u8]) -> Signature {
+    signer.sign(&context_message(ctx, payload))
 }
 
 /// Verify `signature` over `payload` under `verifier` with a domain prefix.
@@ -82,17 +92,17 @@ pub fn verify_with_context(
     payload: &[u8],
     sig: &Signature,
 ) -> bool {
-    let mut msg = Vec::with_capacity(ctx.len() + 2 + payload.len());
-    msg.extend_from_slice(ctx);
-    msg.extend_from_slice(b"||");
-    msg.extend_from_slice(payload);
-    verifier.verify(public_key, &msg, sig)
+    verifier.verify(public_key, &context_message(ctx, payload), sig)
 }
 
 const PUBLIC_KEY_PREFIX: &str = "ed25519:";
 const PRIVATE_KEY_PREFIX: &str = "ed25519-secret:";
 const SIGNATURE_PREFIX: &str = "ed25519sig:";
 const CONTENT_KEY_PREFIX: &str = "xchacha20-key:";
+/// ECDSA-device-key / signature wire prefixes (design §3). The public
+/// key is SEC1-encoded (compressed or uncompressed); the signature is DER.
+const P256_PUBLIC_KEY_PREFIX: &str = "p256:";
+const P256_SIGNATURE_PREFIX: &str = "p256sig:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature(pub String);
@@ -106,13 +116,27 @@ pub struct EncryptedContent {
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct LocalKeyPair {
     pub key_id: String,
     #[zeroize(skip)]
     pub algorithm: KeyAlgorithm,
     pub public_key: String,
     pub private_key: String,
+}
+
+// `Debug` is manually implemented to redact `private_key`. A derived `Debug`
+// (or a reflexive `tracing::debug!(?keypair)` / `format!("{kp:?}")`) would ship
+// the signing secret to logs/sinks. Mirrors `LocalKeySigner`/`RootKeyPair`.
+impl std::fmt::Debug for LocalKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalKeyPair")
+            .field("key_id", &self.key_id)
+            .field("algorithm", &self.algorithm)
+            .field("public_key", &self.public_key)
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl LocalKeyPair {
@@ -130,7 +154,7 @@ pub trait Verifier {
     fn verify(&self, public_key: &PublicKey, payload: &[u8], signature: &Signature) -> bool;
 }
 
-/// implementation-note-35 C6: probe trait that lets `LocalKeySigner`
+/// implementation-note-37 C6: probe trait that lets `LocalKeySigner`
 /// refuse to sign when the underlying persona's status is anything
 /// other than `active` (revoked, enrolling, archived, …). Injected at
 /// signer construction time so `core-crypto` does not pull a SQLite or
@@ -148,7 +172,7 @@ pub trait PersonaActiveProbe: Send + Sync {
     fn is_active(&self) -> bool;
 }
 
-/// implementation-note-35 C6: error variant returned from
+/// implementation-note-37 C6: error variant returned from
 /// [`LocalKeySigner::try_sign`] when the attached
 /// [`PersonaActiveProbe`] reports the persona is not active. Surfaced as
 /// a fresh error rather than reusing `ValidationError` so call sites
@@ -177,7 +201,7 @@ impl std::error::Error for SignerError {}
 pub struct LocalKeySigner {
     public_key: PublicKey,
     signing_key: SigningKey,
-    /// implementation-note-35 C6 — optional probe consulted by
+    /// implementation-note-37 C6 — optional probe consulted by
     /// [`LocalKeySigner::try_sign`]. `None` for legacy construction
     /// paths (tests + any caller predating C6) which means try_sign
     /// always succeeds. Production callers attach a probe via
@@ -221,7 +245,7 @@ impl LocalKeySigner {
         })
     }
 
-    /// implementation-note-35 C6: attach a [`PersonaActiveProbe`] so
+    /// implementation-note-37 C6: attach a [`PersonaActiveProbe`] so
     /// [`Self::try_sign`] consults it before signing. Returns the same
     /// signer with the probe set — chains naturally off
     /// `from_local_key_pair`.
@@ -230,7 +254,7 @@ impl LocalKeySigner {
         self
     }
 
-    /// implementation-note-35 C6: fallible signing entry point.
+    /// implementation-note-37 C6: fallible signing entry point.
     /// Consults the attached [`PersonaActiveProbe`] (if any) and
     /// refuses to sign when the persona is not active. When no probe
     /// is attached, behaves identically to [`Signer::sign`].
@@ -246,7 +270,7 @@ impl LocalKeySigner {
 }
 
 impl Signer for LocalKeySigner {
-    /// implementation-note-35 C6 note: the legacy infallible `sign`
+    /// implementation-note-37 C6 note: the legacy infallible `sign`
     /// remains for call sites that have not migrated to [`Self::try_sign`].
     /// When a probe is attached and reports the persona is inactive,
     /// this method panics with a clear message — fail-loud is preferred
@@ -325,14 +349,31 @@ pub fn generate_random_identifier(prefix: &str) -> String {
 // namespaced info string from this table. Adding a new derivation context
 // requires adding a row here first to prevent cross-context key reuse.
 //
-// | info string (prefix)                         | output purpose                          |
-// |----------------------------------------------|-----------------------------------------|
-// | `emberlink/v1/content-key/<purpose>`         | XChaCha20-Poly1305 content key          |
+// | info string (prefix)                                  | output purpose                          |
+// |-------------------------------------------------------|-----------------------------------------|
+// | `emberlink/v1/content-key/<purpose>`                  | XChaCha20-Poly1305 content key          |
+// | `emberlink/v1/ember-seal/snapshot-key`                | XChaCha20-Poly1305 snapshot-encryption  |
+// |                                                       | key derived from the Daemon Persona     |
+// |                                                       | Ed25519 seed (design / design).       |
+// | `emberlink/v1/ember-seal/x25519-scalar`               | X25519 private scalar for the EmberSeal |
+// |                                                       | recipient (design / design). Yields   |
+// |                                                       | the X25519 keypair the EmberSeal CR's   |
+// |                                                       | `recipientPubkey` points at.            |
 //
-// The `purpose` suffix is caller-supplied and MUST be a stable, lowercase
-// hyphenated label (e.g. "vault-catalog", "vault-payload", "local-state").
+// The `purpose` suffix on `content-key` is caller-supplied and MUST be a
+// stable, lowercase hyphenated label (e.g. "vault-catalog", "vault-payload",
+// "local-state").
+//
 // Info strings are intentionally stable. Never reuse or rename one once it
 // has been used to derive keys in production.
+//
+// **Cross-context separation is load-bearing.** Two info strings that share
+// the same IKM (e.g. the Daemon Persona seed feeding both the EmberSeal
+// snapshot key and the X25519 recipient scalar) MUST be distinct so that
+// compromise of one derivation does not yield the other. The
+// `ember-seal/snapshot-key` and `ember-seal/x25519-scalar` rows above are
+// the canonical example: same seed, different info string, independent
+// outputs.
 
 /// Generate a content encryption key using HKDF-SHA256.
 ///
@@ -342,21 +383,37 @@ pub fn generate_random_identifier(prefix: &str) -> String {
 ///
 /// `purpose` MUST be a stable, lowercase hyphenated label identifying the
 /// encryption context (e.g. `"vault-catalog"`, `"vault-payload"`).
-pub fn generate_content_key(purpose: &str) -> String {
+///
+/// # Heap-residue hygiene (pre-release security review N6)
+///
+/// Returns the key wrapped in [`Zeroizing<String>`] so the heap allocation
+/// holding the hex-encoded 32-byte symmetric key is zeroized on drop.
+/// Callers MUST hold the value as `Zeroizing<String>` end-to-end and pass
+/// `&str` (or rely on `Deref<Target=String>`) into AEAD/HKDF call sites only
+/// at the use moment — never clone or `.to_string()` the contents into a
+/// bare `String`.
+pub fn generate_content_key(purpose: &str) -> Zeroizing<String> {
     let mut ikm = [0u8; 32];
     os_fill(&mut ikm).expect("OS entropy failure");
     let info = format!("emberlink/v1/content-key/{purpose}");
-    derive_content_key(&ikm, info.as_bytes())
+    let key = derive_content_key(&ikm, info.as_bytes());
+    ikm.zeroize();
+    key
 }
 
 /// Derive a content key from input keying material and an info context using
 /// HKDF-SHA256. Exposed for deterministic testing.
-pub fn derive_content_key(ikm: &[u8], info: &[u8]) -> String {
+///
+/// Returns the key as [`Zeroizing<String>`] — see [`generate_content_key`]
+/// for the heap-residue hygiene contract.
+pub fn derive_content_key(ikm: &[u8], info: &[u8]) -> Zeroizing<String> {
     let hk = Hkdf::<Sha256>::new(None, ikm);
     let mut okm = [0u8; 32];
     hk.expand(info, &mut okm)
         .expect("HKDF-SHA256 expand should never fail for 32-byte output");
-    format!("{CONTENT_KEY_PREFIX}{}", bytes_to_hex(&okm))
+    let s = Zeroizing::new(format!("{CONTENT_KEY_PREFIX}{}", bytes_to_hex(&okm)));
+    okm.zeroize();
+    s
 }
 
 /// Encrypt content using XChaCha20-Poly1305 with a random 192-bit nonce.
@@ -433,30 +490,66 @@ pub fn sha256_digest_raw(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-// HKDF info-string registry addition:
-// | `ember-seal-v1`                               | Daemon Persona snapshot encryption key  |
+/// HKDF info string for the EmberSeal snapshot-encryption symmetric key.
+///
+/// See the HKDF-SHA256 derivation registry comment above. MUST remain distinct
+/// from [`HKDF_INFO_EMBERSEAL_X25519_SCALAR`] so the snapshot key and the
+/// X25519 recipient scalar are cryptographically independent even though both
+/// derive from the same Daemon Persona Ed25519 seed.
+pub const HKDF_INFO_EMBERSEAL_SNAPSHOT_KEY: &[u8] = b"emberlink/v1/ember-seal/snapshot-key";
+
+/// HKDF info string for the EmberSeal X25519 recipient private scalar.
+///
+/// See the HKDF-SHA256 derivation registry comment above. MUST remain distinct
+/// from [`HKDF_INFO_EMBERSEAL_SNAPSHOT_KEY`] so an attacker who recovers the
+/// snapshot-encryption symmetric key cannot reconstruct the X25519 scalar
+/// (and vice versa).
+pub const HKDF_INFO_EMBERSEAL_X25519_SCALAR: &[u8] = b"emberlink/v1/ember-seal/x25519-scalar";
 
 /// Derive the 32-byte snapshot-encryption content key from an Ed25519 seed.
 ///
-/// Uses HKDF-SHA256 with info string `"ember-seal-v1"`, mirroring the X25519
-/// derivation described in design §The primitive and design. The result is
-/// returned as an `xchacha20-key:...` prefixed string compatible with
-/// [`encrypt_content`] and [`decrypt_content`].
+/// Uses HKDF-SHA256 with info string [`HKDF_INFO_EMBERSEAL_SNAPSHOT_KEY`]
+/// (`b"emberlink/v1/ember-seal/snapshot-key"`). The result is returned as an
+/// `xchacha20-key:...` prefixed string compatible with [`encrypt_content`]
+/// and [`decrypt_content`].
 ///
-/// This is the key used to seal vault snapshots — only the holder of the
-/// Ed25519 seed (the Daemon Persona) can derive it and decrypt the snapshot.
-pub fn derive_snapshot_encryption_key(ed25519_seed: &[u8]) -> String {
+/// This is the symmetric key used to seal vault snapshots — only the holder
+/// of the Ed25519 seed (the Daemon Persona) can derive it and decrypt the
+/// snapshot.
+///
+/// # Independence from the EmberSeal X25519 recipient
+///
+/// This derivation is cryptographically independent of
+/// [`derive_emberseal_x25519_recipient`] despite sharing the same Ed25519
+/// seed as input keying material: the HKDF info strings differ, so the two
+/// outputs are independent under HKDF-SHA256. Pre-release security review
+/// H2 (2026-06) is the contract for that separation; see the HKDF
+/// derivation-registry comment above.
+///
+/// # Heap-residue hygiene (pre-release security review N6)
+///
+/// Returns the key wrapped in [`Zeroizing<String>`] so the heap allocation
+/// holding the hex-encoded 32-byte symmetric key is zeroized on drop. Per
+/// review N6 the previous bare-`String` return left a heap copy after use.
+/// Although H2 (prior change) split the snapshot-key info string from the
+/// EmberSeal X25519 scalar info string (so an N6 leak no longer escalates
+/// to permanent recipient-key compromise), the snapshot key itself is
+/// still authority-bearing material and must zeroize on drop.
+pub fn derive_snapshot_encryption_key(ed25519_seed: &[u8]) -> Zeroizing<String> {
     let hk = Hkdf::<Sha256>::new(None, ed25519_seed);
     let mut okm = [0u8; 32];
-    hk.expand(b"ember-seal-v1", &mut okm)
+    hk.expand(HKDF_INFO_EMBERSEAL_SNAPSHOT_KEY, &mut okm)
         .expect("HKDF-SHA256 expand cannot fail for 32-byte output");
-    format!("{CONTENT_KEY_PREFIX}{}", bytes_to_hex(&okm))
+    let s = Zeroizing::new(format!("{CONTENT_KEY_PREFIX}{}", bytes_to_hex(&okm)));
+    okm.zeroize();
+    s
 }
 
 /// Derive the EmberSeal X25519 recipient from an Ed25519 Daemon Persona seed.
 ///
 /// Per design §The primitive and design:
-///   1. HKDF-SHA256(seed, info="ember-seal-v1") → 32-byte X25519 private scalar.
+///   1. HKDF-SHA256(seed, info=[`HKDF_INFO_EMBERSEAL_X25519_SCALAR`])
+///      → 32-byte X25519 private scalar.
 ///   2. Scalar × Curve25519 basepoint → X25519 public key (32 bytes, hex-encoded).
 ///
 /// The returned string is the `recipientPubkey` value for the EmberSeal CR
@@ -464,12 +557,21 @@ pub fn derive_snapshot_encryption_key(ed25519_seed: &[u8]) -> String {
 ///
 /// Note: this is the *public key* for asymmetric encryption (NaCl box), not
 /// the symmetric snapshot-encryption key from [`derive_snapshot_encryption_key`].
-/// Both are derived from the same HKDF expansion of the Ed25519 seed but serve
-/// different purposes.
+///
+/// # Independence from the snapshot-encryption key
+///
+/// The two derivations use independent HKDF info strings
+/// ([`HKDF_INFO_EMBERSEAL_X25519_SCALAR`] vs
+/// [`HKDF_INFO_EMBERSEAL_SNAPSHOT_KEY`]) so the X25519 scalar and the
+/// snapshot-encryption symmetric key are cryptographically independent even
+/// though both derive from the same Ed25519 seed. Compromise of one does NOT
+/// yield the other. Per the registry rule above, "every call site MUST use a
+/// unique, namespaced info string"; pre-release security review H2 (2026-06)
+/// is the contract for that separation.
 pub fn derive_emberseal_x25519_recipient(ed25519_seed: &[u8]) -> String {
     let hk = Hkdf::<Sha256>::new(None, ed25519_seed);
     let mut scalar_bytes = [0u8; 32];
-    hk.expand(b"ember-seal-v1", &mut scalar_bytes)
+    hk.expand(HKDF_INFO_EMBERSEAL_X25519_SCALAR, &mut scalar_bytes)
         .expect("HKDF-SHA256 expand cannot fail for 32-byte output");
 
     let static_secret = x25519_dalek::StaticSecret::from(scalar_bytes);
@@ -488,7 +590,7 @@ pub fn public_key_raw_bytes(public_key: &PublicKey) -> Result<[u8; 32], Validati
 /// The public key is shared in the grant link. The private key is held
 /// locally until the offer is claimed or expires, at which point it can
 /// be discarded.
-#[derive(Debug, Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct EphemeralKeyPair {
     /// Hex-encoded age X25519 public key (the recipient address).
     pub public_key_hex: String,
@@ -496,6 +598,20 @@ pub struct EphemeralKeyPair {
     pub public_key_age: String,
     /// The raw age X25519 private key string (for decryption).
     pub private_key_age: String,
+}
+
+// `Debug` is manually implemented to redact `private_key_age` (the X25519
+// secret that decrypts claim responses). The struct also gains
+// `Zeroize`/`ZeroizeOnDrop` — previously it had neither, so the secret both
+// leaked via derived `Debug` and lingered in memory after drop.
+impl std::fmt::Debug for EphemeralKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralKeyPair")
+            .field("public_key_hex", &self.public_key_hex)
+            .field("public_key_age", &self.public_key_age)
+            .field("private_key_age", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Generate an ephemeral X25519 keypair for grant offer exchange.
@@ -531,8 +647,31 @@ pub fn seal_grant_payload(
 pub fn unseal_grant_payload(
     ephemeral_private_key_age: &str,
     sealed_hex: &str,
-) -> Result<Vec<u8>, ValidationError> {
+) -> Result<Zeroizing<Vec<u8>>, ValidationError> {
     unwrap_secret_with_identity(ephemeral_private_key_age, sealed_hex)
+}
+
+/// Generate a fresh age X25519 **recovery identity** (design §6 printed recovery
+/// code). Returns `(secret, public)`: the `secret` is the `AGE-SECRET-KEY-1…`
+/// string shown to the operator ONCE and stored off-host (the daemon never holds
+/// it); the `public` is the `age1…` recipient the daemon records and wraps `KEK_s`
+/// to. Run in the operator session, never the daemon.
+pub fn generate_recovery_identity() -> (String, String) {
+    use age::secrecy::ExposeSecret as _;
+    let identity = age::x25519::Identity::generate();
+    let public = identity.to_public().to_string();
+    let secret = identity.to_string().expose_secret().to_string();
+    (secret, public)
+}
+
+/// Derive the `age1…` public recipient from an `AGE-SECRET-KEY-1…` recovery
+/// secret — used at recovery time to locate the matching stored wrap. Errors on a
+/// malformed secret; reveals nothing beyond the (already public) recipient.
+pub fn recovery_public_from_secret(secret: &str) -> Result<String, ValidationError> {
+    let identity = secret
+        .parse::<age::x25519::Identity>()
+        .map_err(|err| ValidationError::new(format!("invalid age recovery secret: {err}")))?;
+    Ok(identity.to_public().to_string())
 }
 
 pub fn wrap_secret_to_recipient(
@@ -561,7 +700,7 @@ pub fn wrap_secret_to_recipient(
 pub fn unwrap_secret_with_identity(
     identity_private_key: &str,
     wrapped_hex: &str,
-) -> Result<Vec<u8>, ValidationError> {
+) -> Result<Zeroizing<Vec<u8>>, ValidationError> {
     let identity = identity_private_key
         .parse::<age::x25519::Identity>()
         .map_err(|err| ValidationError::new(format!("invalid x25519 identity: {err}")))?;
@@ -575,7 +714,7 @@ pub fn unwrap_secret_with_identity(
     reader
         .read_to_end(&mut plaintext)
         .map_err(|err| ValidationError::new(format!("read wrapped secret: {err}")))?;
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Encrypt `plaintext` to an age x25519 recipient and return the ciphertext
@@ -620,7 +759,7 @@ pub fn wrap_secret_to_recipient_armored(
 pub fn unwrap_armored_with_identity(
     identity_private_key: &str,
     armored: &str,
-) -> Result<Vec<u8>, ValidationError> {
+) -> Result<Zeroizing<Vec<u8>>, ValidationError> {
     let identity = identity_private_key
         .parse::<age::x25519::Identity>()
         .map_err(|err| ValidationError::new(format!("invalid x25519 identity: {err}")))?;
@@ -634,7 +773,7 @@ pub fn unwrap_armored_with_identity(
     reader
         .read_to_end(&mut plaintext)
         .map_err(|err| ValidationError::new(format!("read armored secret: {err}")))?;
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 #[derive(Debug, Clone)]
@@ -666,6 +805,110 @@ impl Signer for FixtureSigner {
     }
 }
 
+/// An ECDSA-(ES256) [`Signer`] whose output is accepted by
+/// [`P256Verifier`] / [`DeviceSignatureVerifier`] (design §3).
+///
+/// This is the signing counterpart of [`P256Verifier`]: it produces a
+/// `p256sig:<DER-hex>` [`Signature`] over `payload` and reports its public
+/// key as the `p256:<SEC1-hex>` material that the verifier checks against. It
+/// exists so the **operator** IdentityRoot — which is device-rooted on a 
+/// presence key, NOT a daemon-held Ed25519 key — can have its genesis events
+/// signed by the device key in code that never touches the Ed25519 path.
+///
+/// On real hardware the private key never leaves the YubiKey / Secure Enclave
+/// (signing is delegated to the device, OQ-6 / PR4c). This in-process holder
+/// is for **synthetic** device keys: tests, and any host-side key the daemon
+/// is explicitly NOT supposed to hold for the operator's *root* — so callers
+/// must keep it off the daemon's operator-root custody boundary. The daemon
+/// stores only the device PUBLIC key.
+#[derive(Clone)]
+pub struct P256Signer {
+    public_key: PublicKey,
+    signing_key: p256::ecdsa::SigningKey,
+}
+
+impl std::fmt::Debug for P256Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the signing key — only the public half.
+        f.debug_struct("P256Signer")
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+impl P256Signer {
+    /// Generate a fresh random signing key from OS entropy.
+    ///
+    /// Uses rejection sampling: a uniform 32-byte string is only a valid 
+    /// scalar when it is in `[1, n-1]` (n = curve order). `SigningKey::from_bytes`
+    /// performs that range/non-zero check, so we loop until it accepts. The
+    /// rejection probability per draw is < 2^-32 (n is very close to 2^256), so
+    /// this terminates on the first iteration with overwhelming probability.
+    pub fn generate() -> Self {
+        loop {
+            let mut scalar = zeroize::Zeroizing::new([0u8; 32]);
+            os_fill(scalar.as_mut()).expect("OS entropy failure");
+            if let Ok(signing_key) = p256::ecdsa::SigningKey::from_bytes((&*scalar).into()) {
+                return Self::from_signing_key(signing_key);
+            }
+        }
+    }
+
+    /// Build a signer from a 32-byte big-endian scalar. Returns an error
+    /// if the bytes are not a valid scalar (zero or ≥ curve order). Used by
+    /// tests to derive deterministic device keys from a fixed seed.
+    pub fn from_scalar_bytes(scalar: &[u8; 32]) -> Result<Self, ValidationError> {
+        let signing_key = p256::ecdsa::SigningKey::from_bytes(scalar.into())
+            .map_err(|err| ValidationError::new(format!("invalid p256 scalar: {err}")))?;
+        Ok(Self::from_signing_key(signing_key))
+    }
+
+    fn from_signing_key(signing_key: p256::ecdsa::SigningKey) -> Self {
+        // Uncompressed SEC1 (`0x04 || X || Y`), matching the encoding the
+        // P256Verifier / device-enrollment path decodes with `from_sec1_bytes`.
+        let sec1 = signing_key.verifying_key().to_encoded_point(false);
+        let public_key = PublicKey(format!(
+            "{P256_PUBLIC_KEY_PREFIX}{}",
+            bytes_to_hex(sec1.as_bytes())
+        ));
+        Self {
+            public_key,
+            signing_key,
+        }
+    }
+
+    /// The `p256:`-prefixed SEC1 public key as [`PublicKeyMaterial`], ready to
+    /// use as a Device / root `initial_key`. `key_id` is caller-chosen and binds
+    /// the same pubkey the signatures verify against.
+    pub fn public_key_material(
+        &self,
+        key_id: impl Into<String>,
+    ) -> core_principals::PublicKeyMaterial {
+        core_principals::PublicKeyMaterial {
+            key_id: key_id.into(),
+            algorithm: KeyAlgorithm::EcdsaP256,
+            public_key: self.public_key.0.clone(),
+        }
+    }
+}
+
+impl Signer for P256Signer {
+    fn sign(&self, payload: &[u8]) -> Signature {
+        use p256::ecdsa::signature::Signer as _;
+        // RFC6979 deterministic ECDSA — no RNG needed. DER-encode `(r, s)` and
+        // hex it under the `p256sig:` prefix the verifier strips.
+        let sig: p256::ecdsa::Signature = self.signing_key.sign(payload);
+        Signature(format!(
+            "{P256_SIGNATURE_PREFIX}{}",
+            bytes_to_hex(sig.to_der().as_bytes())
+        ))
+    }
+
+    fn public_key(&self) -> PublicKey {
+        self.public_key.clone()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FixtureVerifier;
 
@@ -689,6 +932,104 @@ impl Verifier for Ed25519Verifier {
             Err(_) => return false,
         };
         verifying_key.verify_strict(payload, &signature).is_ok()
+    }
+}
+
+/// First-class ECDSA-(ES256) device-signature verifier (design §3, AC-4).
+///
+/// dev0 `presence` Devices are YubiKey PIV ECDSA-keys; FIDO2/passkey
+/// authenticators default to ES256 too — so device-sig verification is
+/// load-bearing across the whole BYO-Authority spectrum, NOT a fallback. This
+/// is a SEPARATE verifier from [`Ed25519Verifier`]: a device signature (or an
+/// attestation-chain signature) is NEVER routed through the Ed25519 path, which
+/// is the algorithm-confusion bar the ADR calls out.
+///
+/// Hygiene (AC-4):
+/// - the enrolled public key is decoded with SEC1 `from_sec1_bytes`, which
+///   performs curve-point validation (off-curve and identity points rejected);
+/// - the hash algorithm is bound to SHA-256 (ES256) by the `ecdsa` verifier —
+///   never caller-selectable;
+/// - signatures are DER-encoded `(r, s)`. ECDSA verification is malleability-
+///   tolerant (high-s and low-s both verify), so freshness/uniqueness MUST be
+///   anchored on the daemon-issued single-use nonce tombstone (design AC-3),
+///   never on raw signature bytes. If signature bytes are ever used for dedup,
+///   normalize to low-s first.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct P256Verifier;
+
+impl Verifier for P256Verifier {
+    fn verify(&self, public_key: &PublicKey, payload: &[u8], signature: &Signature) -> bool {
+        use p256::ecdsa::signature::Verifier as _;
+        let pk_bytes = match decode_prefixed_hex_var(&public_key.0, P256_PUBLIC_KEY_PREFIX) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        // Curve-point validation (AC-4): rejects off-curve / identity points.
+        let verifying_key = match p256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_bytes) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let sig_bytes = match decode_prefixed_hex_var(&signature.0, P256_SIGNATURE_PREFIX) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let sig = match p256::ecdsa::Signature::from_der(&sig_bytes) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        verifying_key.verify(payload, &sig).is_ok()
+    }
+}
+
+/// Validate that a `p256:`-prefixed public key decodes to an on-curve P-256
+/// point (SEC1 `from_sec1_bytes`, the same validation [`P256Verifier`] applies).
+/// Used at enrollment to confirm an attested key is a genuine P-256 point
+/// before binding it as a Device identity key (design §3 / AC-4).
+pub fn p256_public_key_is_valid(public_key: &PublicKey) -> bool {
+    match decode_prefixed_hex_var(&public_key.0, P256_PUBLIC_KEY_PREFIX) {
+        Ok(bytes) => p256::ecdsa::VerifyingKey::from_sec1_bytes(&bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Verify a device signature, selecting the verifier by the public-key
+/// algorithm prefix (`p256:` → ECDSA-, otherwise Ed25519). The presence /
+/// attestation lanes (design) carry ECDSA-keys; `daemon`-class keys are
+/// Ed25519. The prefix is part of the enrolled key material, so selection
+/// cannot be steered by an attacker independently of the key itself.
+pub fn verify_device_signature(
+    public_key: &PublicKey,
+    payload: &[u8],
+    signature: &Signature,
+) -> bool {
+    if public_key.0.starts_with(P256_PUBLIC_KEY_PREFIX) {
+        P256Verifier.verify(public_key, payload, signature)
+    } else {
+        Ed25519Verifier.verify(public_key, payload, signature)
+    }
+}
+
+/// A [`Verifier`] that selects the algorithm from the public key's prefix —
+/// the trait-object form of [`verify_device_signature`].
+///
+/// Use this wherever a verifier must accept identities of either custody class:
+/// `daemon`-class roots/personas are Ed25519, while device-rooted `presence`
+/// identities (design §2/§3 — the operator IdentityRoot is rooted on its
+/// YubiKey PIV ECDSA-key) are . The event-log verifier
+/// ([`core_eventlog::verify_chain`]) and the daemon's append path both need
+/// this so a device-rooted root/persona/device chain is verifiable by an
+/// independent party (AC-1/AC-5), not just the Ed25519 ones.
+///
+/// Algorithm selection is by the *enrolled* key's prefix — which is fixed at
+/// enrollment and is the value the signature is checked against — so it cannot
+/// be steered by an attacker independently of the key (the same algorithm-
+/// confusion bar [`verify_device_signature`] documents).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeviceSignatureVerifier;
+
+impl Verifier for DeviceSignatureVerifier {
+    fn verify(&self, public_key: &PublicKey, payload: &[u8], signature: &Signature) -> bool {
+        verify_device_signature(public_key, payload, signature)
     }
 }
 
@@ -765,6 +1106,16 @@ fn decode_prefixed_hex<const N: usize>(
     Ok(out)
 }
 
+/// Strip `prefix` and hex-decode the remainder with no fixed-length constraint.
+/// SEC1 points (33 / 65 bytes) and DER signatures (~70-72 bytes) are
+/// variable-length, unlike the fixed 32 / 64-byte Ed25519 encodings.
+fn decode_prefixed_hex_var(value: &str, prefix: &str) -> Result<Vec<u8>, ValidationError> {
+    let encoded = value
+        .strip_prefix(prefix)
+        .ok_or_else(|| ValidationError::new(format!("value must start with {prefix}")))?;
+    hex_to_bytes(encoded)
+}
+
 fn decode_hex_to_array<const N: usize>(value: &str) -> Result<[u8; N], ValidationError> {
     let bytes = hex_to_bytes(value)?;
     if bytes.len() != N {
@@ -783,7 +1134,195 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// implementation-note-35 C6: `LocalKeySigner::try_sign` consults
+    #[test]
+    fn recovery_identity_round_trips_and_seals_kek() {
+        // design §6: the printed recovery code seals/recovers a KEK_s.
+        let (secret, public) = generate_recovery_identity();
+        assert!(
+            secret.starts_with("AGE-SECRET-KEY-"),
+            "secret is a printed age code"
+        );
+        assert!(public.starts_with("age1"), "public is an age recipient");
+
+        // The public half is derivable from the secret (used to locate the wrap).
+        assert_eq!(recovery_public_from_secret(&secret).unwrap(), public);
+        assert!(recovery_public_from_secret("not-a-code").is_err());
+
+        // Seal a 32-byte KEK_s to the recipient, recover it with the secret.
+        let kek = [7u8; 32];
+        let wrapped = wrap_secret_to_recipient(&public, &kek).unwrap();
+        let recovered = unwrap_secret_with_identity(&secret, &wrapped).unwrap();
+        assert_eq!(recovered.as_slice(), kek.as_slice());
+
+        // A different code cannot recover it (fail closed).
+        let (other_secret, _) = generate_recovery_identity();
+        assert!(unwrap_secret_with_identity(&other_secret, &wrapped).is_err());
+    }
+
+    #[test]
+    fn local_key_pair_debug_redacts_private_key() {
+        // Secret-hygiene regression: LocalKeyPair derived Debug, leaking
+        // `private_key` to any `tracing::debug!(?kp)` / `format!("{kp:?}")`.
+        let kp = generate_local_key_pair("device", "dbg-test");
+        let dbg = format!("{kp:?}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "private_key must be redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains(&kp.private_key),
+            "Debug must not contain the private key"
+        );
+        assert!(
+            dbg.contains(&kp.public_key),
+            "public key shown for triage: {dbg}"
+        );
+    }
+
+    #[test]
+    fn ephemeral_key_pair_debug_redacts_and_zeroizes() {
+        use zeroize::Zeroize;
+        // EphemeralKeyPair previously had neither redacting Debug nor Zeroize.
+        let kp = generate_ephemeral_keypair();
+        let secret = kp.private_key_age.clone();
+        assert!(!secret.is_empty());
+        let dbg = format!("{kp:?}");
+        assert!(
+            dbg.contains("<redacted>") && !dbg.contains(&secret),
+            "private_key_age must be redacted, not leaked: {dbg}"
+        );
+        let mut kp2 = generate_ephemeral_keypair();
+        kp2.zeroize();
+        assert!(
+            kp2.private_key_age.is_empty(),
+            "zeroize must clear the X25519 secret"
+        );
+    }
+
+    // ── design §3 / AC-4: ECDSA-(ES256) device-signature verifier ──
+
+    /// Build a deterministic keypair from a fixed scalar (RFC6979 signing
+    /// needs no RNG → reproducible). Returns the `p256:`-prefixed SEC1 pubkey
+    /// and the signing key.
+    fn p256_fixture(scalar_byte: u8) -> (PublicKey, p256::ecdsa::SigningKey) {
+        let scalar = [scalar_byte; 32];
+        let signing = p256::ecdsa::SigningKey::from_bytes(&scalar.into())
+            .expect("fixed scalar is a valid key");
+        let vk = signing.verifying_key();
+        let sec1 = vk.to_encoded_point(false); // uncompressed 0x04||X||Y
+        let pk = PublicKey(format!(
+            "{P256_PUBLIC_KEY_PREFIX}{}",
+            bytes_to_hex(sec1.as_bytes())
+        ));
+        (pk, signing)
+    }
+
+    fn p256_sign(signing: &p256::ecdsa::SigningKey, payload: &[u8]) -> Signature {
+        use p256::ecdsa::signature::Signer as _;
+        let sig: p256::ecdsa::Signature = signing.sign(payload);
+        Signature(format!(
+            "{P256_SIGNATURE_PREFIX}{}",
+            bytes_to_hex(sig.to_der().as_bytes())
+        ))
+    }
+
+    #[test]
+    fn p256_verifier_accepts_valid_signature() {
+        let (pk, signing) = p256_fixture(0x11);
+        let payload = b"emberlink/v1/presence||op:audit_migrate||nonce:abc123";
+        let sig = p256_sign(&signing, payload);
+        assert!(P256Verifier.verify(&pk, payload, &sig));
+        // And via the prefix-dispatching helper.
+        assert!(verify_device_signature(&pk, payload, &sig));
+    }
+
+    #[test]
+    fn p256_verifier_rejects_wrong_payload() {
+        let (pk, signing) = p256_fixture(0x22);
+        let sig = p256_sign(&signing, b"original payload");
+        assert!(!P256Verifier.verify(&pk, b"tampered payload", &sig));
+    }
+
+    #[test]
+    fn p256_verifier_rejects_signature_from_other_key() {
+        let (pk_a, _) = p256_fixture(0x33);
+        let (_, signing_b) = p256_fixture(0x44);
+        let payload = b"bind to A, sign with B";
+        let sig_b = p256_sign(&signing_b, payload);
+        assert!(!P256Verifier.verify(&pk_a, payload, &sig_b));
+    }
+
+    #[test]
+    fn p256_verifier_rejects_malformed_inputs_without_panicking() {
+        let (pk, signing) = p256_fixture(0x55);
+        let payload = b"payload";
+        let good = p256_sign(&signing, payload);
+        // Garbage / off-curve pubkey.
+        assert!(!P256Verifier.verify(&PublicKey("p256:deadbeef".into()), payload, &good));
+        assert!(!P256Verifier.verify(&PublicKey("not-a-key".into()), payload, &good));
+        // Garbage signature.
+        assert!(!P256Verifier.verify(&pk, payload, &Signature("p256sig:00".into())));
+        assert!(!P256Verifier.verify(&pk, payload, &Signature("ed25519sig:00".into())));
+    }
+
+    #[test]
+    fn p256_and_ed25519_paths_do_not_cross() {
+        // Algorithm-confusion bar (design §3): a key+sig must NOT verify
+        // under the Ed25519 verifier, and an ed25519: key must fail closed when
+        // handed to the verifier (wrong prefix → no cross-routing).
+        let (p256_pk, signing) = p256_fixture(0x66);
+        let payload = b"cross-check";
+        let p256_sig = p256_sign(&signing, payload);
+        assert!(!Ed25519Verifier.verify(&p256_pk, payload, &p256_sig));
+
+        let ed = generate_local_key_pair("device", "dev-cross");
+        let ed_pk = PublicKey(ed.public_key.clone());
+        assert!(ed_pk.0.starts_with(PUBLIC_KEY_PREFIX));
+        // ed25519: key + sig under P256Verifier → false (prefix mismatch).
+        assert!(!P256Verifier.verify(&ed_pk, payload, &p256_sig));
+        // The dispatcher routes the ed25519: prefix to the Ed25519 verifier; a
+        // signature there must not verify.
+        assert!(!verify_device_signature(&ed_pk, payload, &p256_sig));
+    }
+
+    #[test]
+    fn device_signature_verifier_dispatches_both_algorithms() {
+        let payload = b"emberlink/v1/event||device-rooted";
+
+        // (presence/device-rooted) key+sig verifies through the trait-object
+        // verifier — this is what `core_eventlog::verify_chain` relies on.
+        let (p256_pk, p256_signing) = p256_fixture(0x77);
+        let p256_sig = p256_sign(&p256_signing, payload);
+        assert!(DeviceSignatureVerifier.verify(&p256_pk, payload, &p256_sig));
+
+        // Ed25519 (daemon-class) key+sig also verifies through the same verifier.
+        let ed = generate_local_key_pair("device", "dev-dispatch");
+        let ed_signer = LocalKeySigner::from_local_key_pair(&ed).unwrap();
+        let ed_pk = PublicKey(ed.public_key.clone());
+        let ed_sig = ed_signer.sign(payload);
+        assert!(DeviceSignatureVerifier.verify(&ed_pk, payload, &ed_sig));
+    }
+
+    #[test]
+    fn device_signature_verifier_holds_algorithm_confusion_bar() {
+        // The dispatcher selects by the *key's* prefix, so a signature can
+        // never satisfy an ed25519: key (or vice versa) — no cross-routing.
+        let payload = b"cross";
+        let (p256_pk, p256_signing) = p256_fixture(0x88);
+        let p256_sig = p256_sign(&p256_signing, payload);
+
+        let ed = generate_local_key_pair("device", "dev-bar");
+        let ed_signer = LocalKeySigner::from_local_key_pair(&ed).unwrap();
+        let ed_pk = PublicKey(ed.public_key.clone());
+        let ed_sig = ed_signer.sign(payload);
+
+        // ed25519: key + sig → routed to Ed25519, fails.
+        assert!(!DeviceSignatureVerifier.verify(&ed_pk, payload, &p256_sig));
+        // p256: key + Ed25519 sig → routed to , fails.
+        assert!(!DeviceSignatureVerifier.verify(&p256_pk, payload, &ed_sig));
+    }
+
+    /// implementation-note-37 C6: `LocalKeySigner::try_sign` consults
     /// the attached `PersonaActiveProbe` and refuses to sign when the
     /// persona is not active. The test injects two probes (active and
     /// inactive) and asserts the corresponding outcome.
@@ -826,6 +1365,73 @@ mod tests {
         // No probe attached → try_sign succeeds (legacy backward-compat).
         let no_probe_signer = LocalKeySigner::from_local_key_pair(&key_pair).unwrap();
         assert!(no_probe_signer.try_sign(b"legacy-no-probe").is_ok());
+    }
+
+    #[test]
+    fn p256_signer_output_verifies_under_device_verifier() {
+        // The P256Signer is the signing counterpart of P256Verifier: what it
+        // produces must verify under both P256Verifier and the prefix-dispatching
+        // DeviceSignatureVerifier (the verifier core_eventlog::verify_chain and
+        // the daemon append path use).
+        let signer = P256Signer::generate();
+        let payload = b"emberlink/v1/event||operator-root-genesis";
+        let sig = signer.sign(payload);
+        assert!(signer.public_key().0.starts_with(P256_PUBLIC_KEY_PREFIX));
+        assert!(sig.0.starts_with(P256_SIGNATURE_PREFIX));
+        assert!(P256Verifier.verify(&signer.public_key(), payload, &sig));
+        assert!(DeviceSignatureVerifier.verify(&signer.public_key(), payload, &sig));
+        // Wrong payload fails.
+        assert!(!P256Verifier.verify(&signer.public_key(), b"tampered", &sig));
+    }
+
+    #[test]
+    fn p256_signer_verifies_through_sign_with_context() {
+        // EventEnvelope::from_body signs via sign_with_context(DOMAIN_EVENT, ..);
+        // an independent verifier re-checks via verify_with_context. Exercise the
+        // exact path so the operator-root genesis (-signed events) is provably
+        // verifiable by a party holding only the device pubkey.
+        let signer = P256Signer::generate();
+        let payload = b"signed-bytes-stand-in";
+        let sig = sign_with_context(DOMAIN_EVENT, &signer, payload);
+        assert!(verify_with_context(
+            DOMAIN_EVENT,
+            &DeviceSignatureVerifier,
+            &signer.public_key(),
+            payload,
+            &sig,
+        ));
+        // A different domain must NOT verify (domain separation holds for ).
+        assert!(!verify_with_context(
+            DOMAIN_GRANT_OFFER,
+            &DeviceSignatureVerifier,
+            &signer.public_key(),
+            payload,
+            &sig,
+        ));
+    }
+
+    #[test]
+    fn p256_signer_public_key_material_matches_signer_pubkey() {
+        // The PublicKeyMaterial a caller binds as a root/device initial_key MUST
+        // carry exactly the pubkey the signer signs with — the self-root invariant
+        // (signer.public_key == initial_key.public_key) depends on this.
+        let signer = P256Signer::generate();
+        let material = signer.public_key_material("key-operator-device");
+        assert_eq!(material.algorithm, KeyAlgorithm::EcdsaP256);
+        assert_eq!(material.public_key, signer.public_key().0);
+        assert_eq!(material.key_id, "key-operator-device");
+    }
+
+    #[test]
+    fn p256_signer_from_scalar_is_deterministic_and_distinct_keys_differ() {
+        let a = P256Signer::from_scalar_bytes(&[0x11; 32]).unwrap();
+        let b = P256Signer::from_scalar_bytes(&[0x11; 32]).unwrap();
+        let c = P256Signer::from_scalar_bytes(&[0x22; 32]).unwrap();
+        // Same scalar → same pubkey; different scalar → different pubkey.
+        assert_eq!(a.public_key(), b.public_key());
+        assert_ne!(a.public_key(), c.public_key());
+        // Zero scalar is not a valid key → rejected.
+        assert!(P256Signer::from_scalar_bytes(&[0u8; 32]).is_err());
     }
 
     #[test]
@@ -1092,5 +1698,87 @@ mod tests {
             !verifier.verify(&public_key, b"any message", &signature),
             "verify_strict must reject a signature with a torsion R component"
         );
+    }
+
+    /// Pre-release security review H2 (2026-06): the EmberSeal snapshot
+    /// symmetric key and the EmberSeal X25519 recipient scalar MUST be
+    /// derived under independent HKDF info strings.
+    ///
+    /// Previously both call sites used `HKDF-SHA256(seed, b"ember-seal-v1")`,
+    /// so the snapshot key bytes were *bit-identical* to the X25519 private
+    /// scalar (modulo X25519 clamping, which contains no secret). Any
+    /// disclosure of the snapshot symmetric key — which circulates as a
+    /// non-zeroized `String` (review N6) — would reconstruct the EmberSeal
+    /// X25519 private key and decrypt every envelope ever wrapped to the
+    /// daemon's published recipient pubkey.
+    ///
+    /// This test catches a regression by checking that the X25519 public key
+    /// derived from the *snapshot-key bytes* (treated as a candidate scalar)
+    /// does NOT match the legitimate EmberSeal recipient pubkey. If the two
+    /// info strings ever collide again, this assertion fires.
+    #[test]
+    fn snapshot_key_and_emberseal_scalar_are_independent() {
+        // Arbitrary deterministic seed input.
+        let seed = [0xABu8; 32];
+
+        let snap_key = derive_snapshot_encryption_key(&seed);
+        let recipient_hex = derive_emberseal_x25519_recipient(&seed);
+
+        // The snapshot key wire format is `xchacha20-key:<64 hex chars>`
+        // covering 32 raw bytes. Strip the prefix and decode.
+        let snap_key_hex = snap_key
+            .strip_prefix(CONTENT_KEY_PREFIX)
+            .expect("snapshot key must carry the xchacha20-key: prefix");
+        assert_eq!(
+            snap_key_hex.len(),
+            64,
+            "snapshot key hex body must be 64 chars (32 bytes)"
+        );
+        let snap_key_bytes: [u8; 32] = hex_to_bytes(snap_key_hex)
+            .expect("snapshot key hex must decode")
+            .try_into()
+            .expect("snapshot key must decode to 32 bytes");
+
+        // Treat the snapshot key bytes as a candidate X25519 scalar (this is
+        // exactly what the bug allowed: same 32 bytes used as both). Under
+        // the OLD shared-info-string code, the resulting pubkey was equal to
+        // the legitimate recipient. After the H2 fix, the info strings
+        // differ so the candidate pubkey must NOT match.
+        let candidate_secret = x25519_dalek::StaticSecret::from(snap_key_bytes);
+        let candidate_pubkey = x25519_dalek::PublicKey::from(&candidate_secret);
+        let candidate_hex = core_types::bytes_to_hex(candidate_pubkey.as_bytes());
+
+        assert_ne!(
+            candidate_hex, recipient_hex,
+            "REGRESSION: snapshot key bytes derive the legitimate EmberSeal recipient — \
+             HKDF info strings have collided again (H2). Restore distinct info strings."
+        );
+
+        // Sanity: the two info-string constants must themselves differ.
+        assert_ne!(
+            HKDF_INFO_EMBERSEAL_SNAPSHOT_KEY, HKDF_INFO_EMBERSEAL_X25519_SCALAR,
+            "EmberSeal info-string constants must be distinct (registry invariant)"
+        );
+    }
+
+    /// Pre-release security review N6 (2026-06): content keys and the snapshot
+    /// key must travel as [`Zeroizing<String>`] so the heap allocation holding
+    /// the hex-encoded symmetric key is zeroized on drop.
+    ///
+    /// This is a compile-time witness: the assignments only typecheck if the
+    /// functions return `Zeroizing<String>`. The runtime checks confirm the
+    /// hex-encoded key body has the expected shape inside the wrapper.
+    #[test]
+    fn n6_content_keys_return_zeroizing_string() {
+        let ikm = [0x99u8; 32];
+
+        let generated: Zeroizing<String> = generate_content_key("n6-test");
+        assert!(generated.starts_with(CONTENT_KEY_PREFIX));
+
+        let derived: Zeroizing<String> = derive_content_key(&ikm, b"emberlink/v1/content-key/n6");
+        assert!(derived.starts_with(CONTENT_KEY_PREFIX));
+
+        let snap: Zeroizing<String> = derive_snapshot_encryption_key(&ikm);
+        assert!(snap.starts_with(CONTENT_KEY_PREFIX));
     }
 }

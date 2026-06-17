@@ -54,17 +54,13 @@ pub fn runtime_artifacts() -> Vec<DevRuntimeArtifact> {
         DevRuntimeArtifact::new("ember-daemon", "emberd", DevRuntimeArtifactKind::Daemon),
     ];
 
-    artifacts.extend(
-        ember_construct::VENDORS
-            .iter()
-            .map(|vendor| {
-                DevRuntimeArtifact::new(
-                    "ember-construct",
-                    format!("ember-{}", vendor.name),
-                    DevRuntimeArtifactKind::Construct,
-                )
-            }),
-    );
+    artifacts.extend(ember_construct::VENDORS.iter().map(|vendor| {
+        DevRuntimeArtifact::new(
+            "ember-construct",
+            format!("ember-{}", vendor.name),
+            DevRuntimeArtifactKind::Construct,
+        )
+    }));
 
     artifacts
 }
@@ -93,21 +89,29 @@ mod tests {
     fn artifact_inventory_includes_cli_daemon_and_constructs() {
         let artifacts = runtime_artifacts();
         assert!(
-            artifacts.iter().any(|artifact| artifact.binary_name == "ember"),
+            artifacts
+                .iter()
+                .any(|artifact| artifact.binary_name == "ember"),
             "dev runtime must include ember CLI"
         );
         assert!(
-            artifacts.iter().any(|artifact| artifact.binary_name == "emberd"),
+            artifacts
+                .iter()
+                .any(|artifact| artifact.binary_name == "emberd"),
             "dev runtime must include daemon"
         );
         assert!(
-            artifacts.iter().any(|artifact| artifact.binary_name == "ember-gh"
-                && artifact.kind == DevRuntimeArtifactKind::Construct),
+            artifacts
+                .iter()
+                .any(|artifact| artifact.binary_name == "ember-gh"
+                    && artifact.kind == DevRuntimeArtifactKind::Construct),
             "dev runtime must include cohort-A construct binaries"
         );
         assert!(
-            artifacts.iter().any(|artifact| artifact.binary_name == "ember-git"
-                && artifact.kind == DevRuntimeArtifactKind::Construct),
+            artifacts
+                .iter()
+                .any(|artifact| artifact.binary_name == "ember-git"
+                    && artifact.kind == DevRuntimeArtifactKind::Construct),
             "dev runtime must include git construct binaries"
         );
     }

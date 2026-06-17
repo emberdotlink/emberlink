@@ -1,11 +1,12 @@
 
 
 > [!NOTE]
-> Support level: **Supported**.
-> Source truth: `QUICKSTART.md`, `README.md`, `docs/cli-reference.md`.
+> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
+
 # Install and First Run
 
-The current canonical onboarding flow is:
+If you are trying Ember for the first time, this is the shortest truthful path
+to a working managed Claude session:
 
 1. Install `ember`
 2. Run `ember init --for claude`
@@ -26,15 +27,23 @@ cd emberlink
 cargo install --locked --path crates/emberlink-cli --bin ember
 ```
 
+You do not need Docker for this path. Docker matters only for
+`ember sandbox ...`.
+
 ## Run the canonical onboarding flow
 
 ```bash
 ember init --for claude
 ```
 
-This is the load-bearing first-run path. It wires the Claude Code shadow shims
-and, if needed, offers to run `sudo ember daemon install` before resuming the
-rest of onboarding.
+This is the load-bearing first-run path. It:
+
+- wires the Claude Code shadow shims
+- creates or reuses the managed persona and grant surfaces
+- offers to run `sudo ember daemon install` if the daemon-backed path is not
+  ready yet
+
+Use this before you reach for lower-level daemon or launcher commands.
 
 ## Confirm the daemon is healthy
 
@@ -50,6 +59,8 @@ Use it before you start chasing lower-level commands.
 ```bash
 ember claude
 ```
+
+This is the supported managed launcher path.
 
 If `ANTHROPIC_API_KEY` was present during `ember init --for claude`,
 Ember can reuse a brokered Claude runtime grant. Otherwise Claude's own

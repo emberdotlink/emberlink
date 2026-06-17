@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-396
+//! implementation-note-347
 //!
 //! design Component 2 — modern-Linux `clone3` user-namespace spawn
 //! module. This module is the **load-bearing primitive** that makes
@@ -117,7 +118,7 @@
 //! `broker/handler.rs::handle_broker_exec` routes through
 //! [`spawn_in_execution_domain`] on modern-Linux hosts whose
 //! `[spawn_pool]` config carries `subuid_range_start` (provisioned
-//! at install time by `implementation-note-190`). The
+//! at install time by `implementation-note-167`). The
 //! non-PTY branch is routed in this rework; the PTY branch keeps
 //! the existing `forkpty + setresuid` shape — wiring PTY through
 //! a namespace requires either a `pidfd_open` + `setns` step in
@@ -182,7 +183,7 @@ pub enum ExecDomainError {
     #[error(
         "execution domain unavailable on this platform — \
          requires Linux with kernel.unprivileged_userns_clone=1 \
-         (route to helper-daemon spawn path; implementation-note-397-\
+         (route to helper-daemon spawn path; implementation-note-348-\
          CLONE3-SPAWN-MODULE)"
     )]
     UnsupportedPlatform,
@@ -195,7 +196,7 @@ pub enum ExecDomainError {
     /// bug, not an attack — but we fail closed regardless).
     #[error(
         "construct hash mismatch: expected {expected}, got \
-         {actual} (implementation-note-398)"
+         {actual} (implementation-note-349)"
     )]
     HashMismatch { expected: String, actual: String },
 
@@ -277,7 +278,7 @@ pub enum ExecDomainError {
     /// stderr is captured in `stderr` when non-empty. Most common
     /// cause: the daemon's euid lacks a matching `/etc/subuid`
     /// entry for the requested range (install regression — the
-    /// companion `implementation-note-190` task is
+    /// companion `implementation-note-167` task is
     /// responsible for provisioning the entry).
     #[error(
         "{binary} exited with status {status}; stderr={stderr:?} \
@@ -1027,7 +1028,7 @@ mod tests {
     }
 
     // idmap_helper_not_installed_test_rewritten — checkpoint for
-    // implementation-note-399.
+    // implementation-note-350.
     //
     // The previous `newuidmap_not_installed_surfaces_install_hint`
     // test (deleted here) fabricated the missing-binary condition by

@@ -1,11 +1,12 @@
 //! Local-state key RPC helpers for the launcher-facing `local_state_key_*`
 //! methods.
+//! CLASSIFICATION: PUBLIC
 
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::infra::{
     handler::{DispatchSource, PeerCred, RequestContext, current_vault, local_state_vault_name},
-    handlers::support::emit_local_state_v2_receipt,
     store::DaemonStore,
     vault::VaultScope,
 };
@@ -18,7 +19,7 @@ use core_events::receipt::{
 pub(crate) fn handle_key_get(
     store: &DaemonStore,
     ctx: &RequestContext,
-    source: DispatchSource,
+    source: &DispatchSource,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let caller = params["caller"]
@@ -36,16 +37,23 @@ pub(crate) fn handle_key_get(
     presence::record_activity();
     let vault = current_vault(store, "local_state_key_get")?;
 
-    let (key_string, resolved_or_generated) =
+    // N6: key_string is held as Zeroizing<String> so the local-state content
+    // key zeroizes on drop. The Ok-arm wraps the bare String produced from
+    // vault.get bytes; the Err-arm receives the already-Zeroizing return of
+    // generate_content_key. The JSON serialization below moves through
+    // serde_json::Value::String which DOES heap-clone the bytes — that ride
+    // out of the daemon is unavoidable here; the local heap copy is what
+    // this fix zeroizes.
+    let (key_string, resolved_or_generated): (Zeroizing<String>, &'static str) =
         match vault.get(VaultScope::Interactive, store, &vault_namespace) {
             Ok(bytes) => {
-                let s = String::from_utf8(bytes).map_err(|e| {
+                let s = String::from_utf8(bytes.to_vec()).map_err(|e| {
                     (
                         -32000,
                         format!("local_state_key_get: stored key is not valid UTF-8: {e}"),
                     )
                 })?;
-                (s, "resolved")
+                (Zeroizing::new(s), "resolved")
             }
             Err(crate::infra::vault::VaultError::NotFound) => {
                 let key = core_crypto::generate_content_key("local-state");
@@ -63,21 +71,37 @@ pub(crate) fn handle_key_get(
             Err(e) => return Err((-32000, e.to_string())),
         };
 
+    // design §76-78: local_state.key_resolve is WITHDRAWN from the canonical
+    // Receipt lane — these are local daemon/operator plumbing events, not
+    // durable signed authority artifacts. Emit an immutable audit row instead
+    // of minting a signed v2 receipt. The LocalStateKeyResolveBody is retained
+    // as the typed audit-detail shape. (Sweep 3 finding D2.)
     let body = LocalStateKeyResolveBody {
         peer_uid: peer.uid,
         caller: caller.to_string(),
         vault_namespace: vault_namespace.clone(),
         resolved_or_generated: resolved_or_generated.to_string(),
     };
-    emit_local_state_v2_receipt(
+    if let Err(e) = store.log_event(
+        None,
         RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE,
-        serde_json::to_value(&body),
-        caller,
-        &vault_namespace,
-    );
+        Some(&vault_namespace),
+        resolved_or_generated,
+        serde_json::to_string(&body).ok().as_deref(),
+    ) {
+        tracing::warn!(
+            caller = %caller,
+            vault_namespace = %vault_namespace,
+            error = %e,
+            "local_state.key_resolve: audit-row emission failed — work still committed"
+        );
+    }
 
     Ok(json!({
-        "key": key_string,
+        // N6: borrow as &str (via Deref) so we don't move the inner String
+        // out of Zeroizing. json! will heap-clone the bytes into a Value;
+        // when key_string drops at the end of the scope, the local zeroizes.
+        "key": key_string.as_str(),
         "vault_namespace": vault_namespace,
         "resolved_or_generated": resolved_or_generated,
     }))
@@ -86,7 +110,7 @@ pub(crate) fn handle_key_get(
 pub(crate) fn handle_key_set(
     store: &DaemonStore,
     ctx: &RequestContext,
-    source: DispatchSource,
+    source: &DispatchSource,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let caller = params["caller"]
@@ -167,7 +191,7 @@ pub(crate) fn handle_key_set(
 pub(crate) fn handle_key_rotate_and_reencrypt(
     store: &DaemonStore,
     ctx: &RequestContext,
-    source: DispatchSource,
+    source: &DispatchSource,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let caller = params["caller"]
@@ -206,12 +230,16 @@ pub(crate) fn handle_key_rotate_and_reencrypt(
                 format!("local_state_key_rotate_and_reencrypt: vault.get: {e}"),
             )
         })?;
-    let old_key = String::from_utf8(old_key_bytes).map_err(|e| {
-        (
-            -32000,
-            format!("local_state_key_rotate_and_reencrypt: stored key is not valid UTF-8: {e}"),
-        )
-    })?;
+    // N6: hold old_key as Zeroizing<String> so the local-state content key
+    // zeroizes on drop. The bare String produced from utf8-decoded bytes is
+    // wrapped at receipt.
+    let old_key: Zeroizing<String> =
+        Zeroizing::new(String::from_utf8(old_key_bytes.to_vec()).map_err(|e| {
+            (
+                -32000,
+                format!("local_state_key_rotate_and_reencrypt: stored key is not valid UTF-8: {e}"),
+            )
+        })?);
 
     if ciphertext.len() < 24 {
         return Err((
@@ -271,6 +299,10 @@ pub(crate) fn handle_key_rotate_and_reencrypt(
             )
         })?;
 
+    // design §76-78: local_state.key_rotation is WITHDRAWN from the Receipt
+    // lane — emit an immutable audit row, not a signed v2 receipt. The
+    // LocalStateKeyRotationBody is retained as the typed audit-detail shape.
+    // (Sweep 3 finding D2.)
     let body = LocalStateKeyRotationBody {
         peer_uid: peer.uid,
         caller: caller.to_string(),
@@ -278,12 +310,20 @@ pub(crate) fn handle_key_rotate_and_reencrypt(
         old_key_hash: format!("blake3:{old_key_hash}"),
         new_key_hash: format!("blake3:{new_key_hash}"),
     };
-    emit_local_state_v2_receipt(
+    if let Err(e) = store.log_event(
+        None,
         RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION,
-        serde_json::to_value(&body),
-        caller,
-        &vault_namespace,
-    );
+        Some(&vault_namespace),
+        "rotated",
+        serde_json::to_string(&body).ok().as_deref(),
+    ) {
+        tracing::warn!(
+            caller = %caller,
+            vault_namespace = %vault_namespace,
+            error = %e,
+            "local_state.key_rotation: audit-row emission failed — work still committed"
+        );
+    }
 
     Ok(json!({
         "ciphertext": new_ciphertext,
@@ -292,7 +332,7 @@ pub(crate) fn handle_key_rotate_and_reencrypt(
 }
 
 fn enforce_local_state_gate(
-    source: DispatchSource,
+    source: &DispatchSource,
     peer: Option<PeerCred>,
     caller: &str,
     store: &DaemonStore,

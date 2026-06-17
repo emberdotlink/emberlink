@@ -9,6 +9,7 @@
 pub mod channel;
 pub mod linux;
 pub mod non_interactive;
+pub mod shell_init;
 pub mod verify;
 pub mod wizard;
 

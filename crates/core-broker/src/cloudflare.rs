@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use crate::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, MintStamp};
 
 const DEFAULT_BASE: &str = "https://api.cloudflare.com/client/v4";
 
@@ -194,6 +194,9 @@ impl Broker for CloudflareBroker {
             token: SecretString::from(result.value),
             expires_at,
             materialization_id: result.id,
+            // Cloudflare's token response carries policy but the
+            // projector/clamp pair is deferred to BKR-5 (design G1).
+            mint_stamp: MintStamp::Opaque,
         })
     }
 
@@ -375,6 +378,13 @@ mod tests {
                 ]
             }),
             ttl: Duration::from_secs(900),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "unit test".to_string(),
             caller_persona: None,
             grants_file_rev: None,

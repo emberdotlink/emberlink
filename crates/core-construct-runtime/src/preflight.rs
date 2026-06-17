@@ -11,7 +11,7 @@
 //! ## Phase 2 slice B (this slice) — manifest-backed resolver
 //!
 //! [`resolve_queued_task_permissions`] now consumes each task's
-//! `constructs` field (implementation-note-22) and a
+//! `constructs` field (implementation-note-25) and a
 //! registry of parsed `construct.toml` manifests
 //! ([`crate::manifest::ConstructManifest`]). For every
 //! `"<construct>.<action>"` declaration the task carries, the resolver
@@ -30,12 +30,13 @@
 //! matches `kubectl.toml`'s `key = "kubectl.apply"` when the construct
 //! is `ember-kubectl`).
 //!
-//! implementation-note-23 — checkpoint for stale_check; do not remove.
+//! implementation-note-26 — checkpoint for stale_check; do not remove.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use std::collections::HashMap;
 
-use crate::manifest::{ConstructManifest, lookup};
+use crate::manifest::{ConstructAction, ConstructManifest, ConstructMaterialDeclarations, lookup};
 
 /// A permission a Construct requires to perform an action.
 ///
@@ -97,12 +98,32 @@ pub struct HeadlessRequirementResolution {
     pub fully_declared: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialDeclarationResolution {
+    pub materials_by_task: HashMap<TaskId, ConstructMaterialDeclarations>,
+    pub fully_declared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionIdentityResolution {
+    pub identities_by_task: HashMap<TaskId, Vec<ResolvedActionIdentity>>,
+    pub fully_declared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedActionIdentity {
+    pub plugin_address: String,
+    pub plugin_version: String,
+    pub action_key: String,
+    pub action_version: String,
+}
+
 /// Resolve, for each task, the union of permissions implied by the
 /// Constructs that task declares it invokes.
 ///
 /// **Pre:** every entry in `tasks` is a `(task_id, task.constructs)` pair
 /// where each construct declaration is the
-/// implementation-note-22 shape
+/// implementation-note-25 shape
 /// `"<construct>.<action>"` (e.g. `"ember-gh.pr_merge"`,
 /// `"ember-kubectl.apply"`). `registry` maps a manifest's `[meta] name`
 /// (e.g. `"ember-gh"`) to its parsed [`ConstructManifest`].
@@ -180,10 +201,6 @@ pub fn resolve_queued_task_authority_refs(
                 fully_declared = false;
                 continue;
             };
-            if action_refs.is_empty() {
-                fully_declared = false;
-                continue;
-            }
             refs.extend(action_refs);
         }
         out.insert(task_id.clone(), refs.into_iter().collect());
@@ -232,6 +249,107 @@ pub fn resolve_queued_task_headless_requirements(
     }
 }
 
+pub fn resolve_queued_task_material_declarations(
+    tasks: &[(TaskId, Vec<String>)],
+    registry: &HashMap<String, ConstructManifest>,
+) -> MaterialDeclarationResolution {
+    let mut out = HashMap::with_capacity(tasks.len());
+    let mut fully_declared = true;
+    for (task_id, declarations) in tasks {
+        let mut materials = ConstructMaterialDeclarations::default();
+        for decl in declarations {
+            let Some((construct_name, action_suffix)) = decl.split_once('.') else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(manifest) = lookup(registry, construct_name) else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(action) = action_entry(manifest, action_suffix) else {
+                fully_declared = false;
+                continue;
+            };
+            let resolved = resolved_material(manifest, action);
+            if manifest
+                .headless_requirements
+                .iter()
+                .any(|requirement| requirement == "env_passthrough_authority")
+                && resolved.is_empty()
+            {
+                fully_declared = false;
+                continue;
+            }
+            extend_unique(&mut materials.vault_paths, resolved.vault_paths);
+            extend_unique(&mut materials.env_passthrough, resolved.env_passthrough);
+            extend_unique(&mut materials.file_env, resolved.file_env);
+        }
+        out.insert(task_id.clone(), materials);
+    }
+    MaterialDeclarationResolution {
+        materials_by_task: out,
+        fully_declared,
+    }
+}
+
+pub fn resolve_queued_task_action_identities(
+    tasks: &[(TaskId, Vec<String>)],
+    registry: &HashMap<String, ConstructManifest>,
+) -> ActionIdentityResolution {
+    let mut out = HashMap::with_capacity(tasks.len());
+    let mut fully_declared = true;
+    for (task_id, declarations) in tasks {
+        let mut identities = Vec::new();
+        for decl in declarations {
+            let Some((construct_name, action_suffix)) = decl.split_once('.') else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(manifest) = lookup(registry, construct_name) else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(action) = action_entry(manifest, action_suffix) else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(plugin_address) = manifest
+                .plugin_address
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(plugin_version) = manifest.action_plugin_version() else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(action_version) = action
+                .action_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                fully_declared = false;
+                continue;
+            };
+            identities.push(ResolvedActionIdentity {
+                plugin_address: plugin_address.to_string(),
+                plugin_version: plugin_version.to_string(),
+                action_key: action.key.clone(),
+                action_version: action_version.to_string(),
+            });
+        }
+        out.insert(task_id.clone(), identities);
+    }
+    ActionIdentityResolution {
+        identities_by_task: out,
+        fully_declared,
+    }
+}
+
 /// True when `action_suffix` resolves to a declared action key in
 /// `manifest`, trying the suffix verbatim and the short-name-prepended
 /// variant. See [`resolve_queued_task_permissions`] for the convention
@@ -243,7 +361,7 @@ fn action_key_present(manifest: &ConstructManifest, action_suffix: &str) -> bool
 fn action_entry<'a>(
     manifest: &'a ConstructManifest,
     action_suffix: &str,
-) -> Option<&'a crate::manifest::ConstructAction> {
+) -> Option<&'a ConstructAction> {
     if let Some(action) = manifest.actions.iter().find(|a| a.key == action_suffix) {
         return Some(action);
     }
@@ -261,6 +379,37 @@ fn action_authority_refs(manifest: &ConstructManifest, action_suffix: &str) -> O
         return Some(action.authority_refs.clone());
     }
     Some(manifest.authority_refs.clone())
+}
+
+fn resolved_material(
+    manifest: &ConstructManifest,
+    action: &ConstructAction,
+) -> ConstructMaterialDeclarations {
+    ConstructMaterialDeclarations {
+        vault_paths: if action.delegated_material.vault_paths.is_empty() {
+            manifest.delegated_material.vault_paths.clone()
+        } else {
+            action.delegated_material.vault_paths.clone()
+        },
+        env_passthrough: if action.delegated_material.env_passthrough.is_empty() {
+            manifest.delegated_material.env_passthrough.clone()
+        } else {
+            action.delegated_material.env_passthrough.clone()
+        },
+        file_env: if action.delegated_material.file_env.is_empty() {
+            manifest.delegated_material.file_env.clone()
+        } else {
+            action.delegated_material.file_env.clone()
+        },
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, additions: Vec<String>) {
+    for value in additions {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
 }
 
 /// Diff a set of needed permissions against an enrolled persona template,
@@ -297,6 +446,7 @@ mod tests {
 name = "ember-gh"
 
 authority_refs = ["github"]
+env_passthrough = ["GH_TOKEN"]
 
 default = "deny"
 
@@ -310,6 +460,7 @@ key = "pr_merge"
     const KUBECTL_MANIFEST: &str = r#"
 [meta]
 name = "ember-kubectl"
+file_env = ["KUBECONFIG"]
 
 default = "deny"
 
@@ -408,14 +559,14 @@ key = "pulumi.up"
     }
 
     #[test]
-    fn missing_authority_ref_marks_resolution_incomplete() {
+    fn empty_authority_ref_can_still_be_fully_declared() {
         let registry = registry_with(&[KUBECTL_MANIFEST]);
         let tasks = vec![(
             "TASK-I".to_string(),
             vec!["ember-kubectl.apply".to_string()],
         )];
         let resolved = resolve_queued_task_authority_refs(&tasks, &registry);
-        assert!(!resolved.fully_declared);
+        assert!(resolved.fully_declared);
         assert!(resolved.refs_by_task.get("TASK-I").unwrap().is_empty());
     }
 
@@ -440,6 +591,44 @@ key = "pulumi.up"
         assert_eq!(
             resolved.requirements_by_task.get("TASK-K"),
             Some(&vec!["runtime_kms".to_string()])
+        );
+    }
+
+    #[test]
+    fn material_declarations_round_trip_manifest_default() {
+        let registry = registry_with(&[KUBECTL_MANIFEST]);
+        let tasks = vec![(
+            "TASK-M".to_string(),
+            vec!["ember-kubectl.apply".to_string()],
+        )];
+        let resolved = resolve_queued_task_material_declarations(&tasks, &registry);
+        assert!(resolved.fully_declared);
+        assert_eq!(
+            resolved.materials_by_task.get("TASK-M"),
+            Some(&ConstructMaterialDeclarations {
+                vault_paths: Vec::new(),
+                env_passthrough: Vec::new(),
+                file_env: vec!["KUBECONFIG".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn action_identity_resolution_returns_structured_identity() {
+        let registry = registry_with(&[include_str!(
+            "../../../crates/ember-construct/construct/gh.toml"
+        )]);
+        let tasks = vec![("TASK-N".to_string(), vec!["ember-gh.pr_merge".to_string()])];
+        let resolved = resolve_queued_task_action_identities(&tasks, &registry);
+        assert!(resolved.fully_declared);
+        assert_eq!(
+            resolved.identities_by_task.get("TASK-N"),
+            Some(&vec![ResolvedActionIdentity {
+                plugin_address: "registry.ember.systems/ember-systems/ember-gh".to_string(),
+                plugin_version: "0.1.0".to_string(),
+                action_key: "pr_merge".to_string(),
+                action_version: "v1".to_string(),
+            }])
         );
     }
 

@@ -17,11 +17,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ember_daemon::infra::rate_limit::RateLimiter;
-use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::socket::{SocketListener, new_shared_policy_engine};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+    ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -32,7 +32,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn permissive_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: "credential.access.*".to_string(),
+            action: ActionSelector::named("credential.access.*"),
             risk: RiskLevel::Low,
             requirement: ApprovalRequirement::Auto,
             tier: None,
@@ -67,7 +67,7 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(permissive_policy());
+            let policy = new_shared_policy_engine(permissive_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault; // hold until end of scope: set_vault is the wire now
             let listener =
@@ -144,15 +144,19 @@ fn local_state_key_resolves_via_daemon_socket() {
 
     // Daemon generates keys via core_crypto::generate_content_key("local-state")
     // which produces "xchacha20-key:<64 hex>" = 78 chars total.
+    //
+    // N6-deeper: `local_state_content_key()` returns `Zeroizing<String>`; pass
+    // `&str` (via deref) at every consumer site.
+    let key_str: &str = &key;
     assert!(
-        key.starts_with("xchacha20-key:"),
-        "expected xchacha20-key: prefix, got: {key}"
+        key_str.starts_with("xchacha20-key:"),
+        "expected xchacha20-key: prefix, got: {key_str}"
     );
     assert_eq!(
-        key.len(),
+        key_str.len(),
         78,
-        "expected 78-char xchacha20-key: key, got len {} for: {key}",
-        key.len()
+        "expected 78-char xchacha20-key: key, got len {} for: {key_str}",
+        key_str.len()
     );
 }
 
@@ -171,8 +175,9 @@ fn local_state_key_is_idempotent_across_calls() {
 
     unsafe { std::env::remove_var("EMBER_SOCKET_PATH") };
 
+    // N6-deeper: deref through Zeroizing<String> to compare as &str.
     assert_eq!(
-        key1, key2,
+        &*key1, &*key2,
         "daemon must return the same key on repeated calls for the same caller"
     );
 }
@@ -195,7 +200,8 @@ fn emberlink_key_env_var_bypass_honored_for_xchacha20_prefix() {
 
     unsafe { std::env::remove_var("EMBERLINK_KEY") };
 
-    assert_eq!(key, test_key);
+    // N6-deeper: deref through Zeroizing<String> to compare as &str.
+    assert_eq!(&*key, &test_key);
 }
 
 #[test]

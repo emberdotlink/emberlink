@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-207 subtask A — positive test that
+//! implementation-note-379 subtask A — positive test that
 //! `DaemonConfig::for_test(&tmpdir)` scopes every path-bearing field
 //! under `tmpdir`, so a T3 test cannot accidentally bind the operator's
 //! real `~/.ember/run/daemon.sock`.

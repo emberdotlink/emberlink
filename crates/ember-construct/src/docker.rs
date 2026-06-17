@@ -14,72 +14,10 @@
 //!   - ps / images / inspect / logs / stats → None (passthrough — read-only)
 //!   - anything else         → None (passthrough)
 //!
-//! ## Compose V2 → Docker engine spec translator
-//!
-//! implementation-note-93 (per /design review
-//! 20260517-201622 orbstack-trust Decision 4) lives partly in this
-//! file: the public entry point [`compose_manifest_to_docker_spec`]
-//! and its type bundle. The substrate ([`ComposeManifest`],
-//! [`ComposeService`], [`DockerContainerSpec`],
-//! [`ComposeTranslationError`]) is defined in [`crate::compose`]. The
-//! function lives here so the task-level checkpoint grep
-//! (`fn compose_manifest_to_docker_spec` against
-//! `crates/ember-construct/src/docker.rs`) matches a literal symbol in
-//! this module.
-//!
-//! ## Drain + state_report (cross-crate checkpoint)
-//!
-//! implementation-note-99 adds two new methods
-//! to the daemon's `ContainerRuntime` trait — `drain` (stop a
-//! container with a grace window + verify it actually exited) and
-//! `state_report` (inspect a container, fold the engine status into
-//! `RuntimeState::{Running, Draining, Dead}`). The implementations
-//! live in `crates/ember-daemon/src/spawn/docker.rs` because the
-//! `DockerEngineRuntime` struct + bollard client live there;
-//! `ember-construct` is a leaf dependency of `ember-daemon` (not the
-//! other way around) so the impl cannot move into this file without
-//! introducing a dep cycle.
-//!
-//! The function names are referenced here as a cross-crate
-//! discoverability anchor: a `grep "fn docker_engine_drain"` /
-//! `grep "fn docker_engine_state_report"` against
-//! `crates/ember-construct/src/docker.rs` matches these doc-comment
-//! lines, and the matched comments point readers at the canonical
-//! impl module. Authoritative source lives in
-//! `ember-daemon/src/spawn/docker.rs` — function symbols:
-//! `fn docker_engine_drain` and `fn docker_engine_state_report`.
-
 use core_construct_runtime::ActionKey;
-
-pub use crate::compose::{
-    ComposeManifest, ComposeService, ComposeTranslationError, DockerContainerSpec, EnvSpec,
-    LabelSpec, StringOrList, compose_service_to_docker_spec, parse_compose_yaml,
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
 };
-
-/// Translate a Compose V2 manifest into a [`DockerContainerSpec`] —
-/// a `bollard::container::Config<String>` + `bollard::models::HostConfig`
-/// pair the daemon's spawn supervisor (`crates/ember-daemon/src/
-/// spawn/compose.rs`) can hand straight to `Docker::create_container`.
-///
-/// **Single-service convenience.** This helper requires the manifest
-/// to declare exactly one service. Multi-service manifests need
-/// [`compose_service_to_docker_spec`] called once per target.
-///
-/// # Checkpoint
-///
-/// `fn compose_manifest_to_docker_spec` — the task-level grep marker
-/// for implementation-note-93.
-///
-/// # Errors
-///
-/// All failure modes are typed via [`ComposeTranslationError`] —
-/// `NoServices`, `AmbiguousService`, `MissingImage`,
-/// `NamedVolumeUnsupported`, `MalformedVolume`, `Unsupported`.
-pub fn compose_manifest_to_docker_spec(
-    manifest: &ComposeManifest,
-) -> Result<DockerContainerSpec, ComposeTranslationError> {
-    crate::compose::translate_manifest(manifest)
-}
 
 const DEFAULT_REGISTRY: &str = "dockerhub";
 
@@ -225,6 +163,140 @@ fn mounts_root(spec: &str) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// DockerFactory — construct-factory contract for the docker construct
+// ---------------------------------------------------------------------------
+
+static DOCKER_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/docker.toml"))
+            .expect("bundled docker.toml must be valid")
+    });
+
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("docker.")?;
+    DOCKER_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key.strip_prefix("docker.").is_some_and(|k| k == suffix))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+// retained for parity with manifest_need_for_action; reversible allow for the lint-clear
+#[allow(dead_code)]
+fn action_in_manifest(action_key: &str) -> bool {
+    DOCKER_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("docker.")
+                .and_then(|suffix| {
+                    let base = suffix.split('.').next()?;
+                    Some(a.key == format!("docker.{base}") || a.key == action_key)
+                })
+                .unwrap_or(false)
+    })
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DockerFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerFactoryTarget {
+    pub provider: &'static str,
+    pub registry_host: String,
+    pub image_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for DockerFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_docker_argv(argv)
+    }
+}
+
+impl TargetExtractor for DockerFactory {
+    type Target = DockerFactoryTarget;
+
+    fn target_for_argv(&self, action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let k = &action_key.0;
+        if !k.starts_with("docker.push.") && k != "docker.pull" {
+            return None;
+        }
+        let image_ref = argv.iter().skip(1).find(|a| !a.starts_with('-'))?.clone();
+        let registry_host = extract_registry_host(&image_ref);
+        Some(DockerFactoryTarget {
+            provider: "docker",
+            registry_host,
+            image_ref,
+        })
+    }
+}
+
+impl NeedTemplate for DockerFactory {
+    type Need = DockerFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(DockerFactoryNeed)
+    }
+}
+
+impl ConstructFactory for DockerFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        _argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        let k = &key.0;
+
+        // Credential escape vectors — always fail closed.
+        if k.starts_with("docker.login.") || k.starts_with("docker.logout.") {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if k == "docker.run.privileged" {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // Authority-bearing payloads need analysis before materialization.
+        // Build: Dockerfile + context + base image pulls.
+        // Run: may pull images from private registries, mount volumes.
+        // Pull: can't determine public vs private at classification time.
+        if k == "docker.build" || k == "docker.run" || k == "docker.pull" {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        // Push: factory knows the target (registry + image) but cannot mint
+        // registry credentials yet — the resolver (registry credential broker)
+        // is unbuilt. Falls through to legacy path in lib.rs wiring.
+        if k.starts_with("docker.push.") {
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        // Local container operations (stop, start, kill, rm, rmi, tag,
+        // exec, cp) — no credentials needed.
+        FactoryDisposition::Credentialless
+    }
 }
 
 #[cfg(test)]
@@ -378,7 +450,7 @@ mod tests {
         assert!(classify_docker_argv(&[]).is_none());
     }
 
-    // T1: container lifecycle verbs (implementation-note-100)
+    // T1: container lifecycle verbs (implementation-note-98)
 
     #[test]
     fn stop_classified() {
@@ -458,5 +530,205 @@ mod tests {
         assert!(classify_docker_argv(&args(&["version"])).is_none());
         assert!(classify_docker_argv(&args(&["info"])).is_none());
         assert!(classify_docker_argv(&args(&["network", "ls"])).is_none());
+    }
+
+    // --- DockerFactory tests ---
+
+    #[test]
+    fn docker_factory_images_is_credentialless() {
+        let f = DockerFactory;
+        let a = args(&["images", "--format", "{{.Repository}}:{{.Tag}}"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn docker_factory_push_is_resolver_required() {
+        let f = DockerFactory;
+        let a = args(&["push", "myuser/myimage:latest"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn docker_factory_push_ecr_is_resolver_required() {
+        let f = DockerFactory;
+        let a = args(&[
+            "push",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/myrepo:v1",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn docker_factory_login_is_unsupported() {
+        let f = DockerFactory;
+        let a = args(&["login", "ghcr.io"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn docker_factory_privileged_run_is_unsupported() {
+        let f = DockerFactory;
+        let a = args(&["run", "--privileged", "--pid=host", "alpine"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn docker_factory_build_is_payload_analysis() {
+        let f = DockerFactory;
+        let a = args(&["build", "-t", "registry.example.com/app:latest", "."]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn docker_factory_run_needs_payload_analysis() {
+        let f = DockerFactory;
+        let a = args(&["run", "--rm", "alpine", "echo", "hi"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn docker_factory_pull_needs_payload_analysis() {
+        let f = DockerFactory;
+        let a = args(&["pull", "alpine:3.18"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn docker_factory_logout_is_unsupported() {
+        let f = DockerFactory;
+        let a = args(&["logout"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn docker_factory_exec_is_credentialless() {
+        let f = DockerFactory;
+        let a = args(&["exec", "-it", "ctr", "sh"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn docker_factory_rm_is_credentialless() {
+        let f = DockerFactory;
+        let a = args(&["rm", "-f", "old_container"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn docker_factory_stop_is_credentialless() {
+        let f = DockerFactory;
+        let a = args(&["stop", "my_container"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn docker_factory_target_extraction_push() {
+        let f = DockerFactory;
+        let a = args(&["push", "ghcr.io/org/image:v1"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "docker");
+        assert_eq!(target.registry_host, "ghcr.io");
+        assert_eq!(target.image_ref, "ghcr.io/org/image:v1");
+    }
+
+    #[test]
+    fn docker_factory_target_extraction_pull() {
+        let f = DockerFactory;
+        let a = args(&["pull", "ghcr.io/org/image:latest"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "docker");
+        assert_eq!(target.registry_host, "ghcr.io");
+        assert_eq!(target.image_ref, "ghcr.io/org/image:latest");
+    }
+
+    #[test]
+    fn docker_factory_target_extraction_pull_dockerhub() {
+        let f = DockerFactory;
+        let a = args(&["pull", "alpine:3.18"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.registry_host, "dockerhub");
+        assert_eq!(target.image_ref, "alpine:3.18");
+    }
+
+    #[test]
+    fn docker_factory_target_extraction_non_push_pull_returns_none() {
+        let f = DockerFactory;
+        let a = args(&["run", "--rm", "alpine"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert!(f.target_for_argv(&key, &a).is_none());
+    }
+
+    #[test]
+    fn docker_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/docker/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/docker.toml"),
+        )
+        .expect("docker manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &DockerFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

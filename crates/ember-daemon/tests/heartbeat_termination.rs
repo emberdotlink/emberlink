@@ -1,4 +1,4 @@
-//! implementation-note-48 T2 — heartbeat-lost dirty-exit.
+//! implementation-note-55 T2 — heartbeat-lost dirty-exit.
 //!
 //! H1 invariant (cohort-A test plan): every grant terminates in a signed
 //! Receipt across all four termination paths. This file pins the
@@ -72,11 +72,14 @@ fn create_terminating_session(
     let meta = SessionMeta {
         session_id: "sess-heartbeat-lost".to_string(),
         persona: persona_id.to_string(),
+        durable_persona: None,
         grant_id: grant_id.to_string(),
+        caller_binding_id: None,
         started_at,
         launcher_pid: FAKE_DEAD_PID,
-        workflow_id: None,
-        workflow_template: None,
+        authority_strict: false,
+        delegation_id: None,
+        delegation_template: None,
     };
     session_store.create(&meta).expect("create session meta");
 
@@ -237,11 +240,14 @@ fn live_pid_with_stale_heartbeat_does_not_terminate() {
     let meta = SessionMeta {
         session_id: "sess-live-pid".to_string(),
         persona: persona.id.clone(),
+        durable_persona: None,
         grant_id: grant.id.clone(),
+        caller_binding_id: None,
         started_at,
         launcher_pid: std::process::id(),
-        workflow_id: None,
-        workflow_template: None,
+        authority_strict: false,
+        delegation_id: None,
+        delegation_template: None,
     };
     session_store.create(&meta).expect("create session meta");
     let session_dir = sessions_root.path().join(&meta.session_id);
@@ -286,11 +292,14 @@ fn fresh_heartbeat_does_not_terminate_even_with_dead_pid() {
     let meta = SessionMeta {
         session_id: "sess-fresh-hb".to_string(),
         persona: persona.id.clone(),
+        durable_persona: None,
         grant_id: grant.id.clone(),
+        caller_binding_id: None,
         started_at: Utc::now(),
         launcher_pid: FAKE_DEAD_PID,
-        workflow_id: None,
-        workflow_template: None,
+        authority_strict: false,
+        delegation_id: None,
+        delegation_template: None,
     };
     session_store.create(&meta).expect("create session meta");
     let session_dir = sessions_root.path().join(&meta.session_id);
@@ -331,11 +340,14 @@ fn heartbeat_timeout_boundary_is_90_seconds() {
     let meta = SessionMeta {
         session_id: "sess-90s-boundary".to_string(),
         persona: persona.id.clone(),
+        durable_persona: None,
         grant_id: grant.id.clone(),
+        caller_binding_id: None,
         started_at: t_zero,
         launcher_pid: FAKE_DEAD_PID,
-        workflow_id: None,
-        workflow_template: None,
+        authority_strict: false,
+        delegation_id: None,
+        delegation_template: None,
     };
     session_store.create(&meta).expect("create session meta");
     let session_dir = sessions_root.path().join(&meta.session_id);
@@ -353,10 +365,10 @@ fn heartbeat_timeout_boundary_is_90_seconds() {
 }
 
 #[test]
-#[ignore = "T3 — real launcher under qember.sh; out of scope for implementation-note-48 PR"]
+#[ignore = "T3 — real launcher under qember.sh; out of scope for implementation-note-55 PR"]
 fn t3_real_launcher_sigkill() {
     // T3 placeholder per the brief. Spawn a real launcher under
     // `qember.sh`, send SIGKILL, and verify the daemon emits the
-    // Receipt within 120 s of wall-clock. Unlocked once the cohort-A
-    // T3 harness is wired (see TODO.md `public_release_e2e/main.rs`).
+    // Receipt within 120 s of wall-clock. Unlocked once the release
+    // T3 harness is wired.
 }

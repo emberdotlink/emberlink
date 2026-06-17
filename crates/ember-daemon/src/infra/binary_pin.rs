@@ -24,7 +24,7 @@
 //!   binary blake3 against the manifest. Mismatch → fail-closed.
 //! - Missing manifest → fail-closed with directive to run generate.
 //!
-//! Path 2 (filed as `implementation-note-199`) replaces the
+//! Path 2 (filed as `implementation-note-177`) replaces the
 //! daemon-self-signing model with Ember Systems IdentityRoot pre-signing
 //! in the release pipeline. Until then, this module's TOFU is the
 //! strongest v0.3-shippable check.
@@ -181,11 +181,15 @@ impl BinaryPinManifest {
 /// - **Linux:** `readlink("/proc/<pid>/exe")`.
 /// - **Other:** returns `None`.
 ///
-/// TOCTOU acknowledgment: the file at the returned path could be
-/// replaced between this resolve and a subsequent open+hash. For Linux
-/// this is mitigated by opening via the symlink (kernel resolves to the
-/// actually-exec'd inode). For macOS, accept a small window for v0.3 —
-/// pidfd-equivalent hardening lands in a follow-up.
+/// TOCTOU acknowledgment: this resolves a PATH STRING (`readlink` / `proc_pidpath`)
+/// which [`peer_binary_blake3`] then opens BY PATH — so the file at the returned
+/// path can be replaced between resolve and open+hash (a same-uid attacker
+/// renaming a signed binary onto the path). This is NOT inode-pinned: an earlier
+/// version of this comment falsely claimed Linux "opens via the symlink"; the
+/// code opens the resolved path, not the `/proc/<pid>/exe` fd. Callers that need
+/// inode pinning (the design bridge provenance gate) open `/proc/<pid>/exe`
+/// directly instead (see `infra::rpc_listener::hash_peer_exe`). pidfd/csops-grade
+/// hardening of THIS helper lands in a follow-up.
 #[cfg(target_os = "macos")]
 fn peer_binary_path(pid: i32) -> Option<std::path::PathBuf> {
     use std::os::raw::{c_char, c_int};

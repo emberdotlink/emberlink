@@ -1,148 +1,106 @@
-//! macOS System.keychain MEK passphrase reader.
+//! SE wrap/unwrap primitives for double-envelope custody (design).
 //!
-//! The installer stores the vault master-encryption-key passphrase as a
-//! generic-password item. The daemon reads it through `securityd` at startup,
-//! validates UTF-8, and returns it in a zeroizing buffer. Missing or denied
-//! keychain access is reported as an installation diagnostic.
+//! The CLI relay uses these to peel/apply the **outer** SE layer of the
+//! double-envelope custody model. The outer envelope is an SE-ECIES blob
+//! wrapping the DWK-encrypted inner blob; the CLI runs in the Aqua/501
+//! session domain where SE operations succeed.
+//!
+//! The SE key lives in the daemon process's DPK (Data Protection
+//! Keychain) under label [`VAULT_MEK_SE_LABEL`].
+//!
+//! ## What was removed (design S4)
+//!
+//! `ensure_vault_mek_se` — the function that provisioned the SE key and
+//! was called by the now-deleted `se_unseal_with_presence`. The DE path
+//! provisions the SE key through the CLI relay, not the daemon.
 
 #![cfg(target_os = "macos")]
 
-use std::path::Path;
-
+use ember_broker::secure_enclave::{EciesKeyLabel, se_unwrap, se_wrap};
 use zeroize::Zeroizing;
 
 use crate::infra::vault::VaultError;
 
-/// macOS keychain service identifier for the vault-MEK item. Shared
-/// between the install writer and the daemon reader.
+pub const VAULT_MEK_SE_LABEL: &str = "sh.emberlink.daemon.vault-mek";
+
+// design S4: `ensure_vault_mek_se` deleted — the DE path provisions
+// the SE key through the CLI relay, not the daemon. The `VAULT_MEK_SE_LABEL`
+// const is kept because the DWK AAD and CLI relay reference it.
+
+/// SE-wrap a 32-byte interactive key. Returns the opaque ECIES blob.
+pub fn wrap_interactive_key(label: &EciesKeyLabel, key: &[u8; 32]) -> Result<Vec<u8>, VaultError> {
+    se_wrap(label, key).map_err(|e| VaultError::Crypto(format!("vault MEK SE wrap failed: {e}")))
+}
+
+/// SE-unwrap a wrapped interactive key blob back to 32 bytes.
 ///
-/// Uses the product's reverse-DNS namespace.
-pub const VAULT_MEK_SERVICE: &str = "sh.emberlink.daemon";
+/// The returned key is in a `Zeroizing` wrapper; the caller copies it
+/// into the vault's `[u8; 32]` slot and the wrapper zeroizes the
+/// intermediate `Vec` on drop.
+pub fn unwrap_interactive_key(label: &EciesKeyLabel, blob: &[u8]) -> Result<[u8; 32], VaultError> {
+    let plaintext = Zeroizing::new(
+        se_unwrap(label, blob)
+            .map_err(|e| VaultError::Crypto(format!("vault MEK SE unwrap failed: {e}")))?,
+    );
+    if plaintext.len() != 32 {
+        return Err(VaultError::Crypto(format!(
+            "vault MEK SE unwrap produced {} bytes (expected 32)",
+            plaintext.len()
+        )));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&plaintext);
+    Ok(key)
+}
 
-/// macOS keychain account identifier for the vault-MEK item.
-pub const VAULT_MEK_ACCOUNT: &str = "vault-mek";
-
-/// Canonical path to the system keychain. The only macOS keychain that
-/// is brokered by `securityd` cross-session and cross-uid for items with
-/// permissive partition lists. Apple's own system daemons (`apsd`,
-/// `mDNSResponder`, `cfprefsd`, etc.) use the same pattern for their
-/// bootstrap credentials.
-pub const SYSTEM_KEYCHAIN_PATH: &str = "/Library/Keychains/System.keychain";
-
-/// Legacy SE-key label retained for the SSH-agent T1 path, which still
-/// generates session-scoped SE keys in the calling process's DPK. The
-/// vault-MEK lane no longer uses this label.
-pub const SE_KEY_LABEL: &str = "sh.emberlink.daemon.vault-mek";
-
-/// Read the MEK passphrase from `/Library/Keychains/System.keychain`,
-/// validate UTF-8, and return it wrapped in `Zeroizing` so the buffer is
-/// zeroed on drop.
-///
-/// `data_dir` is currently unused — the function signature is preserved
-/// for the caller (`vault.rs::resolve_passphrase`) so the System.keychain
-/// migration is a single-site change. A future revision may use
-/// `data_dir` for a stamp file marking "install has completed."
-///
-/// # Errors
-///
-/// - [`VaultError::Io`] if the keychain can't be opened, the item isn't
-///   present (operator hasn't run install), or the calling daemon
-///   doesn't have read access to the item (partition-list mismatch).
-/// - [`VaultError::Crypto`] if the keychain item contents are not valid
-///   UTF-8 (would indicate the item was tampered with — install writes a
-///   64-char ASCII hex passphrase).
-pub fn get_mek_passphrase(_data_dir: &Path) -> Result<Zeroizing<String>, VaultError> {
-    use security_framework::os::macos::keychain::SecKeychain;
-
-    let keychain = SecKeychain::open(SYSTEM_KEYCHAIN_PATH).map_err(|e| {
-        tracing::warn!(
-            path = SYSTEM_KEYCHAIN_PATH,
-            error = %e,
-            "SecKeychain::open failed"
-        );
-        VaultError::Io(format!(
-            "opening System.keychain at {SYSTEM_KEYCHAIN_PATH}: {e}"
-        ))
-    })?;
-
-    let (password_bytes, _item) = keychain
-        .find_generic_password(VAULT_MEK_SERVICE, VAULT_MEK_ACCOUNT)
-        .map_err(|e| {
-            tracing::warn!(
-                service = VAULT_MEK_SERVICE,
-                account = VAULT_MEK_ACCOUNT,
-                error = %e,
-                "MEK keychain item lookup failed"
-            );
-            VaultError::Io(format!(
-                "MEK keychain item not found or not accessible \
-                 (service={VAULT_MEK_SERVICE} account={VAULT_MEK_ACCOUNT}): \
-                 {e} — run `sudo ember daemon install` to provision"
-            ))
-        })?;
-
-    // SecKeychainItemPassword derefs to &[u8]. Copy into a Zeroizing<Vec>
-    // immediately so the bytes are scrubbed on drop even if the UTF-8
-    // conversion fails.
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(password_bytes.to_vec());
-
-    std::str::from_utf8(&plaintext)
-        .map(|s| Zeroizing::new(s.to_owned()))
-        .map_err(|e| {
-            tracing::warn!(error = %e, "MEK passphrase was not valid UTF-8");
-            VaultError::Crypto("MEK passphrase was not valid UTF-8 (see daemon log)".to_string())
-        })
+/// Test-only: create a stub SE label for vault MEK tests. Bypasses real
+/// SE key creation (which requires a signed binary). Same pattern as
+/// `set_lease_kek_for_test` in store.rs.
+#[cfg(test)]
+pub(crate) fn stub_vault_mek_label() -> EciesKeyLabel {
+    use ember_broker::secure_enclave::{new_stub_key, se_register_stub_key};
+    let handle = new_stub_key(VAULT_MEK_SE_LABEL);
+    se_register_stub_key(VAULT_MEK_SE_LABEL, &handle);
+    EciesKeyLabel::from_provisioned(VAULT_MEK_SE_LABEL)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// T1 — constants the install path and daemon reader share. Drift
-    /// here breaks the contract silently. The string values are wired
-    /// into operator-facing error messages (`security find-generic-password
-    /// -a vault-mek -s sh.emberlink.daemon`) so they're locked.
     #[test]
-    fn vault_mek_keychain_constants_stable() {
-        assert_eq!(VAULT_MEK_SERVICE, "sh.emberlink.daemon");
-        assert_eq!(VAULT_MEK_ACCOUNT, "vault-mek");
-        assert_eq!(SYSTEM_KEYCHAIN_PATH, "/Library/Keychains/System.keychain");
+    fn wrap_unwrap_round_trip() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let label = stub_vault_mek_label();
+
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).unwrap();
+
+        let blob = wrap_interactive_key(&label, &key).expect("wrap");
+        let recovered = unwrap_interactive_key(&label, &blob).expect("unwrap");
+        assert_eq!(recovered, key);
     }
 
-    /// T1 — missing keychain item produces an `Io` error pointing at
-    /// `sudo ember daemon install`. This is the operator-facing "you forgot
-    /// to install" diagnostic; the error text is part of the UX contract.
-    ///
-    /// `#[ignore]` because the test reads a process-global hardcoded
-    /// service/account (`sh.emberlink.daemon` / `vault-mek`) from the
-    /// real System.keychain and expects ABSENCE. On any host that has
-    /// run `sudo ember daemon install` (i.e. the operator's dev host running
-    /// the production daemon) the item is present and the test fails —
-    /// even when invoked through `cargo-env.sh --keyring-service
-    /// ember-daemon-qa --keyring-account qa`, because `get_mek_passphrase`
-    /// uses the hardcoded constants instead of the env-overridable
-    /// `EMBER_KEYRING_SERVICE` the rest of the suite respects. Run with
-    /// `cargo test -- --ignored` on a fresh dev host where install has
-    /// not run, or `sudo security delete-generic-password -a vault-mek
-    /// -s sh.emberlink.daemon /Library/Keychains/System.keychain` to
-    /// clear state first (DESTRUCTIVE — breaks the live daemon's vault).
-    /// Filed as `implementation-note-373` to
-    /// refactor `get_mek_passphrase` to accept service/account args so
-    /// the test can use unique strings that are guaranteed absent.
     #[test]
-    #[ignore]
-    fn missing_keychain_item_returns_install_hint() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err =
-            get_mek_passphrase(tmp.path()).expect_err("must fail when keychain item is absent");
+    fn unwrap_rejects_wrong_length() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let label = stub_vault_mek_label();
+
+        let short_key = [42u8; 16];
+        let blob = se_wrap(&label, &short_key).expect("wrap short");
+        let err = unwrap_interactive_key(&label, &blob).expect_err("must reject");
         match err {
-            VaultError::Io(msg) => {
-                assert!(
-                    msg.contains("ember daemon install"),
-                    "expected install hint in error message, got: {msg}"
-                );
-            }
-            other => panic!("expected VaultError::Io with install hint, got: {other:?}"),
+            VaultError::Crypto(msg) => assert!(msg.contains("16 bytes"), "{msg}"),
+            other => panic!("expected Crypto error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn label_constant_is_stable() {
+        assert_eq!(VAULT_MEK_SE_LABEL, "sh.emberlink.daemon.vault-mek");
     }
 }

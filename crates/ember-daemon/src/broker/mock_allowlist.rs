@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-142 (design §Component 2) —
+//! implementation-note-20 (design §Component 2) —
 //! parser + helper for `EMBER_ALLOW_MOCK_BROKERS`. MockBroker registration
 //! is now an explicit opt-in: missing provider credentials FAIL daemon
 //! startup unless the operator has named the provider in this allowlist.
@@ -13,8 +14,10 @@
 //! Receipts emitted by Mock-registered brokers stamp `mock_broker: true`
 //! (sibling to `dev_mode_active`) so any audit trail can distinguish
 //! "real credentials" from "Mock that returned a plausible-looking fake
-//! token." See `crate::infra::receipt::build_broker_materialization_envelope`
-//! / `build_broker_revocation_envelope` for the stamp wiring.
+//! token." See `crate::broker::handler::materialization::emit_materialization_audit_event`
+//! (audit-row stamp; materialization is an audit event, not a Receipt —
+//! design §B.6) and `crate::infra::receipt::build_broker_revocation_envelope`
+//! (revocation receipt stamp) for the stamp wiring.
 //!
 //! Checkpoint for headless ranker grep:
 //! **`dev_prod_parity_mock_broker_explicit_landed`** — this module's

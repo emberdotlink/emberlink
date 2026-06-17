@@ -1,3 +1,4 @@
+// CLASSIFICATION: PUBLIC
 
 //! `SO_PEERCRED` / `LOCAL_PEERCRED` extraction for the helper's UDS
 //! accept loop.

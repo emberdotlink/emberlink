@@ -10,3 +10,6 @@ core-crypto = { path = "../core-crypto" }
 core-types = { path = "../core-types" }
 core-event-types = { path = "../core-event-types" }
 serde_json = "1"
+
+[lints]
+workspace = true

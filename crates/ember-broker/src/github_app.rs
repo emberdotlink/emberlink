@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,7 +51,9 @@ pub struct GhAppCredentials {
     /// The installation ID for the target account or organisation.
     pub installation_id: String,
     /// PEM-encoded RSA private key (PKCS#8 or traditional PKCS#1).
-    pub private_key_pem: String,
+    /// Wrapped in `SecretString` — zeroized on drop so the PEM never
+    /// lingers in freed heap memory.
+    pub private_key_pem: SecretString,
 }
 
 /// A scoped, time-bound GitHub App installation token.
@@ -60,6 +63,22 @@ pub struct InstallationToken {
     pub token: String,
     /// When GitHub says this token expires (normally ~1 hour from mint time).
     pub expires_at: DateTime<Utc>,
+    /// The provider's **authoritative scope echo** from the access-token
+    /// response: the `permissions` GitHub actually granted, sorted for a stable
+    /// record. The provider-truth half of the materialization audit event
+    /// (design amendment 2 / design §B). Empty when GitHub omitted the field.
+    #[serde(default)]
+    pub granted_permissions: Vec<(String, String)>,
+    /// The repositories (full `owner/repo` names, sorted) the token is scoped to.
+    /// Empty when `repository_selection == "all"` (an all-repos token) or when
+    /// GitHub omitted the field — an empty/all echo fails the downstream
+    /// `native_upper_bound` bound closed rather than recording it as narrow.
+    #[serde(default)]
+    pub granted_repositories: Vec<String>,
+    /// GitHub's `repository_selection` — `"all"` or `"selected"`. `"all"` means
+    /// the token is NOT repo-bounded (the unbounded case).
+    #[serde(default)]
+    pub repository_selection: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +110,7 @@ pub fn build_jwt(
         iat: now_epoch_secs,
         exp,
     };
+    crate::install_jwt_crypto_provider();
     let header = Header::new(Algorithm::RS256);
     let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
         .map_err(|e| GhAppError::JwtSigning(e.to_string()))?;
@@ -132,6 +152,24 @@ pub fn build_access_token_request(
 struct GhAccessTokenResponse {
     token: String,
     expires_at: String, // RFC3339 from GitHub
+    /// Permissions GitHub actually granted (`{"contents":"read", ...}`). The
+    /// provider's authoritative scope echo (design amendment 2 / design §B).
+    #[serde(default)]
+    permissions: std::collections::HashMap<String, String>,
+    /// The repositories the token is scoped to — present when
+    /// `repository_selection == "selected"`.
+    #[serde(default)]
+    repositories: Vec<GhRepoRef>,
+    /// `"all"` (not repo-bounded) or `"selected"`.
+    #[serde(default)]
+    repository_selection: Option<String>,
+}
+
+/// One repository in the access-token response's `repositories` array. We keep
+/// only `full_name` (`owner/repo`) — the scope echo's target axis.
+#[derive(Debug, Deserialize)]
+struct GhRepoRef {
+    full_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,14 +293,18 @@ pub async fn mint_installation_token_with_client<C: HttpClient + ?Sized>(
             "installation_id is empty".to_string(),
         ));
     }
-    if creds.private_key_pem.is_empty() {
+    if creds.private_key_pem.expose_secret().is_empty() {
         return Err(GhAppError::NotConfigured(
             "private_key_pem is empty".to_string(),
         ));
     }
 
     let now_secs = Utc::now().timestamp();
-    let jwt = build_jwt(&creds.app_id, &creds.private_key_pem, now_secs)?;
+    let jwt = build_jwt(
+        &creds.app_id,
+        creds.private_key_pem.expose_secret(),
+        now_secs,
+    )?;
 
     let req_body = build_access_token_request(repos, permissions);
     let body_str = serde_json::to_string(&req_body)
@@ -289,9 +331,25 @@ pub async fn mint_installation_token_with_client<C: HttpClient + ?Sized>(
         .map_err(|e| GhAppError::Parse(format!("parse expires_at: {e}")))?
         .with_timezone(&Utc);
 
+    // Capture the provider's authoritative scope echo (design amendment 2 /
+    // design §B), sorted so the materialization audit record is byte-stable
+    // (GitHub's `permissions` object and `repositories` array have no
+    // guaranteed order; a `HashMap` iterates nondeterministically).
+    let mut granted_permissions: Vec<(String, String)> = parsed.permissions.into_iter().collect();
+    granted_permissions.sort();
+    let mut granted_repositories: Vec<String> = parsed
+        .repositories
+        .into_iter()
+        .map(|r| r.full_name)
+        .collect();
+    granted_repositories.sort();
+
     Ok(InstallationToken {
         token: parsed.token,
         expires_at,
+        granted_permissions,
+        granted_repositories,
+        repository_selection: parsed.repository_selection,
     })
 }
 
@@ -414,7 +472,7 @@ mod tests {
         let creds = GhAppCredentials {
             app_id: "12345".to_string(),
             installation_id: "67890".to_string(),
-            private_key_pem: pem,
+            private_key_pem: SecretString::from(pem),
         };
         let mock_body = serde_json::json!({
             "token": "ghs_test_token_xyz",
@@ -441,7 +499,7 @@ mod tests {
         let creds = GhAppCredentials {
             app_id: "12345".to_string(),
             installation_id: "67890".to_string(),
-            private_key_pem: pem,
+            private_key_pem: SecretString::from(pem),
         };
         let client = MockHttpClient {
             status: 401,
@@ -463,7 +521,7 @@ mod tests {
         let creds = GhAppCredentials {
             app_id: String::new(),
             installation_id: "67890".to_string(),
-            private_key_pem: "dummy".to_string(),
+            private_key_pem: SecretString::from("dummy".to_string()),
         };
         let client = MockHttpClient {
             status: 201,
@@ -481,7 +539,7 @@ mod tests {
         let creds = GhAppCredentials {
             app_id: "12345".to_string(),
             installation_id: String::new(),
-            private_key_pem: pem,
+            private_key_pem: SecretString::from(pem),
         };
         let client = MockHttpClient {
             status: 201,
@@ -498,7 +556,7 @@ mod tests {
         let creds = GhAppCredentials {
             app_id: "12345".to_string(),
             installation_id: "67890".to_string(),
-            private_key_pem: String::new(),
+            private_key_pem: SecretString::from(String::new()),
         };
         let client = MockHttpClient {
             status: 201,

@@ -5,6 +5,7 @@
 //! GitHub App provisioning, socket/plist/install paths, daemon PID, manifest
 //! fingerprint, registered broker count, and trust roots.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use super::{gh_app, identity_root};
 use crate::dev_runtime_artifacts::{DevRuntimeArtifactKind, runtime_artifacts};

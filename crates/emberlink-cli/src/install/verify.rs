@@ -44,13 +44,19 @@
 //!
 //! [acceptance criterion]: ../../../release-checklist
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sigstore::cosign::payload::SimpleSigning;
+use sigstore::{
+    cosign::{Client as CosignClient, CosignCapabilities, bundle::SignedArtifactBundle},
+    crypto::{CosignVerificationKey, SigningScheme},
+};
 
 use core_crypto::canonicalize_jcs;
 use ember_update::in_toto::{self, SignedEnvelope};
@@ -189,13 +195,23 @@ pub struct TrustedPublisher {
 
 /// The official Emberlink release publisher.
 ///
-/// The corresponding Ed25519 secret key is held in the project's hardware
-/// security module — see `docs/install-supply-chain.md` §"Publisher key
-/// custody". The base64 string here is a placeholder that the release
-/// pipeline will overwrite once the production key is provisioned (implementation-note-492
-/// follow-up). Until then, `verify_install_bundle` will fail-closed with
-/// `BadPublisherKey` because the placeholder isn't a valid Ed25519 point.
+/// The corresponding Ed25519 secret key is the minisign release key custody-
+/// sealed by the operator (key ID `E8CCC724654C2D95`; minisign-framed pubkey
+/// `RWSVLUxlJMfM6FYUUClkb8ssL2pmBw+vKrmH03RYO89c8KpvzFt31GQa` shipped in
+/// `web/sh/install.sh:30` as the curl-pipe trust anchor). This module embeds
+/// only the raw 32-byte Ed25519 public-key portion so the Rust-side bundle
+/// verifier can validate signatures without minisign framing logic.
+///
+/// Provenance + custody memo: `akasha/raw/emberlink/ops/identity-root-key-2026-06.md`.
 pub const EMBERLINK_RELEASE_PUBLISHER_DID: &str = "did:web:ember.link";
+
+// ember_identity_root_pubkey_provisioned — checkpoint for
+// implementation-note-421. Raw 32-byte Ed25519 public key
+// (extracted from the minisign-framed pubkey by skipping the 2-byte
+// signature algorithm prefix + 8-byte key ID). Round-trips with the
+// production minisign key ID E8CCC724654C2D95.
+pub const EMBERLINK_RELEASE_PUBLISHER_ED25519_B64: &str =
+    "VhRQKWRvyywvamYHD68quYfTdFg7z1zwqm/MW3fUZBo=";
 
 /// Compute the publisher trust list given any operator-supplied additions.
 ///
@@ -203,11 +219,7 @@ pub const EMBERLINK_RELEASE_PUBLISHER_DID: &str = "did:web:ember.link";
 pub fn default_trust_list() -> Vec<TrustedPublisher> {
     vec![TrustedPublisher {
         publisher_did: EMBERLINK_RELEASE_PUBLISHER_DID.to_string(),
-        // Placeholder — production key will be provisioned via the release
-        // pipeline (see `docs/install-supply-chain.md` §"Publisher key
-        // custody"). Until then, verification falls back to
-        // `BadPublisherKey`, which is the correct fail-closed default.
-        ed25519_pub_b64: "PLACEHOLDER_PUBLISHER_KEY_NOT_YET_PROVISIONED".to_string(),
+        ed25519_pub_b64: EMBERLINK_RELEASE_PUBLISHER_ED25519_B64.to_string(),
     }]
 }
 
@@ -358,6 +370,146 @@ pub fn verify_bundle_in_toto_envelope(
 // bundle being installed.  The `verify_install_bundle` call above handles the Ember-IdentityRoot
 // Ed25519 witness; the channel pointer verification is the discovery / freshness layer on top.
 
+const SIGSTORE_KEYLESS_PUBLISHER: &str = "sigstore/keyless";
+const REKOR_PUBLIC_KEY_ID: &str =
+    "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d";
+const REKOR_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwr\n\
+kBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==\n\
+-----END PUBLIC KEY-----\n";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RekorHashedrekord {
+    api_version: String,
+    kind: String,
+    spec: RekorHashedrekordSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct RekorHashedrekordSpec {
+    data: RekorHashedrekordData,
+    signature: RekorHashedrekordSignature,
+}
+
+#[derive(Debug, Deserialize)]
+struct RekorHashedrekordData {
+    hash: RekorHashedrekordHash,
+}
+
+#[derive(Debug, Deserialize)]
+struct RekorHashedrekordHash {
+    algorithm: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RekorHashedrekordSignature {
+    content: String,
+    public_key: RekorPublicKey,
+}
+
+#[derive(Debug, Deserialize)]
+struct RekorPublicKey {
+    content: String,
+}
+
+impl RekorHashedrekord {
+    fn verify_for_bundle(
+        &self,
+        blob: &[u8],
+        bundle: &SignedArtifactBundle,
+    ) -> Result<(), VerifyError> {
+        if self.api_version != "0.0.1" {
+            return Err(bad_sigstore_signature(format!(
+                "unsupported Rekor apiVersion {}",
+                self.api_version
+            )));
+        }
+        if self.kind != "hashedrekord" {
+            return Err(bad_sigstore_signature(format!(
+                "unsupported Rekor entry kind {}",
+                self.kind
+            )));
+        }
+        if !self.spec.data.hash.algorithm.eq_ignore_ascii_case("sha256") {
+            return Err(bad_sigstore_signature(format!(
+                "unsupported Rekor digest algorithm {}",
+                self.spec.data.hash.algorithm
+            )));
+        }
+
+        let expected_digest = hex::encode(Sha256::digest(blob));
+        if self.spec.data.hash.value != expected_digest {
+            return Err(bad_sigstore_signature(format!(
+                "Rekor hashedrekord digest mismatches manifest hash (expected sha256:{}, log carried sha256:{})",
+                expected_digest, self.spec.data.hash.value
+            )));
+        }
+
+        if self.spec.signature.content != bundle.base64_signature {
+            return Err(bad_sigstore_signature(
+                "Rekor hashedrekord signature does not match cosign bundle signature".to_string(),
+            ));
+        }
+
+        if self.spec.signature.public_key.content != bundle.cert {
+            return Err(bad_sigstore_signature(
+                "Rekor hashedrekord public key does not match cosign bundle certificate"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+fn bad_sigstore_signature(detail: impl Into<String>) -> VerifyError {
+    VerifyError::BadSignature {
+        publisher_did: SIGSTORE_KEYLESS_PUBLISHER.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn rekor_public_keys() -> Result<BTreeMap<String, CosignVerificationKey>, VerifyError> {
+    let key =
+        CosignVerificationKey::from_pem(REKOR_PUBLIC_KEY_PEM.as_bytes(), &SigningScheme::default())
+            .map_err(|e| bad_sigstore_signature(format!("Rekor public key parse failed: {e}")))?;
+    Ok(BTreeMap::from([(REKOR_PUBLIC_KEY_ID.to_string(), key)]))
+}
+
+fn verify_sigstore_witness(blob: &[u8], sigstore_sig: &[u8]) -> Result<(), VerifyError> {
+    if sigstore_sig.is_empty() {
+        return Err(bad_sigstore_signature(
+            "sigstore witness is absent — manifest must be co-signed by release.yml",
+        ));
+    }
+
+    let bundle_json = std::str::from_utf8(sigstore_sig)
+        .map_err(|e| bad_sigstore_signature(format!("sigstore witness is not UTF-8: {e}")))?;
+    let bundle = SignedArtifactBundle::new_verified(bundle_json, &rekor_public_keys()?)
+        .map_err(|e| bad_sigstore_signature(format!("cosign/Rekor bundle verify failed: {e}")))?;
+
+    let rekor_body = base64::engine::general_purpose::STANDARD
+        .decode(&bundle.rekor_bundle.payload.body)
+        .map_err(|e| bad_sigstore_signature(format!("Rekor payload body is not base64: {e}")))?;
+    let rekor_body: RekorHashedrekord = serde_json::from_slice(&rekor_body)
+        .map_err(|e| bad_sigstore_signature(format!("Rekor hashedrekord parse failed: {e}")))?;
+    rekor_body.verify_for_bundle(blob, &bundle)?;
+
+    let cert_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&bundle.cert)
+        .map_err(|e| bad_sigstore_signature(format!("cosign bundle cert is not base64: {e}")))?;
+    let cert = std::str::from_utf8(&cert_bytes)
+        .map_err(|e| bad_sigstore_signature(format!("cosign bundle cert is not UTF-8: {e}")))?;
+
+    <CosignClient as CosignCapabilities>::verify_blob(cert, &bundle.base64_signature, blob)
+        .map_err(|e| bad_sigstore_signature(format!("cosign blob signature failed: {e}")))?;
+
+    Ok(())
+}
+
 /// Dual-witness verification for image manifests hosted at `manifests.emberlink.dev`.
 ///
 /// Each manifest blob served by the R2 + Worker stack
@@ -369,9 +521,8 @@ pub fn verify_bundle_in_toto_envelope(
 ///    `.github/workflows/release.yml` using GitHub Actions OIDC identity.
 ///    The signature is bound to the Rekor public transparency log, so there is
 ///    no long-lived cosign signing key. This witness is passed as
-///    `sigstore_sig` (the raw bytes that cosign would verify, i.e. the decoded
-///    `.sig` sidecar). Currently modelled as an opaque byte slice; the full
-///    cosign-verify integration is left for a follow-up task (implementation-note-493).
+///    `sigstore_sig`; the verifier requires a Rekor-backed cosign
+///    signed-artifact bundle and rejects digest-only witness shapes.
 ///
 /// 2. **Ember-IdentityRoot Ed25519** — the release pipeline signs the manifest
 ///    blob with the project's hardware-bound Ed25519 key (see
@@ -381,8 +532,9 @@ pub fn verify_bundle_in_toto_envelope(
 /// # Arguments
 ///
 /// - `blob` — the raw manifest JSON bytes fetched from `manifests.emberlink.dev`.
-/// - `sigstore_sig` — raw bytes of the sigstore keyless signature sidecar.
-///   Must be non-empty; deep cosign verification is a follow-up.
+/// - `sigstore_sig` — bytes of the sigstore witness sidecar. Must be
+///   non-empty, verify against Rekor's signed entry timestamp, and carry a
+///   hashedrekord entry matching `sha256(blob)`.
 /// - `ember_id_root_sig` — 64-byte Ed25519 signature over `blob`, produced by
 ///   the Ember-IdentityRoot signing key.
 /// - `ember_id_root_key` — the Ember-IdentityRoot Ed25519 verifying key.
@@ -404,37 +556,12 @@ pub fn verify_manifest_dual_witness(
     ember_id_root_sig: &[u8],
     ember_id_root_key: &VerifyingKey,
 ) -> Result<(), VerifyError> {
-    // Witness 1: sigstore keyless — parse `sigstore_sig` as a cosign
-    // SimpleSigning envelope (JCS-encoded JSON) and verify its
-    // `critical.image.docker_manifest_digest` matches `sha256(blob)`. This is
-    // implementation-note-494 (anchor:
-    // sigstore_witness_envelope_digest_verified). Fulcio cert chain
-    // verification + Rekor inclusion-proof verification are deferred to
-    // implementation-note-439 and -C — a determined attacker who can
-    // forge a SimpleSigning envelope locally can still pass this slice until
-    // -B and -C land.
-    if sigstore_sig.is_empty() {
-        return Err(VerifyError::BadSignature {
-            publisher_did: "sigstore/keyless".to_string(),
-            detail: "sigstore witness is absent — manifest must be co-signed by release.yml"
-                .to_string(),
-        });
-    }
-    let envelope: SimpleSigning =
-        serde_json::from_slice(sigstore_sig).map_err(|e| VerifyError::BadSignature {
-            publisher_did: "sigstore/keyless".to_string(),
-            detail: format!("envelope parse: {}", e),
-        })?;
-    let blob_digest = format!("sha256:{}", hex::encode(Sha256::digest(blob)));
-    if !envelope.satisfies_manifest_digest(&blob_digest) {
-        return Err(VerifyError::BadSignature {
-            publisher_did: "sigstore/keyless".to_string(),
-            detail: format!(
-                "envelope payload digest mismatches manifest hash (expected {}, envelope carried {})",
-                blob_digest, envelope.critical.image.docker_manifest_digest,
-            ),
-        });
-    }
+    // Witness 1: sigstore keyless — anchor:
+    // sigstore_witness_real_verification. Verify a Rekor-backed cosign
+    // signed-artifact bundle, bind the Rekor hashedrekord entry to
+    // `sha256(blob)`, and verify the blob signature with the certificate
+    // carried by the bundle.
+    verify_sigstore_witness(blob, sigstore_sig)?;
 
     // Witness 2: Ember-IdentityRoot Ed25519 — verify raw signature over blob.
     if ember_id_root_sig.len() != 64 {
@@ -681,13 +808,19 @@ mod tests {
         (sk, vk)
     }
 
+    const REAL_REKOR_ARTIFACT: &[u8] =
+        include_bytes!("../../tests/fixtures/cosign/real-rekor-artifact.txt");
+    const REAL_REKOR_BUNDLE: &[u8] =
+        include_bytes!("../../tests/fixtures/cosign/real-rekor.cosign-bundle.json");
+    const NO_REKOR_MANIFEST: &[u8] = include_bytes!("../../tests/fixtures/cosign/manifest.json");
+    const NO_REKOR_V03_BUNDLE: &[u8] =
+        include_bytes!("../../tests/fixtures/cosign/manifest.cosign-bundle.json");
+
     /// Build a cosign `SimpleSigning` envelope whose
     /// `critical.image.docker-manifest-digest` matches `sha256(blob)`.
     ///
-    /// Produces the canonical cosign JSON shape (kebab-case keys, type
-    /// `"cosign container image signature"`) so the envelope deserializes
-    /// via `sigstore::cosign::payload::SimpleSigning` deserialization
-    /// inside `verify_manifest_dual_witness`.
+    /// This shape is now a negative fixture: digest-only SimpleSigning JSON is
+    /// not enough to satisfy the Rekor-backed sigstore witness gate.
     fn cosign_envelope_for(blob: &[u8]) -> Vec<u8> {
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(blob)));
         let envelope = serde_json::json!({
@@ -703,31 +836,53 @@ mod tests {
 
     #[test]
     fn dual_witness_accepts_valid_manifest() {
+        // Anchor: sigstore_witness_real_verification.
         let (sk, vk) = dual_witness_fixture();
-        let blob = b"{ \"version\": \"0.4.0\", \"digest\": \"sha256:abc\" }";
+        let blob = REAL_REKOR_ARTIFACT;
         let sig: ed25519_dalek::Signature = sk.sign(blob);
-        let sigstore_sig = cosign_envelope_for(blob);
 
-        verify_manifest_dual_witness(blob, &sigstore_sig, &sig.to_bytes(), &vk)
-            .expect("valid dual-witness should pass");
+        verify_manifest_dual_witness(blob, REAL_REKOR_BUNDLE, &sig.to_bytes(), &vk)
+            .expect("real Rekor-backed cosign bundle + IdentityRoot signature should pass");
     }
 
     #[test]
     fn dual_witness_rejects_tampered_manifest() {
         let (sk, vk) = dual_witness_fixture();
-        let blob = b"{ \"version\": \"0.4.0\", \"digest\": \"sha256:abc\" }";
-        let sig: ed25519_dalek::Signature = sk.sign(blob);
+        let tampered = b"something!\n";
+        let sig: ed25519_dalek::Signature = sk.sign(tampered);
 
-        // Tamper: verify a DIFFERENT blob against the original signature.
-        // The envelope is built against `tampered` so the sigstore witness
-        // passes, isolating the failure to the Ember-IdentityRoot witness.
-        let tampered = b"{ \"version\": \"0.4.0\", \"digest\": \"sha256:EVIL\" }";
-        let tampered_envelope = cosign_envelope_for(tampered);
-        let err = verify_manifest_dual_witness(tampered, &tampered_envelope, &sig.to_bytes(), &vk)
+        let err = verify_manifest_dual_witness(tampered, REAL_REKOR_BUNDLE, &sig.to_bytes(), &vk)
             .unwrap_err();
+        match err {
+            VerifyError::BadSignature {
+                ref publisher_did,
+                ref detail,
+            } => {
+                assert_eq!(publisher_did, SIGSTORE_KEYLESS_PUBLISHER);
+                assert!(
+                    detail.contains("Rekor hashedrekord digest mismatches manifest hash"),
+                    "expected Rekor digest mismatch detail, got {detail:?}"
+                );
+            }
+            other => panic!("expected BadSignature(Rekor digest mismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dual_witness_rejects_bad_ember_id_root_sig() {
+        let (sk, vk) = dual_witness_fixture();
+        let bad_sig: ed25519_dalek::Signature = sk.sign(b"different manifest");
+
+        let err = verify_manifest_dual_witness(
+            REAL_REKOR_ARTIFACT,
+            REAL_REKOR_BUNDLE,
+            &bad_sig.to_bytes(),
+            &vk,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, VerifyError::SignatureMismatch { .. }),
-            "expected SignatureMismatch on tampered blob, got {err:?}"
+            "expected SignatureMismatch on bad Ember-IdentityRoot sig, got {err:?}"
         );
     }
 
@@ -748,73 +903,90 @@ mod tests {
     #[test]
     fn dual_witness_rejects_malformed_ember_id_root_sig() {
         let (_sk, vk) = dual_witness_fixture();
-        let blob = b"{ \"version\": \"0.4.0\" }";
-        let sigstore_sig = cosign_envelope_for(blob);
 
         // Pass a 32-byte (truncated) signature instead of 64.
         let short_sig = vec![0u8; 32];
-        let err = verify_manifest_dual_witness(blob, &sigstore_sig, &short_sig, &vk).unwrap_err();
+        let err =
+            verify_manifest_dual_witness(REAL_REKOR_ARTIFACT, REAL_REKOR_BUNDLE, &short_sig, &vk)
+                .unwrap_err();
         assert!(
             matches!(err, VerifyError::BadSignature { .. }),
             "expected BadSignature for malformed Ember-IdentityRoot sig, got {err:?}"
         );
     }
 
-    /// implementation-note-494 T1: bytes that don't deserialize as
-    /// a cosign SimpleSigning envelope must be rejected before any digest
-    /// comparison — the previous `if sigstore_sig.is_empty()` stub accepted
-    /// arbitrary non-empty bytes; this test pins that the structural-parse
-    /// gate now closes that surface.
+    /// implementation-note-422 T1: a fake non-empty sigstore witness
+    /// must be rejected; the old stub accepted any non-empty bytes.
     #[test]
-    fn dual_witness_rejects_non_envelope_bytes() {
+    fn dual_witness_rejects_fake_sigstore_sig_fixture() {
         let (sk, vk) = dual_witness_fixture();
-        let blob = b"{ \"version\": \"0.4.0\" }";
+        let blob = REAL_REKOR_ARTIFACT;
         let sig: ed25519_dalek::Signature = sk.sign(blob);
 
-        // Pre-slice stub byte string — not JSON, must fail to parse.
-        let bogus = b"cosign-keyless-stub-sig";
+        let bogus = b"fake-sigstore-sig";
         let err = verify_manifest_dual_witness(blob, bogus, &sig.to_bytes(), &vk).unwrap_err();
         match err {
             VerifyError::BadSignature {
                 ref publisher_did,
                 ref detail,
             } => {
-                assert_eq!(publisher_did, "sigstore/keyless");
+                assert_eq!(publisher_did, SIGSTORE_KEYLESS_PUBLISHER);
                 assert!(
-                    detail.starts_with("envelope parse:"),
-                    "expected `envelope parse:` prefix, got {detail:?}"
+                    detail.contains("cosign/Rekor bundle verify failed"),
+                    "expected cosign/Rekor parse detail, got {detail:?}"
                 );
             }
-            other => panic!("expected BadSignature(envelope parse), got {other:?}"),
+            other => panic!("expected BadSignature(cosign/Rekor parse), got {other:?}"),
         }
     }
 
-    /// implementation-note-494 T1: a structurally-valid envelope
-    /// whose `docker-manifest-digest` does not match `sha256(blob)` must be
-    /// rejected — checkpoint `sigstore_witness_envelope_digest_verified`.
     #[test]
-    fn dual_witness_rejects_envelope_with_digest_mismatch() {
+    fn dual_witness_rejects_digest_only_simple_signing_envelope() {
         let (sk, vk) = dual_witness_fixture();
         let blob = b"{ \"version\": \"0.4.0\" }";
         let sig: ed25519_dalek::Signature = sk.sign(blob);
+        let envelope = cosign_envelope_for(blob);
 
-        // Envelope built for a DIFFERENT blob → digest mismatch.
-        let other_blob = b"{ \"version\": \"99.0.0\" }";
-        let envelope_for_other = cosign_envelope_for(other_blob);
-        let err = verify_manifest_dual_witness(blob, &envelope_for_other, &sig.to_bytes(), &vk)
-            .unwrap_err();
+        let err = verify_manifest_dual_witness(blob, &envelope, &sig.to_bytes(), &vk).unwrap_err();
         match err {
             VerifyError::BadSignature {
                 ref publisher_did,
                 ref detail,
             } => {
-                assert_eq!(publisher_did, "sigstore/keyless");
+                assert_eq!(publisher_did, SIGSTORE_KEYLESS_PUBLISHER);
                 assert!(
-                    detail.contains("envelope payload digest mismatches manifest hash"),
-                    "expected digest-mismatch detail, got {detail:?}"
+                    detail.contains("cosign/Rekor bundle verify failed"),
+                    "expected cosign/Rekor rejection detail, got {detail:?}"
                 );
             }
-            other => panic!("expected BadSignature(digest mismatch), got {other:?}"),
+            other => panic!("expected BadSignature(cosign/Rekor rejection), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dual_witness_rejects_no_rekor_v03_bundle_fixture() {
+        let (sk, vk) = dual_witness_fixture();
+        let sig: ed25519_dalek::Signature = sk.sign(NO_REKOR_MANIFEST);
+
+        let err = verify_manifest_dual_witness(
+            NO_REKOR_MANIFEST,
+            NO_REKOR_V03_BUNDLE,
+            &sig.to_bytes(),
+            &vk,
+        )
+        .unwrap_err();
+        match err {
+            VerifyError::BadSignature {
+                ref publisher_did,
+                ref detail,
+            } => {
+                assert_eq!(publisher_did, SIGSTORE_KEYLESS_PUBLISHER);
+                assert!(
+                    detail.contains("cosign/Rekor bundle verify failed"),
+                    "expected no-Rekor v0.3 bundle rejection detail, got {detail:?}"
+                );
+            }
+            other => panic!("expected BadSignature(no Rekor), got {other:?}"),
         }
     }
 }

@@ -1,4 +1,5 @@
-//! T2 integration tests for EMBER-INIT-FIRST-implementation-note-467.
+//! CLASSIFICATION: PUBLIC
+//! T2 integration tests for EMBER-INIT-FIRST-implementation-note-444.
 //!
 //! Verifies that `ember init` emits a real signed Grant Receipt v2 envelope
 //! to `<data_dir>/receipts/first.json`, and that re-running is idempotent
@@ -10,6 +11,8 @@
 //! JSON field assertions and idempotency guard without spawning a process.
 
 use std::fs;
+use std::io::{BufRead as _, Write as _};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -21,6 +24,102 @@ use emberlink_cli::onboarding::first_grant::{
 
 fn ember_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ember")
+}
+
+fn spawn_fake_init_daemon(
+    socket_path: PathBuf,
+    receipt_already_exists: bool,
+) -> std::thread::JoinHandle<()> {
+    fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket dir");
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind fake init daemon");
+
+    std::thread::spawn(move || {
+        let signer = core_crypto::FixtureSigner::new("init-first-grant-binary-daemon");
+        let public_key = signer.public_key().0.clone();
+        let persona_id = "persona-rpc-bin";
+
+        listener
+            .set_nonblocking(true)
+            .expect("set fake init daemon nonblocking");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_create_persona = false;
+        let mut saw_build_first_grant_receipt = receipt_already_exists;
+
+        while std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("restore blocking on fake init daemon stream");
+                    stream
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if saw_create_persona && saw_build_first_grant_receipt {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                Err(err) => panic!("fake init daemon accept error: {err}"),
+            };
+            let mut reader =
+                std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("read fake init daemon request");
+            let request: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("parse fake init daemon request");
+
+            let response = match request["method"].as_str().unwrap() {
+                "create_persona" => {
+                    saw_create_persona = true;
+                    assert_eq!(request["params"]["name"], serde_json::json!("root"));
+                    serde_json::json!({
+                        "id": request["id"],
+                        "result": {
+                            "id": persona_id,
+                            "name": "root",
+                            "public_key": public_key,
+                        },
+                    })
+                }
+                "build_init_first_grant_receipt" => {
+                    saw_build_first_grant_receipt = true;
+                    assert_eq!(
+                        request["params"]["persona_id"],
+                        serde_json::json!(persona_id)
+                    );
+                    let file =
+                        ember_daemon::infra::init_first_grant::build_first_grant_receipt_file(
+                            persona_id, &signer,
+                        )
+                        .expect("build first-grant receipt");
+                    serde_json::json!({
+                        "id": request["id"],
+                        "result": serde_json::to_value(file).expect("serialize receipt file"),
+                    })
+                }
+                other => panic!("unexpected init daemon method: {other}"),
+            };
+
+            let mut encoded = serde_json::to_string(&response).expect("encode fake response");
+            encoded.push('\n');
+            stream
+                .write_all(encoded.as_bytes())
+                .expect("write fake init daemon response");
+        }
+
+        assert!(
+            saw_create_persona,
+            "fake init daemon never received create_persona"
+        );
+        assert!(
+            saw_build_first_grant_receipt,
+            "fake init daemon never received build_init_first_grant_receipt"
+        );
+    })
 }
 
 /// Minimal config.toml that points data_dir and socket_dir at our tmp paths.
@@ -44,6 +143,12 @@ fn write_config(tmp: &tempfile::TempDir) -> PathBuf {
 
 /// Run `ember init --config <path>` with passphrase env, return (stdout, stderr, exit).
 fn run_ember_init(config_path: &std::path::Path) -> (String, String, i32) {
+    let tmp_root = config_path.parent().expect("config parent");
+    let receipt_already_exists = tmp_root.join("data/receipts/first.json").exists();
+    let server = spawn_fake_init_daemon(
+        tmp_root.join("run").join("daemon.sock"),
+        receipt_already_exists,
+    );
     let out = Command::new(ember_bin())
         .args(["init", "--config", config_path.to_str().unwrap()])
         .env("EMBER_VAULT_PASSPHRASE", "test-receipt-passphrase")
@@ -52,6 +157,7 @@ fn run_ember_init(config_path: &std::path::Path) -> (String, String, i32) {
         .env("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1")
         .output()
         .expect("spawn ember init");
+    server.join().expect("fake init daemon thread");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -144,6 +250,14 @@ fn ember_init_stdout_contains_receipt_path_and_sentinel() {
         stdout.contains(INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL),
         "stdout must contain checkpoint '{}'; got:\n{stdout}",
         INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL
+    );
+    assert!(
+        stdout.contains("Ember ready"),
+        "stdout should render the daemon-backed init summary; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("-- First Grant Receipt --"),
+        "stdout should no longer use the legacy receipt transcript; got:\n{stdout}"
     );
 }
 

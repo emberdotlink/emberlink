@@ -59,7 +59,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, IdentityRef, MintStamp,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -541,6 +543,12 @@ impl Broker for AzureCliBroker {
             token: SecretString::from(parsed.access_token),
             expires_at,
             materialization_id,
+            mint_stamp: MintStamp::Identity {
+                identity: IdentityRef {
+                    provider: BrokerProvider::AzureCli,
+                    identity: format!("{}/{}", self.sp.tenant_id, self.sp.client_id),
+                },
+            },
         })
     }
 
@@ -682,6 +690,13 @@ mod tests {
             provider: BrokerProvider::AzureCli,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -1358,5 +1373,28 @@ mod tests {
             matches!(err, BrokerError::PolicyRejected(_)),
             "expected PolicyRejected for AADSTS70021, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn issue_mint_stamp_records_service_principal_identity() {
+        let mock = Arc::new(MockAzureClient::new().with_response(200, token_ok_body()));
+        let broker = AzureCliBroker::with_client(fixture_sp(), mock);
+        let req = azure_request(
+            serde_json::json!({ "resource": "https://management.azure.com/", "scope": [], "ttl_seconds": 3600 }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        match &cred.mint_stamp {
+            MintStamp::Identity { identity } => {
+                assert_eq!(identity.provider, BrokerProvider::AzureCli);
+                assert_eq!(
+                    identity.identity,
+                    "11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                );
+            }
+            other => panic!("expected MintStamp::Identity, got {other:?}"),
+        }
     }
 }

@@ -2,12 +2,14 @@
 //!
 //! Exercises `emberlink_cli::call_daemon_method` against a fake Unix socket
 //! daemon so the library is compiled in normal mode (`cfg(not(test))` for the
-//! library itself). This pins the operator-facing contract after the auto-
-//! unlock retry path exhausts:
+//! library itself). This pins the operator-facing contract for a locked vault.
 //!
-//! - first RPC returns a locked-session daemon error
-//! - auto-unlock retry calls `vault_unlock_begin`
-//! - `vault_unlock_begin` also returns a locked-session daemon error
+//! design slice 4 C retired the forgeable native/managed vault-unlock ceremony
+//! (and the client-side auto-unlock retry). So:
+//!
+//! - the RPC returns a locked-session daemon error
+//! - `call_daemon_method` does NOT retry with `vault_unlock_begin` — it surfaces
+//!   the daemon's guidance directly
 //! - the surfaced `ValidationError` must contain guidance, not the raw daemon
 //!   payload
 
@@ -16,7 +18,10 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 use std::time::Duration;
 
-fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> std::os::unix::net::UnixStream {
+fn accept_with_timeout(
+    listener: &UnixListener,
+    timeout: Duration,
+) -> std::os::unix::net::UnixStream {
     listener
         .set_nonblocking(true)
         .expect("set_nonblocking on listener");
@@ -41,7 +46,7 @@ fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> std::os::u
 }
 
 #[test]
-fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
+fn call_daemon_method_locked_vault_surfaces_guidance_without_retry() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let socket_path = tmp.path().join("daemon.sock");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -53,34 +58,34 @@ fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
             let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
             ready_tx.send(()).expect("signal ready");
 
-            for expected_method in ["create_persona", "vault_unlock_begin"] {
-                let mut stream = accept_with_timeout(&listener, Duration::from_secs(10));
-                let mut reader = std::io::BufReader::new(
-                    stream.try_clone().expect("clone fake daemon stream"),
-                );
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .expect("read fake daemon request");
-                let request: serde_json::Value =
-                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
-                assert_eq!(request["method"], serde_json::json!(expected_method));
+            // design slice 4 C: exactly ONE request — the client no longer
+            // retries with `vault_unlock_begin`. The locked-vault error is
+            // surfaced as guidance directly.
+            let mut stream = accept_with_timeout(&listener, Duration::from_secs(10));
+            let mut reader =
+                std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("read fake daemon request");
+            let request: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("parse fake daemon request");
+            assert_eq!(request["method"], serde_json::json!("create_persona"));
 
-                let response = serde_json::json!({
-                    "id": request["id"],
-                    "error": {
-                        "code": -32030,
-                        "message": "create_persona denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth",
-                    }
-                });
+            let response = serde_json::json!({
+                "id": request["id"],
+                "error": {
+                    "code": -32030,
+                    "message": "create_persona denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth",
+                }
+            });
 
-                let mut encoded =
-                    serde_json::to_string(&response).expect("encode fake daemon response");
-                encoded.push('\n');
-                stream
-                    .write_all(encoded.as_bytes())
-                    .expect("write fake daemon response");
-            }
+            let mut encoded =
+                serde_json::to_string(&response).expect("encode fake daemon response");
+            encoded.push('\n');
+            stream
+                .write_all(encoded.as_bytes())
+                .expect("write fake daemon response");
         }
     });
 
@@ -90,7 +95,7 @@ fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
         "create_persona",
         &serde_json::json!({"name": "needs-guidance"}),
     )
-    .expect_err("retry exhaustion should surface guidance");
+    .expect_err("locked vault should surface guidance");
 
     let msg = err.to_string();
     assert!(
@@ -101,7 +106,10 @@ fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
         msg.contains("managed separate-uid biometric unlock"),
         "expected unlock hint, got: {msg}"
     );
-    assert!(msg.contains("EMBER_VAULT_PASSPHRASE"), "expected bootstrap hint, got: {msg}");
+    assert!(
+        msg.contains("EMBER_VAULT_PASSPHRASE"),
+        "expected bootstrap hint, got: {msg}"
+    );
 
     server.join().expect("fake daemon thread");
 }

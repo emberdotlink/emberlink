@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_event_types::{EventBody, EventRefRelation, FileManifest};
+use core_event_types::{
+    AttestationTier, CustodyClass, EventBody, EventRefRelation, FileManifest, PresenceFactor,
+};
 use core_events::{EventEnvelope, EventRef};
 use core_grant_types::grant_conditions::{GrantCondition, MAX_CONDITION_DEPTH};
 use core_principals::{EndpointDescriptor, TrustAttestation};
@@ -186,6 +188,13 @@ pub fn apply_event(
                     active_encryption_key: body.initial_encryption_key.clone(),
                     status: DeviceStatus::Active,
                     replacement_device_id: None,
+                    // A `DeviceAdded` device is one whose key the daemon holds
+                    // (design §1) — i.e. `daemon`-class, no attestation, no human
+                    // presence gate (unattended).
+                    custody_class: CustodyClass::Daemon,
+                    attestation_statement: None,
+                    attestation_tier: AttestationTier::None,
+                    presence_factor: PresenceFactor::Unattended,
                 },
             );
             push_key_history(
@@ -197,6 +206,75 @@ pub fn apply_event(
                 &mut state.device_encryption_key_history,
                 &body.device_id,
                 &body.initial_encryption_key.key_id,
+            );
+        }
+        EventBody::DeviceEnrolled(body) => {
+            if !state.roots_current.contains_key(&body.root_id) {
+                return Err(ValidationError::new(format!(
+                    "device references unknown root: {}",
+                    body.root_id
+                )));
+            }
+            if state.devices_current.contains_key(&body.device_id) {
+                return Err(ValidationError::new(format!(
+                    "device already exists: {}",
+                    body.device_id
+                )));
+            }
+            // Structural invariant (design §3, two-axis): an attestation-backed
+            // TIER (or co-authority custody) must carry its recorded statement.
+            // The cryptographic chain verification against the binary-embedded
+            // vendor roots happens in `verify_chain` (the independent verifier,
+            // AC-1) — here the presence of the statement is the materialization-
+            // level invariant. The `AttestationTier::None` dev0 floor carries none.
+            let statement_required = body.attestation_tier.requires_statement()
+                || body.custody_class == CustodyClass::CoAuthority;
+            if statement_required
+                && body
+                    .attestation_statement
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                return Err(ValidationError::new(format!(
+                    "custody class {} at attestation tier {} requires a recorded attestation statement",
+                    body.custody_class.as_str(),
+                    body.attestation_tier.as_str(),
+                )));
+            }
+            state.devices_current.insert(
+                body.device_id.clone(),
+                DeviceRecord {
+                    root_id: body.root_id.clone(),
+                    device_id: body.device_id.clone(),
+                    label: body.label.clone(),
+                    active_key: body.device_key.clone(),
+                    // design §4 (presence-as-decryption): an enrolled `presence`
+                    // Device carries a DISTINCT ECIES recipient key, never the
+                    // signing key. macOS SE cannot enforce sign-vs-decrypt usage
+                    // on one key (§4 AC-3), so reusing `device_key` here would
+                    // collapse the very sign==decrypt separation the cut kills.
+                    // Enrollment provisions a second `UserPresence` SE key for
+                    // this slot; §4 seals scope KEKs to it.
+                    active_encryption_key: body.encryption_key.clone(),
+                    status: DeviceStatus::Active,
+                    replacement_device_id: None,
+                    custody_class: body.custody_class,
+                    attestation_statement: body.attestation_statement.clone(),
+                    attestation_tier: body.attestation_tier,
+                    presence_factor: body.presence_factor,
+                },
+            );
+            push_key_history(
+                &mut state.device_key_history,
+                &body.device_id,
+                &body.device_key.key_id,
+            );
+            push_key_history(
+                &mut state.device_encryption_key_history,
+                &body.device_id,
+                &body.encryption_key.key_id,
             );
         }
         EventBody::DeviceKeyRotated(body) => {
@@ -895,7 +973,8 @@ mod tests {
     use super::*;
     use core_crypto::FixtureSigner;
     use core_event_types::{
-        DeviceReplacedEvent, EventBody, RecoveryRequestedEvent, RootCreatedEvent, SignerBinding,
+        DeviceEnrolledEvent, DeviceReplacedEvent, EventBody, RecoveryRequestedEvent,
+        RootCreatedEvent, SignerBinding,
     };
     use core_events::{EventEnvelope, EventRef as CrateEventRef};
     use core_principals::{KeyAlgorithm, PublicKeyMaterial};
@@ -949,6 +1028,10 @@ mod tests {
                     active_encryption_key: make_enc_key(device),
                     status: DeviceStatus::Active,
                     replacement_device_id: None,
+                    custody_class: CustodyClass::Daemon,
+                    attestation_statement: None,
+                    attestation_tier: AttestationTier::None,
+                    presence_factor: PresenceFactor::Unattended,
                 },
             );
         }
@@ -1038,6 +1121,10 @@ mod tests {
                 active_encryption_key: make_enc_key("device-a2"),
                 status: DeviceStatus::Active,
                 replacement_device_id: None,
+                custody_class: CustodyClass::Daemon,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::Unattended,
             },
         );
         let event = make_event(
@@ -1397,5 +1484,63 @@ mod tests {
             SignerBinding::root("new-root", "key-new-root"),
         );
         check_chain(&state, &event).expect("genesis event must pass check_chain");
+    }
+
+    // ── design §4: DeviceEnrolled records a DISTINCT §4 ECIES recipient key ──
+
+    #[test]
+    fn device_enrolled_records_distinct_encryption_key_not_the_signing_key() {
+        // Regression guard for the concrete hole the slice-3 cut closes: the
+        // `DeviceEnrolled` materialize arm used to set `active_encryption_key =
+        // device_key` (reusing the signing key as the §4 ECIES recipient). It now
+        // records the event's distinct `encryption_key`, and its key id enters the
+        // device's encryption-key history.
+        let mut state = MaterializedState::default();
+        state.roots_current.insert(
+            "root-a".into(),
+            RootRecord {
+                root_id: "root-a".into(),
+                display_name: "root-a".into(),
+                active_key: make_key("key-root-a"),
+                status: RootStatus::Active,
+            },
+        );
+
+        let signing = make_key("key-device-presence");
+        let recipient = make_enc_key("device-presence");
+        assert_ne!(
+            signing.public_key, recipient.public_key,
+            "fixture sanity: the two keys must differ"
+        );
+
+        let event = make_event(
+            "evt-enroll",
+            EventBody::DeviceEnrolled(DeviceEnrolledEvent {
+                root_id: "root-a".into(),
+                device_id: "device-presence".into(),
+                label: "Operator Presence".into(),
+                device_key: signing.clone(),
+                encryption_key: recipient.clone(),
+                custody_class: CustodyClass::Presence,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::UserPresence,
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        apply_event(&mut state, &event).expect("DeviceEnrolled must materialize");
+
+        let dev = &state.devices_current["device-presence"];
+        assert_eq!(dev.active_key.public_key, signing.public_key);
+        assert_eq!(dev.active_encryption_key.public_key, recipient.public_key);
+        assert_ne!(
+            dev.active_encryption_key.public_key, dev.active_key.public_key,
+            "the §4 ECIES recipient must NOT reuse the signing key (design §4)"
+        );
+        // The encryption-key history records the recipient key id (mirrors DeviceAdded).
+        assert_eq!(
+            state.device_encryption_key_history["device-presence"],
+            vec![recipient.key_id.clone()],
+        );
     }
 }

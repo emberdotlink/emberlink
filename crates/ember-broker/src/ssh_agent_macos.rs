@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::secure_enclave::{SeKeyHandle, se_pubkey_bytes, se_sign_with_touch_id_reason};
+use crate::secure_enclave::{SeKeyHandle, SignKeyHandle, se_sign_with_touch_id_reason};
 
 // ---------------------------------------------------------------------------
 // OpenSSH agent wire constants (duplicated from ssh_agent.rs to keep modules
@@ -165,7 +165,9 @@ pub fn encode_sign_response_p256(der_sig: &[u8]) -> Vec<u8> {
 /// Wraps a `SeKeyHandle` with the cached public key bytes and blob, so we
 /// avoid re-exporting on every request.
 struct SeSessionKey {
-    handle: SeKeyHandle,
+    /// SSH-agent keys are sign-only; carry the sign role in the type so the
+    /// signing call sites are role-checked (design AC-3).
+    handle: SignKeyHandle,
     /// Uncompressed P-256 point (65 bytes).
     pubkey_uncompressed: Vec<u8>,
     /// Pre-built OpenSSH public key blob.
@@ -174,7 +176,8 @@ struct SeSessionKey {
 
 impl SeSessionKey {
     fn new(handle: SeKeyHandle) -> Result<Self, crate::secure_enclave::SeError> {
-        let pubkey_uncompressed = se_pubkey_bytes(&handle)?;
+        let handle = SignKeyHandle::from_provisioned(handle);
+        let pubkey_uncompressed = handle.public_key_bytes()?;
         let pubkey_blob = encode_ecdsa_p256_pubkey_blob(&pubkey_uncompressed);
         Ok(Self {
             handle,
@@ -236,7 +239,9 @@ pub fn spawn_session_ssh_agent_se(
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind SE ssh-agent socket: {}", socket_path.display()))?;
 
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))
+    // 0600 owner-only — the in-daemon ssh-bridge is the sole client of this raw
+    // signer socket (group access was for the retired broker_exec cross-uid child).
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .context("set SE socket permissions")?;
 
     let session_key =

@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+core-event-types = { path = "../core-event-types" }
 core-grants = { path = "../core-grants" }
 core-types = { path = "../core-types" }
 core-grant-types = { path = "../core-grant-types" }
@@ -24,3 +25,6 @@ proptest = "1"
 futures = "0.3"
 async-trait = "0.1"
 tempfile = "3"
+
+[lints]
+workspace = true

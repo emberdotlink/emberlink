@@ -21,13 +21,22 @@ impl RateLimiter {
     /// Check if a request from this persona is allowed.
     /// Returns true if allowed, false if rate-limited.
     pub fn check(&mut self, persona_id: &str) -> bool {
-        let now = Instant::now();
-        let entries = self.state.entry(persona_id.to_string()).or_default();
+        self.check_key_at(persona_id, self.max_requests, self.window, Instant::now())
+    }
+
+    fn check_key_at(
+        &mut self,
+        key: &str,
+        max_requests: usize,
+        window: Duration,
+        now: Instant,
+    ) -> bool {
+        let entries = self.state.entry(key.to_string()).or_default();
 
         // Remove expired entries
-        entries.retain(|t| now.duration_since(*t) < self.window);
+        entries.retain(|t| now.saturating_duration_since(*t) < window);
 
-        if entries.len() >= self.max_requests {
+        if entries.len() >= max_requests {
             return false;
         }
 
@@ -44,6 +53,22 @@ impl RateLimiter {
     pub fn check_action(&mut self, persona_id: &str, action: &str) -> bool {
         let key = format!("{persona_id}\u{1f}{action}");
         self.check(&key)
+    }
+
+    /// Per-action minimum-interval gate.
+    ///
+    /// This uses the same keyed sliding-window state as [`Self::check_action`],
+    /// but pins the action to one request per `window_secs`. `refresh_cert`
+    /// uses this to enforce design's 60-second floor per cert chain without
+    /// changing the broader default pre-evaluation limit.
+    pub fn check_action_min_interval(
+        &mut self,
+        persona_id: &str,
+        action: &str,
+        window_secs: u64,
+    ) -> bool {
+        let key = format!("{persona_id}\u{1f}{action}");
+        self.check_key_at(&key, 1, Duration::from_secs(window_secs), Instant::now())
     }
 
     /// Clean up expired entries for all personas.
@@ -92,6 +117,18 @@ mod tests {
         assert!(!rl.check_action("persona-1", "git.push"));
         // Same persona, different action: independent window.
         assert!(rl.check_action("persona-1", "deploy.staging"));
+    }
+
+    #[test]
+    fn check_action_min_interval_blocks_until_window_expires() {
+        let mut rl = RateLimiter::new(100, 60);
+        assert!(rl.check_action_min_interval("persona-1", "refresh_cert:ctr-a", 60));
+        assert!(!rl.check_action_min_interval("persona-1", "refresh_cert:ctr-a", 60));
+        assert!(rl.check_action_min_interval("persona-1", "refresh_cert:ctr-b", 60));
+
+        let mut expired = RateLimiter::new(100, 60);
+        assert!(expired.check_action_min_interval("persona-1", "refresh_cert:ctr-a", 0));
+        assert!(expired.check_action_min_interval("persona-1", "refresh_cert:ctr-a", 0));
     }
 
     #[test]

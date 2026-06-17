@@ -1,10 +1,6 @@
+# CLASSIFICATION: PUBLIC
 #
-# design Components 2 + 3 — privileged sibling spawn-helper daemon +
-# the MACOS-PRIMITIVES Decision 5 `emberd-spawn-shim`.
-#
-# implementation-note-187
-# implementation-note-186
-# implementation-note-188
+# Privileged sibling spawn-helper daemon and macOS spawn shim.
 #
 # Three binaries are conditionally compiled, sharing the lib's wire
 # protocol:
@@ -13,10 +9,9 @@
 #     child, async-signal-safe-only.
 #   - emberd-spawn-helper-macos:  LaunchDaemon, macOS. Uses `posix_
 #     spawn(2)` to invoke `emberd-spawn-shim`; the shim — not the helper
-#     itself — performs the privileged setup (per MACOS-PRIMITIVES
-#     Decision 5: NO `Command::pre_exec` because the macOS fork-without-
-#     exec quirk forbids any Security framework / Mach IPC dance in the
-#     post-fork pre-execve window).
+#     itself — performs the privileged setup. The helper never uses
+#     `Command::pre_exec` for Security-framework work in the post-fork
+#     pre-execve window.
 #   - emberd-spawn-shim:          tiny single-purpose binary that runs
 #     under the target uid after the helper's `posix_spawn`. Does
 #     `sandbox_init` → `chroot` → `setgid`/`setuid` → `execve` and
@@ -27,7 +22,7 @@ name = "ember-spawn-helper"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "design Components 2 + 3 — privileged sibling spawn-helper (systemd on hardened Linux, LaunchDaemon on macOS) + MACOS-PRIMITIVES Decision 5 emberd-spawn-shim."
+description = "Privileged sibling spawn-helper for hardened Linux and macOS, plus the macOS emberd-spawn-shim."
 publish = false
 
 [lib]
@@ -36,7 +31,7 @@ path = "src/lib.rs"
 
 # macOS LaunchDaemon binary — tokio-driven accept loop. Uses
 # `posix_spawn(2)` to invoke `emberd-spawn-shim` (the shim does the
-# privileged setup, not this bin). Per MACOS-PRIMITIVES Decision 5.
+# privileged setup, not this bin).
 [[bin]]
 name = "emberd-spawn-helper-macos"
 path = "src/bin/emberd_spawn_helper_macos.rs"
@@ -47,10 +42,9 @@ path = "src/bin/emberd_spawn_helper_macos.rs"
 name = "emberd-spawn-helper-linux"
 path = "src/bin/emberd_spawn_helper_linux.rs"
 
-# MACOS-PRIMITIVES Decision 5 — the single-purpose shim that the macOS
-# helper invokes via `posix_spawn`. Runs as the target pool uid,
-# performs sandbox_init/chroot/setuid, then `execve`s the real
-# construct binary, replacing itself.
+# Single-purpose shim that the macOS helper invokes via `posix_spawn`. Runs
+# as the target pool uid, performs sandbox_init/chroot/setuid, then `execve`s
+# the real construct binary, replacing itself.
 [[bin]]
 name = "emberd-spawn-shim"
 path = "src/bin/emberd_spawn_shim.rs"
@@ -59,7 +53,7 @@ path = "src/bin/emberd_spawn_shim.rs"
 blake3 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-nix = { version = "0.29", features = ["user", "fs", "signal"] }
+nix = { version = "0.31", features = ["user", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -71,3 +65,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "test-util", "process"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

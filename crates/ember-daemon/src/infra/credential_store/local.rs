@@ -20,7 +20,7 @@
 //!
 //! # Receipt emission (implementation-note-136)
 //!
-//! Per implementation-note-214 security-review Findings 5 and 17 (audit-completeness
+//! Per implementation-note-183 security-review Findings 5 and 17 (audit-completeness
 //! gap for vault reads), every successful `get` emits a v2
 //! [`ReceiptEnvelope`] with `kind = "vault.read"`. Emission is
 //! best-effort — failures to sign or persist log a warning but do not
@@ -56,7 +56,7 @@ enum VaultSource {
 
 /// `CredentialStore` impl backed by the local sealed-credential vault.
 ///
-/// implementation-note-215: the live vault is resolved from the shared
+/// implementation-note-184: the live vault is resolved from the shared
 /// store slot at point of use instead of being owned directly here. That lets
 /// explicit lock cut off credential-store reads without needing to tear down
 /// the helper itself.
@@ -283,8 +283,8 @@ fn current_headless_vault(
             "headless enrollment key unavailable for vault key {key}: {err}"
         ))
     })?;
-    // implementation-note-193 (B1) + adversarial CRIT-1 fix
-    // (2026-05-22): construct a implementation-note-216 Vault. Pre-fix this used
+    // implementation-note-170 (B1) + adversarial CRIT-1 fix
+    // (2026-05-22): construct a implementation-note-185 Vault. Pre-fix this used
     // `Vault::new(mek)` which set BOTH lanes to the headless MEK; any
     // accidental `seal()` / `Vault::add(Interactive, ...)` call on the
     // returned Rc would silently route headless-MEK through the
@@ -309,6 +309,9 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         VaultError::NotFound => StoreError::NotFound(key.to_string()),
         VaultError::Store(inner) => StoreError::Other(format!("sqlite: {inner}")),
         VaultError::Crypto(msg) => StoreError::Other(format!("crypto: {msg}")),
+        VaultError::PresenceRequired => {
+            StoreError::Unavailable("credential requires fresh biometric presence".to_string())
+        }
         VaultError::Keyring(msg) => StoreError::Unavailable(format!("keyring: {msg}")),
         VaultError::Io(msg) => StoreError::Unavailable(format!("io: {msg}")),
         VaultError::ProductionSentinelMissing(msg) => {
@@ -319,7 +322,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
             // human-readable rendering of the path-grammar violation.
             StoreError::Other(format!("invalid credential name: {}", name_err))
         }
-        // implementation-note-217 sealed-blob variants. These
+        // implementation-note-186 sealed-blob variants. These
         // errors only surface from `export_mek_sealed`/`import_mek_sealed`
         // (the vault-level sealed-export substrate), not from the
         // get/list/add/remove credential paths this mapper serves. Map
@@ -332,10 +335,8 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         | VaultError::SealedBlobUnknownKdf { .. }
         | VaultError::SealedBlobUnknownAead { .. }
         | VaultError::SealedBlobFingerprintMismatch { .. }
-        | VaultError::SealedBlobAeadFailure) => {
-            StoreError::Other(format!("sealed-blob: {sealed}"))
-        }
-        // implementation-note-218 — same shape: surfaces
+        | VaultError::SealedBlobAeadFailure) => StoreError::Other(format!("sealed-blob: {sealed}")),
+        // implementation-note-187 — same shape: surfaces
         // from the rotation-witness emit path
         // (`emit_identity_rotation_witness`) which the credential
         // store does not call today, but the variant must still be
@@ -343,7 +344,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         emit @ VaultError::WitnessEmit(_) => {
             StoreError::Other(format!("identity-rotation-witness: {emit}"))
         }
-        // implementation-note-193 (B1) + adversarial CRIT-1
+        // implementation-note-170 (B1) + adversarial CRIT-1
         // fix: a headless-only Vault refusing an Interactive-lane op
         // surfaces as `HeadlessOnly`. The local credential store only
         // routes Headless-scope operations through `current_headless_vault`
@@ -352,8 +353,14 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         // Interactive op — a programmer error, not a runtime condition.
         // Map to `Other` so the operator-facing error names the
         // structural cause.
-        VaultError::HeadlessOnly => StoreError::Other(
-            "headless-only vault refused interactive-lane operation".to_string(),
+        VaultError::HeadlessOnly => {
+            StoreError::Other("headless-only vault refused interactive-lane operation".to_string())
+        }
+        VaultError::AuthorityBearingRequiresPresence => StoreError::Other(
+            "authority-bearing vault value requires presence-unwrapped scope KEK".to_string(),
+        ),
+        VaultError::AuthorityCustodyRotationUnsupported => StoreError::Other(
+            "MEK rotation is unsupported on a presence-backed (KEK_s) vault".to_string(),
         ),
     }
 }
@@ -372,19 +379,17 @@ impl CredentialStore for LocalEncryptedStore {
         // log a warning but do NOT fail the read.
         emit_vault_read_receipt(&self.store, key, scope);
 
-        Ok(plaintext)
+        Ok(plaintext.to_vec())
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
-        // `Vault::add` enforces the design path-grammar gate on new
-        // keys and inserts a freshly-encrypted row. SQLite enforces
-        // `name` uniqueness via index, so a "put" over an existing key
-        // currently fails — this matches the existing `vault_add`
-        // semantics. Overwrite-in-place is a follow-up; for now callers
-        // must `delete` first if they really mean overwrite.
+        // `put` is the overwrite-capable path. Route through
+        // `Vault::replace` so the local encrypted store matches the
+        // daemon RPC's `vault_put` semantics and avoids a delete/add
+        // race window.
         let (vault, scope) = self.write_access(key)?;
         vault
-            .add(scope, &self.store, key, value, None)
+            .replace(scope, &self.store, key, value, None)
             .map(|_info| ())
             .map_err(|e| map_vault_error(e, key))
     }
@@ -583,7 +588,7 @@ mod tests {
             match err {
                 StoreError::Unavailable(message) => {
                     assert!(
-                        message.contains("vault unavailable"),
+                        message.contains("live vault is locked"),
                         "shared live-vault seam must keep the unavailable reason: {message}"
                     );
                     assert!(

@@ -242,11 +242,19 @@ mod tests {
             "type": "service_account",
             "project_id": "test-project",
             "private_key_id": "abc123",
-            "private_key": "\x2d----BEGIN PRIVATE KEY-----\nFAKEKEYDATA\n-----END PRIVATE KEY-----\n",
+            "private_key": fake_private_key_pem(),
             "client_email": "ember-broker@test-project.iam.gserviceaccount.com",
             "client_id": "1234567890",
         })
         .to_string()
+    }
+
+    fn fake_private_key_pem() -> String {
+        format!(
+            "{}PRIVATE KEY-----\nFAKEKEYDATA\n{}PRIVATE KEY-----\n",
+            "-----BEGIN ",
+            "-----END "
+        )
     }
 
     #[test]
@@ -374,12 +382,10 @@ mod tests {
         )
         .await
         .unwrap();
-        mock.put(
-            STORE_KEY_PRIVATE_KEY,
-            b"\x2d----BEGIN PRIVATE KEY-----\nFAKEKEYDATA\n-----END PRIVATE KEY-----\n",
-        )
-        .await
-        .unwrap();
+        let private_key = fake_private_key_pem();
+        mock.put(STORE_KEY_PRIVATE_KEY, private_key.as_bytes())
+            .await
+            .unwrap();
         mock.put(STORE_KEY_PROJECT_ID, b"test-project")
             .await
             .unwrap();

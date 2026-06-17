@@ -6,11 +6,11 @@
 //!
 //! - `binary_manifest` (default) — reads sidecar from `<artifact>.sig` or
 //!   the explicit `--sidecar` path.
-//! - `receipt` (implementation-note-409) — Receipt envelope JSON; no
+//! - `receipt` (implementation-note-361) — Receipt envelope JSON; no
 //!   sidecar (the signature is inline). `--sidecar` is ignored on this
 //!   kind, and the wire sidecar bytes are sent empty.
 //!
-//! Workflow grant chain walk lands in implementation-note-410.
+//! Delegation grant chain walk lands in implementation-note-362.
 //!
 //! The CLI reads the artifact + (when applicable) sidecar from disk and
 //! base64-encodes both for the wire. The daemon never touches a
@@ -25,13 +25,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// One trust-root row in the daemon's verdict response. Present only
 /// when `verdict == "verified"`; the wire form is `null` for every
 /// other verdict.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustRootMatch {
     pub fingerprint_hex: String,
     /// `"release"` or `"operator"` (lowercase). Stable wire form.
@@ -43,7 +43,7 @@ pub struct TrustRootMatch {
 /// authoritative list); `trust_root` is `Some` iff `verdict ==
 /// "verified"`; `chain` is the human-readable narrative the daemon
 /// renders for operator display.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrustExplainResponse {
     pub verdict: String,
     #[serde(default)]
@@ -79,7 +79,7 @@ pub enum TrustExplainError {
 /// both, call `trust.explain`, and parse the response.
 ///
 /// `sidecar_path = None` is the path for artifact kinds that carry the
-/// signature inline (Receipt envelope, workflow grant). The wire
+/// signature inline (Receipt envelope, delegation grant). The wire
 /// `sidecar_bytes_b64` is sent as the empty string; the daemon enforces
 /// "non-empty sidecar bytes" → `sidecar_not_supported_for_kind` for
 /// those kinds.
@@ -152,11 +152,16 @@ pub fn render_human(resp: &TrustExplainResponse) -> String {
     out
 }
 
+/// Render the typed daemon response as stable machine-readable JSON.
+pub fn render_json(resp: &TrustExplainResponse) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(resp)
+}
+
 /// Returns true for artifact kinds whose wire shape carries the
-/// signature inline (Receipt envelope, workflow grant). For these, the
+/// signature inline (Receipt envelope, delegation grant). For these, the
 /// CLI sends empty sidecar bytes; `--sidecar` is ignored.
 fn artifact_kind_uses_inline_signature(kind: &str) -> bool {
-    matches!(kind, "receipt" | "workflow_grant")
+    matches!(kind, "receipt" | "authority_delegation")
 }
 
 /// Entry point for the `ember trust explain` subcommand. Returns 0 on
@@ -167,10 +172,11 @@ pub fn run(
     artifact_kind: &str,
     artifact_path: &Path,
     sidecar_path: Option<&Path>,
+    json_output: bool,
 ) -> i32 {
     let computed_sidecar;
     let sidecar: Option<&Path> = if artifact_kind_uses_inline_signature(artifact_kind) {
-        // Receipt + workflow_grant envelopes carry their signature
+        // Receipt + authority_delegation envelopes carry their signature
         // inline. Ignore --sidecar entirely; daemon rejects non-empty
         // sidecar bytes for these kinds.
         None
@@ -186,8 +192,22 @@ pub fn run(
 
     match fetch_trust_explain(socket_path, artifact_kind, artifact_path, sidecar) {
         Ok(resp) => {
-            print!("{}", render_human(&resp));
-            if resp.verdict == "verified" { 0 } else { 1 }
+            if json_output {
+                match render_json(&resp) {
+                    Ok(body) => println!("{body}"),
+                    Err(err) => {
+                        eprintln!("ember trust explain: encode JSON output: {err}");
+                        return 2;
+                    }
+                }
+            } else {
+                print!("{}", render_human(&resp));
+            }
+            if resp.verdict == "verified" {
+                0
+            } else {
+                1
+            }
         }
         Err(TrustExplainError::DaemonUnavailable { socket, source }) => {
             eprintln!(
@@ -349,6 +369,22 @@ mod tests {
     }
 
     #[test]
+    fn render_json_preserves_typed_response() {
+        let resp = TrustExplainResponse {
+            verdict: "verified".to_string(),
+            trust_root: Some(TrustRootMatch {
+                fingerprint_hex: "aa".repeat(32),
+                source: "release".to_string(),
+            }),
+            chain: "artifact to release root".to_string(),
+        };
+        let json: Value = serde_json::from_str(&render_json(&resp).unwrap()).unwrap();
+        assert_eq!(json["verdict"], "verified");
+        assert_eq!(json["trust_root"]["source"], "release");
+        assert_eq!(json["chain"], "artifact to release root");
+    }
+
+    #[test]
     fn default_sidecar_path_appends_dot_sig() {
         let p = default_sidecar_path(Path::new("/tmp/manifest.toml"));
         assert_eq!(p, PathBuf::from("/tmp/manifest.toml.sig"));
@@ -360,7 +396,7 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/release.sig"));
     }
 
-    /// implementation-note-409: receipt + workflow_grant kinds carry
+    /// implementation-note-361: receipt + authority_delegation kinds carry
     /// the signature inline; the run path must NOT compute a default
     /// sidecar path (it would fail trying to read a `.sig` that doesn't
     /// exist) and must pass empty bytes for the wire sidecar.
@@ -371,8 +407,8 @@ mod tests {
             "receipt envelopes carry the signature inline"
         );
         assert!(
-            artifact_kind_uses_inline_signature("workflow_grant"),
-            "workflow grants carry the signature inline"
+            artifact_kind_uses_inline_signature("authority_delegation"),
+            "delegation grants carry the signature inline"
         );
         assert!(
             !artifact_kind_uses_inline_signature("binary_manifest"),

@@ -1,33 +1,21 @@
-//! implementation-note-19 — Phase 1 substrate.
+//! Headless pre-flight scope-check substrate (Phase 1).
 //!
-//! implementation-note-20
-//!
-//! Per design §"Pre-flight scope check at enrollment" Layer 2
-//! (Historical): at enrollment time, the CLI surfaces recent
-//! permission-gap entries scoped to the enrolling persona so the
-//! operator can widen the template for the enrollment duration.
+//! Per design §"Pre-flight scope check at enrollment" Layer 2: at
+//! enrollment time, the CLI surfaces recent permission-gap entries
+//! scoped to the enrolling persona so the operator can widen the
+//! template for the enrollment duration.
 //!
 //! This module is the **shape** of the pre-flight CTA caller. Phase 1
 //! ships the substrate — daemon socket call, CTA renderer, and
 //! [`PreflightDecision`] enum — without wiring it into an actual
-//! `ember headless enroll` command (that command does not yet exist;
-//! see the blocked-by dependency on implementation-note-21 in
-//! `release-checklist`). Phase 2 (implementation-note-489) will:
+//! `ember headless enroll` command (that command does not yet exist).
+//! Phase 2 will:
 //!   - wire this helper into the enrollment flow,
 //!   - apply per-enrollment template amendments that revert at expiry,
 //!   - amend the enrollment Receipt with the widen-template evidence
 //!     (needs a new Receipt-kind catalog entry).
 //!
-//! The location of this file deviates from the brief's nominal
-//! `crates/emberlink-cli/src/commands/headless.rs` because `commands.rs`
-//! is a single 300K-line file rather than a directory; converting it
-//! to a `commands/` directory is out of scope for Phase 1. The
-//! checkpoint `// implementation-note-20` lives in this file +
-//! `crates/headless-runtime/src/permission_gaps.rs` +
-//! `crates/ember-daemon/src/infra/handler.rs` so the `target_state_anchor`
-//! signal in `release-checklist` resolves cleanly.
 
-// implementation-note-20
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -164,9 +152,9 @@ pub fn preflight_gaps_cta(
     let lookback = lookback.unwrap_or(Duration::from_secs(DEFAULT_LOOKBACK_SECS));
     let gaps = fetch_gaps(socket_path, persona, lookback)?;
     let cta = format_cta(persona, &gaps, lookback);
-    // Phase 1 stub: return `Skip` unconditionally. Phase 2 (post
-    // implementation-note-21) wires the interactive prompt and
-    // the per-enrollment template amendment path.
+    // Phase 1 stub: return `Skip` unconditionally. Phase 2 wires the
+    // interactive prompt and the per-enrollment template amendment
+    // path once the headless enroll command lands.
     Ok((PreflightDecision::Skip, cta))
 }
 
@@ -265,12 +253,12 @@ fn headless_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<S
     None
 }
 
-// ─── implementation-note-490 — enroll / revoke / status commands ──
+// ─── Headless enroll / revoke / status commands ──────────────────────
 //
 // CLI surface for the daemon-side `headless_enroll` / `headless_revoke` /
-// `headless_status` socket methods that shipped in prior change
-// (implementation-note-294 Phase 1). Per design §"Headless:
-// attested device, variable enrollment". The daemon-side handlers
+// `headless_status` socket methods that shipped in prior change.
+// Per design §"Headless: attested device, variable enrollment".
+// The daemon-side handlers
 // now ship a first real local enroll/revoke/status workflow. `headless_enroll`
 // installs a fresh headless MEK plus the currently configured local
 // broker-authority subset; `headless_revoke` and `headless_status` operate on
@@ -324,6 +312,11 @@ pub enum HeadlessCommandError {
     DurationExceedsCeiling { requested: u64, max: u64 },
     /// Operator answered `n` at the confirmation prompt.
     Cancelled,
+    /// Bounded headless enrollment requires an explicit queued task
+    /// declaration so the daemon can derive authority and material subsets.
+    MissingTaskDeclaration,
+    /// The queued task declaration was absent, empty, or malformed.
+    InvalidTaskDeclaration(String),
     /// Daemon-RPC layer surfaced an error (socket, wire, protocol).
     Preflight(PreflightError),
     /// I/O failure reading from stdin / writing to stdout for the
@@ -348,6 +341,13 @@ impl std::fmt::Display for HeadlessCommandError {
                 )
             }
             HeadlessCommandError::Cancelled => write!(f, "enrollment cancelled"),
+            HeadlessCommandError::MissingTaskDeclaration => write!(
+                f,
+                "bounded headless enrollment requires `--input <tasks.json>`; run `ember headless preflight --input <tasks.json>` first, then enroll with the same file"
+            ),
+            HeadlessCommandError::InvalidTaskDeclaration(message) => {
+                write!(f, "invalid headless task declaration: {message}")
+            }
             HeadlessCommandError::Preflight(e) => write!(f, "{e}"),
             HeadlessCommandError::Io(s) => write!(f, "interactive prompt I/O: {s}"),
         }
@@ -367,6 +367,9 @@ impl From<PreflightError> for HeadlessCommandError {
 /// (tests, future SDK wrappers) can construct the same input shape.
 #[derive(Debug, Clone, Default)]
 pub struct EnrollArgs {
+    /// Path to a JSON file containing at least `{ "tasks": [...] }`.
+    /// The same file should be used with `ember headless preflight`.
+    pub input_json_path: Option<PathBuf>,
     /// Duration spec; `None` falls back to the 4h default.
     pub duration: Option<String>,
     /// Persona to enroll; `None` uses `"main"` (matches the daemon-side
@@ -422,15 +425,17 @@ pub fn parse_duration_spec(spec: &str) -> Result<Duration, HeadlessCommandError>
 /// caller can embed the rendered CTA into the enrollment Receipt.
 pub fn render_enroll_cta(duration_display: &str) -> String {
     let mut buf = String::new();
-    buf.push_str("\n  Enable headless — for how long?\n\n");
+    buf.push_str("\n  Enable bounded headless work — for how long?\n\n");
     buf.push_str("  Default: 4 hours.\n");
     buf.push_str("  You can choose anything up to 7 days.\n\n");
-    buf.push_str("  This lets ember mint short-lived credentials for headless\n");
-    buf.push_str("  or scheduled jobs while you're away from your laptop.\n\n");
-    buf.push_str("  Scope: only the actions you've already approved in your\n");
-    buf.push_str("  scope template. Headless cannot do anything you haven't\n");
-    buf.push_str("  already authorized.\n\n");
-    buf.push_str("  Revoke any time: `ember headless revoke` from any device.\n\n");
+    buf.push_str("  Posture: strict + delegated. Out-of-scope work denies\n");
+    buf.push_str("  instead of prompting while you're away.\n\n");
+    buf.push_str("  Scope: derived from the queued tasks in `--input` plus their\n");
+    buf.push_str("  declared vault/env/file materials. Undeclared material is not\n");
+    buf.push_str("  carried into the unattended lane.\n\n");
+    buf.push_str("  Evidence: enrollment emits a receipt; revoke or expiry closes\n");
+    buf.push_str("  the unattended window.\n\n");
+    buf.push_str("  Revoke any time: `ember headless revoke`.\n\n");
     buf.push_str(&format!("  Duration [{duration_display}]:\n"));
     buf.push_str(&format!(
         "  Confirm enrollment for {duration_display}? [Y/n]:\n"
@@ -466,9 +471,10 @@ fn format_duration_display(secs: u64) -> String {
 ///   1. Resolve duration (CLI arg → default 4h).
 ///   2. Validate against `HEADLESS_TIER0_MAX_SECS` (CLI-side; the
 ///      daemon re-checks).
-///   3. Print the CTA copy (Y/n confirm). `--yes` skips this.
-///   4. Call `headless_enroll` socket method on the daemon.
-///   5. Print the daemon's response.
+///   3. Load a non-empty queued task declaration from `--input`.
+///   4. Print the CTA copy (Y/n confirm). `--yes` skips this.
+///   5. Call `headless_enroll` socket method on the daemon.
+///   6. Print the daemon's response.
 pub fn cmd_enroll(socket_path: &Path, args: EnrollArgs) -> Result<(), HeadlessCommandError> {
     let duration = match &args.duration {
         Some(spec) => parse_duration_spec(spec)?,
@@ -483,6 +489,12 @@ pub fn cmd_enroll(socket_path: &Path, args: EnrollArgs) -> Result<(), HeadlessCo
     }
     let persona = args.persona.as_deref().unwrap_or("main");
     let duration_display = format_duration_display(secs);
+    let input_path = args
+        .input_json_path
+        .as_ref()
+        .ok_or(HeadlessCommandError::MissingTaskDeclaration)?;
+    let input = read_json_file(input_path)?;
+    let tasks = require_non_empty_tasks(&input)?;
 
     if !args.yes {
         print!("{}", render_enroll_cta(&duration_display));
@@ -503,6 +515,7 @@ pub fn cmd_enroll(socket_path: &Path, args: EnrollArgs) -> Result<(), HeadlessCo
     let params = json!({
         "persona_id": persona,
         "duration_seconds": secs,
+        "tasks": tasks,
     });
     let result = call_daemon(socket_path, "headless_enroll", &params)?;
     println!(
@@ -545,9 +558,8 @@ pub fn cmd_status(socket_path: &Path) -> Result<(), HeadlessCommandError> {
     Ok(())
 }
 
-// ─── implementation-note-295 — CLI surface ─────────
+// ─── Layer 1 pre-flight Constructs — CLI surface ──────────────────────
 //
-// implementation-note-296
 //
 // `ember headless preflight` shells the daemon's
 // `headless_preflight_layer1` RPC, then renders the gap list as a
@@ -657,12 +669,7 @@ pub fn format_preflight_gap_table(gaps: &[PreflightLayer1Gap]) -> String {
 /// an error.
 pub fn cmd_preflight(socket_path: &Path, args: PreflightArgs) -> Result<(), HeadlessCommandError> {
     let params = match &args.input_json_path {
-        Some(path) => {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| HeadlessCommandError::Io(format!("read {}: {e}", path.display())))?;
-            serde_json::from_str::<Value>(&raw)
-                .map_err(|e| HeadlessCommandError::Io(format!("parse {}: {e}", path.display())))?
-        }
+        Some(path) => read_json_file(path)?,
         None => json!({ "tasks": [] }),
     };
     let result = call_daemon(socket_path, "headless_preflight_layer1", &params)?;
@@ -677,6 +684,30 @@ pub fn cmd_preflight(socket_path: &Path, args: PreflightArgs) -> Result<(), Head
         print!("{}", format_preflight_gap_table(&gaps));
     }
     Ok(())
+}
+
+fn read_json_file(path: &Path) -> Result<Value, HeadlessCommandError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| HeadlessCommandError::Io(format!("read {}: {e}", path.display())))?;
+    serde_json::from_str::<Value>(&raw)
+        .map_err(|e| HeadlessCommandError::Io(format!("parse {}: {e}", path.display())))
+}
+
+fn require_non_empty_tasks(input: &Value) -> Result<Value, HeadlessCommandError> {
+    let tasks = input.get("tasks").ok_or_else(|| {
+        HeadlessCommandError::InvalidTaskDeclaration(
+            "missing top-level `tasks` array in input JSON".to_string(),
+        )
+    })?;
+    match tasks.as_array() {
+        Some(tasks) if !tasks.is_empty() => Ok(Value::Array(tasks.clone())),
+        Some(_) => Err(HeadlessCommandError::InvalidTaskDeclaration(
+            "`tasks` must contain at least one queued task".to_string(),
+        )),
+        None => Err(HeadlessCommandError::InvalidTaskDeclaration(
+            "`tasks` must be an array".to_string(),
+        )),
+    }
 }
 
 /// True iff the operator's response to the `[Y/n]` confirm accepts the
@@ -774,7 +805,7 @@ mod tests {
         requires_copy(PreflightDecision::Skip);
     }
 
-    // ─── implementation-note-490 helper tests ───────────────────
+    // ─── Headless enroll / revoke / status helper tests ───────────────
 
     #[test]
     fn parse_duration_spec_recognizes_canonical_units() {
@@ -810,15 +841,60 @@ mod tests {
     #[test]
     fn render_enroll_cta_includes_locked_copy() {
         let cta = render_enroll_cta("4h");
-        // Spot-check the load-bearing lines from the implementation-note-491 lock.
-        assert!(cta.contains("Enable headless — for how long?"));
+        // Spot-check the load-bearing lines from the locked CTA copy.
+        assert!(cta.contains("Enable bounded headless work"));
         assert!(cta.contains("Default: 4 hours."));
         assert!(cta.contains("anything up to 7 days"));
-        assert!(cta.contains("Scope: only the actions you've already approved"));
-        assert!(cta.contains("Headless cannot do anything you haven't"));
+        assert!(cta.contains("strict + delegated"));
+        assert!(cta.contains("declared vault/env/file materials"));
+        assert!(cta.contains("enrollment emits a receipt"));
         assert!(cta.contains("ember headless revoke"));
         assert!(cta.contains("Duration [4h]:"));
         assert!(cta.contains("Confirm enrollment for 4h? [Y/n]:"));
+    }
+
+    #[test]
+    fn require_non_empty_tasks_accepts_declared_queue() {
+        let input = json!({
+            "tasks": [
+                {"task_id": "task-1", "constructs": ["ember-gh.pr_merge"]}
+            ],
+            "template": [],
+        });
+        let tasks = require_non_empty_tasks(&input).expect("tasks");
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["task_id"], "task-1");
+    }
+
+    #[test]
+    fn require_non_empty_tasks_rejects_missing_or_empty_queue() {
+        assert!(matches!(
+            require_non_empty_tasks(&json!({})),
+            Err(HeadlessCommandError::InvalidTaskDeclaration(_))
+        ));
+        assert!(matches!(
+            require_non_empty_tasks(&json!({"tasks": []})),
+            Err(HeadlessCommandError::InvalidTaskDeclaration(_))
+        ));
+        assert!(matches!(
+            require_non_empty_tasks(&json!({"tasks": "task-1"})),
+            Err(HeadlessCommandError::InvalidTaskDeclaration(_))
+        ));
+    }
+
+    #[test]
+    fn enroll_refuses_before_daemon_when_input_is_missing() {
+        let err = cmd_enroll(
+            Path::new("/no/such/socket"),
+            EnrollArgs {
+                input_json_path: None,
+                duration: Some("4h".to_string()),
+                persona: None,
+                yes: true,
+            },
+        )
+        .expect_err("missing input should fail before daemon socket use");
+        assert!(matches!(err, HeadlessCommandError::MissingTaskDeclaration));
     }
 
     #[test]
@@ -877,7 +953,7 @@ mod tests {
         assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
-    // ─── implementation-note-295 — CLI table tests ─
+    // ─── Layer 1 pre-flight Constructs — CLI table tests ─────────────
 
     #[test]
     fn preflight_table_renders_no_gaps_message_for_empty_input() {

@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Supported**.
-> Source truth: `README.md`, `QUICKSTART.md`, `docs/current-architecture.md`, `docs/cli-reference.md`.
+> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
+
 # Receipts and Audit
 
 Emberlink does not just broker authority. It also leaves evidence behind.
@@ -118,4 +118,3 @@ ember status --troubleshoot
 ember receipt list
 ember audit query
 ```
-

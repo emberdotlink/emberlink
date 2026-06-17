@@ -1,5 +1,6 @@
 //! core-event-types — audit-log wire format.
 //!
+//! CLASSIFICATION: PUBLIC
 //!
 //! Holds the event envelope shapes (`events.rs`) and the storage
 //! relationships those events refer to (`FileManifest`,
@@ -15,10 +16,19 @@
 //! from its two sub-modules. Going there means going to the events
 //! surface; the glob hides nothing.
 
+pub mod action_ref;
+pub mod delegation_receipt;
 pub mod events;
+pub mod execution_contract;
+pub mod rail;
 pub mod storage;
-pub mod workflow_receipt;
 
+pub use action_ref::{ActionRef, ActionRefPattern, ActionSelector};
+pub use delegation_receipt::PregrantPath;
 pub use events::*;
+pub use execution_contract::{
+    AuditPolicy, ExecutionContract, InteractionClass, LeasePolicy, MaterialExposure,
+    MaterializationPolicy, RevocationStrategy, RunnerClass, RunnerPolicy, TopologyPolicy,
+};
+pub use rail::RailTrustContract;
 pub use storage::*;
-pub use workflow_receipt::PregrantPath;

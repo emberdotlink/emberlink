@@ -72,7 +72,7 @@ fn fake_approval_with_skill_ref(skill_ref: Option<&str>) -> ApprovalRequestInfo 
         composite_statements: None,
         result_grant_id: None,
         skill_ref: skill_ref.map(str::to_owned),
-        // implementation-note-10 — the
+        // implementation-note-13 — the
         // five grant-shaping fields default to None for legacy fixtures
         // that don't exercise the delegation-cap path.
         max_delegation_depth: None,

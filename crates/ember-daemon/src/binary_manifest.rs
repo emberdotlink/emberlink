@@ -25,7 +25,7 @@
 //! - T-CONSTRUCT-BINARY-DISTRIBUTION-CHANNEL: the v0.3.0 channel decision (this file)
 
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,25 @@ use std::path::{Path, PathBuf};
 /// release-tooling determinism.
 pub const COHORT_A_CONSTRUCTS: &[&str] = &["ember-gh", "ember-git", "ember-kubectl"];
 
+/// Platform-specific RPC sibling admitted by the daemon-side rpc-forward
+/// provenance gate. It is not a Construct, but it must live in the same signed
+/// runtime manifest so the bridge receiver can prove the peer is the shipped
+/// `emberd-rpc` binary before accepting forwarded frames.
+#[cfg(target_os = "macos")]
+pub const BUNDLED_EMBERD_RPC_TOOL: &str = "emberd-rpc-macos";
+#[cfg(target_os = "linux")]
+pub const BUNDLED_EMBERD_RPC_TOOL: &str = "emberd-rpc-linux";
+
+#[cfg(target_os = "macos")]
+pub fn bundled_emberd_rpc_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/emberd-rpc-macos")
+}
+
+#[cfg(target_os = "linux")]
+pub fn bundled_emberd_rpc_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/emberd-rpc-linux")
+}
+
 /// Where the v0.3.0 release pipeline lays down bundled Construct
 /// binaries on disk. The daemon scans this directory at startup +
 /// records the entries it finds into the runtime manifest with
@@ -45,6 +64,28 @@ pub const COHORT_A_CONSTRUCTS: &[&str] = &["ember-gh", "ember-git", "ember-kubec
 /// (`/usr/local/lib/ember/binaries/<tool>-<version>`).
 pub fn bundled_install_dir() -> PathBuf {
     PathBuf::from("/usr/local/lib/ember/binaries")
+}
+
+/// Runtime binaries that should be signed into the bundled manifest for a scan
+/// rooted at `from_dir`.
+///
+/// Constructs are read from `from_dir`; the RPC sibling is installed at the
+/// platform launcher path (`/usr/local/bin/emberd-rpc-*`) and is included only
+/// for the canonical bundled install directory. This keeps tests and custom
+/// scans deterministic while making the normal host/release install produce the
+/// manifest required by the rpc-forward provenance gate.
+pub fn bundled_runtime_manifest_candidates(from_dir: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = COHORT_A_CONSTRUCTS
+        .iter()
+        .map(|tool| (*tool, from_dir.join(tool)))
+        .collect::<Vec<_>>();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if from_dir == bundled_install_dir() {
+        candidates.push((BUNDLED_EMBERD_RPC_TOOL, bundled_emberd_rpc_path()));
+    }
+
+    candidates
 }
 
 /// Binary distribution channel — names *where* a pinned binary came
@@ -306,6 +347,74 @@ pub fn verify_manifest_signature_with_trust_roots(
     Err(VerifyError::SignatureMismatch)
 }
 
+/// Errors raised by [`write_signed_manifest`].
+#[derive(Debug, thiserror::Error)]
+pub enum WriteSignedError {
+    #[error("toml serialize: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
+    #[error("sidecar serialize: {0}")]
+    SidecarSerialize(#[from] serde_json::Error),
+    #[error("io {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Render `manifest` as TOML, sign the exact TOML bytes with `signer`, and
+/// write both the manifest file and its `.sig` JSON sidecar to disk in the
+/// shape that [`verify_manifest_signature_with_trust_roots`] expects.
+///
+/// `manifest_path` is the destination TOML path. The sidecar lands at
+/// `manifest_path.with_extension("toml.sig")` to match the verifier's lookup
+/// (see [`verify_manifest_signature_with_trust_roots`]).
+///
+/// The signature is computed over the exact bytes that get written to disk —
+/// the manifest is serialized once, signed, and written; the verifier later
+/// reads those same bytes and re-checks. Any mismatch (post-sign edit, byte
+/// reorder, etc.) trips `VerifyError::SignatureMismatch`.
+///
+/// The parent directory of `manifest_path` is created if absent so callers
+/// don't need to pre-mkdir the destination.
+pub fn write_signed_manifest(
+    manifest: &BinaryManifest,
+    signer: &SigningKey,
+    manifest_path: &Path,
+) -> Result<(), WriteSignedError> {
+    let toml_body = toml::to_string_pretty(manifest)?;
+    let toml_bytes = toml_body.as_bytes();
+
+    let sig = signer.sign(toml_bytes);
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "signature": format!("ed25519:{sig_b64}"),
+        "signature_alg": "ed25519",
+    });
+    let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
+
+    if let Some(parent) = manifest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| WriteSignedError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    std::fs::write(manifest_path, toml_bytes).map_err(|e| WriteSignedError::Io {
+        path: manifest_path.to_path_buf(),
+        source: e,
+    })?;
+
+    let sidecar_path = manifest_path.with_extension("toml.sig");
+    std::fs::write(&sidecar_path, &sidecar_bytes).map_err(|e| WriteSignedError::Io {
+        path: sidecar_path,
+        source: e,
+    })?;
+
+    Ok(())
+}
+
 /// design §Component 5 — process-global flag mirroring the daemon's
 /// dev/prod posture at the trust-set level. Set once at startup by
 /// `infra/runtime.rs` after the trust-root set is resolved; consulted by
@@ -438,6 +547,31 @@ pub fn build_trust_root_records(
         .collect()
 }
 
+/// Append operator-supplied trust roots, skipping roots already present in the
+/// release/default trust set. Returns the number of roots actually appended.
+///
+/// `EMBER_TRUST_ROOTS` is a channel for additional signers. If a script feeds
+/// the compiled release root back through that channel, it must not flip
+/// `dev_mode_active` or duplicate the release root in `trust.list`.
+pub(crate) fn append_unique_operator_trust_roots(
+    trust_roots: &mut Vec<VerifyingKey>,
+    operator_roots: impl IntoIterator<Item = VerifyingKey>,
+) -> usize {
+    let mut appended = 0;
+    for root in operator_roots {
+        let candidate = root.to_bytes();
+        if trust_roots
+            .iter()
+            .any(|existing| existing.to_bytes() == candidate)
+        {
+            continue;
+        }
+        trust_roots.push(root);
+        appended += 1;
+    }
+    appended
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -501,7 +635,7 @@ pub fn parse_trust_roots(raw: &str) -> Result<Vec<VerifyingKey>, VerifyError> {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-125 — peer binary pinning
+// implementation-note-124 — peer binary pinning
 // ---------------------------------------------------------------------------
 
 /// Error variants surfaced by [`verify_peer_binary`]. Distinct from
@@ -702,8 +836,14 @@ pub fn verify_peer_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+
+    // Tests that exercise the on-disk manifest loader / signer / verifier
+    // (any test that needs `tempfile`) live in
+    // `tests/binary_manifest_loader.rs` as T2 integration tests per the
+    // four-tier convention (`.claude/rules/test-tiers.md`). This in-tree
+    // module keeps only T1-shape (no-I/O) tests.
+    //
+    // Anchor: t1_tier_baseline_drained
 
     #[test]
     fn load_manifest_returns_empty_when_missing() {
@@ -712,220 +852,18 @@ mod tests {
         assert!(m.entries.is_empty());
     }
 
-    #[test]
-    fn load_manifest_parses_toml() {
-        let mut f = NamedTempFile::new().expect("temp");
-        write!(
-            f,
-            r#"
-[[entries]]
-tool_name = "ember-gh"
-version = "1.0.0"
-content_hash = "blake3:abc123"
-absolute_path = "/usr/local/bin/ember-gh"
-installed_at = 1735689600
-publisher = "did:emberlink"
-"#
-        )
-        .expect("write");
-        let m = load_manifest(f.path()).expect("parse");
-        assert_eq!(m.entries.len(), 1);
-        assert_eq!(m.entries[0].tool_name, "ember-gh");
-    }
-
-    #[test]
-    fn verify_manifest_signature_missing_sidecar_returns_err() {
-        use ed25519_dalek::SigningKey;
-
-        let mut f = NamedTempFile::new().expect("temp");
-        f.write_all(b"[some] = \"manifest\"").expect("write");
-
-        let sk = SigningKey::from_bytes(&[1u8; 32]);
-        let pk = sk.verifying_key();
-
-        let result = verify_manifest_signature(f.path(), &pk);
-        assert!(matches!(result, Err(VerifyError::MissingSidecar(_))));
-    }
-
-    #[test]
-    fn verify_manifest_signature_happy_path() {
-        use ed25519_dalek::{Signer, SigningKey};
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let manifest_bytes = b"[some] = \"manifest\"";
-        std::fs::write(&manifest_path, manifest_bytes).expect("write manifest");
-
-        let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let pk = sk.verifying_key();
-        let sig = sk.sign(manifest_bytes);
-
-        let sidecar = serde_json::json!({
-            "schema_version": 1,
-            "signature": format!("ed25519:{}", base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())),
-            "signature_alg": "ed25519",
-        });
-        let sidecar_path = manifest_path.with_extension("toml.sig");
-        std::fs::write(&sidecar_path, sidecar.to_string()).expect("write sidecar");
-
-        verify_manifest_signature(&manifest_path, &pk).expect("should verify");
-    }
-
-    #[test]
-    fn verify_manifest_signature_tampered_returns_err() {
-        use ed25519_dalek::{Signer, SigningKey};
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let original_bytes = b"[orig] = \"v1\"";
-        std::fs::write(&manifest_path, original_bytes).expect("write manifest");
-
-        let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let pk = sk.verifying_key();
-        let sig = sk.sign(original_bytes);
-
-        let sidecar = serde_json::json!({
-            "schema_version": 1,
-            "signature": format!("ed25519:{}", base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())),
-            "signature_alg": "ed25519",
-        });
-        let sidecar_path = manifest_path.with_extension("toml.sig");
-        std::fs::write(&sidecar_path, sidecar.to_string()).expect("write sidecar");
-
-        // Tamper the manifest after signing.
-        std::fs::write(&manifest_path, b"[orig] = \"v2-tampered\"").expect("rewrite");
-
-        let result = verify_manifest_signature(&manifest_path, &pk);
-        assert!(matches!(result, Err(VerifyError::SignatureMismatch)));
-    }
-
     // -----------------------------------------------------------------
     // design §Component 1 — trust-root SET parameterization tests.
-    // T1 property-shape (parameterized examples covering the relevant
-    // axis of variation: release-only / release+dev / release+N) and T2
-    // integration coverage via the signed-manifest round-trip.
+    //
+    // The parameterized verifier tests (release-only / release+dev /
+    // release+N / empty-set) used `tempfile::tempdir` to materialize the
+    // signed manifest + sidecar on disk; they were refiled to
+    // `tests/binary_manifest_loader.rs` as T2 integration tests per
+    // implementation-note-125.
+    //
+    // The `parse_trust_roots` parser tests below are pure-string T1
+    // tests that legitimately belong in-tree.
     // -----------------------------------------------------------------
-
-    /// Build a signed manifest at `path` using `signing_key`. Returns the
-    /// manifest bytes that were signed; caller can mutate the file after
-    /// to test the tamper path.
-    fn fixture_signed_manifest(
-        path: &std::path::Path,
-        signing_key: &ed25519_dalek::SigningKey,
-        manifest_bytes: &[u8],
-    ) {
-        use ed25519_dalek::Signer;
-        std::fs::write(path, manifest_bytes).expect("write manifest");
-        let sig = signing_key.sign(manifest_bytes);
-        let sidecar = serde_json::json!({
-            "schema_version": 1,
-            "signature": format!(
-                "ed25519:{}",
-                base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
-            ),
-            "signature_alg": "ed25519",
-        });
-        let sidecar_path = path.with_extension("toml.sig");
-        std::fs::write(&sidecar_path, sidecar.to_string()).expect("write sidecar");
-    }
-
-    #[test]
-    fn verify_with_trust_roots_release_only_accepts_release_signed() {
-        // T1: prod-shape trust set (length 1) — release-signed manifest verifies.
-        use ed25519_dalek::SigningKey;
-        use tempfile::tempdir;
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
-        fixture_signed_manifest(&manifest_path, &release_sk, b"[some] = \"manifest\"");
-
-        let trust_roots = vec![release_sk.verifying_key()];
-        verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots)
-            .expect("release-signed verifies under release-only trust set");
-    }
-
-    #[test]
-    fn verify_with_trust_roots_release_only_rejects_dev_signed() {
-        // T1: prod-shape trust set (length 1) — dev-signed manifest rejected.
-        // This is the load-bearing invariant for design §Component 1:
-        // when `EMBER_TRUST_ROOTS` is unset the daemon trusts ONLY the
-        // compiled-in release root.
-        use ed25519_dalek::SigningKey;
-        use tempfile::tempdir;
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
-        let dev_sk = SigningKey::from_bytes(&[2u8; 32]);
-        fixture_signed_manifest(&manifest_path, &dev_sk, b"[some] = \"manifest\"");
-
-        let trust_roots = vec![release_sk.verifying_key()];
-        let result = verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots);
-        assert!(
-            matches!(result, Err(VerifyError::SignatureMismatch)),
-            "dev-signed manifest must NOT verify under release-only trust set; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn verify_with_trust_roots_release_plus_dev_accepts_dev_signed() {
-        // T1: dev-shape trust set (length 2) — dev-signed manifest verifies
-        // when the dev root is added alongside the release root.
-        use ed25519_dalek::SigningKey;
-        use tempfile::tempdir;
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
-        let dev_sk = SigningKey::from_bytes(&[2u8; 32]);
-        fixture_signed_manifest(&manifest_path, &dev_sk, b"[some] = \"manifest\"");
-
-        let trust_roots = vec![release_sk.verifying_key(), dev_sk.verifying_key()];
-        verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots)
-            .expect("dev-signed verifies when dev root added to trust set");
-    }
-
-    #[test]
-    fn verify_with_trust_roots_release_plus_n_accepts_internal_signed() {
-        // T1: org-policy-shape trust set (length 3) — internal-endorsement
-        // root added without removing release. Reflects design's
-        // `EMBER_TRUST_ROOTS=<dev>,<org-internal>` example.
-        use ed25519_dalek::SigningKey;
-        use tempfile::tempdir;
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
-        let dev_sk = SigningKey::from_bytes(&[2u8; 32]);
-        let org_sk = SigningKey::from_bytes(&[3u8; 32]);
-        fixture_signed_manifest(&manifest_path, &org_sk, b"[some] = \"manifest\"");
-
-        let trust_roots = vec![
-            release_sk.verifying_key(),
-            dev_sk.verifying_key(),
-            org_sk.verifying_key(),
-        ];
-        verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots)
-            .expect("org-internal-signed verifies under release+dev+org trust set");
-    }
-
-    #[test]
-    fn verify_with_trust_roots_empty_set_fails_loud() {
-        // T1: defense — empty trust set is rejected at the API boundary
-        // rather than short-circuiting to Ok via the for-loop's zero
-        // iterations.
-        use tempfile::tempdir;
-        let dir = tempdir().expect("temp");
-        let manifest_path = dir.path().join("manifest.toml");
-        let release_sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        fixture_signed_manifest(&manifest_path, &release_sk, b"[some] = \"manifest\"");
-
-        let trust_roots: Vec<VerifyingKey> = vec![];
-        let result = verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots);
-        assert!(
-            matches!(result, Err(VerifyError::TrustRootsEmpty)),
-            "empty trust set must surface TrustRootsEmpty; got {result:?}"
-        );
-    }
 
     #[test]
     fn parse_trust_roots_empty_returns_empty_vec() {
@@ -1002,6 +940,24 @@ publisher = "did:emberlink"
         assert_eq!(parsed.len(), 1);
     }
 
+    #[test]
+    fn duplicate_release_root_from_operator_channel_is_not_operator_posture() {
+        let release = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let dev = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+        let mut trust_roots = vec![release];
+
+        let appended =
+            append_unique_operator_trust_roots(&mut trust_roots, vec![release, dev, dev]);
+
+        assert_eq!(appended, 1, "only the non-release dev root is appended");
+        assert_eq!(trust_roots, vec![release, dev]);
+
+        let records = build_trust_root_records(&trust_roots, appended);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].source, TrustRootSource::Release);
+        assert_eq!(records[1].source, TrustRootSource::Operator);
+    }
+
     // -----------------------------------------------------------------
     // T-CONSTRUCT-BINARY-DISTRIBUTION-CHANNEL: lookup + channel tests
     // -----------------------------------------------------------------
@@ -1038,6 +994,30 @@ publisher = "did:emberlink"
     }
 
     #[test]
+    fn bundled_runtime_manifest_candidates_keep_custom_scans_to_constructs() {
+        let from_dir = PathBuf::from("/tmp/ember-test-binaries");
+        let candidates = bundled_runtime_manifest_candidates(&from_dir);
+        assert_eq!(candidates.len(), COHORT_A_CONSTRUCTS.len());
+        for (tool, (candidate_tool, path)) in COHORT_A_CONSTRUCTS.iter().zip(candidates) {
+            assert_eq!(*tool, candidate_tool);
+            assert_eq!(path, from_dir.join(tool));
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn bundled_runtime_manifest_candidates_include_platform_rpc_sibling_for_canonical_dir() {
+        let candidates = bundled_runtime_manifest_candidates(&bundled_install_dir());
+        assert!(
+            candidates
+                .iter()
+                .any(|(tool, path)| *tool == BUNDLED_EMBERD_RPC_TOOL
+                    && *path == bundled_emberd_rpc_path()),
+            "canonical runtime manifest candidates must include the rpc sibling: {candidates:?}"
+        );
+    }
+
+    #[test]
     fn lookup_construct_returns_bundled_entry() {
         let manifest = BinaryManifest {
             entries: vec![fixture_bundled_entry("ember-gh")],
@@ -1070,28 +1050,9 @@ publisher = "did:emberlink"
         assert!(matches!(err, LookupError::UnsupportedChannel { .. }));
     }
 
-    #[test]
-    fn channel_defaults_to_bundled_for_legacy_manifests() {
-        // Pre-channel manifests written by older daemons omit the
-        // `channel` field; serde default must materialize Bundled so
-        // the v0.3.0 daemon can keep reading them.
-        let mut f = NamedTempFile::new().expect("temp");
-        write!(
-            f,
-            r#"
-[[entries]]
-tool_name = "ember-gh"
-version = "1.0.0"
-content_hash = "blake3:abc123"
-absolute_path = "/usr/local/lib/ember/binaries/ember-gh"
-installed_at = 1735689600
-publisher = "did:emberlink"
-"#
-        )
-        .expect("write");
-        let m = load_manifest(f.path()).expect("parse");
-        assert_eq!(m.entries[0].channel, BinaryDistributionChannel::Bundled);
-    }
+    // `channel_defaults_to_bundled_for_legacy_manifests` moved to
+    // `tests/binary_manifest_loader.rs` (T2) — it needed `NamedTempFile`
+    // to exercise the serde `default` path against an on-disk TOML.
 
     #[test]
     fn bundled_install_dir_is_canonical_path() {
@@ -1105,7 +1066,7 @@ publisher = "did:emberlink"
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-125 — peer binary
+    // implementation-note-124 — peer binary
     // pinning gate. The broker handlers refuse a request whose peer
     // binary (resolved via /proc/<pid>/exe + blake3) is not in the
     // signed manifest, or whose process is being traced.

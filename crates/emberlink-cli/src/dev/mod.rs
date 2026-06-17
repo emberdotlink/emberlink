@@ -5,6 +5,7 @@
 //! - `dev_prod_parity_ember_dev_install_slice_b_landed` (this PR: gh_app + uids)
 //! - `dev_prod_parity_ember_dev_sync_landed` (prior change)
 //!
+//! CLASSIFICATION: PUBLIC
 
 pub mod gh_app;
 pub mod identity_root;

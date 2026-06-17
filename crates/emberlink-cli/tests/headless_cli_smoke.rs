@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-490 — clap-parse smoke for the
+//! implementation-note-474 — clap-parse smoke for the
 //! `ember headless [enroll|revoke|status]` surface.
 //!
 //! The real socket round-trip is exercised by the qember.sh T3
@@ -54,6 +55,10 @@ fn headless_enroll_help_exposes_duration_flag() {
     let (stdout, _stderr, code) = run_ember(&["headless", "enroll", "--help"]);
     assert_eq!(code, 0, "ember headless enroll --help should exit 0");
     assert!(
+        stdout.contains("--input"),
+        "enroll --help should advertise required --input; stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("--duration"),
         "enroll --help should advertise --duration; stdout:\n{stdout}"
     );
@@ -92,9 +97,9 @@ fn headless_unknown_subcommand_is_refused() {
     );
 }
 
-// ─── implementation-note-295 — clap smoke ──────────
+// ─── implementation-note-242 — clap smoke ──────────
 //
-// implementation-note-296
+// implementation-note-243
 
 #[test]
 fn headless_help_lists_preflight_subcommand() {

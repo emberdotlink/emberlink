@@ -1,5 +1,6 @@
 # Python SDK examples
 
+
 ## Prerequisites
 
 Before running any example you need:
@@ -7,21 +8,23 @@ Before running any example you need:
 1. **ember daemon running**
 
    ```bash
-   ember daemon start
+   ember init --for claude
+   ember status
    ```
 
 2. **A persona for your agent**
 
    ```bash
-   ember trust create-persona my-agent
+   ember persona list
+   ember persona create --name my-agent
    # copy the printed persona ID
    ```
 
 3. **A credential stored under a name the agent will request**
 
    ```bash
-   ember storage add github-token
-   # paste or type the token value when prompted
+   echo "$GITHUB_TOKEN" | ember vault add --name github-token --stdin
+   # or run the same command without a pipe and type the token when prompted
    ```
 
 4. **Python package installed** (editable install from repo root, or `pip install emberlink-agent`)
@@ -64,7 +67,7 @@ python examples/request_credential.py
 When a request returns `status: pending` the human owner must approve it before the agent can use the credential. Check the ember UI or run:
 
 ```bash
-ember trust approvals
+ember approval list
 ```
 
 Once approved, call `request_grant` again (or poll `grant_status`) and proceed with `use_credential`.

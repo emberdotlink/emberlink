@@ -1,5 +1,16 @@
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+const EMBER_ENABLE_LEGACY_MACOS_NOTIFIER_ENV: &str = "EMBER_ENABLE_LEGACY_MACOS_NOTIFIER";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosNotificationPolicy {
+    CustomOnly,
+    LegacyFallbackAllowed,
+    BellOnly,
+}
+
 /// Errors returned by [`validate_notifier_path`].
 #[derive(Debug)]
 pub enum NotifyError {
@@ -82,14 +93,11 @@ pub fn validate_notifier_path(path: &Path) -> Result<(), NotifyError> {
 /// 1. `EMBER_NOTIFIER` env var — path to a custom notifier binary, called
 ///    as `<path> --title <title> --message <message>` (terminal-notifier
 ///    compatible).
-/// 2. `terminal-notifier` on `$PATH` — preferred on macOS because it has
-///    its own signed bundle identity; `display notification` from osascript
-///    runs under Script Editor's identity and silently fails (or launches
-///    Script Editor on some macOS versions) if Script Editor lacks
-///    notification permission in System Settings.
-/// 3. `osascript -e 'display notification ...'` — fallback. Captures stderr
-///    so a notify-permission failure surfaces in the daemon log instead
-///    of mystery-disappearing.
+/// 2. Bell + log only — default when no custom notifier is configured.
+///    This avoids the legacy `terminal-notifier` / `osascript` macOS
+///    surface, which produced stale system-style approval banners.
+/// 3. `terminal-notifier` / `osascript` — legacy fallback, opt-in only via
+///    `EMBER_ENABLE_LEGACY_MACOS_NOTIFIER=1`.
 ///
 /// ## Linux: uses `notify-send`.
 ///
@@ -143,55 +151,61 @@ pub fn send_notification_with_url(
     let title = sanitize(title);
     let subtitle = subtitle.map(sanitize);
     let message = sanitize(message);
+    let mut delivered = false;
 
     #[cfg(target_os = "macos")]
     {
-        if try_custom_notifier(&title, subtitle.as_deref(), &message) {
-            log_sent(&title, subtitle.as_deref(), &message);
-            return;
+        match macos_notification_policy(
+            std::env::var_os("EMBER_NOTIFIER").is_some(),
+            std::env::var(EMBER_ENABLE_LEGACY_MACOS_NOTIFIER_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            MacosNotificationPolicy::CustomOnly => {
+                delivered = try_custom_notifier(&title, subtitle.as_deref(), &message);
+                if !delivered {
+                    tracing::warn!(
+                        env = EMBER_ENABLE_LEGACY_MACOS_NOTIFIER_ENV,
+                        "EMBER_NOTIFIER is configured but did not deliver; skipping legacy macOS desktop notification fallback"
+                    );
+                }
+            }
+            MacosNotificationPolicy::LegacyFallbackAllowed => {
+                delivered = try_terminal_notifier(&title, subtitle.as_deref(), &message, click_url);
+                if !delivered {
+                    if click_url.is_some() {
+                        tracing::debug!(
+                            "click-through URL not supported on osascript path; install terminal-notifier (brew) for click-through support"
+                        );
+                    }
+                    delivered = try_osascript(&title, subtitle.as_deref(), &message);
+                }
+            }
+            MacosNotificationPolicy::BellOnly => {
+                tracing::info!(
+                    env = EMBER_ENABLE_LEGACY_MACOS_NOTIFIER_ENV,
+                    "legacy macOS desktop notification fallback disabled; configure EMBER_NOTIFIER for a real desktop surface or set EMBER_ENABLE_LEGACY_MACOS_NOTIFIER=1 to opt back in temporarily"
+                );
+            }
         }
-        if try_terminal_notifier(&title, subtitle.as_deref(), &message, click_url) {
-            log_sent(&title, subtitle.as_deref(), &message);
-            return;
-        }
-        if click_url.is_some() {
-            tracing::debug!(
-                "click-through URL not supported on osascript path; install terminal-notifier (brew) for click-through support"
-            );
-        }
-        try_osascript(&title, subtitle.as_deref(), &message);
     }
 
     #[cfg(target_os = "linux")]
     {
-        let combined = match subtitle.as_deref() {
-            Some(s) if !s.is_empty() => format!("{s}\n{message}"),
-            _ => message.clone(),
-        };
-        match std::process::Command::new("notify-send")
-            .args([title.as_str(), combined.as_str()])
-            .output()
-        {
-            Ok(out) if !out.status.success() => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!(
-                    cmd = "notify-send",
-                    exit = out.status.code().unwrap_or(-1),
-                    stderr = %stderr.trim(),
-                    "subprocess failed"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(cmd = "notify-send", error = %e, "subprocess spawn failed");
-            }
-        }
+        delivered = try_notify_send(&title, subtitle.as_deref(), &message);
     }
 
-    // Terminal bell as universal fallback
-    eprint!("\x07");
-
-    log_sent(&title, subtitle.as_deref(), &message);
+    if delivered {
+        log_sent(&title, subtitle.as_deref(), &message);
+    } else {
+        eprint!("\x07");
+        tracing::info!(
+            title = title,
+            subtitle = subtitle.as_deref().unwrap_or(""),
+            message = message,
+            "notification fell back to bell/log only",
+        );
+    }
 }
 
 fn log_sent(title: &str, subtitle: Option<&str>, message: &str) {
@@ -207,6 +221,20 @@ fn log_sent(title: &str, subtitle: Option<&str>, message: &str) {
 /// string literals. Keep spaces.
 fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() || *c == ' ').collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_notification_policy(
+    custom_notifier_configured: bool,
+    legacy_opt_in_raw: Option<&str>,
+) -> MacosNotificationPolicy {
+    if custom_notifier_configured {
+        MacosNotificationPolicy::CustomOnly
+    } else if legacy_opt_in_raw == Some("1") {
+        MacosNotificationPolicy::LegacyFallbackAllowed
+    } else {
+        MacosNotificationPolicy::BellOnly
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -255,7 +283,7 @@ fn try_terminal_notifier(
 }
 
 #[cfg(target_os = "macos")]
-fn try_osascript(title: &str, subtitle: Option<&str>, message: &str) {
+fn try_osascript(title: &str, subtitle: Option<&str>, message: &str) -> bool {
     // AppleScript escape: backslash and double-quote.
     fn escape(s: &str) -> String {
         s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -285,10 +313,40 @@ fn try_osascript(title: &str, subtitle: Option<&str>, message: &str) {
                 stderr = %stderr.trim(),
                 "osascript notification failed — did you grant Script Editor notification permission in System Settings > Notifications? Install terminal-notifier (brew) for a more reliable path."
             );
+            false
         }
-        Ok(_) => {}
+        Ok(_) => true,
         Err(e) => {
             tracing::warn!(error = %e, "osascript spawn failed");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_notify_send(title: &str, subtitle: Option<&str>, message: &str) -> bool {
+    let combined = match subtitle {
+        Some(s) if !s.is_empty() => format!("{s}\n{message}"),
+        _ => message.to_string(),
+    };
+    match std::process::Command::new("notify-send")
+        .args([title, combined.as_str()])
+        .output()
+    {
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!(
+                cmd = "notify-send",
+                exit = out.status.code().unwrap_or(-1),
+                stderr = %stderr.trim(),
+                "subprocess failed"
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(cmd = "notify-send", error = %e, "subprocess spawn failed");
+            false
         }
     }
 }
@@ -307,6 +365,35 @@ mod tests {
     #[test]
     fn sanitize_keeps_unicode() {
         assert_eq!(sanitize("naïve résumé"), "naïve résumé");
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos_policy {
+        use super::super::{MacosNotificationPolicy, macos_notification_policy};
+
+        #[test]
+        fn defaults_to_bell_only_without_custom_notifier_or_opt_in() {
+            assert_eq!(
+                macos_notification_policy(false, None),
+                MacosNotificationPolicy::BellOnly
+            );
+        }
+
+        #[test]
+        fn opt_in_reenables_legacy_macos_fallbacks() {
+            assert_eq!(
+                macos_notification_policy(false, Some("1")),
+                MacosNotificationPolicy::LegacyFallbackAllowed
+            );
+        }
+
+        #[test]
+        fn custom_notifier_beats_legacy_opt_in() {
+            assert_eq!(
+                macos_notification_policy(true, Some("1")),
+                MacosNotificationPolicy::CustomOnly
+            );
+        }
     }
 
     #[cfg(unix)]

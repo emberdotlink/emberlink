@@ -30,6 +30,9 @@
 //! | `<any> {list,get,describe}`                              | `None` (passthrough)           |
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// Okta CLI global flags that take a value as the *next* argv token.
 /// When stripping, both the flag and its value are removed.
@@ -175,6 +178,204 @@ pub fn classify_okta_argv(argv: &[String]) -> Option<ActionKey> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OktaFactory — construct-factory contract for the okta construct
+// ---------------------------------------------------------------------------
+
+/// Parsed okta.toml action manifest, initialised once at first access.
+static OKTA_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/okta.toml"))
+            .expect("bundled okta.toml must be valid")
+    });
+
+/// Look up the `need` atoms for an action key from the bundled manifest.
+/// Returns `None` if the action is absent from the manifest or has an empty
+/// `need` list.
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    OKTA_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key)
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+/// Returns `true` when `action_key` has an entry in the bundled manifest
+/// (regardless of whether it carries a `need`).
+fn action_in_manifest(action_key: &str) -> bool {
+    OKTA_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .any(|a| a.key == action_key)
+}
+
+/// factory implementation for the `okta` construct.
+#[derive(Debug, Default, Clone)]
+pub struct OktaFactory;
+
+/// Provider-specific target extracted from an `okta` argv invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OktaFactoryTarget {
+    pub provider: &'static str,
+    pub org_url: Option<String>,
+    pub resource_id: Option<String>,
+}
+
+/// Need atoms derived from the bundled manifest for one `okta` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OktaFactoryNeed(pub Vec<String>);
+
+/// Extract `--org-url <value>` or `--org-url=<value>` from raw argv.
+fn extract_org_url(argv: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = &argv[i];
+        if let Some(value) = tok.strip_prefix("--org-url=")
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+        if tok == "--org-url"
+            && let Some(value) = argv.get(i + 1)
+            && !value.starts_with('-')
+        {
+            return Some(value.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` if raw argv contains `--profile`, `-p`, `--token`, or `-t`.
+///
+/// These flags select credential source or material directly, which is outside
+/// the factory mediation contract.
+fn has_credential_source_flag(argv: &[String]) -> bool {
+    for tok in argv {
+        // Exact matches for the flag tokens.
+        if tok == "--profile" || tok == "-p" || tok == "--token" || tok == "-t" {
+            return true;
+        }
+        // `--flag=value` form.
+        if tok.starts_with("--profile=") || tok.starts_with("--token=") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` if the raw argv contains the `login` resource (before flag
+/// stripping), indicating an interactive credential-source mutation.
+fn has_login_verb(argv: &[String]) -> bool {
+    let stripped = strip_global_flags(argv);
+    stripped.first().map(|s| s.as_str()) == Some("login")
+}
+
+/// Returns `true` if the argv contains a `--file` flag in combination with a
+/// `policies` verb, indicating authority-bearing policy payload.
+fn has_policy_file_arg(argv: &[String]) -> bool {
+    let stripped = strip_global_flags(argv);
+    let is_policies = stripped.first().map(|s| s.as_str()) == Some("policies");
+    if !is_policies {
+        return false;
+    }
+    argv.iter()
+        .any(|tok| tok == "--file" || tok.starts_with("--file="))
+}
+
+impl InvocationGrammar for OktaFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_okta_argv(argv)
+    }
+}
+
+impl TargetExtractor for OktaFactory {
+    type Target = OktaFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let org_url = extract_org_url(argv);
+
+        // Extract the first non-flag positional after the resource+verb as a
+        // resource identifier (user email, group id, etc.).
+        let stripped = strip_global_flags(argv);
+        let resource_id = stripped
+            .get(2..)
+            .unwrap_or_default()
+            .iter()
+            .find(|tok| !tok.starts_with('-'))
+            .cloned();
+
+        Some(OktaFactoryTarget {
+            provider: "okta",
+            org_url,
+            resource_id,
+        })
+    }
+}
+
+impl NeedTemplate for OktaFactory {
+    type Need = OktaFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(OktaFactoryNeed)
+    }
+}
+
+impl ConstructFactory for OktaFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        // Credential-source flags bypass the factory entirely — fail closed.
+        // Checked before action_key gate because these flags are dangerous
+        // regardless of whether the verb itself classified.
+        if has_credential_source_flag(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // `okta login` is a credential-source mutation — fail closed.
+        // The classifier does not produce an action key for `login`, so
+        // this must be checked before the None-key branch.
+        if has_login_verb(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // No action key → reads, version, --version, help — no credentials.
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        // Policy file args carry authority-bearing payloads.
+        if has_policy_file_arg(argv) {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        // Action not in manifest → not declared, fail closed.
+        if !action_in_manifest(&key.0) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // Action is in the manifest. Org/profile must still be resolved from
+        // the local okta config, so we need a resolver.
+        FactoryDisposition::ResolverRequired
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,11 +420,6 @@ mod tests {
     fn users_reset_password_classified() {
         let r = classify_okta_argv(&args(&["users", "reset-password", "uid"])).unwrap();
         assert_eq!(r.0, "okta.users.reset-password");
-    }
-
-    #[test]
-    fn users_list_passthrough() {
-        assert!(classify_okta_argv(&args(&["users", "list"])).is_none());
     }
 
     #[test]
@@ -668,7 +864,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Okta)`, and a request that
     // declares `provider = Okta` round-trips through issue → revoke
-    // without panicking. Real Okta broker impl is implementation-note-104
+    // without panicking. Real Okta broker impl is implementation-note-103
     // (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
@@ -682,6 +878,13 @@ mod tests {
                 "scopes": ["okta.users.manage", "okta.groups.manage"],
             }),
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "ember-okta integration test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -725,5 +928,205 @@ mod tests {
     #[test]
     fn okta_provider_as_str() {
         assert_eq!(BrokerProvider::Okta.as_str(), "okta");
+    }
+
+    // --- OktaFactory tests ---
+
+    #[test]
+    fn okta_factory_version_is_credentialless() {
+        let f = OktaFactory;
+        let a = args(&["--version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn okta_factory_users_list_is_credentialless() {
+        let f = OktaFactory;
+        let a = args(&["users", "list"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn okta_factory_users_delete_is_resolver_required() {
+        let f = OktaFactory;
+        let a = args(&["users", "delete", "alice@example.com"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn okta_factory_profile_flag_is_unsupported() {
+        let f = OktaFactory;
+        let a = args(&["--profile", "prod", "users", "delete", "alice@example.com"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn okta_factory_short_profile_flag_is_unsupported() {
+        let f = OktaFactory;
+        let a = args(&["-p", "prod", "users", "delete", "uid"]);
+        // -p is not in the long-form global-flag strip list, so the
+        // classifier sees "-p" as resource and returns None.  The factory
+        // detects the short flag in raw argv and fails closed regardless.
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn okta_factory_token_flag_is_unsupported() {
+        let f = OktaFactory;
+        let a = args(&["--token", "00secret", "users", "create", "--email", "u@x"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn okta_factory_short_token_flag_is_unsupported() {
+        let f = OktaFactory;
+        let a = args(&["-t", "00secret", "users", "create", "--email", "u@x"]);
+        // -t is not in the long-form global-flag strip list, so the
+        // classifier sees "-t" as resource and returns None.  The factory
+        // detects the short flag in raw argv and fails closed regardless.
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn okta_factory_login_is_unsupported() {
+        let f = OktaFactory;
+        let a = args(&["login"]);
+        let key = f.action_key_for_argv(&a);
+        // login is not classified by the argv classifier, but the factory
+        // detects it as a credential-source mutation and fails closed.
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn okta_factory_policy_update_with_file_is_payload_analysis() {
+        let f = OktaFactory;
+        let a = args(&["policies", "update", "policy-123", "--file", "policy.json"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn okta_factory_policy_create_with_file_equals_is_payload_analysis() {
+        let f = OktaFactory;
+        let a = args(&["policies", "create", "--file=rules.json"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn okta_factory_groups_create_is_resolver_required() {
+        let f = OktaFactory;
+        let a = args(&["groups", "create", "admins"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn okta_factory_target_extraction() {
+        let f = OktaFactory;
+        let a = args(&[
+            "users",
+            "delete",
+            "alice@example.com",
+            "--org-url",
+            "https://dev-ember.okta.com",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "okta");
+        assert_eq!(
+            target.org_url,
+            Some("https://dev-ember.okta.com".to_string())
+        );
+        assert_eq!(target.resource_id, Some("alice@example.com".to_string()));
+    }
+
+    #[test]
+    fn okta_factory_target_extraction_org_url_equals() {
+        let f = OktaFactory;
+        let a = args(&[
+            "users",
+            "create",
+            "--org-url=https://ember.okta.com",
+            "--email",
+            "u@x",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.org_url, Some("https://ember.okta.com".to_string()));
+    }
+
+    #[test]
+    fn okta_factory_target_extraction_no_org_url() {
+        let f = OktaFactory;
+        let a = args(&["groups", "delete", "gid"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "okta");
+        assert!(target.org_url.is_none());
+        assert_eq!(target.resource_id, Some("gid".to_string()));
+    }
+
+    #[test]
+    fn okta_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/okta/factory-fixtures.toml"
+        ))
+        .expect("fixture TOML parses");
+        let errors = core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/okta.toml"),
+        )
+        .expect("valid okta manifest");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &OktaFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

@@ -4,42 +4,31 @@
 //! Pre-launch, we accept that an existing-vault user with key drift wipes
 //! `<data_dir>/vault.salt` and reseeds. These tests therefore exercise the
 //! **fresh-vault** contract only: open → add → close → re-open → get must
-//! always round-trip cleanly under a stable passphrase + persistent salt.
-//! They use `EMBER_VAULT_PASSPHRASE` to short-circuit the keyring lookup,
-//! keeping the suite portable to Linux/CI runners.
+//! always round-trip cleanly under a stable key.
+//!
+//! design S4: migrated from `Vault::open_from_config` (retired) to
+//! `Vault::new([key])` with a deterministic test key.
 //!
 //! marker: vault-aead-decrypt-fix
 
-use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::{Vault, VaultError, VaultScope};
-use tempfile::TempDir;
 
-/// Helper: build a `DaemonConfig` whose `data_dir` points at a fresh tempdir
-/// so each test owns its own `vault.salt`.
-fn config_with_data_dir(tmp: &TempDir) -> DaemonConfig {
-    DaemonConfig::for_test(tmp.path())
-}
+const TEST_KEY: [u8; 32] = [0xAB; 32];
 
 /// End-to-end round-trip: open a vault, write a credential, drop the vault,
-/// re-open from the same `DaemonConfig`, read the credential back. The test
-/// gate in `resolve_passphrase` returns a deterministic passphrase under
-/// `cargo test`, so the same `data_dir` (= same salt) deterministically
-/// yields the same master key across opens — no env-var manipulation needed.
+/// re-open from the same key, read the credential back.
 #[test]
 fn vault_open_add_get_round_trips_across_sessions() {
-    let tmp = TempDir::new().expect("tempdir");
-    let config = config_with_data_dir(&tmp);
-
-    let store1 = DaemonStore::open_in_memory().expect("store 1");
+    let store = DaemonStore::open_in_memory().expect("store");
 
     // Session 1: create the vault, write a credential.
     {
-        let vault1 = Vault::open_from_config(&config).expect("open vault 1");
+        let vault1 = Vault::new(TEST_KEY);
         vault1
             .add(
                 VaultScope::Interactive,
-                &store1,
+                &store,
                 "decrypt-fix-key",
                 b"super-secret-value",
                 None,
@@ -47,32 +36,28 @@ fn vault_open_add_get_round_trips_across_sessions() {
             .expect("add credential");
 
         let same_session = vault1
-            .get(VaultScope::Interactive, &store1, "decrypt-fix-key")
+            .get(VaultScope::Interactive, &store, "decrypt-fix-key")
             .expect("get within session 1");
-        assert_eq!(same_session, b"super-secret-value");
+        assert_eq!(same_session.as_slice(), b"super-secret-value");
     }
 
-    // Session 2: re-open with the SAME config (same salt file persisted on
-    // disk). The store from session 1 still holds the encrypted credential.
-    let vault2 = Vault::open_from_config(&config).expect("open vault 2");
+    // Session 2: re-open with the same key.
+    let vault2 = Vault::new(TEST_KEY);
     let across_sessions = vault2
-        .get(VaultScope::Interactive, &store1, "decrypt-fix-key")
+        .get(VaultScope::Interactive, &store, "decrypt-fix-key")
         .expect("get across session boundary");
-    assert_eq!(across_sessions, b"super-secret-value");
+    assert_eq!(across_sessions.as_slice(), b"super-secret-value");
 }
 
-/// Once initialized, the same `data_dir` (= same persistent `vault.salt`)
-/// + same passphrase must always yield the same master key. Every `get`
+/// The same key must always yield identical decryptions. Every `get`
 /// across re-opens must succeed — no AEAD failure on a stable vault.
 #[test]
-fn vault_key_stable_across_opens_with_persistent_salt() {
-    let tmp = TempDir::new().expect("tempdir");
-    let config = config_with_data_dir(&tmp);
+fn vault_key_stable_across_opens() {
     let store = DaemonStore::open_in_memory().expect("store");
 
-    // First open: salt file is created.
+    // First open: add a credential.
     {
-        let vault1 = Vault::open_from_config(&config).expect("open 1");
+        let vault1 = Vault::new(TEST_KEY);
         vault1
             .add(
                 VaultScope::Interactive,
@@ -84,15 +69,15 @@ fn vault_key_stable_across_opens_with_persistent_salt() {
             .expect("add");
     }
 
-    // Subsequent opens: same salt + same deterministic test passphrase = same
-    // master key. Every `get` must succeed — no AEAD failure.
+    // Subsequent opens: same key = same master key. Every `get` must succeed.
     for i in 0..5 {
-        let v = Vault::open_from_config(&config).expect("re-open");
+        let v = Vault::new(TEST_KEY);
         let value = v
             .get(VaultScope::Interactive, &store, "stable-key")
             .unwrap_or_else(|e| panic!("get on re-open #{i} failed: {e:?}"));
         assert_eq!(
-            value, b"stable-value",
+            value.as_slice(),
+            b"stable-value",
             "re-open #{i} returned wrong plaintext"
         );
     }
@@ -104,13 +89,11 @@ fn vault_key_stable_across_opens_with_persistent_salt() {
 /// `vault get` returns `aead::Error`.
 #[test]
 fn multi_credential_multi_session_all_decrypt() {
-    let tmp = TempDir::new().expect("tempdir");
-    let config = config_with_data_dir(&tmp);
     let store = DaemonStore::open_in_memory().expect("store");
 
     // Add three credentials under three different opens.
     {
-        let v = Vault::open_from_config(&config).expect("open 1");
+        let v = Vault::new(TEST_KEY);
         v.add(
             VaultScope::Interactive,
             &store,
@@ -121,7 +104,7 @@ fn multi_credential_multi_session_all_decrypt() {
         .expect("add pulumi");
     }
     {
-        let v = Vault::open_from_config(&config).expect("open 2");
+        let v = Vault::new(TEST_KEY);
         v.add(
             VaultScope::Interactive,
             &store,
@@ -132,7 +115,7 @@ fn multi_credential_multi_session_all_decrypt() {
         .expect("add tailscale token");
     }
     {
-        let v = Vault::open_from_config(&config).expect("open 3");
+        let v = Vault::new(TEST_KEY);
         v.add(
             VaultScope::Interactive,
             &store,
@@ -143,8 +126,8 @@ fn multi_credential_multi_session_all_decrypt() {
         .expect("add tailnet");
     }
 
-    // List sees all three (mirrors the operator's working `vault list`).
-    let list_vault = Vault::open_from_config(&config).expect("open for list");
+    // List sees all three.
+    let list_vault = Vault::new(TEST_KEY);
     let listed = list_vault
         .list(VaultScope::Interactive, &store)
         .expect("list");
@@ -164,20 +147,17 @@ fn multi_credential_multi_session_all_decrypt() {
         ("tailscale/tailnet", &b"tailnet-name"[..]),
     ];
     for (name, expected) in names_and_expected {
-        let v = Vault::open_from_config(&config).expect("open for get");
+        let v = Vault::new(TEST_KEY);
         let got = v
             .get(VaultScope::Interactive, &store, name)
             .unwrap_or_else(|e| panic!("AEAD decrypt failed on {name:?}: {e:?}"));
-        assert_eq!(got, expected, "wrong plaintext for {name:?}");
+        assert_eq!(got.as_slice(), expected, "wrong plaintext for {name:?}");
     }
 }
 
 /// Direct check: `Vault::get` on a credential sealed with key K1 must surface
 /// `VaultError::Crypto(...)` (NOT `Ok` and NOT a panic) when re-opened under
-/// key K2. This is the AEAD authentication-tag-mismatch path that the bug
-/// report's `aead::Error` corresponds to. The CLI maps this to a non-zero
-/// exit code in `crates/emberlink-cli/src/bin/ember.rs:1781-1789` —
-/// confirming that branch is the only `Err(_)` arm of `vault get`.
+/// key K2. This is the AEAD authentication-tag-mismatch path.
 #[test]
 fn aead_decrypt_failure_surfaces_as_vault_error_crypto() {
     let store = DaemonStore::open_in_memory().expect("store");

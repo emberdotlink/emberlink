@@ -1,10 +1,11 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! ember-relay — bidirectional UDS<->TCP relay for the yolo VM trust-broker bridge.
 //! Two binaries:
 //!   - `ember-relay-host` (macOS host): TCP listener -> AF_UNIX dialer (to daemon sock)
 //!   - `ember-relay-vm` (Linux VM): AF_UNIX listener -> TCP dialer (to host relay)
 //!
-//! implementation-note-429
+//! implementation-note-389
 //!
 //! ## Topology (canonical wire diagram)
 //!
@@ -32,7 +33,7 @@
 //! except for a single HELLO frame written by the VM-side relay before any
 //! agent bytes flow. The frame schema lives in [`handshake`]; the host-side
 //! relay forwards it verbatim (the daemon parses it — that's
-//! implementation-note-428).
+//! implementation-note-388).
 //!
 //! ## Security invariants
 //!

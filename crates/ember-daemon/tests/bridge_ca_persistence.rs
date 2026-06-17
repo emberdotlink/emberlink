@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-328 — T2 integration coverage
+//! implementation-note-365 — T2 integration coverage
 //! for the Bridge CA load-or-mint helper.
 //!
 //! Spinning up the full `DaemonRuntime::run` requires a PID file, a Unix

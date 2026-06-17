@@ -16,11 +16,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ember_daemon::infra::rate_limit::RateLimiter;
-use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::socket::{SocketListener, new_shared_policy_engine};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+    ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -28,7 +28,7 @@ use tokio::sync::watch;
 fn auto_approve_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: "credential.access.*".to_string(),
+            action: ActionSelector::named("credential.access.*"),
             risk: RiskLevel::Low,
             requirement: ApprovalRequirement::Auto,
             tier: None,
@@ -59,7 +59,7 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([7u8; 32]));
             store.set_vault(Rc::clone(&vault));
-            let policy = Rc::new(auto_approve_policy());
+            let policy = new_shared_policy_engine(auto_approve_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault;
             let listener =
@@ -77,8 +77,8 @@ fn daemon_call(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let stream =
-        std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| format!("connect: {e}"))?;
+    let stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .map_err(|e| format!("connect: {e}"))?;
     let mut writer = stream.try_clone().map_err(|e| format!("clone: {e}"))?;
     let mut reader = BufReader::new(stream);
     let req = serde_json::json!({"id": "1", "method": method, "params": params});
@@ -137,7 +137,11 @@ fn extract_error_text(resp: &serde_json::Value) -> String {
         "unexpected JSON-RPC error: {resp}"
     );
     let result = resp.get("result").expect("missing result");
-    assert_eq!(result["isError"], serde_json::json!(true), "expected tool error");
+    assert_eq!(
+        result["isError"],
+        serde_json::json!(true),
+        "expected tool error"
+    );
     result["content"][0]["text"].as_str().unwrap().to_string()
 }
 
@@ -285,11 +289,17 @@ async fn mcp_binary_round_trips_live_daemon_and_no_daemon_modes() {
     );
     let receipts_json: serde_json::Value =
         serde_json::from_str(&extract_text_result(&receipts)).unwrap();
-    assert!(receipts_json.is_array(), "list_receipts should return a JSON array");
+    assert!(
+        receipts_json.is_array(),
+        "list_receipts should return a JSON array"
+    );
 
     drop(child_stdin);
     let status = child.wait().unwrap();
-    assert!(status.success(), "emberlink-mcp exited unsuccessfully: {status}");
+    assert!(
+        status.success(),
+        "emberlink-mcp exited unsuccessfully: {status}"
+    );
 
     let mut no_daemon_child = Command::new(env!("CARGO_BIN_EXE_emberlink-mcp"))
         .arg("--persona")

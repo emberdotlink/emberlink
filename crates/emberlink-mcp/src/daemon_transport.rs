@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -15,6 +16,19 @@ use tokio_rustls::TlsConnector;
 /// `ca.crt` is the SOLE trust anchor — system roots are deliberately NEVER
 /// consulted, mirroring the server-side invariant in
 /// `crates/ember-rpc/src/listener.rs::build_server_tls_config`.
+///
+/// `tls_config` is wrapped in `Arc<RwLock<Arc<ClientConfig>>>` so the
+/// implementation-note-486 refresh path can hot-swap the underlying
+/// `ClientConfig` (refreshed per-agent cert + key) and have every
+/// `DaemonTransport` clone that shares this `MtlsBridgeConfig` observe the
+/// new config on its next RPC. Anchor: `emberlink_mcp_cert_swap_landed`.
+///
+/// Under v0.3.0's per-RPC connect-then-close pattern (find via
+/// `per_rpc_connect_then_close_pattern` checkpoint below), cert swap is
+/// trivial: write new cert+key into the lock; the next `call_raw` opens a
+/// fresh TCP+TLS connection and presents the new cert; the previous RPC's
+/// connection was already closed. No connection pool drain semantics
+/// required — design §Component 4.
 #[derive(Clone)]
 pub struct MtlsBridgeConfig {
     /// `host:port` string the orchestrator publishes via `EMBER_DAEMON_ENDPOINT`.
@@ -22,13 +36,95 @@ pub struct MtlsBridgeConfig {
     /// the host's container-network gateway IP plus the listener port.
     pub endpoint: String,
     /// Pre-built TLS config holding the per-agent client cert + the bridge CA
-    /// as the sole root.
-    pub tls_config: Arc<ClientConfig>,
+    /// as the sole root. Wrapped in `Arc<RwLock<Arc<ClientConfig>>>` so the
+    /// cert-refresh path can hot-swap it via
+    /// [`MtlsBridgeConfig::swap_client_config`] without rebuilding the
+    /// surrounding transport or re-handshaking in-flight connections.
+    pub tls_config: Arc<RwLock<Arc<ClientConfig>>>,
     /// SNI / server-name presented during the TLS handshake. ember-rpc's
     /// server cert is minted with a stable SAN; the client side validates
     /// against this name. Defaults to `localhost` for parity with the
     /// listener smoke tests.
     pub server_name: String,
+    /// Shared "refresh has been failing past the 90% band" flag. Set to
+    /// `true` by the refresh client (see `cert_expiry.rs`) at the 90%
+    /// band when no successful refresh has landed; gates NEW tool calls
+    /// via [`DaemonTransport::call_tool`] with a typed `RefreshFailing`
+    /// error. In-flight RPCs are NOT interrupted — design §Component 5
+    /// "Soft fail-closed at 90% TTL". Anchor:
+    /// `emberlink_mcp_cert_refresh_client_landed`.
+    ///
+    /// `None` for host-mode (UDS) configs and for tests that don't wire
+    /// the refresh client; in those cases `call_tool` never refuses.
+    pub refresh_failing: Arc<AtomicBool>,
+}
+
+impl MtlsBridgeConfig {
+    /// Build a `MtlsBridgeConfig` from a plain `Arc<ClientConfig>`. The
+    /// outer `Arc<RwLock<...>>` wrapper is constructed here so callers
+    /// don't have to know the swap-substrate shape. The `refresh_failing`
+    /// flag is initialized `false`; the refresh client (see
+    /// `cert_expiry.rs`) flips it at the 90% band when no successful
+    /// refresh has landed yet.
+    pub fn new(endpoint: String, tls_config: Arc<ClientConfig>, server_name: String) -> Self {
+        Self {
+            endpoint,
+            tls_config: Arc::new(RwLock::new(tls_config)),
+            server_name,
+            refresh_failing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Mark the bridge as refresh-failing (90% band reached with no
+    /// successful refresh). Subsequent `call_tool` invocations refuse
+    /// with the typed [`DaemonTransportError::RefreshFailing`] error.
+    /// Cleared on the next successful refresh.
+    pub fn set_refresh_failing(&self, failing: bool) {
+        self.refresh_failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Cheap read of the refresh-failing flag. `false` for host-mode
+    /// (UDS) configs and for tests that don't wire the refresh client.
+    pub fn is_refresh_failing(&self) -> bool {
+        self.refresh_failing.load(Ordering::SeqCst)
+    }
+
+    /// Atomically replace the inner `Arc<ClientConfig>` with `new_config`.
+    /// Every `MtlsBridgeConfig` clone that shares the outer
+    /// `Arc<RwLock<...>>` observes the swap on its next RPC; in-flight
+    /// connections that already captured the old `Arc<ClientConfig>`
+    /// snapshot finish on the old cert (per design §Component 4
+    /// "no in-flight RPC interruption"). Anchor:
+    /// `emberlink_mcp_cert_swap_landed` — searchable anchor for the
+    /// M7 cert-swap acceptance criterion.
+    ///
+    /// Panics only if the lock is poisoned (a prior write panic'd while
+    /// holding the lock). The bridge transport never panics under normal
+    /// operation, so a poisoned lock is a bug-not-runtime condition; we
+    /// surface it loudly rather than papering over it.
+    pub fn swap_client_config(&self, new_config: Arc<ClientConfig>) {
+        // emberlink_mcp_cert_swap_landed — the rustls ClientConfig swap
+        // point for the design cert-refresh chain (M7). Atomically
+        // replaces the inner Arc; readers see the old value until they
+        // re-read the lock on the next call.
+        let mut guard = self
+            .tls_config
+            .write()
+            .expect("MtlsBridgeConfig::tls_config lock poisoned");
+        *guard = new_config;
+    }
+
+    /// Snapshot the current `Arc<ClientConfig>` for a single RPC. Returns
+    /// a cheap `Arc` clone so the read-lock guard never crosses an
+    /// `.await` point — which would otherwise leak a `!Send` guard into
+    /// the tokio task. Used by [`DaemonTransport::mtls_round_trip`].
+    pub fn current_client_config(&self) -> Arc<ClientConfig> {
+        let guard = self
+            .tls_config
+            .read()
+            .expect("MtlsBridgeConfig::tls_config lock poisoned");
+        Arc::clone(&*guard)
+    }
 }
 
 impl std::fmt::Debug for MtlsBridgeConfig {
@@ -110,7 +206,7 @@ impl DaemonTransport {
 
     /// Returns `true` when the transport routes through the mTLS bridge
     /// rather than a host UDS. Used by unit tests to assert the
-    /// `EMBER_DAEMON_ENDPOINT` selector wired the expected variant.
+    /// `EMBER_BRIDGE_URL` selector wired the expected variant.
     pub fn is_mtls(&self) -> bool {
         matches!(self.inner, Transport::Mtls { .. })
     }
@@ -246,11 +342,25 @@ impl DaemonTransport {
     }
 
     /// Execute an MCP tool call by routing through the daemon.
+    ///
+    /// Per design §Component 5 "Soft fail-closed at 90% TTL": if the
+    /// mTLS bridge transport's refresh client has flipped the
+    /// `refresh_failing` flag (no successful refresh has landed at the
+    /// 90% band), NEW tool calls refuse with
+    /// [`DaemonTransportError::RefreshFailing`]. In-flight calls already
+    /// past this gate continue uninterrupted. The refresh-RPC path
+    /// itself uses [`Self::call_raw`] and is NOT gated — refresh
+    /// attempts must continue running even after the 90% band.
     pub fn call_tool(
         &self,
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, DaemonTransportError> {
+        if let Transport::Mtls { config, .. } = &self.inner
+            && config.is_refresh_failing()
+        {
+            return Err(DaemonTransportError::RefreshFailing);
+        }
         // Special case: `request_grant` routes through `request_access` so
         // policy evaluation AND the pre-eval rate limiter both apply.
         // TODO 69.1 / design. `translated` owns the augmented params so a
@@ -362,7 +472,13 @@ impl DaemonTransport {
         let request = request_line.to_owned();
         let endpoint = config.endpoint.clone();
         let server_name_str = config.server_name.clone();
-        let tls_config = Arc::clone(&config.tls_config);
+        // per_rpc_connect_then_close_pattern — snapshot the current
+        // ClientConfig on every RPC so a concurrent
+        // `swap_client_config` is picked up on the *next* call without
+        // disturbing this one. The snapshot is a cheap Arc clone; the
+        // read lock is released before the `.await` so we never carry a
+        // !Send guard across an await point.
+        let tls_config = config.current_client_config();
         runtime.block_on(async move {
             let server_name = ServerName::try_from(server_name_str)
                 .map_err(|e| DaemonTransportError::Protocol(format!("invalid server_name: {e}")))?;
@@ -437,11 +553,15 @@ impl std::fmt::Display for BridgeCertError {
 
 impl std::error::Error for BridgeCertError {}
 
-/// Default in-container path for the per-agent client cert bundle. The
-/// orchestrator's spawn flow mounts these into the container at this
-/// path (implementation-note-26). Overridable via
-/// `EMBER_BRIDGE_CERT_DIR` for tests + alternate deployment shapes.
-pub const DEFAULT_BRIDGE_CERT_DIR: &str = "/run/ember/client-cert";
+/// Canonical in-container cert paths (design §4 — one in-container bridge env
+/// contract). The orchestrator mounts the bundle at `/run/ember` and sets the
+/// explicit `EMBER_CLIENT_CERT` / `EMBER_CLIENT_KEY` / `EMBER_CA_CERT` paths;
+/// `EMBER_BRIDGE_CERT_DIR` overrides the directory for tests / alternate shapes.
+/// These mirror `core_construct_runtime::rpc`'s defaults so both in-container
+/// consumers of the one contract resolve identically.
+pub const DEFAULT_CLIENT_CERT_PATH: &str = "/run/ember/client.crt";
+pub const DEFAULT_CLIENT_KEY_PATH: &str = "/run/ember/client.key";
+pub const DEFAULT_CA_CERT_PATH: &str = "/run/ember/ca.crt";
 
 /// Cert + key + CA loaded off disk. Returned by [`load_bridge_cert_files`]
 /// so the startup path can (a) build the [`ClientConfig`] and (b) feed
@@ -467,21 +587,67 @@ impl std::fmt::Debug for LoadedBridgeCert {
     }
 }
 
-/// Resolve the cert directory: env-var override wins, otherwise the
-/// canonical in-container path. Pure function — no I/O.
-pub fn resolve_bridge_cert_dir() -> PathBuf {
-    std::env::var_os("EMBER_BRIDGE_CERT_DIR")
+/// Resolve the client-cert / key / CA paths from the unified in-container bridge
+/// env contract (design §4), identical to the construct-shim resolution
+/// (`core_construct_runtime::rpc::decide_transport`) so both in-container
+/// consumers interpret one contract the same way:
+///   explicit `EMBER_CLIENT_CERT` → `<EMBER_BRIDGE_CERT_DIR>/client.crt` → default
+/// (and likewise key / ca). Pure function — no I/O.
+pub fn resolve_bridge_cert_paths() -> (PathBuf, PathBuf, PathBuf) {
+    let cert_dir = std::env::var_os("EMBER_BRIDGE_CERT_DIR").map(PathBuf::from);
+    let cert = std::env::var_os("EMBER_CLIENT_CERT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_BRIDGE_CERT_DIR))
+        .or_else(|| cert_dir.as_ref().map(|d| d.join("client.crt")))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_CERT_PATH));
+    let key = std::env::var_os("EMBER_CLIENT_KEY")
+        .map(PathBuf::from)
+        .or_else(|| cert_dir.as_ref().map(|d| d.join("client.key")))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_KEY_PATH));
+    let ca = std::env::var_os("EMBER_CA_CERT")
+        .map(PathBuf::from)
+        .or_else(|| cert_dir.as_ref().map(|d| d.join("ca.crt")))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CA_CERT_PATH));
+    (cert, key, ca)
+}
+
+/// Derive the `host:port` authority for the raw mTLS dial from the unified
+/// `EMBER_BRIDGE_URL` (design §4), e.g.
+/// `https://host.docker.internal:8765` → `host.docker.internal:8765`.
+/// Tolerates a bare `host:port` (no scheme) and strips any trailing path.
+/// `core_construct_runtime` consumes the same `EMBER_BRIDGE_URL` directly as a
+/// reqwest URL; the raw rustls dial needs only the authority, parsed here.
+pub fn endpoint_from_bridge_url(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
 }
 
 /// Read + parse the three PEM files. Fails closed on any missing or
 /// malformed file — the caller (`main.rs`) exits non-zero on Err so the
 /// container doesn't silently fall through to an anonymous-client lane.
 pub fn load_bridge_cert_files(dir: &Path) -> Result<LoadedBridgeCert, BridgeCertError> {
-    let cert_path = dir.join("client.crt");
-    let key_path = dir.join("client.key");
-    let ca_path = dir.join("ca.crt");
+    load_bridge_cert_from_paths(
+        &dir.join("client.crt"),
+        &dir.join("client.key"),
+        &dir.join("ca.crt"),
+    )
+}
+
+/// Read + parse the three PEM files at explicit paths (the unified contract's
+/// resolved [`resolve_bridge_cert_paths`] output). Fails closed on any missing
+/// or malformed file — the caller exits non-zero so the container never falls
+/// through to an anonymous-client lane.
+pub fn load_bridge_cert_from_paths(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+) -> Result<LoadedBridgeCert, BridgeCertError> {
+    let cert_path = cert_path.to_path_buf();
+    let key_path = key_path.to_path_buf();
+    let ca_path = ca_path.to_path_buf();
 
     let cert_bytes =
         std::fs::read(&cert_path).map_err(|e| BridgeCertError::ReadCert(cert_path.clone(), e))?;
@@ -561,6 +727,11 @@ pub enum DaemonTransportError {
     Protocol(String),
     DaemonError(String),
     UnknownTool(String),
+    /// Soft fail-closed: bridge cert refresh has been failing past the
+    /// 90% band; new tool calls are refused while in-flight RPCs are
+    /// preserved. design §Component 5 "Soft fail-closed at 90% TTL".
+    /// Anchor: `emberlink_mcp_cert_refresh_client_landed`.
+    RefreshFailing,
 }
 
 impl std::fmt::Display for DaemonTransportError {
@@ -570,6 +741,10 @@ impl std::fmt::Display for DaemonTransportError {
             Self::Protocol(s) => write!(f, "protocol error: {s}"),
             Self::DaemonError(s) => write!(f, "daemon error: {s}"),
             Self::UnknownTool(s) => write!(f, "unknown tool: {s}"),
+            Self::RefreshFailing => write!(
+                f,
+                "bridge cert refresh failing past 90% TTL band; new RPCs refused (in-flight preserved)"
+            ),
         }
     }
 }

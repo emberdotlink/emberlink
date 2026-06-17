@@ -35,6 +35,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use ember_broker::github_app::GhAppCredentials;
+use secrecy::SecretString;
 
 /// Filename inside `~/.config/emberlink/` containing `EMBER_ENGINE_APP_ID`
 /// and `EMBER_ENGINE_INSTALLATION_ID` shell-style assignments.
@@ -146,7 +147,7 @@ pub fn load_with_paths(
     Ok(Some(GhAppCredentials {
         app_id,
         installation_id,
-        private_key_pem,
+        private_key_pem: SecretString::from(private_key_pem),
     }))
 }
 
@@ -293,7 +294,7 @@ pub async fn github_config_from_store(
         return Ok(Some(GhAppCredentials {
             app_id,
             installation_id,
-            private_key_pem,
+            private_key_pem: SecretString::from(private_key_pem),
         }));
     }
 
@@ -330,6 +331,7 @@ fn parse_env_var(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     // PEM fixtures live at `crates/ember-daemon/tests/fixtures/*.pem` so they
     // resolve under the gitleaks `.gitleaks.toml` path allowlist for
@@ -425,7 +427,12 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
             .expect("creds present");
         assert_eq!(result.app_id, "12345");
         assert_eq!(result.installation_id, "67890");
-        assert!(result.private_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(
+            result
+                .private_key_pem
+                .expose_secret()
+                .contains("BEGIN PRIVATE KEY")
+        );
     }
 
     #[test]
@@ -509,7 +516,12 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
         let creds = result.expect("credentials should be present");
         assert_eq!(creds.app_id, "12345");
         assert_eq!(creds.installation_id, "42");
-        assert!(creds.private_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(
+            creds
+                .private_key_pem
+                .expose_secret()
+                .contains("BEGIN PRIVATE KEY")
+        );
     }
 
     /// When the vault is empty (no `github/apps/` entries at all), the
@@ -621,7 +633,7 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
             .expect("credentials must be present");
         assert_eq!(creds.app_id, "override-id");
         assert_eq!(creds.installation_id, "override-inst");
-        assert!(creds.private_key_pem.contains("override"));
+        assert!(creds.private_key_pem.expose_secret().contains("override"));
     }
 
     /// When EMBER_APP_PEM_PATH is set to an empty string it must be treated as

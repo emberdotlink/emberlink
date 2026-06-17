@@ -1,6 +1,6 @@
-// implementation-note-63 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
+// implementation-note-70 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
 
-use core_crypto::grant_chain::{self, RootKeyPair};
+use core_crypto::grant_chain::{self, PubkeyNextKeyPair, RootKeyPair, SignedBlockOutput};
 use core_event_types::PresentationAudienceKind;
 use core_grant_types::{
     AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus, RecipientProfile,
@@ -39,6 +39,7 @@ pub fn build_single_statement_block(
         budget: budget.filter(|b| !b.is_none_set()),
         usage,
         conditions: Vec::new(),
+        can_delegate: None,
     };
 
     Block {
@@ -94,6 +95,36 @@ pub fn sign_block_zero_with(
 ) -> Result<SignedBlock, ChainBuildError> {
     grant_chain::sign_block_zero(root, block)
         .map(|out| out.signed)
+        .map_err(|e| ChainBuildError::SigningFailed(e.to_string()))
+}
+
+/// Sign a single block with the given root keypair, returning BOTH the
+/// signed block AND the freshly-minted `pubkey_next_secret`.
+///
+/// Required by the H3 fix: the secret must be persisted so a later
+/// delegation can call `sign_appended_block` and produce an append-chain
+/// that verifies end-to-end against the apex root (rather than the
+/// pre-fix shape where each delegated grant was a fresh single-block
+/// chain linked only by a mutable `parent_grant_id` column).
+pub fn sign_block_zero_with_returning_output(
+    root: &RootKeyPair,
+    block: &Block,
+) -> Result<SignedBlockOutput, ChainBuildError> {
+    grant_chain::sign_block_zero(root, block)
+        .map_err(|e| ChainBuildError::SigningFailed(e.to_string()))
+}
+
+/// Sign an appended block (block N≥1) using the previous block's
+/// `pubkey_next` private key. Returns the signed block AND the
+/// freshly-minted `pubkey_next_secret` for the new tail — the caller
+/// MUST persist that secret to be able to extend the chain again.
+///
+/// Required by the H3 fix: real Biscuit-style append-chain delegation.
+pub fn sign_appended_block_with(
+    prev_pubkey_next: &PubkeyNextKeyPair,
+    block: &Block,
+) -> Result<SignedBlockOutput, ChainBuildError> {
+    grant_chain::sign_appended_block(prev_pubkey_next, block)
         .map_err(|e| ChainBuildError::SigningFailed(e.to_string()))
 }
 
@@ -157,6 +188,8 @@ pub fn classify_resource_type(credential_name: &str, scope: &str) -> ResourceTyp
         ResourceType::Time
     } else if scope.starts_with("compute:") {
         ResourceType::Compute
+    } else if scope.starts_with("recovery:") {
+        ResourceType::Recovery
     } else {
         let _ = credential_name;
         ResourceType::Credential
@@ -189,6 +222,19 @@ pub fn scope_to_actions_and_selector(
         [a] => a.to_string(),
         [provider, a, ..] => format!("{provider}:{a}"),
     };
+    // H3-fix selector consistency (security/c1-h1-h3): for any scope
+    // with at least three segments we extract the TAIL (parts[2..]) as
+    // the resource selector. Pre-fix a wildcard-bearing 3-segment scope
+    // like `"github:push:acme/*"` produced `Glob{"github:push:acme/*"}`
+    // (full scope-as-pattern) while a non-wildcard sibling
+    // `"github:push:acme/widgets"` produced `Exact{"acme/widgets"}`
+    // (tail). The two shapes were structurally incomparable by
+    // `check_statement_attenuation`, so any structural attenuation
+    // check between them — at delegate write time OR at use time —
+    // would always fail with "no parent with matching selector".
+    // Post-fix both shapes share the tail-only convention, matching
+    // what `proxy::scope_tests` constructs by hand and what the
+    // proxy's matchers expect at request time.
     let selector = if scope == "*" {
         ResourceSelector::Any
     } else if parts.len() == 4 && !parts.iter().any(|p| p.is_empty()) {
@@ -196,16 +242,16 @@ pub fn scope_to_actions_and_selector(
             primary_glob: parts[2].to_string(),
             subtarget_glob: parts[3].to_string(),
         }
-    } else if scope.contains('*') {
-        ResourceSelector::Glob {
-            pattern: scope.into(),
-        }
     } else if parts.len() >= 3 {
         let tail = parts[2..].join(":");
         if tail.contains('*') {
             ResourceSelector::Glob { pattern: tail }
         } else {
             ResourceSelector::Exact { value: tail }
+        }
+    } else if scope.contains('*') {
+        ResourceSelector::Glob {
+            pattern: scope.into(),
         }
     } else {
         ResourceSelector::Exact {

@@ -3,7 +3,27 @@ pub mod tls;
 
 pub use admission::{AdmissionError, AdmittedRequest};
 
-use std::collections::HashMap;
+/// Domain-separation prefix bound into every `RESPOND_GRANT_REQUEST`
+/// signature so a signed payload for this wire cannot be replayed into a
+/// different protocol that happens to share the responder's signing key
+/// (design §4 algorithm-confusion / cross-protocol guard).
+///
+/// implementation-note-490 acceptance #2.
+pub const RESPOND_GRANT_REQUEST_DOMAIN_SEP: &[u8] = b"emberlink-relay/respond-grant-request/v1\0";
+
+/// Nonce size required on `RESPOND_GRANT_REQUEST` frames (32 raw bytes,
+/// 64 hex chars). Matches design's per-use nonce tombstone convention.
+pub const RESPOND_GRANT_REQUEST_NONCE_BYTES: usize = 32;
+
+/// Soft cap on the consumed-nonce dedup set. The relay only ever needs
+/// nonces that are still in their replay window — once a grant request
+/// has been resolved the responder cannot reissue, so the set can shed
+/// pressure under sustained abuse without losing security. Far above
+/// the legitimate `100`-per-target REQUEST_GRANT rate limit so it never
+/// kicks in under normal operation.
+const MAX_CONSUMED_NONCES: usize = 100_000;
+
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use core_crypto::{Ed25519Verifier, parse_did, resolve_did_jwks};
+use core_crypto::{Ed25519Verifier, PublicKey, Signature, Verifier, parse_did, resolve_did_jwks};
 use core_principals::{RelayAdmission, RelayMode, TrustThreshold};
 use core_sync::{PortableRelaySubmission, check_relay_submission_admission};
 
@@ -30,12 +50,12 @@ pub struct RelayConfig {
     pub max_per_peer: usize,
     /// Maximum total envelopes across all mailboxes (0 = unlimited).
     pub max_total: usize,
-    /// Optional shared secret that gates admin commands (STATS, SHUTDOWN,
-    /// SHUTDOWN-NOTICE, DRAIN).  When set, every admin command must include
-    /// the token as its first space-delimited argument; requests that omit or
-    /// mis-state the token are rejected with `AUTH-REQUIRED`.
-    /// When `None` the relay accepts admin commands from any connected client
-    /// (suitable for local/test deployments only).
+    /// Optional shared secret that gates authority-bearing admin commands
+    /// (STATS, SHUTDOWN, SHUTDOWN-NOTICE, DRAIN). Every admin command must
+    /// include the token as its first space-delimited argument; requests that
+    /// omit or mis-state the token are rejected with `AUTH-REQUIRED`.
+    /// When `None` the relay rejects admin commands rather than accepting
+    /// them from arbitrary clients.
     pub admin_token: Option<String>,
     /// Maximum simultaneous TCP connections (0 = unlimited).
     /// Connections beyond this limit are immediately closed.
@@ -55,7 +75,10 @@ pub struct RelayConfig {
     /// Default: 9101.
     pub health_port: Option<u16>,
     /// TCP port for the WebSocket listener (None = disabled).
-    /// Default: 9200.
+    ///
+    /// v0.3.0 release containment disables this listener from CLI config
+    /// because the legacy WS protocol carries the full command surface without
+    /// TLS/client auth. `--ws-port` is accepted as a compatibility no-op.
     pub ws_port: Option<u16>,
 }
 
@@ -69,6 +92,11 @@ impl RelayConfig {
         let mut tls_cert: Option<String> = None;
         let mut tls_key: Option<String> = None;
         let mut tls_self_signed = false;
+        // `no_tls` is only mutated when the `insecure-no-tls` feature is on.
+        // Suppress `unused_mut` (and `unused_variables` in the negative gate)
+        // so the production build stays warning-clean without splitting the
+        // surrounding `match` block.
+        #[allow(unused_mut, unused_assignments)]
         let mut no_tls = false;
         let mut max_per_peer: usize = 10_000;
         let mut max_total: usize = 1_000_000;
@@ -79,7 +107,7 @@ impl RelayConfig {
         let mut max_offer_bytes_total: usize = 50 * 1024 * 1024; // 50 MB
         let mut max_offer_ttl_secs: u64 = 72 * 3600; // 72 hours
         let mut health_port: Option<u16> = Some(9101);
-        let mut ws_port: Option<u16> = Some(9200);
+        let mut ws_port: Option<u16> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -146,7 +174,22 @@ impl RelayConfig {
                     tls_self_signed = true;
                 }
                 "--no-tls" => {
-                    no_tls = true;
+                    // implementation-note-490 Tier A §A4:
+                    // mandatory TLS in production. The `insecure-no-tls` feature
+                    // is OFF by default; production builds reject this flag as
+                    // unknown rather than silently downgrading to plain TCP.
+                    // Anchor: `respond_grant_request_signed_no_tls_test_only_feature`.
+                    #[cfg(feature = "insecure-no-tls")]
+                    {
+                        no_tls = true;
+                    }
+                    #[cfg(not(feature = "insecure-no-tls"))]
+                    {
+                        return Err("--no-tls is rejected in production builds; \
+                             rebuild with --features insecure-no-tls only for test \
+                             loopback rigs (implementation-note-490)"
+                            .to_string());
+                    }
                 }
                 "--max-per-peer" => {
                     i += 1;
@@ -226,12 +269,12 @@ impl RelayConfig {
                 }
                 "--ws-port" => {
                     i += 1;
-                    let port: u16 = args
+                    let _port: u16 = args
                         .get(i)
                         .ok_or("--ws-port requires a port number")?
                         .parse()
                         .map_err(|e| format!("invalid ws-port: {e}"))?;
-                    ws_port = Some(port);
+                    ws_port = None;
                 }
                 "--no-ws" => {
                     ws_port = None;
@@ -335,13 +378,32 @@ pub enum GrantRequestStatus {
 }
 
 /// A grant request from an agent to a human identity.
+///
+/// **At-rest sealing — implementation-note-491.** The relay used
+/// to store the requester id, scope, and justification as plaintext
+/// `String` fields. The relay contract mandates that relays see only opaque
+/// encrypted envelopes — "relays never hold plaintext content" — and the
+/// free-relay tier's compelled-disclosure resistance depends on it. After this
+/// change the relay stores a single
+/// `sealed_payload: Vec<u8>` opaque blob; the responder unseals it
+/// outside the relay's address space.
+///
+/// `target_id` stays cleartext because the relay must route fetch
+/// queries by it — the minimum metadata design allows the relay to see
+/// for routing.
+///
+/// `target_signing_pubkey` is the responder's persona signing key,
+/// posted in cleartext by the requester at REQUEST time so the relay can
+/// verify the signature attached to the matching `RESPOND_GRANT_REQUEST`
+/// (implementation-note-490 acceptance #2).
+/// The signing-pubkey itself is public material; carrying it on the
+/// wire does not leak anything design protects.
 #[derive(Debug, Clone)]
 pub struct GrantRequest {
     pub request_id: String,
     pub target_id: String,
-    pub requester_id: String,
-    pub scope: String,
-    pub justification: String,
+    pub target_signing_pubkey: PublicKey,
+    pub sealed_payload: Vec<u8>,
     pub created_at: u64,
     pub status: GrantRequestStatus,
 }
@@ -362,6 +424,12 @@ pub struct RelayState {
     pub grant_requests: HashMap<String, Vec<GrantRequest>>,
     /// Monotonically increasing counter for grant request IDs.
     pub next_grant_request_id: u64,
+    /// implementation-note-490: nonces consumed by
+    /// accepted `RESPOND_GRANT_REQUEST` frames. Each successful response
+    /// inserts its 32-byte nonce here; replays are rejected with
+    /// `REJECTED nonce replay`. Bounded by `MAX_CONSUMED_NONCES` to cap
+    /// memory growth.
+    pub consumed_response_nonces: HashSet<String>,
     pub stats: RelayStats,
     pub shutdown_notice: Option<ShutdownNotice>,
 }
@@ -450,13 +518,16 @@ pub fn run(config: RelayConfig) {
     if config.admin_token.is_some() {
         eprintln!("  admin commands: token-protected");
     } else {
-        eprintln!("  admin commands: UNPROTECTED (set --admin-token for production use)");
+        eprintln!("  admin commands: disabled (set --admin-token to enable)");
     }
     if config.max_connections > 0 {
         eprintln!("  max connections: {}", config.max_connections);
     }
     if config.read_timeout_secs > 0 {
         eprintln!("  read/write timeout: {}s", config.read_timeout_secs);
+    }
+    if config.ws_port.is_none() {
+        eprintln!("  ws listener: disabled for v0.3.0 release containment");
     }
 
     let tls_config = match tls::build_server_config(&config.tls_mode) {
@@ -476,14 +547,18 @@ pub fn run(config: RelayConfig) {
     if let Some(port) = config.health_port {
         let mode = config.mode;
         let ws_port = config.ws_port;
-        thread::spawn(move || run_health_server(port, mode, start_time, ws_port));
+        let bind_host = auxiliary_bind_host(&config.bind_address);
+        thread::spawn(move || run_health_server_bound(bind_host, port, mode, start_time, ws_port));
     }
 
     if let Some(ws_port) = config.ws_port {
         let ws_config = Arc::clone(&config);
         let ws_state = Arc::clone(&state);
         let ws_active = Arc::clone(&active_connections);
-        thread::spawn(move || run_ws_listener(ws_port, ws_config, ws_state, ws_active));
+        let ws_bind_host = auxiliary_bind_host(&config.bind_address);
+        thread::spawn(move || {
+            run_ws_listener_bound(ws_bind_host, ws_port, ws_config, ws_state, ws_active)
+        });
         eprintln!("  ws port: {ws_port}");
     }
 
@@ -548,20 +623,21 @@ pub fn run(config: RelayConfig) {
 /// Client sends: 4-byte big-endian length prefix, then payload bytes.
 /// Payload is one of:
 ///   - A PortableRelaySubmission (submit for forwarding)
-///   - `DRAIN <peer-id>` or `DRAIN <peer-id> <admin-token>` — receive queued envelopes
-///   - `STATS` or `STATS <admin-token>` — relay statistics
-///   - `SHUTDOWN` or `SHUTDOWN <admin-token>` — immediate shutdown (flushes all mailboxes)
-///   - `SHUTDOWN-NOTICE <reason> <deadline-epoch>` or
-///     `SHUTDOWN-NOTICE <admin-token> <reason> <deadline-epoch>` — graceful shutdown
+///   - `DRAIN <peer-id> <admin-token>` — receive queued envelopes
+///   - `STATS <admin-token>` — relay statistics
+///   - `SHUTDOWN <admin-token>` — immediate shutdown (flushes all mailboxes)
+///   - `SHUTDOWN-NOTICE <admin-token> <reason> <deadline-epoch>` — graceful shutdown
 ///   - `DEPOSIT_OFFER <offer-id> <expires-at-epoch> <hex-payload>` — store a grant offer envelope
 ///   - `FETCH_OFFER <offer-id>` — retrieve a grant offer envelope by ID
 ///   - `CLAIM_OFFER <offer-id>` — mark a grant offer as consumed
 ///   - `FETCH_AND_CLAIM <offer-id>` — atomically fetch and claim an offer (recommended)
 ///
-/// When `--admin-token` is configured, admin commands without the correct token
-/// receive an `AUTH-REQUIRED` response and are otherwise ignored.
+/// Admin commands without the correct configured token receive an
+/// `AUTH-REQUIRED` response and are otherwise ignored.
 /// Grant offer commands (DEPOSIT_OFFER, FETCH_OFFER, CLAIM_OFFER, FETCH_AND_CLAIM) are open to any
 /// connected client — same policy as envelope submission.
+/// Legacy credential/grant-request commands are parsed for compatibility but
+/// dispatch rejects them for v0.3.0 release containment.
 ///
 /// Server responds with the same length-prefixed format.
 fn handle_connection(
@@ -666,69 +742,28 @@ pub fn dispatch_command(
             }
             handle_fetch_and_claim_offer(stream, state, &offer_id);
         }
-        Command::DepositCredential { grant_id, payload } => {
-            if !offer_admission_ok(config) {
-                respond(
-                    stream,
-                    b"REJECTED relay admission policy requires authenticated submission",
-                );
-                return;
-            }
-            handle_deposit_credential(stream, state, grant_id, payload);
-        }
-        Command::FetchCredential(grant_id) => {
-            if !offer_admission_ok(config) {
-                respond(
-                    stream,
-                    b"REJECTED relay admission policy requires authenticated submission",
-                );
-                return;
-            }
-            handle_fetch_credential(stream, state, &grant_id);
-        }
-        Command::RequestGrant {
-            target_id,
-            requester_id,
-            scope,
-            justification,
-        } => {
-            if !offer_admission_ok(config) {
-                respond(
-                    stream,
-                    b"REJECTED relay admission policy requires authenticated submission",
-                );
-                return;
-            }
-            handle_request_grant(stream, state, target_id, requester_id, scope, justification);
-        }
-        Command::FetchGrantRequests(target_id) => {
-            if !offer_admission_ok(config) {
-                respond(
-                    stream,
-                    b"REJECTED relay admission policy requires authenticated submission",
-                );
-                return;
-            }
-            handle_fetch_grant_requests(stream, state, &target_id);
-        }
-        Command::RespondGrantRequest {
-            request_id,
-            approved,
-        } => {
-            if !offer_admission_ok(config) {
-                respond(
-                    stream,
-                    b"REJECTED relay admission policy requires authenticated submission",
-                );
-                return;
-            }
-            handle_respond_grant_request(stream, state, &request_id, approved);
+        Command::DepositCredential { .. } => reject_release_disabled(stream, "DEPOSIT_CREDENTIAL"),
+        Command::FetchCredential(_) => reject_release_disabled(stream, "FETCH_CREDENTIAL"),
+        Command::RequestGrant { .. } => reject_release_disabled(stream, "REQUEST_GRANT"),
+        Command::FetchGrantRequests(_) => reject_release_disabled(stream, "FETCH_GRANT_REQUESTS"),
+        Command::RespondGrantRequest { .. } => {
+            reject_release_disabled(stream, "RESPOND_GRANT_REQUEST")
         }
         Command::AdminRequired => respond(
             stream,
             b"AUTH-REQUIRED admin token required for this command",
         ),
     }
+}
+
+fn reject_release_disabled(stream: &mut impl io::Write, command: &str) {
+    respond(
+        stream,
+        format!(
+            "REJECTED {command} disabled for v0.3.0 release containment; use opaque relay envelopes"
+        )
+        .as_bytes(),
+    );
 }
 
 /// Parsed command derived from an incoming payload frame.
@@ -757,19 +792,37 @@ pub enum Command {
     },
     /// Fetch a stored credential: `FETCH_CREDENTIAL <grant-id>`
     FetchCredential(String),
-    /// Request a grant from a human identity: `REQUEST_GRANT <target-id> <requester-id> <scope> <justification>`
+    /// Request a grant from a human identity. The plaintext requester /
+    /// scope / justification fields are sealed off-relay per
+    /// `implementation-note-491`; only the routing-required
+    /// `target_id` and the responder's expected signing pubkey ride in
+    /// cleartext.
+    ///
+    /// Wire format:
+    /// `REQUEST_GRANT <target-id> <target-signing-pubkey-hex> <sealed-payload-hex>`
     RequestGrant {
         target_id: String,
-        requester_id: String,
-        scope: String,
-        justification: String,
+        target_signing_pubkey: PublicKey,
+        sealed_payload: Vec<u8>,
     },
     /// Fetch pending grant requests for a target identity: `FETCH_GRANT_REQUESTS <target-id>`
     FetchGrantRequests(String),
-    /// Respond to a grant request: `RESPOND_GRANT_REQUEST <request-id> <approved|denied>`
+    /// Respond to a grant request with a nonce + signature so the relay
+    /// can authenticate the responder rather than trusting an unauth'd
+    /// admission token (implementation-note-490
+    /// acceptance #2).
+    ///
+    /// Wire format:
+    /// `RESPOND_GRANT_REQUEST <request-id> <approved|denied> <nonce-hex> <signature-hex>`
+    ///
+    /// The signature is over
+    /// `RESPOND_GRANT_REQUEST_DOMAIN_SEP || request_id_bytes || verdict_byte || nonce_raw`
+    /// by the responder persona signing key bound at REQUEST time.
     RespondGrantRequest {
         request_id: String,
         approved: bool,
+        nonce_hex: String,
+        signature: Signature,
     },
     /// Admin command detected but token missing or wrong.
     AdminRequired,
@@ -786,8 +839,8 @@ pub enum Command {
 /// - `SHUTDOWN-NOTICE <token> <reason> <deadline-epoch>`
 /// - `DRAIN <peer-id> <token>`  (token is the *last* space-delimited field)
 ///
-/// When `admin_token` is `None` the relay is in open/test mode and accepts
-/// the original unauthenticated command format.
+/// When `admin_token` is `None`, admin commands fail closed with
+/// `Command::AdminRequired`.
 pub fn parse_command(payload: &[u8], admin_token: Option<&str>) -> Command {
     let Ok(text) = std::str::from_utf8(payload) else {
         return Command::Submission;
@@ -795,10 +848,7 @@ pub fn parse_command(payload: &[u8], admin_token: Option<&str>) -> Command {
 
     // STATS
     if text == "STATS" {
-        return match admin_token {
-            None => Command::Stats,
-            Some(_) => Command::AdminRequired,
-        };
+        return Command::AdminRequired;
     }
     if let Some(rest) = text.strip_prefix("STATS ") {
         return if admin_auth_ok(rest.trim(), admin_token) {
@@ -810,10 +860,7 @@ pub fn parse_command(payload: &[u8], admin_token: Option<&str>) -> Command {
 
     // SHUTDOWN (exact, no args)
     if text == "SHUTDOWN" {
-        return match admin_token {
-            None => Command::Shutdown,
-            Some(_) => Command::AdminRequired,
-        };
+        return Command::AdminRequired;
     }
     if let Some(rest) = text.strip_prefix("SHUTDOWN ") {
         // Must not be a SHUTDOWN-NOTICE prefix handled below
@@ -829,10 +876,7 @@ pub fn parse_command(payload: &[u8], admin_token: Option<&str>) -> Command {
     // SHUTDOWN-NOTICE
     if let Some(remainder) = text.strip_prefix("SHUTDOWN-NOTICE ") {
         return match admin_token {
-            None => {
-                // Original format: SHUTDOWN-NOTICE <reason> <deadline-epoch>
-                parse_notice_args(remainder)
-            }
+            None => Command::AdminRequired,
             Some(tok) => {
                 // Authenticated format: SHUTDOWN-NOTICE <token> <reason> <deadline-epoch>
                 if let Some((provided_tok, rest)) = remainder.split_once(' ') {
@@ -851,15 +895,7 @@ pub fn parse_command(payload: &[u8], admin_token: Option<&str>) -> Command {
     // DRAIN
     if let Some(rest) = text.strip_prefix("DRAIN ") {
         return match admin_token {
-            None => {
-                // Original format: DRAIN <peer-id>
-                let peer_id = rest.trim();
-                if peer_id.is_empty() {
-                    Command::Submission // malformed, fall through
-                } else {
-                    Command::Drain(peer_id.to_string())
-                }
-            }
+            None => Command::AdminRequired,
             Some(tok) => {
                 // Authenticated format: DRAIN <peer-id> <token>
                 // token is the last space-delimited field
@@ -956,7 +992,7 @@ pub fn offer_admission_ok(config: &RelayConfig) -> bool {
 
 pub fn admin_auth_ok(provided: &str, configured: Option<&str>) -> bool {
     match configured {
-        None => true,
+        None => false,
         Some(tok) => provided == tok,
     }
 }
@@ -1101,39 +1137,59 @@ pub fn handle_fetch_credential(
 
 /// Parse the remainder of a `REQUEST_GRANT` command.
 ///
-/// Expected format: `<target-id> <requester-id> <scope> <justification>`
-/// Justification consumes the rest of the line (may contain spaces).
+/// Expected format: `<target-id> <target-signing-pubkey-hex> <sealed-payload-hex>`
+///
+/// Per implementation-note-491, the requester id, scope, and
+/// justification all ride inside `sealed-payload-hex` — the relay sees
+/// only opaque sealed bytes for those fields. `target_id` stays
+/// cleartext because the relay routes fetch queries by it (the minimum
+/// metadata design §3 allows the relay to see).
+///
+/// The pubkey is captured here so the responder's signed
+/// `RESPOND_GRANT_REQUEST` can be verified later
+/// (`respond_grant_request_signed`).
 fn parse_request_grant(remainder: &str) -> Command {
-    let mut parts = remainder.splitn(4, ' ');
+    let mut parts = remainder.splitn(3, ' ');
     let target_id = match parts.next() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Command::Submission,
     };
-    let requester_id = match parts.next() {
+    let pubkey_hex = match parts.next() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Command::Submission,
     };
-    let scope = match parts.next() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return Command::Submission,
-    };
-    let justification = match parts.next() {
+    let sealed_hex = match parts.next() {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Command::Submission,
+    };
+    // Decode the sealed payload eagerly — invalid hex is a malformed
+    // command, falling through to `Submission` mirrors how
+    // `parse_deposit_offer` handles bad-hex payloads.
+    let sealed_payload = match hex::decode(&sealed_hex) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return Command::Submission,
     };
     Command::RequestGrant {
         target_id,
-        requester_id,
-        scope,
-        justification,
+        target_signing_pubkey: PublicKey(pubkey_hex),
+        sealed_payload,
     }
 }
 
 /// Parse the remainder of a `RESPOND_GRANT_REQUEST` command.
 ///
-/// Expected format: `<request-id> <approved|denied>`
+/// Expected format: `<request-id> <approved|denied> <nonce-hex> <signature-hex>`
+///
+/// The nonce is the operator's per-response replay-defeating tombstone
+/// (`RESPOND_GRANT_REQUEST_NONCE_BYTES` raw bytes); the signature is the
+/// responder's persona-key signature over the payload built in
+/// `respond_grant_request_signing_payload`. We accept the wire shape
+/// here and defer cryptographic verification to
+/// `handle_respond_grant_request` so a parse-time refusal does not leak
+/// "request id exists" vs "signature is wrong" through different
+/// rejection paths.
 fn parse_respond_grant_request(remainder: &str) -> Command {
-    let mut parts = remainder.splitn(2, ' ');
+    let mut parts = remainder.splitn(4, ' ');
     let request_id = match parts.next() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Command::Submission,
@@ -1147,22 +1203,66 @@ fn parse_respond_grant_request(remainder: &str) -> Command {
         "denied" => false,
         _ => return Command::Submission,
     };
+    let nonce_hex = match parts.next() {
+        Some(s) if s.len() == RESPOND_GRANT_REQUEST_NONCE_BYTES * 2 => s.to_string(),
+        _ => return Command::Submission,
+    };
+    // Refuse non-hex nonces at parse time — handles the case where the
+    // nonce slot is the right length but not valid hex.
+    if hex::decode(&nonce_hex).is_err() {
+        return Command::Submission;
+    }
+    let signature_hex = match parts.next() {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Command::Submission,
+    };
     Command::RespondGrantRequest {
         request_id,
         approved,
+        nonce_hex,
+        signature: Signature(signature_hex),
     }
 }
 
+/// Build the canonical signed payload bound to a `RESPOND_GRANT_REQUEST`
+/// (implementation-note-490 acceptance #2).
+///
+/// The payload is `DOMAIN_SEP || request_id_bytes || verdict_byte ||
+/// nonce_raw`. Including the verdict byte means a "denied" signature
+/// cannot be replayed against the same request id to flip the verdict
+/// to "approved", and including the request id binds the signature to
+/// the specific grant request rather than the responder's broader
+/// authority.
+pub fn respond_grant_request_signing_payload(
+    request_id: &str,
+    approved: bool,
+    nonce_raw: &[u8],
+) -> Vec<u8> {
+    let verdict_byte: u8 = if approved { 1 } else { 0 };
+    let mut payload = Vec::with_capacity(
+        RESPOND_GRANT_REQUEST_DOMAIN_SEP.len() + request_id.len() + 1 + nonce_raw.len(),
+    );
+    payload.extend_from_slice(RESPOND_GRANT_REQUEST_DOMAIN_SEP);
+    payload.extend_from_slice(request_id.as_bytes());
+    payload.push(verdict_byte);
+    payload.extend_from_slice(nonce_raw);
+    payload
+}
+
 /// Store a grant request from an agent targeting a human identity.
+///
+/// Per `implementation-note-491`, the requester id, scope, and
+/// justification have been sealed off-relay; only the routing-required
+/// `target_id` and the responder's signing pubkey (used later to verify
+/// the matching `RESPOND_GRANT_REQUEST` signature) ride in cleartext.
 ///
 /// Wire response: `OK <request-id>` on success.
 pub fn handle_request_grant(
     stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     target_id: String,
-    requester_id: String,
-    scope: String,
-    justification: String,
+    target_signing_pubkey: PublicKey,
+    sealed_payload: Vec<u8>,
 ) {
     let now = now_epoch_secs();
     let mut s = acquire_state(state);
@@ -1191,9 +1291,8 @@ pub fn handle_request_grant(
     let request = GrantRequest {
         request_id: request_id.clone(),
         target_id: target_id.clone(),
-        requester_id,
-        scope,
-        justification,
+        target_signing_pubkey,
+        sealed_payload,
         created_at: now,
         status: GrantRequestStatus::Pending,
     };
@@ -1208,6 +1307,12 @@ pub fn handle_request_grant(
 /// Wire response:
 /// - `NONE` if no requests exist for this target.
 /// - Newline-separated JSON objects for each request, followed by `END`.
+///
+/// Per `implementation-note-491` the requester id / scope /
+/// justification fields are emitted as a single hex-encoded
+/// `sealed_payload`; the responder unseals them outside the relay's
+/// address space. The relay never reconstructs plaintext for any of
+/// these fields, so the JSON shape changed accordingly.
 pub fn handle_fetch_grant_requests(
     stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
@@ -1230,11 +1335,17 @@ pub fn handle_fetch_grant_requests(
             GrantRequestStatus::Approved => "approved",
             GrantRequestStatus::Denied => "denied",
         };
-        // Escape JSON-sensitive characters in user-provided fields.
+        // Escape JSON-sensitive characters in operator-controlled fields.
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let sealed_hex = hex::encode(&r.sealed_payload);
         lines.push(format!(
-            r#"{{"request_id":"{}","target_id":"{}","requester_id":"{}","scope":"{}","justification":"{}","created_at":{},"status":"{}"}}"#,
-            esc(&r.request_id), esc(&r.target_id), esc(&r.requester_id), esc(&r.scope), esc(&r.justification), r.created_at, status
+            r#"{{"request_id":"{}","target_id":"{}","target_signing_pubkey":"{}","sealed_payload":"{}","created_at":{},"status":"{}"}}"#,
+            esc(&r.request_id),
+            esc(&r.target_id),
+            esc(&r.target_signing_pubkey.0),
+            sealed_hex,
+            r.created_at,
+            status,
         ));
     }
     lines.push("END".to_string());
@@ -1242,38 +1353,128 @@ pub fn handle_fetch_grant_requests(
     respond(stream, lines.join("\n").as_bytes());
 }
 
+// respond_grant_request_signed — implementation-note-490
 /// Respond to a grant request (approve or deny).
 ///
+/// The caller MUST supply a fresh `nonce_raw` and a signature over
+/// `respond_grant_request_signing_payload(request_id, approved, nonce_raw)`
+/// produced by the responder persona signing key bound at REQUEST time.
+/// The relay verifies the signature against that bound pubkey using
+/// `Ed25519Verifier` (design §3 algorithm-bound), then tombstones the
+/// nonce in `consumed_response_nonces` so a captured frame cannot be
+/// replayed.
+///
 /// Wire response:
-/// - `OK` on success.
+/// - `OK` on accepted, signed response.
 /// - `NOT_FOUND` if no request with the given ID exists.
+/// - `ALREADY_RESOLVED` if the request has already been answered.
+/// - `REJECTED nonce replay` if the nonce has been seen before.
+/// - `REJECTED signature verification failed` if the signature does not
+///   verify under the bound responder pubkey.
+///
+/// Signature failure and nonce-replay BOTH refuse without mutating the
+/// grant-request state — only an `OK` response transitions the request
+/// from `Pending` to `Approved`/`Denied`.
 pub fn handle_respond_grant_request(
     stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     request_id: &str,
     approved: bool,
+    nonce_hex: &str,
+    signature: &Signature,
 ) {
+    // Decode the nonce up front: a malformed nonce is a wire-level error,
+    // not authority-bearing input.
+    let nonce_raw = match hex::decode(nonce_hex) {
+        Ok(bytes) if bytes.len() == RESPOND_GRANT_REQUEST_NONCE_BYTES => bytes,
+        _ => {
+            respond(stream, b"REJECTED nonce malformed");
+            return;
+        }
+    };
+
     let mut s = acquire_state(state);
 
-    // Search across all target_ids for the request.
-    for requests in s.grant_requests.values_mut() {
-        if let Some(req) = requests.iter_mut().find(|r| r.request_id == request_id) {
-            // Replay guard: only pending requests can be responded to.
+    // Replay guard — refuse before touching the grant-request store so a
+    // captured frame is structurally inert. Constant-time nonce lookup
+    // is unnecessary because the nonce is single-use random material and
+    // a hit cannot leak useful information beyond "this exact frame was
+    // already accepted".
+    if s.consumed_response_nonces.contains(nonce_hex) {
+        respond(stream, b"REJECTED nonce replay");
+        return;
+    }
+
+    // Lookup the request, snapshotting the bound pubkey so we can drop
+    // the borrow before mutating the consumed-nonce set.
+    let mut found_target: Option<String> = None;
+    let mut found_index: Option<usize> = None;
+    let mut already_resolved = false;
+    let mut bound_pubkey: Option<PublicKey> = None;
+    for (target, requests) in s.grant_requests.iter() {
+        if let Some(idx) = requests.iter().position(|r| r.request_id == request_id) {
+            let req = &requests[idx];
             if !matches!(req.status, GrantRequestStatus::Pending) {
-                respond(stream, b"ALREADY_RESOLVED");
-                return;
-            }
-            req.status = if approved {
-                GrantRequestStatus::Approved
+                already_resolved = true;
             } else {
-                GrantRequestStatus::Denied
-            };
-            respond(stream, b"OK");
-            return;
+                bound_pubkey = Some(req.target_signing_pubkey.clone());
+            }
+            found_target = Some(target.clone());
+            found_index = Some(idx);
+            break;
         }
     }
 
-    respond(stream, b"NOT_FOUND");
+    if found_target.is_none() {
+        respond(stream, b"NOT_FOUND");
+        return;
+    }
+    if already_resolved {
+        respond(stream, b"ALREADY_RESOLVED");
+        return;
+    }
+    let Some(pubkey) = bound_pubkey else {
+        // Defensive: only reachable if a pending request lost its bound
+        // pubkey, which the request store does not allow today.
+        respond(stream, b"REJECTED missing bound responder pubkey");
+        return;
+    };
+
+    // Verify the responder signature against the bound persona pubkey.
+    // `Ed25519Verifier` is the algorithm-bound verifier per design §3:
+    // it rejects any signature whose key prefix is not `ed25519:`, so a
+    // P-256 device signature cannot accidentally satisfy this gate.
+    let payload = respond_grant_request_signing_payload(request_id, approved, &nonce_raw);
+    if !Ed25519Verifier.verify(&pubkey, &payload, signature) {
+        respond(stream, b"REJECTED signature verification failed");
+        return;
+    }
+
+    // Tombstone the nonce before mutating grant state so any panic between
+    // here and `respond` cannot leak an authenticated nonce back into the
+    // accept-window. Cap the dedup set so a flood of valid responses
+    // cannot drive unbounded memory growth — once we hit the soft cap we
+    // refuse new responses rather than evict (eviction would re-open the
+    // replay window for the evicted nonce).
+    if s.consumed_response_nonces.len() >= MAX_CONSUMED_NONCES {
+        respond(stream, b"REJECTED nonce store full");
+        return;
+    }
+    s.consumed_response_nonces.insert(nonce_hex.to_string());
+
+    // Apply the verdict.
+    let target = found_target.expect("found_target checked above");
+    let idx = found_index.expect("found_index checked above");
+    if let Some(requests) = s.grant_requests.get_mut(&target) {
+        let req = &mut requests[idx];
+        req.status = if approved {
+            GrantRequestStatus::Approved
+        } else {
+            GrantRequestStatus::Denied
+        };
+    }
+
+    respond(stream, b"OK");
 }
 
 pub fn handle_envelope_submission(
@@ -1699,6 +1900,36 @@ pub fn write_frame(stream: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     stream.flush()
 }
 
+/// Derive the host portion that auxiliary listeners should use from the main
+/// relay bind address. This keeps health/JWKS/WS helpers inside the same bind
+/// scope instead of silently widening to 0.0.0.0.
+pub fn auxiliary_bind_host(bind_address: &str) -> String {
+    if let Some(end) = bind_address.find(']')
+        && bind_address.starts_with('[')
+    {
+        return bind_address[..=end].to_string();
+    }
+
+    bind_address
+        .rsplit_once(':')
+        .map(|(host, _port)| {
+            if host.is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                host.to_string()
+            }
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn auxiliary_listener_addr(bind_host: &str, port: u16) -> String {
+    if bind_host.starts_with('[') || !bind_host.contains(':') {
+        format!("{bind_host}:{port}")
+    } else {
+        format!("[{bind_host}]:{port}")
+    }
+}
+
 /// WebSocket listener that speaks the same relay protocol in a WS envelope.
 ///
 /// Each incoming connection performs a WebSocket handshake, reads one Binary
@@ -1711,7 +1942,23 @@ pub fn run_ws_listener(
     state: Arc<Mutex<RelayState>>,
     active_connections: Arc<AtomicUsize>,
 ) {
-    let addr = format!("0.0.0.0:{port}");
+    run_ws_listener_bound(
+        "127.0.0.1".to_string(),
+        port,
+        config,
+        state,
+        active_connections,
+    );
+}
+
+pub fn run_ws_listener_bound(
+    bind_host: String,
+    port: u16,
+    config: Arc<RelayConfig>,
+    state: Arc<Mutex<RelayState>>,
+    active_connections: Arc<AtomicUsize>,
+) {
+    let addr = auxiliary_listener_addr(&bind_host, port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1831,22 +2078,24 @@ OFFER LIMITS:
 
 ADMIN SECURITY:
     --admin-token <tok> Shared secret required for STATS, SHUTDOWN, SHUTDOWN-NOTICE,
-                        and DRAIN commands.  Omitting this flag leaves admin commands
-                        unprotected — acceptable for local/test use only.
+                        and DRAIN commands.  Omitting this flag disables admin
+                        commands.
 
 CONNECTION LIMITS:
     --max-connections <n>  Max simultaneous TCP connections (default: 1000, 0 = unlimited)
     --read-timeout <secs>  Read/write timeout per connection in seconds (default: 30, 0 = none)
 
 WEBSOCKET:
-    --ws-port <port>       WebSocket listener port (default: 9200)
-    --no-ws                Disable the WebSocket listener
+    --ws-port <port>       Accepted for compatibility but disabled for v0.3.0
+                           release containment.
+    --no-ws                Disable the WebSocket listener (default)
 
-TLS OPTIONS:
+TLS OPTIONS (mandatory in production builds — implementation-note-492):
     --tls-self-signed   Generate a self-signed certificate at startup (default)
     --tls-cert <path>   Path to PEM certificate file (e.g., Let's Encrypt fullchain.pem)
     --tls-key <path>    Path to PEM private key file (e.g., Let's Encrypt privkey.pem)
-    --no-tls            Disable TLS (plain TCP, for local development only)
+    (--no-tls is rejected in production; only the `insecure-no-tls` cargo
+     feature re-exposes it for test loopback rigs.)
 
     --help              Show this help
 
@@ -1855,18 +2104,17 @@ WIRE PROTOCOL:
     Submit:          send a PortableRelaySubmission payload
     Drain:           \"DRAIN <peer-id>\" or \"DRAIN <peer-id> <token>\" (when --admin-token set)
     Stats:           \"STATS\" or \"STATS <token>\"
-    Shutdown Notice: \"SHUTDOWN-NOTICE <reason> <deadline-epoch>\" or
-                     \"SHUTDOWN-NOTICE <token> <reason> <deadline-epoch>\"
-    Shutdown:        \"SHUTDOWN\" or \"SHUTDOWN <token>\"
-    Admin commands without the correct token receive AUTH-REQUIRED and are ignored.
+    Shutdown Notice: \"SHUTDOWN-NOTICE <token> <reason> <deadline-epoch>\"
+    Shutdown:        \"SHUTDOWN <token>\"
+    Admin commands without the correct configured token receive AUTH-REQUIRED and are ignored.
     Deposit Offer:   \"DEPOSIT_OFFER <offer-id> <expires-at-epoch> <hex-payload>\"
     Fetch Offer:     \"FETCH_OFFER <offer-id>\"
     Claim Offer:     \"CLAIM_OFFER <offer-id>\"
     Fetch+Claim:     \"FETCH_AND_CLAIM <offer-id>\"  (atomic, recommended)
+    Legacy credential and grant-request commands are rejected for v0.3.0 release containment.
 
 EXAMPLES:
     emberlink-relay --mode open
-    emberlink-relay --mode open --no-tls
     emberlink-relay --admin-token s3cr3t --mode open
     emberlink-relay --tls-cert /etc/letsencrypt/live/relay.example.com/fullchain.pem \\
                     --tls-key /etc/letsencrypt/live/relay.example.com/privkey.pem
@@ -1878,13 +2126,25 @@ EXAMPLES:
 
 /// Minimal HTTP server for the /health readiness probe.
 ///
-/// Listens on a plain TCP port (no TLS) and responds to `GET /health` with
-/// a 200 JSON body containing relay status, mode, and uptime in seconds.
+/// The compatibility helper listens on loopback. Production startup calls
+/// [`run_health_server_bound`] with a host derived from the main relay
+/// `--bind` address. The server responds to `GET /health` with a 200 JSON
+/// body containing relay status, mode, and uptime in seconds.
 /// Any other request receives a 404.  The listener runs in its own OS thread
 /// and never terminates; it is intended to be spawned before the main accept
 /// loop starts.
 pub fn run_health_server(port: u16, mode: RelayMode, start_time: Instant, ws_port: Option<u16>) {
-    let addr = format!("0.0.0.0:{port}");
+    run_health_server_bound("127.0.0.1".to_string(), port, mode, start_time, ws_port);
+}
+
+pub fn run_health_server_bound(
+    bind_host: String,
+    port: u16,
+    mode: RelayMode,
+    start_time: Instant,
+    ws_port: Option<u16>,
+) {
+    let addr = auxiliary_listener_addr(&bind_host, port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {

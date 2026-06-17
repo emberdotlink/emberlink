@@ -1,4 +1,5 @@
 //! EMBER_OVERRIDE_SHADOW
+//! CLASSIFICATION: PUBLIC
 //! Override pattern for agent-container bind-mount source paths.
 //!
 //! design Component 3 — container-resident agents bind-mount host Constructs
@@ -12,7 +13,7 @@
 //!
 //! The two env vars `EMBER_OVERRIDE_SHADOW` and `EMBER_OVERRIDE_CLAUDE`
 //! redirect the bind-mount source paths at render time. The template
-//! (`crates/headless-runtime/templates/compose.yml.j2`) picks them up via Jinja2
+//! (`crates/emberlink-cli/templates/compose.yml.j2`) picks them up via Jinja2
 //! variables `ember_override_shadow` / `ember_override_claude`.
 //!
 //! Overrides are never silent: `status_banner` returns a one-line string that

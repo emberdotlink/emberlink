@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! T1 property tests for the edge CA primitives (design Amendment 1 v3).
 //!

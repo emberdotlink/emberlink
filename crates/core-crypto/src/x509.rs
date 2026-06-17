@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Per-agent X.509 CA with RFC 5280 §4.2.1.10 nameConstraints.
 //!
@@ -115,7 +116,7 @@ pub fn mint_per_agent_ca_with_name_constraints(
 /// Mint per-agent mTLS client cert signed by daemon's client-auth signer key
 /// (held in emberd mlock'd buffer; never on disk).
 ///
-/// SAN URIs emitted, per design component 2 / implementation-note-39:
+/// SAN URIs emitted, per design component 2 / implementation-note-40:
 /// - Always: `urn:emberlink:agent:<agent_id>` (URN compat, retained one release for downstream consumers).
 /// - When `container_id` is `Some`: also `spiffe://emberd/persona/<agent_id>` and `spiffe://emberd/container/<container_id>` (SPIFFE shape, per KMS-edge precedent in `core_crypto::ca::parse_spiffe_uri`).
 ///

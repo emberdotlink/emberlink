@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Experimental**.
-> Source truth: `packages/agent-sdk-py/README.md`.
+> Support level: **Experimental**. Reviewed: 2026-06-17. Status: current.
+
 # Python SDK
 
 The Python package exists, but the broader SDK/headless story is still
@@ -71,4 +71,3 @@ The package-local README remains the detailed source for the package as it
 exists today:
 
 - `packages/agent-sdk-py/README.md`
-

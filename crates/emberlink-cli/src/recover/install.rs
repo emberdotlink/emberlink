@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember recover install` — recover install-time state per design.
 //!
@@ -10,7 +11,7 @@
 
 use clap::{Args, ValueEnum};
 
-use super::{RecoverResult, note_receipt_contract};
+use super::{RecoverOutcome, RecoverResult, note_receipt_contract};
 
 #[derive(Args, Debug)]
 pub struct RecoverInstallArgs {
@@ -69,10 +70,10 @@ pub fn handle(args: RecoverInstallArgs) -> RecoverResult {
 
     println!(
         "ember recover install (mode={mode}, scope={scope}): scaffold only — \
-         per-F-code implementations land as implementation-note-524-* tasks ship. \
+         per-F-code implementations land as implementation-note-457-* tasks ship. \
          See `ember recover --explain F-INSTALL-1` (or 2, 3, 4) for the \
          F-code-anchored runbook."
     );
     note_receipt_contract("install", &scope);
-    Ok(())
+    Ok(RecoverOutcome::ok())
 }

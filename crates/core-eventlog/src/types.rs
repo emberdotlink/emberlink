@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_event_types::{StorageLedgerEntry, StorageRelationship};
+use core_event_types::{
+    AttestationTier, CustodyClass, PresenceFactor, StorageLedgerEntry, StorageRelationship,
+};
 
 use core_principals::{
     EndpointDescriptor, PublicKeyMaterial, RecoveryScope, SurvivalMode, TrustAttestation,
@@ -54,6 +56,22 @@ pub struct DeviceRecord {
     pub active_encryption_key: PublicKeyMaterial,
     pub status: DeviceStatus,
     pub replacement_device_id: Option<String>,
+    /// Key-custody class (design §1). Devices added via `DeviceAdded` are
+    /// `daemon`-class (the daemon holds their key); `presence`/`co-authority`
+    /// devices arrive via `DeviceEnrolled` with a recorded attestation.
+    pub custody_class: CustodyClass,
+    /// Raw vendor/authority attestation statement proving the custody class,
+    /// re-verifiable against the binary-embedded roots. `None` for `daemon`-class
+    /// and for the `AttestationTier::None` dev0 floor.
+    pub attestation_statement: Option<String>,
+    /// The **claimed** attestation strength (design §3, two-axis model). This is
+    /// the recorded claim; authority decisions read the tier PROVEN by
+    /// [`crate::verify_chain`] (which re-runs the statement), never this field
+    /// blind — it is metadata for re-verification, not a trusted boolean.
+    pub attestation_tier: AttestationTier,
+    /// How the Device's use-time human-presence gate is enforced (design §3,
+    /// presence axis). `Unattended` for `daemon`/`co-authority` custody.
+    pub presence_factor: PresenceFactor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

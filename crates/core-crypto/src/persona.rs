@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //! Daemon-as-Persona signing helper per design.
 //!
 //! Receipts are signed by the Daemon Persona's Ed25519 key. The canonical

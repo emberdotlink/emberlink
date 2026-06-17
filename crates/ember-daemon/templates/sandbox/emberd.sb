@@ -3,8 +3,6 @@
 ;;
 ;; macOS sandbox-exec profile for the emberd daemon process, the
 ;; Darwin equivalent of the seccomp filter in infra/seccomp/emberd-seccomp.json.
-;; Per implementation-note-412. Authored
-;; 2026-05-20 as slice C of implementation-note-329 decomposition.
 ;;
 ;; sandbox-exec uses TrustedBSD MAC + Scheme-based policy DSL. The
 ;; primitives differ from seccomp (file/network/process granularity

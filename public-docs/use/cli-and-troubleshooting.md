@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Supported**.
-> Source truth: `docs/cli-reference.md`, `QUICKSTART.md`, `docs/current-architecture.md`.
+> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
+
 # CLI and Troubleshooting
 
 For the current pre-release surface, the top-level operator journey is:
@@ -12,6 +12,14 @@ For the current pre-release surface, the top-level operator journey is:
 3. `ember claude`
 
 Everything else should support that journey, not compete with it.
+
+## What to remember first
+
+If you only remember one rule, make it this:
+
+- start with `ember init --for claude`
+- verify with `ember status`
+- relaunch through `ember claude`
 
 ## Headline commands
 
@@ -27,7 +35,7 @@ Everything else should support that journey, not compete with it.
 
 ## First repair steps
 
-If the installed path looks wrong, start here:
+If the installed path looks wrong, start here and in this order:
 
 ```bash
 ember status
@@ -39,7 +47,7 @@ These are the primary repair entry points for the installed daemon posture.
 
 ## GitHub repair path
 
-If the install is healthy but GitHub authority is not ready, use:
+If the install looks healthy but GitHub authority is not ready, use:
 
 ```bash
 ember github status --json
@@ -48,6 +56,17 @@ ember github setup
 
 For the current App-first truth and degraded PAT boundary, see
 [GitHub setup and auth](./github-setup-and-auth/).
+
+## After repair
+
+Once the daemon and GitHub posture both look healthy, go back to:
+
+```bash
+ember claude
+```
+
+That is the supported managed launcher path. Do not switch to lower-level
+foreground-daemon habits just because something broke once.
 
 ## What is intentionally not the primary docs story
 

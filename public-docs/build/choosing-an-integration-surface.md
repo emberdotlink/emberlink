@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `QUICKSTART.md`, `docs/current-architecture.md`, `crates/emberlink-mcp/README.md`, `packages/agent-sdk-ts/README.md`, `packages/agent-sdk-py/README.md`, `project design notes`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Choose an Integration Surface
 
 Emberlink exposes more than one user-facing surface, but they are not equal.

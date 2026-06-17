@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! mTLS server + client config loaders for ember-relay.
 //!

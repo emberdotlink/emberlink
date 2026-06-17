@@ -4,6 +4,7 @@
 //! for App ID + PEM path, then persists them into the shared operator
 //! authority bundle (`github.env` + `github-app.pem`) used by dev runtimes.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use std::fs;
 use std::io::{self, IsTerminal as _, Write as _};
@@ -240,6 +241,17 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn fake_private_key_pem(label: &str, body: &str) -> String {
+        format!(
+            "{}{}-----\n{}\n{}{}-----\n",
+            "-----BEGIN ",
+            label,
+            body,
+            "-----END ",
+            label
+        )
+    }
+
     #[test]
     fn creation_url_contains_expected_params() {
         let url = gh_app_creation_url();
@@ -256,7 +268,8 @@ mod tests {
     fn copy_pem_sets_mode_0640() {
         let tmp = TempDir::new().unwrap();
         let dest = tmp.path().join("test.pem");
-        let pem_bytes = b"\x2d----BEGIN RSA PRIVATE KEY-----\nFAKE\n-----END RSA PRIVATE KEY-----\n";
+        let pem = fake_private_key_pem("RSA PRIVATE KEY", "FAKE");
+        let pem_bytes = pem.as_bytes();
 
         let hash = copy_pem_with_mode(pem_bytes, &dest).unwrap();
 
@@ -317,8 +330,8 @@ mod tests {
 
     #[test]
     fn validate_pem_bytes_accepts_private_key_pem() {
-        let pem_bytes = b"\x2d----BEGIN PRIVATE KEY-----\nRkFLRQ==\n-----END PRIVATE KEY-----\n";
-        validate_pem_bytes(pem_bytes).expect("valid private key PEM must pass");
+        let pem = fake_private_key_pem("PRIVATE KEY", "RkFLRQ==");
+        validate_pem_bytes(pem.as_bytes()).expect("valid private key PEM must pass");
     }
 
     #[test]
@@ -339,8 +352,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().to_path_buf();
         write_github_env(&config_dir, 424242).unwrap();
+        let pem = fake_private_key_pem("PRIVATE KEY", "RkFLRQ==");
         copy_pem_with_mode(
-            b"\x2d----BEGIN PRIVATE KEY-----\nRkFLRQ==\n-----END PRIVATE KEY-----\n",
+            pem.as_bytes(),
             &config_dir.join("github-app.pem"),
         )
         .unwrap();
@@ -356,10 +370,11 @@ mod tests {
     fn persist_gh_app_writes_env_and_pem() {
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().to_path_buf();
+        let pem = fake_private_key_pem("PRIVATE KEY", "RkFLRQ==");
         let record = persist_gh_app(
             &config_dir,
             31337,
-            b"\x2d----BEGIN PRIVATE KEY-----\nRkFLRQ==\n-----END PRIVATE KEY-----\n",
+            pem.as_bytes(),
         )
         .expect("persist must succeed");
         assert_eq!(record.app_id, 31337);
@@ -374,9 +389,6 @@ mod tests {
             Path::new("/tmp/emberlink-dev/worktree-a"),
         );
         let dir = operator_authority_dir_from_runtime(&runtime).expect("authority dir");
-        assert_eq!(
-            dir,
-            PathBuf::from("/home/tester/.config/emberlink-dev")
-        );
+        assert_eq!(dir, PathBuf::from("/home/tester/.config/emberlink-dev"));
     }
 }

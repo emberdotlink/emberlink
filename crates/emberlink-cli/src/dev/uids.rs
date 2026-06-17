@@ -8,6 +8,7 @@
 //! Uses a `CommandRunner` trait so tests can inject a stub without actually
 //! calling dscl.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use std::process::Command;
 

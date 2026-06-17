@@ -1,4 +1,5 @@
 //! image_key_rotation
+//! CLASSIFICATION: PUBLIC
 //!
 //! Two-tier key-rotation scaffold for image signing.
 //!

@@ -55,7 +55,7 @@ pub enum PresenceKind {
     RevokedBefore,
 }
 
-/// receipt_v2_presence_reason — per design Topic 6 D5 / implementation-note-49.
+/// receipt_v2_presence_reason — per design Topic 6 D5 / implementation-note-56.
 /// *Why* the presence proof was requested. Distinct from [`PresenceKind`]
 /// (which is *what kind* of presence the receipt witnesses): `PresenceReason`
 /// records the lifecycle event that triggered re-prompting the user for
@@ -134,7 +134,7 @@ pub struct ReceiptEnvelope {
     /// add-scope / jit / re-auth). `None` on receipts where presence wasn't
     /// re-elicited (mid-session tool calls riding an existing handle). See
     /// [`PresenceReason`] for the variants. Per design Topic 6 D5 /
-    /// implementation-note-49.
+    /// implementation-note-56.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_reason: Option<PresenceReason>,
     /// Opaque handle ID for the presence-proof binding this call rode (or
@@ -143,7 +143,7 @@ pub struct ReceiptEnvelope {
     pub handle_id: Option<HandleId>,
     /// SHA-256 of the presence challenge bound to the call, as produced by
     /// `core_crypto::presence::bind_presence_challenge`. Recorded so audit can
-    /// re-bind the challenge tuple (workflow_id, action_key, spiffe_uri,
+    /// re-bind the challenge tuple (delegation_id, action_key, spiffe_uri,
     /// nonce) deterministically without storing the components themselves.
     /// `None` on receipts without an associated presence challenge.
     #[serde(default, skip_serializing_if = "Option::is_none")]

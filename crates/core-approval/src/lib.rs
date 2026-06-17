@@ -6,8 +6,8 @@ pub mod states;
 pub use lifecycle::{ApprovalLifecycle, LifecycleError, RequestId, SubmitMetadata};
 pub use outcome::ApprovalOutcome;
 pub use policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyError, PolicyEvaluation, PolicyRule,
-    RiskLevel, Tier, classify_tier, normalize_action,
+    ActionRef, ActionSelector, ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyError,
+    PolicyEvaluation, PolicyRule, RiskLevel, Tier, classify_tier, normalize_action,
 };
 pub use states::{TransitionError, transition, ttl_elapsed};
 

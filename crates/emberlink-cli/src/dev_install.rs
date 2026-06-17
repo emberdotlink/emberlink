@@ -4,6 +4,7 @@
 //! compare; only bootout/bootstrap if content changed. Advisory file lock at
 //! /var/run/ember-dev-install.lock serializes launchctl operations.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -139,9 +140,7 @@ impl InstallOps for RealInstallOps {
         if !status.success() {
             let code = status.code().unwrap_or(-1);
             if code != 113 {
-                return Err(io::Error::other(format!(
-                    "launchctl bootout exited {code}"
-                )));
+                return Err(io::Error::other(format!("launchctl bootout exited {code}")));
             }
         }
         Ok(())
@@ -321,6 +320,11 @@ mod tests {
         );
         // KeepAlive
         assert!(rendered.contains("<true/>"), "KeepAlive missing");
+        // design §security-req-5: restart-cadence throttle.
+        assert!(
+            rendered.contains("<key>ThrottleInterval</key>"),
+            "ThrottleInterval missing"
+        );
     }
 
     // --- install_plist idempotency tests ---

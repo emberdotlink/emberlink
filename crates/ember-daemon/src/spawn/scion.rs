@@ -1,4 +1,4 @@
-//! implementation-note-154: container mount-table helpers.
+//! Container mount-table helpers.
 //!
 //! Bind-mount strategy (one socket per agent, parent dir read-only):
 //!
@@ -21,10 +21,12 @@
 //! lets us swap runtimes without rewriting the security-critical
 //! mount-table logic.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use core_crypto::Signer;
 use core_events::receipt::{
@@ -38,9 +40,13 @@ use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
+use crate::spawn::runtime::{
+    ContainerRuntime, RuntimeSpawnError, RuntimeState, SpawnSpec, SpawnedContainer, UdsBindMount,
+};
+
 /// Errors raised by the SCION agent-spawn path.
 ///
-/// The two variants relevant to implementation-note-204 are:
+/// The two variants relevant to binary hash pinning are:
 ///
 /// - [`SpawnError::BinaryHashMismatch`] — the on-disk binary's SHA-256
 ///   does not match the operator-pinned hash from [`crate::infra::config::DaemonConfig::scion_binary_sha256`].
@@ -73,7 +79,7 @@ pub enum SpawnError {
     /// [`SpawnError`] for the rationale.
     #[error("scion binary io error: {0}")]
     BinaryIo(#[from] std::io::Error),
-    /// implementation-note-112 — the configured
+    /// The configured
     /// in-container UDS path does not exist, is not a socket, or
     /// could not be `stat`-ed. Validated BEFORE `connect()` so a
     /// dangling path produces a clean error instead of a vague
@@ -88,21 +94,21 @@ pub enum SpawnError {
         /// Human-readable reason (`not found`, `not a socket`, etc.).
         reason: String,
     },
-    /// implementation-note-112 — `tokio::net::UnixStream::connect`
+    /// `tokio::net::UnixStream::connect`
     /// failed against an already-validated path. Carries the underlying
     /// I/O error (`ECONNREFUSED` when the receiver crashed between
     /// validation and connect, `EACCES` when the agent uid doesn't
     /// hold 0660 on the socket, etc.).
     #[error("scion exec connect failed: {0}")]
     ExecConnect(std::io::Error),
-    /// implementation-note-112 — encoding or writing
+    /// Encoding or writing
     /// the SpawnDirective frame failed mid-handshake. The connection
     /// is owned by the caller at the point of return; this variant
     /// is reached only on the pre-return write path inside
     /// [`send_spawn_directive`] itself.
     #[error("scion exec directive write failed: {0}")]
     ExecDirectiveWrite(FrameError),
-    /// implementation-note-357 — failed to capture the
+    /// Failed to capture the
     /// (cgroup_v2_id, userns_inode, mnt_ns_inode) tuple for a freshly
     /// spawned container PID. Refuse-spawn: a missing binding tuple
     /// breaks the agent_socket_enrollments → container identity
@@ -193,7 +199,7 @@ pub struct MountSpec {
 /// [`MountKind::MlockedPersonaKey`] is a virtual entry — it describes
 /// the in-process mlocked memory region for the agent's persona key, not
 /// a filesystem mount. It is emitted only by
-/// [`scion_mount_table_with_persona_key`] (implementation-note-298)
+/// [`scion_mount_table_with_persona_key`]
 /// so the lifecycle of the locked region is observable in the same
 /// table that the container runtime consumes for the socket bind-mounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +214,7 @@ pub enum MountKind {
     /// it can `connect()` and send/receive bytes, but the parent-dir
     /// RO mount prevents `unlink`/`rename` of the inode itself.
     ReadWriteSocket,
-    /// implementation-note-298 — virtual entry describing the
+    /// Virtual entry describing the
     /// in-process mlocked memory region holding the persona's Ed25519
     /// secret. The `source` path is a checkpoint (`/proc/self/mem`) and
     /// the `target` carries the persona id so reconcilers can correlate
@@ -269,7 +275,7 @@ pub fn scion_mount_table_for_socket(socket_path: &Path) -> Vec<MountSpec> {
     ]
 }
 
-/// implementation-note-298 — build the mount-table contribution
+/// Build the mount-table contribution
 /// for a per-agent UDS socket AND surface the persona's mlocked
 /// memory region as an additional informational entry.
 ///
@@ -304,7 +310,126 @@ pub fn scion_mount_table_with_persona_key(socket_path: &Path, persona_id: &str) 
     mounts
 }
 
-/// implementation-note-112 — emberd-side wire-protocol
+fn uds_bind_mounts_from_mount_table(mounts: &[MountSpec]) -> Vec<UdsBindMount> {
+    mounts
+        .iter()
+        .filter_map(|mount| match mount.kind {
+            MountKind::ReadOnlyDir => Some(UdsBindMount {
+                host_path: mount.source.clone(),
+                container_path: mount.target.clone(),
+                read_only: true,
+            }),
+            MountKind::ReadWriteSocket => Some(UdsBindMount {
+                host_path: mount.source.clone(),
+                container_path: mount.target.clone(),
+                read_only: false,
+            }),
+            // Informational only: runtimes must not try to materialize
+            // the in-process mlocked key region as a filesystem mount.
+            MountKind::MlockedPersonaKey => None,
+        })
+        .collect()
+}
+
+/// Apply a SCION mount table to a canonical spawn spec, then dispatch
+/// through any [`ContainerRuntime`] implementation.
+///
+/// This is the caller-side narrow waist for SCION spawn: SCION owns the
+/// mount-table translation, while the selected runtime owns container
+/// lifecycle. Tests can pass a noop/recording runtime here without
+/// changing SCION-specific caller code.
+pub async fn spawn_with_scion_mount_table<R>(
+    runtime: &R,
+    mut spec: SpawnSpec,
+    mounts: &[MountSpec],
+) -> Result<SpawnedContainer, RuntimeSpawnError>
+where
+    R: ContainerRuntime + ?Sized,
+{
+    spec.uds_mounts
+        .extend(uds_bind_mounts_from_mount_table(mounts));
+    runtime.spawn(spec).await
+}
+
+/// SCION-facing adapter over a generic [`ContainerRuntime`].
+///
+/// SCION owns the security-critical mount-table logic; the underlying
+/// runtime owns the backend-specific container lifecycle. This adapter
+/// keeps those responsibilities separate by translating SCION's
+/// [`MountSpec`] table into canonical runtime [`UdsBindMount`]s and
+/// delegating the actual spawn/drain/state-report calls through the
+/// shared runtime trait.
+pub struct ScionRuntime {
+    inner: Box<dyn ContainerRuntime>,
+}
+
+impl ScionRuntime {
+    pub fn new<R>(inner: R) -> Self
+    where
+        R: ContainerRuntime + 'static,
+    {
+        Self {
+            inner: Box::new(inner),
+        }
+    }
+
+    pub fn from_boxed(inner: Box<dyn ContainerRuntime>) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &dyn ContainerRuntime {
+        self.inner.as_ref()
+    }
+
+    /// Apply a SCION mount table to the canonical spawn spec, then
+    /// delegate the launch to the wrapped runtime through trait
+    /// dispatch.
+    pub async fn spawn_with_mount_table(
+        &self,
+        spec: SpawnSpec,
+        mounts: &[MountSpec],
+    ) -> Result<SpawnedContainer, RuntimeSpawnError> {
+        spawn_with_scion_mount_table(self.inner.as_ref(), spec, mounts).await
+    }
+}
+
+#[async_trait]
+impl ContainerRuntime for ScionRuntime {
+    async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnedContainer, RuntimeSpawnError> {
+        self.inner.spawn(spec).await
+    }
+
+    async fn bind_mount_uds(
+        &self,
+        container_id: &str,
+        host_path: &Path,
+        in_container_path: &Path,
+    ) -> Result<(), RuntimeSpawnError> {
+        self.inner
+            .bind_mount_uds(container_id, host_path, in_container_path)
+            .await
+    }
+
+    async fn drain(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), RuntimeSpawnError> {
+        self.inner.drain(container_id, grace).await
+    }
+
+    async fn state_report(&self, container_id: &str) -> Result<RuntimeState, RuntimeSpawnError> {
+        self.inner.state_report(container_id).await
+    }
+}
+
+impl fmt::Debug for ScionRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScionRuntime").finish_non_exhaustive()
+    }
+}
+
+/// emberd-side wire-protocol
 /// counterpart to `ember_exec::spawn::handle_spawn_directive` (subtask C).
 ///
 /// Opens a `tokio::net::UnixStream` to the in-container `ember-exec`
@@ -393,13 +518,13 @@ pub async fn send_spawn_directive(
     Ok(stream)
 }
 
-/// implementation-note-45 — build + sign a Receipt v2 envelope
+/// Build + sign a Receipt v2 envelope
 /// of kind `exec.completion` for the just-completed in-container exec.
 ///
 /// Called by [`crate::broker::handler::handle_broker_exec`]'s in-container
 /// branch on every `ExecFrame::Exit` arriving from the in-container
 /// `ember-exec` sidecar. The receipt is the audit-trail anchor for the
-/// parent implementation-note-46 acceptance — emberd (not ember-exec)
+/// parent service-acceptance — emberd (not ember-exec)
 /// is the receipt signer; ember-exec only reports the child's exit code,
 /// and emberd composes + signs the v2 envelope from the inputs the daemon
 /// already trusts (the directive's `binary_path` + the blake3 hash the
@@ -476,10 +601,11 @@ pub fn emit_exec_completion_receipt<S: Signer>(
         receipt_id: String::new(),
         daemon_root_id,
         traceparent: None,
-        // implementation-note-45 — emberd (daemon persona) is
-        // the receipt signer per the parent implementation-note-46
-        // acceptance, matching the `broker.materialization` envelope's
-        // posture in `crate::infra::receipt::build_broker_materialization_envelope`.
+        // emberd (daemon persona) is
+        // the receipt signer per the parent service-acceptance,
+        // matching the `broker.revocation` envelope's
+        // DaemonPersona posture in
+        // `crate::infra::receipt::build_broker_revocation_envelope`.
         termination_authority: TerminationAuthority::DaemonPersona,
         presence_kind: None,
         body: body_value,
@@ -494,7 +620,7 @@ pub fn emit_exec_completion_receipt<S: Signer>(
     Ok(envelope)
 }
 
-/// implementation-note-111 — build + dual-sign a Receipt v2
+/// Build + dual-sign a Receipt v2
 /// envelope of kind `spawn.witness` for a parent→child grant edge.
 ///
 /// Called from the spawn path (`crate::trust::grant::delegate_grant_full_sql`)
@@ -541,7 +667,7 @@ pub fn emit_spawn_witness_receipt<P: Signer, D: Signer>(
     daemon_signer: &D,
 ) -> Result<ReceiptEnvelope, SignError> {
     // 1. Build the unsigned body and have the parent persona sign it.
-    //    implementation-note-73 — the
+    //    The
     //    `ca_fingerprint` binds the spawn to the daemon's SE-sealed Bridge CA
     //    (Slice B's `runtime.bridge_ca.lock().unwrap().as_ref().map(|ca|
     //    ca.fingerprint())`). Callers without a fingerprint to bind (legacy
@@ -584,7 +710,7 @@ pub fn emit_spawn_witness_receipt<P: Signer, D: Signer>(
     Ok(envelope)
 }
 
-/// implementation-note-400 — mint a per-agent X.509 CA for the
+/// Mint a per-agent X.509 CA for the
 /// ember-proxy TLS interceptor.
 ///
 /// Each SCION worker runs its own ember-proxy instance (design §7). The
@@ -638,7 +764,7 @@ pub fn mint_per_agent_proxy_ca(
     core_crypto::mint_per_agent_ca_with_name_constraints(agent_id, names, hours)
 }
 
-/// implementation-note-401 — mint a per-agent mTLS client cert for the
+/// Mint a per-agent mTLS client cert for the
 /// ember-proxy SCION listener.
 ///
 /// The proxy at `https://localhost:8443` inside the worker container requires
@@ -687,7 +813,7 @@ pub fn mint_per_agent_mtls_client_cert(
     core_crypto::mint_per_agent_client_cert(agent_id, container_id, signer_key, signer_cert, hours)
 }
 
-/// implementation-note-357 — the three-tuple captured at
+/// The three-tuple captured at
 /// spawn-completion that binds an `agent_socket_enrollments` row to a
 /// kernel-observable namespace identity.
 ///
@@ -824,6 +950,134 @@ pub fn capture_container_ns_inodes_at(
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntime {
+        specs: Arc<Mutex<Vec<SpawnSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for RecordingRuntime {
+        async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnedContainer, RuntimeSpawnError> {
+            self.specs.lock().expect("record spawn spec").push(spec);
+            Ok(SpawnedContainer {
+                container_id: "container-test-001".to_string(),
+                name: Some("scion-runtime-test".to_string()),
+            })
+        }
+
+        async fn drain(
+            &self,
+            _container_id: &str,
+            _grace: std::time::Duration,
+        ) -> Result<(), RuntimeSpawnError> {
+            Ok(())
+        }
+
+        async fn state_report(
+            &self,
+            _container_id: &str,
+        ) -> Result<RuntimeState, RuntimeSpawnError> {
+            Ok(RuntimeState::Running)
+        }
+    }
+
+    #[test]
+    fn scion_runtime_coerces_to_dyn_container_runtime() {
+        fn assert_dyn_runtime(_r: &dyn ContainerRuntime) {}
+
+        let runtime = ScionRuntime::new(RecordingRuntime::default());
+        assert_dyn_runtime(&runtime);
+    }
+
+    #[tokio::test]
+    async fn scion_runtime_spawn_with_mount_table_extends_spec_and_skips_mlock_entry() {
+        let recorder = RecordingRuntime::default();
+        let runtime =
+            ScionRuntime::from_boxed(Box::new(recorder.clone()) as Box<dyn ContainerRuntime>);
+        let path = Path::new("/run/emberd/agent-abc.sock");
+        let mounts = scion_mount_table_with_persona_key(path, "persona-12345");
+        let seed_mount = UdsBindMount {
+            host_path: PathBuf::from("/already/present.sock"),
+            container_path: PathBuf::from("/run/emberd/already-present.sock"),
+            read_only: false,
+        };
+
+        let spawned = runtime
+            .spawn_with_mount_table(
+                SpawnSpec {
+                    image: "ubuntu:24.04".to_string(),
+                    uds_mounts: vec![seed_mount.clone()],
+                    ..Default::default()
+                },
+                &mounts,
+            )
+            .await
+            .expect("spawn_with_mount_table succeeds");
+
+        assert_eq!(spawned.container_id, "container-test-001");
+
+        let recorded = recorder.specs.lock().expect("inspect recorded spec");
+        let captured = recorded
+            .last()
+            .expect("spawn_with_mount_table records one spec");
+        assert_eq!(
+            captured.uds_mounts.len(),
+            3,
+            "seed mount + [parent dir, socket inode] expected",
+        );
+        assert_eq!(captured.uds_mounts[0], seed_mount);
+        assert!(
+            captured
+                .uds_mounts
+                .iter()
+                .any(|m| m.container_path == PathBuf::from("/run/emberd") && m.read_only),
+            "parent dir mount must remain read-only",
+        );
+        assert!(
+            captured.uds_mounts.iter().any(|m| m.container_path
+                == PathBuf::from("/run/emberd/agent-abc.sock")
+                && !m.read_only),
+            "socket inode mount must remain read-write",
+        );
+        assert!(
+            captured
+                .uds_mounts
+                .iter()
+                .all(|m| !m.container_path.to_string_lossy().contains("/mlocked/")),
+            "informational mlocked entry must not become a filesystem bind mount",
+        );
+    }
+
+    #[tokio::test]
+    async fn scion_mount_table_spawn_accepts_dyn_container_runtime() {
+        let recorder = RecordingRuntime::default();
+        let runtime: Box<dyn ContainerRuntime> = Box::new(recorder.clone());
+        let path = Path::new("/run/emberd/agent-dyn.sock");
+        let mounts = scion_mount_table_for_socket(path);
+
+        spawn_with_scion_mount_table(
+            runtime.as_ref(),
+            SpawnSpec {
+                image: "ubuntu:24.04".to_string(),
+                ..Default::default()
+            },
+            &mounts,
+        )
+        .await
+        .expect("generic dyn runtime spawn succeeds");
+
+        let recorded = recorder.specs.lock().expect("inspect recorded spec");
+        let captured = recorded.last().expect("dyn path records one spec");
+        assert_eq!(captured.uds_mounts.len(), 2);
+        assert!(
+            captured.uds_mounts.iter().any(|m| m.container_path
+                == PathBuf::from("/run/emberd/agent-dyn.sock")
+                && !m.read_only),
+            "dyn caller path must preserve the SCION socket bind",
+        );
+    }
 
     #[test]
     fn mount_table_parent_dir_is_read_only() {
@@ -961,7 +1215,7 @@ mod tests {
 
     #[test]
     fn emit_spawn_witness_receipt_dual_signature_verifies() {
-        // implementation-note-111 — the emit function
+        // The emit function
         // must produce an envelope where BOTH signatures verify under
         // the supplied trust anchors:
         //
@@ -980,8 +1234,8 @@ mod tests {
             verify_receipt_v2, verify_spawn_witness_parent_signature,
         };
 
-        let parent_signer = FixtureSigner::new("implementation-note-402spawn-witness-parent-key");
-        let daemon_signer = FixtureSigner::new("implementation-note-402spawn-witness-daemon-key");
+        let parent_signer = FixtureSigner::new("implementation-note-351spawn-witness-parent-key");
+        let daemon_signer = FixtureSigner::new("implementation-note-351spawn-witness-daemon-key");
         let parent_pk = parent_signer.public_key();
         let daemon_pk = daemon_signer.public_key();
 
@@ -1065,7 +1319,7 @@ mod tests {
 
     #[test]
     fn mount_table_with_persona_key_appends_mlock_entry() {
-        // implementation-note-298 — the companion table extends
+        // The companion table extends
         // the bare socket-only table with a third MlockedPersonaKey
         // entry. The first two entries match the bare table byte-for-
         // byte so callers can swap variants without losing the
@@ -1090,7 +1344,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-357 T2 fixture — happy path.
+    /// T2 fixture — happy path.
     ///
     /// Build a fake `/proc/<pid>/` tree and a fake cgroup root in a
     /// tempdir, run the capture helper against them, assert the three
@@ -1132,7 +1386,7 @@ mod tests {
         assert_eq!(captured.mnt_ns_inode, expected_mntns);
     }
 
-    /// implementation-note-357 T2 fixture — failure path.
+    /// T2 fixture — failure path.
     ///
     /// Missing `/proc/<pid>/cgroup` must produce
     /// [`SpawnError::NamespaceInodeCaptureFailed`]. The spawn flow
@@ -1153,7 +1407,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-357 T2 fixture — malformed cgroup
+    /// T2 fixture — malformed cgroup
     /// file (no `0::` line) refuses.
     #[test]
     #[cfg(target_os = "linux")]

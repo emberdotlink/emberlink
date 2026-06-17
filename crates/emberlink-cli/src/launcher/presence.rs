@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //! Launcher-side browser presence helpers.
 //!
 //! The shipped local launcher path is still direct Unix-socket `register_session`

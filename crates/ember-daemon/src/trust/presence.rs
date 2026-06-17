@@ -30,11 +30,11 @@
 //!
 //! ## Read vs write semantics
 //!
-//! Read operations (`vault_get`, `vault_list`, status, dashboard) call
-//! `record_activity()` to bump the session's `last_activity` timestamp.
-//! They never trigger a prompt themselves — that would spam the user when a
-//! dashboard polls. Write/high-risk operations call `require_user_presence`,
-//! which:
+//! Ordinary read operations (`vault_get`, `vault_list`, status, dashboard)
+//! call `record_activity()` to bump the session's `last_activity` timestamp.
+//! They do not trigger a prompt themselves; per-entry biometric vault rows are
+//! the explicit exception and require a fresh presence proof before decrypt.
+//! Write/high-risk operations call `require_user_presence`, which:
 //!
 //! - returns `Allowed` when the session is unlocked AND `last_activity` is
 //!   within `idle_timeout` AND we're not in quiet hours,
@@ -142,6 +142,23 @@ pub enum GateOutcome {
 
 /// Internal session state. Exposed here only so unit tests can construct
 /// scenarios; production code goes through the module-level functions.
+///
+/// # Unified-lock semantics
+///
+/// `presence_gate_soft_lock_distinction_landed`: there is only ONE locked
+/// state. The previous comment-vs-code drift (comment claimed idle auto-lock
+/// retained "soft-lock" semantics for headless survivability while the code
+/// simultaneously cleared the SE session cache, forcing a Touch ID re-prompt
+/// either way) has been resolved by removing the soft-lock fiction. Every
+/// transition out of `Unlocked` — explicit `ember vault lock`, idle
+/// auto-lock, OS presence event, startup, grace-window expiry — produces an
+/// identical `Locked` state that requires a fresh Touch ID prompt to recover.
+///
+/// Recovery path: callers (CLI, dashboard, headless) invoke `vault_unlock`
+/// over the daemon socket (see `implementation-note-364`
+/// for the subcommand contract). Background headless that needs to survive
+/// idle windows must call `vault_unlock` explicitly before high-risk ops
+/// rather than relying on an implicit auto-unlock window.
 #[derive(Debug, Clone)]
 pub enum SessionState {
     /// Session has never been unlocked, OR was explicitly locked via
@@ -200,7 +217,7 @@ impl PresenceManager {
 /// check is also a write (last_activity bump).
 static MANAGER: Lazy<Mutex<PresenceManager>> = Lazy::new(|| Mutex::new(PresenceManager::new()));
 
-/// implementation-note-35 C2: register the daemon's `DaemonStore` so
+/// implementation-note-37 C2: register the daemon's `DaemonStore` so
 /// `lock()` can clear the shared live-vault slot on explicit lock. Called
 /// once at daemon startup from `runtime.rs` after the store is opened.
 ///
@@ -286,7 +303,7 @@ pub fn mark_unlocked() {
 /// subcommand; also called from any `lock-on-shutdown` handlers in the
 /// daemon supervisor.
 ///
-/// implementation-note-35 C2 — **hard-lock semantics**:
+/// implementation-note-37 C2 — **hard-lock semantics**:
 ///
 /// - Flips `SessionState` to `Locked`.
 /// - Clears the macOS SE-keyring session cache so the next interactive
@@ -300,11 +317,20 @@ pub fn mark_unlocked() {
 /// - Clears any tracked interactive session pins; explicit lock is a hard
 ///   privilege drop even if a launcher session is still open.
 ///
-/// Idle auto-lock (`require_user_presence_at`'s `idle >= idle_timeout`
-/// branch) deliberately does NOT drop the vault — it retains soft-lock
-/// so background headless survives the idle window without a
-/// re-prompt. The asymmetry is intentional: explicit lock = user is
-/// reducing privilege; idle lock = user has wandered off.
+/// **Idle auto-lock vs explicit lock asymmetry** — observable today but
+/// security-equivalent: the auto-lock branch in
+/// [`require_user_presence_at`] flips `SessionState` to `Locked` and
+/// clears the SE session cache (same Touch ID re-prompt requirement) but
+/// does NOT drop the `Rc<Vault>` from `DaemonStore`. The asymmetry is
+/// observability (an auto-locked daemon still has the vault Rc attached,
+/// useful for diagnostics) rather than a "soft-lock" privilege carve-out
+/// — both paths require a fresh Touch ID prompt to recover, and
+/// `vault_unlock` (see `implementation-note-364`)
+/// is the canonical recovery route for both. Earlier comment drift
+/// claimed idle auto-lock was a "soft-lock" that headless could
+/// survive without a re-prompt; that was never true in code (the SE
+/// cache clear made the re-prompt unavoidable) and the doctrine has been
+/// removed as part of `presence_gate_soft_lock_distinction_landed`.
 pub fn lock() {
     let mut m = MANAGER.lock().expect("presence manager poisoned");
     m.state = SessionState::Locked;
@@ -319,6 +345,23 @@ pub fn lock() {
     // Clear the shared live-vault slot and forget active session pins.
     crate::infra::interactive_unlock::explicit_lock();
     tracing::info!("vault session re-locked (explicit, hard-lock — MEK cleared)");
+}
+
+/// Hard-lock the interactive lane because the host OS asserted a presence
+/// boundary such as screen lock or system sleep.
+pub fn invalidate_for_os_presence_event(trigger: &str) {
+    let mut m = MANAGER.lock().expect("presence manager poisoned");
+    m.state = SessionState::Locked;
+    #[cfg(target_os = "macos")]
+    {
+        crate::infra::vault_macos::clear_session_cache();
+    }
+    drop(m);
+    crate::infra::interactive_unlock::explicit_lock();
+    tracing::info!(
+        trigger,
+        "vault session re-locked (macOS presence invalidation)"
+    );
 }
 
 /// Boot-time hard-lock after the daemon finishes startup-only vault bootstrap.
@@ -442,19 +485,24 @@ pub fn require_user_presence_at(
         SessionState::Locked => GateOutcome::Locked {
             reason: format!(
                 "{} denied: session is locked; same-daemon operator-uid reopen \
-                 is disabled to avoid legacy login-keychain prompts. Supported lanes: \
-                 managed separate-uid biometric unlock \
-                 (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon \
-                 bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future \
-                 broker-mediated browser auth",
+                 is disabled to avoid legacy login-keychain prompts. Run `ember vault unlock` \
+                 to invoke the managed separate-uid biometric unlock flow when available. \
+                 If you are on a dev probe lane, restart the daemon with \
+                 `EMBER_VAULT_PASSPHRASE`; future broker-mediated browser auth remains planned",
                 op.as_str()
             ),
         },
         SessionState::Unlocked { last_activity, .. } => {
             let idle = now.saturating_duration_since(last_activity);
             if idle >= m.config.idle_timeout {
-                // Auto-lock. Subsequent high-risk ops fail closed until the
-                // caller reopens the interactive vault lane.
+                // Auto-lock — same Touch ID re-prompt requirement as explicit
+                // `lock()` from the caller's perspective. The SE session
+                // cache is cleared so the next vault MEK read prompts; the
+                // `Rc<Vault>` in DaemonStore is intentionally retained for
+                // diagnostic observability (the lock is enforced at the gate,
+                // not at the vault slot — caller still must surface the
+                // `GateOutcome::Locked` and call `vault_unlock` to recover).
+                // See `presence_gate_soft_lock_distinction_landed`.
                 m.state = SessionState::Locked;
                 #[cfg(target_os = "macos")]
                 {
@@ -462,11 +510,12 @@ pub fn require_user_presence_at(
                 }
                 tracing::info!(
                     idle_secs = idle.as_secs(),
-                    "vault session auto-locked (idle timeout)"
+                    "vault session auto-locked (idle timeout); recovery via vault_unlock"
                 );
                 GateOutcome::Locked {
                     reason: format!(
-                        "{} denied: session auto-locked after {}s idle (limit {}s)",
+                        "{} denied: session auto-locked after {}s idle (limit {}s); \
+                         run `ember vault unlock` to re-prompt for Touch ID",
                         op.as_str(),
                         idle.as_secs(),
                         m.config.idle_timeout.as_secs()
@@ -845,7 +894,7 @@ mod tests {
         assert!(idle.is_none());
     }
 
-    /// implementation-note-35 C2: explicit `lock()` is hard-lock —
+    /// implementation-note-37 C2: explicit `lock()` is hard-lock —
     /// the registered `DaemonStore` no longer carries a vault handle
     /// after the call, so the next vault op MUST re-derive the MEK
     /// from the keyring (forces a fresh biometric on macOS).
@@ -875,7 +924,7 @@ mod tests {
         assert!(!unlocked, "explicit lock() must also flip session state");
     }
 
-    /// implementation-note-35 C3: the session-cache value type is
+    /// implementation-note-37 C3: the session-cache value type is
     /// `Zeroizing<String>` so dropping a cache entry overwrites the
     /// passphrase bytes in place. We assert the contract by allocating
     /// a `Zeroizing<String>`, snapshotting the inner pointer, dropping
@@ -913,19 +962,23 @@ mod tests {
         drop(wrapped);
     }
 
-    /// implementation-note-35 C2 partner: idle auto-lock retains
-    /// soft-lock semantics — the vault stays Rc'd so background
-    /// headless doesn't have to re-prompt. Only the session presence
-    /// state flips.
+    /// implementation-note-37 C2 partner / `presence_gate_soft_lock_distinction_landed`:
+    /// idle auto-lock retains `Rc<Vault>` for diagnostic observability — the
+    /// vault stays Rc'd in `DaemonStore` even though the gate enforces a hard
+    /// Touch ID re-prompt requirement. The previous "soft-lock = headless
+    /// survives idle without re-prompt" framing was a comment fiction (the
+    /// same auto-lock branch already cleared the SE session cache, making
+    /// a re-prompt unavoidable). Recovery for either lock path is
+    /// `vault_unlock` per `implementation-note-364`.
     ///
     /// The auto-lock branch runs INSIDE `require_user_presence_at`'s
     /// mutex block, AFTER the `dev_mode_enabled()` short-circuit. Under
     /// `cargo test` dev-mode is always true (test binary detection),
     /// so the auto-lock state transition does not fire from the test
-    /// harness. We assert the property by direct construction: a soft
-    /// lock by definition does NOT call `drop_vault`, so a manager
-    /// flip to `Locked` without going through the explicit `lock()`
-    /// path leaves the store's vault attached.
+    /// harness. We assert the observable property by direct construction:
+    /// the idle-auto-lock branch does NOT call `drop_vault`, so a manager
+    /// flip to `Locked` without going through the explicit `lock()` path
+    /// leaves the store's vault attached.
     #[test]
     fn idle_auto_lock_preserves_vault_rc() {
         let _g = setup();
@@ -935,9 +988,11 @@ mod tests {
         register_store(Rc::clone(&store_rc));
 
         mark_unlocked();
-        // Simulate the soft-lock path: state flips back to Locked
-        // (e.g. an idle-auto-lock branch inside require_user_presence)
-        // but the store keeps its vault.
+        // Simulate the idle-auto-lock path: state flips back to Locked
+        // (the idle-auto-lock branch inside require_user_presence_at) but
+        // the store keeps its vault Rc. This asymmetry vs explicit lock()
+        // is observability-only — the gate still returns Locked and the
+        // caller still must call `vault_unlock` to recover.
         {
             let mut m = MANAGER.lock().expect("presence manager poisoned");
             m.state = SessionState::Locked;
@@ -945,7 +1000,76 @@ mod tests {
 
         assert!(
             store_rc.vault().is_some(),
-            "soft-lock (idle auto-lock) must NOT drop Rc<Vault> — headless survives idle"
+            "idle auto-lock must NOT drop Rc<Vault> from DaemonStore — \
+             retention is observability-only; the gate still enforces Locked"
+        );
+    }
+
+    /// T2 — `presence_gate_soft_lock_distinction_landed`: explicit lock
+    /// vs idle auto-lock produce IDENTICAL gate observables (both
+    /// `SessionState::Locked`, both require `vault_unlock` for recovery)
+    /// but DIFFER in their `DaemonStore` side-effect (only explicit
+    /// `lock()` drops `Rc<Vault>`). This pins the unified-lock contract:
+    /// no implicit auto-unlock window for headless, no soft-lock
+    /// privilege carve-out — the recovery path is the same
+    /// `vault_unlock` RPC for both.
+    #[test]
+    fn unified_lock_semantics_explicit_vs_idle_auto_lock() {
+        let _g = setup();
+
+        // --- Path 1: explicit lock — drops Rc<Vault>, flips to Locked ---
+        let store_a = crate::infra::store::DaemonStore::open_in_memory().unwrap();
+        store_a.set_vault(Rc::new(crate::infra::vault::Vault::new([0x55u8; 32])));
+        let store_a_rc = Rc::new(store_a);
+        register_store(Rc::clone(&store_a_rc));
+        mark_unlocked();
+        let (unlocked_before_a, _) = snapshot();
+        assert!(unlocked_before_a);
+        lock();
+        let (unlocked_after_a, idle_after_a) = snapshot();
+        assert!(
+            !unlocked_after_a,
+            "explicit lock() must flip to SessionState::Locked"
+        );
+        assert!(idle_after_a.is_none(), "Locked state reports no idle");
+        assert!(
+            store_a_rc.vault().is_none(),
+            "explicit lock() must drop Rc<Vault> (hard-lock)"
+        );
+
+        // --- Path 2: simulated idle auto-lock — retains Rc<Vault>, flips to Locked ---
+        // The auto-lock branch inside `require_user_presence_at` cannot
+        // execute under cargo-test dev-mode (it short-circuits to
+        // `Allowed` before reaching the state machine), so we simulate
+        // the state transition the branch performs directly.
+        let store_b = crate::infra::store::DaemonStore::open_in_memory().unwrap();
+        store_b.set_vault(Rc::new(crate::infra::vault::Vault::new([0x66u8; 32])));
+        let store_b_rc = Rc::new(store_b);
+        register_store(Rc::clone(&store_b_rc));
+        mark_unlocked();
+        let (unlocked_before_b, _) = snapshot();
+        assert!(unlocked_before_b);
+        {
+            let mut m = MANAGER.lock().expect("presence manager poisoned");
+            m.state = SessionState::Locked;
+        }
+        let (unlocked_after_b, idle_after_b) = snapshot();
+
+        // Gate observable is identical to the explicit-lock path.
+        assert_eq!(
+            unlocked_after_a, unlocked_after_b,
+            "explicit lock + idle auto-lock must produce identical gate state"
+        );
+        assert_eq!(
+            idle_after_a, idle_after_b,
+            "explicit lock + idle auto-lock must produce identical idle snapshot"
+        );
+
+        // Side-effect on DaemonStore differs (observability-only).
+        assert!(
+            store_b_rc.vault().is_some(),
+            "idle auto-lock branch must NOT drop Rc<Vault> (the differing \
+             side-effect is observability-only, not a privilege carve-out)"
         );
     }
 

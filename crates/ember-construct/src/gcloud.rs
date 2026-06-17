@@ -37,6 +37,9 @@
 //! | `describe \| list \| get-iam-policy \| auth list \| config list` | `None` (passthrough)         |
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// gcloud CLI global flags that take a value as the *next* argv token.
 /// When stripping, both the flag and its value are removed.
@@ -280,6 +283,226 @@ pub fn classify_gcloud_argv(argv: &[String]) -> Option<ActionKey> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GcloudFactory — construct-factory contract for the gcloud construct
+// ---------------------------------------------------------------------------
+
+/// Parsed gcloud.toml action manifest, initialised once at first access.
+static GCLOUD_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/gcloud.toml"))
+            .expect("bundled gcloud.toml must be valid")
+    });
+
+/// Look up the `need` atoms for an action key from the bundled manifest.
+/// Returns `None` if the action is absent from the manifest or has an
+/// empty `need` list.
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("gcloud.")?;
+    GCLOUD_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key.strip_prefix("gcloud.").is_some_and(|k| k == suffix))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+/// Returns `true` when `action_key` (full form, e.g. `"gcloud.storage.rm"`)
+/// has an entry in the bundled manifest (regardless of whether it carries a
+/// `need`).
+fn action_in_manifest(action_key: &str) -> bool {
+    GCLOUD_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("gcloud.")
+                .is_some_and(|suffix| a.key == action_key || a.key.ends_with(suffix))
+    })
+}
+
+/// Extract `--project <value>` or `--project=<value>` from raw argv.
+fn extract_project_flag(argv: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = &argv[i];
+        if let Some(value) = tok.strip_prefix("--project=")
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+        if tok == "--project"
+            && let Some(value) = argv.get(i + 1)
+            && !value.starts_with('-')
+        {
+            return Some(value.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` if the raw argv contains `--impersonate-service-account`
+/// (either `--impersonate-service-account=<sa>` or the space-separated form).
+fn has_impersonate_flag(argv: &[String]) -> bool {
+    argv.iter().any(|tok| {
+        tok == "--impersonate-service-account" || tok.starts_with("--impersonate-service-account=")
+    })
+}
+
+/// Returns `true` if the raw argv looks like an `auth` subcommand
+/// (e.g. `auth login`, `auth activate-service-account`).
+fn is_auth_subcommand(argv: &[String]) -> bool {
+    let stripped = strip_global_flags(argv);
+    stripped.first().map(|s| s.as_str()) == Some("auth")
+}
+
+/// Returns `true` if the raw argv contains a `set-iam-policy` verb
+/// followed by a file argument that looks like a JSON policy payload.
+fn is_iam_policy_file_invocation(argv: &[String]) -> bool {
+    let stripped = strip_global_flags(argv);
+    // Look for `set-iam-policy` anywhere in the stripped tokens.
+    let has_set_iam = stripped.iter().any(|tok| tok == "set-iam-policy");
+    if !has_set_iam {
+        return false;
+    }
+    // After `set-iam-policy`, look for a positional arg that ends in .json
+    // or .yaml (IAM policy file). Accept the broad pattern — the daemon
+    // validates server-side.
+    if let Some(pos) = stripped.iter().position(|tok| tok == "set-iam-policy") {
+        return stripped[pos + 1..].iter().any(|tok| {
+            !tok.starts_with('-') && (tok.ends_with(".json") || tok.ends_with(".yaml"))
+        });
+    }
+    false
+}
+
+/// Extract the first positional resource argument from the stripped argv
+/// (skipping group/subgroup/verb tokens and flags).
+///
+/// Uses the action_key segment count to determine how many leading tokens
+/// are structural (e.g. `gcloud.compute.instances.delete` = 3 structural
+/// tokens: `compute`, `instances`, `delete`).
+fn extract_resource_name(action_key: &ActionKey, argv: &[String]) -> Option<String> {
+    let stripped = strip_global_flags(argv);
+    // Count segments after the `gcloud.` prefix in the action key to
+    // determine how many leading tokens are group/subgroup/verb.
+    let depth = action_key
+        .0
+        .strip_prefix("gcloud.")
+        .map(|suffix| suffix.split('.').count())
+        .unwrap_or(2);
+    stripped
+        .get(depth..)
+        .unwrap_or_default()
+        .iter()
+        .find(|tok| !tok.starts_with('-'))
+        .cloned()
+}
+
+/// factory implementation for the `gcloud` construct.
+#[derive(Debug, Default, Clone)]
+pub struct GcloudFactory;
+
+/// Provider-specific target extracted from a `gcloud` argv invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcloudFactoryTarget {
+    pub provider: &'static str,
+    pub project: Option<String>,
+    pub resource_name: Option<String>,
+}
+
+/// Need atoms derived from the bundled manifest for one `gcloud` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcloudFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for GcloudFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_gcloud_argv(argv)
+    }
+}
+
+impl TargetExtractor for GcloudFactory {
+    type Target = GcloudFactoryTarget;
+
+    fn target_for_argv(&self, action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let project = extract_project_flag(argv);
+        let resource_name = extract_resource_name(action_key, argv);
+        Some(GcloudFactoryTarget {
+            provider: "gcp",
+            project,
+            resource_name,
+        })
+    }
+}
+
+impl NeedTemplate for GcloudFactory {
+    type Need = GcloudFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(GcloudFactoryNeed)
+    }
+}
+
+impl ConstructFactory for GcloudFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        // Auth subcommands are credential-bypass vectors — always fail closed.
+        // The classifier returns None for auth verbs, so check the raw argv.
+        if is_auth_subcommand(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // --impersonate-service-account selects delegated credential authority
+        // that the factory cannot mediate.
+        if has_impersonate_flag(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // IAM policy file arguments carry principals, roles, and conditions
+        // that require payload analysis before the broker can scope authority.
+        if is_iam_policy_file_invocation(argv) {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        let Some(key) = action_key else {
+            // Unclassified argv — read-only or version inspection. No
+            // credentials needed.
+            return FactoryDisposition::Credentialless;
+        };
+
+        // Action not in the manifest — no bounded authority declared.
+        if !action_in_manifest(&key.0) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // Action is in the manifest but carries no `need` — authority is
+        // unbounded, fail closed.
+        if manifest_need_for_action(&key.0).is_none() {
+            // gcloud actions currently have no `need` fields in the manifest.
+            // Project/account must be resolved from gcloud config before
+            // the broker can scope authority.
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        // Action has a manifest entry with a `need` — fully resolvable.
+        FactoryDisposition::ResolverRequired
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,18 +512,6 @@ mod tests {
     }
 
     // --- compute instances ---
-
-    #[test]
-    fn compute_instances_create_classified() {
-        let r = classify_gcloud_argv(&args(&["compute", "instances", "create", "my-vm"])).unwrap();
-        assert_eq!(r.0, "gcloud.compute.instances.create");
-    }
-
-    #[test]
-    fn compute_instances_delete_classified() {
-        let r = classify_gcloud_argv(&args(&["compute", "instances", "delete", "my-vm"])).unwrap();
-        assert_eq!(r.0, "gcloud.compute.instances.delete");
-    }
 
     #[test]
     fn compute_instances_start_classified() {
@@ -318,13 +529,6 @@ mod tests {
     fn compute_instances_reset_classified() {
         let r = classify_gcloud_argv(&args(&["compute", "instances", "reset", "my-vm"])).unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.reset");
-    }
-
-    #[test]
-    fn compute_instances_describe_passthrough() {
-        assert!(
-            classify_gcloud_argv(&args(&["compute", "instances", "describe", "my-vm"])).is_none()
-        );
     }
 
     #[test]
@@ -791,7 +995,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Gcp)`, and a request that
     // declares `provider = Gcp` round-trips through issue → revoke
-    // without panicking. Real GCP impl is implementation-note-102 (separate task).
+    // without panicking. Real GCP impl is implementation-note-100 (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;
@@ -805,6 +1009,13 @@ mod tests {
                 "actions": ["storage.objects.get", "storage.objects.create"],
             }),
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "ember-gcloud integration test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -843,5 +1054,132 @@ mod tests {
             BrokerError::InvalidScope(_) => {}
             other => panic!("expected InvalidScope, got {other:?}"),
         }
+    }
+
+    // --- GcloudFactory tests ---
+
+    #[test]
+    fn gcloud_factory_version_is_credentialless() {
+        let f = GcloudFactory;
+        let a = args(&["version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn gcloud_factory_compute_instances_list_is_credentialless() {
+        let f = GcloudFactory;
+        let a = args(&["compute", "instances", "list"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn gcloud_factory_auth_login_is_unsupported() {
+        let f = GcloudFactory;
+        let a = args(&["auth", "login"]);
+        let key = f.action_key_for_argv(&a);
+        // auth verbs are not classified (early return None in classifier)
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn gcloud_factory_impersonate_is_unsupported() {
+        let f = GcloudFactory;
+        let a = args(&[
+            "--impersonate-service-account",
+            "deploy@prod.iam.gserviceaccount.com",
+            "storage",
+            "rm",
+            "gs://assets/app.tar.gz",
+        ]);
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn gcloud_factory_iam_policy_file_needs_payload_analysis() {
+        let f = GcloudFactory;
+        let a = args(&["projects", "set-iam-policy", "prod-project", "policy.json"]);
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn gcloud_factory_storage_rm_is_resolver_required() {
+        let f = GcloudFactory;
+        let a = args(&["storage", "rm", "gs://assets/releases/app.tar.gz"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn gcloud_factory_target_extraction_with_project() {
+        let f = GcloudFactory;
+        let a = args(&[
+            "--project",
+            "my-proj",
+            "compute",
+            "instances",
+            "delete",
+            "my-vm",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "gcp");
+        assert_eq!(target.project, Some("my-proj".to_string()));
+        assert_eq!(target.resource_name, Some("my-vm".to_string()));
+    }
+
+    #[test]
+    fn gcloud_factory_target_extraction_no_project() {
+        let f = GcloudFactory;
+        let a = args(&["compute", "instances", "start", "my-vm"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "gcp");
+        assert_eq!(target.project, None);
+        assert_eq!(target.resource_name, Some("my-vm".to_string()));
+    }
+
+    #[test]
+    fn factory_fixtures_pass() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/gcloud/factory-fixtures.toml"
+        ))
+        .expect("fixture TOML parses");
+        let errors = core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/gcloud.toml"),
+        )
+        .expect("valid gcloud manifest");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &GcloudFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

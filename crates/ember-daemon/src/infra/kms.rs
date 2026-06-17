@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! KMS caller resolution — loopback and mTLS edge paths (design Amendment 1 v3).
 //!

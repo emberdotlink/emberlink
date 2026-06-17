@@ -5,7 +5,7 @@ use core_event_types::{
 };
 use core_principals::{
     DisclosedLinkage, DisclosedPersona, DisclosureView, IdentityRoot, LinkageAssertion, Persona,
-    PublicKeyMaterial,
+    PublicKeyMaterial, SurvivalMode,
 };
 
 pub fn create_root(
@@ -13,9 +13,18 @@ pub fn create_root(
     display_name: impl Into<String>,
     active_key: PublicKeyMaterial,
 ) -> IdentityRoot {
+    // Per design 2026-06-15 amendment: `IdentityRoot` is a transitional
+    // alias for a self-parented `Principal` (`id == parent_id`). The
+    // root's display-name maps onto the unified `label` slot;
+    // `survival_mode` defaults to `Strict` (a root has no continuity
+    // policy of its own).
+    let id_str: String = id.into();
     IdentityRoot {
-        id: id.into(),
-        display_name: display_name.into(),
+        parent_id: id_str.clone(),
+        id: id_str,
+        label: display_name.into(),
+        disclosure_profile: None,
+        survival_mode: SurvivalMode::Strict,
         active_key,
     }
 }
@@ -149,7 +158,9 @@ pub fn disclosure_view(
 ) -> DisclosureView {
     let personas = personas
         .iter()
-        .filter(|persona| persona.root_id == root_id)
+        // Persona is a `Principal` alias post design 2026-06-15;
+        // `root_id` migrated to the recursive `parent_id` slot.
+        .filter(|persona| persona.parent_id == root_id)
         .map(|persona| DisclosedPersona {
             persona_id: persona.id.clone(),
             label: persona.label.clone(),
@@ -192,7 +203,7 @@ mod tests {
         let personas = vec![
             Persona {
                 id: "persona-a1".into(),
-                root_id: "root-a".into(),
+                parent_id: "root-a".into(),
                 label: "professional".into(),
                 disclosure_profile: Some("persona.professional".into()),
                 survival_mode: SurvivalMode::Strict,
@@ -204,7 +215,7 @@ mod tests {
             },
             Persona {
                 id: "persona-a2".into(),
-                root_id: "root-a".into(),
+                parent_id: "root-a".into(),
                 label: "friends".into(),
                 disclosure_profile: Some("persona.friends".into()),
                 survival_mode: SurvivalMode::Strict,
@@ -216,7 +227,7 @@ mod tests {
             },
             Persona {
                 id: "persona-b1".into(),
-                root_id: "root-b".into(),
+                parent_id: "root-b".into(),
                 label: "pseudonymous".into(),
                 disclosure_profile: Some("persona.pseudonymous".into()),
                 survival_mode: SurvivalMode::Strict,
@@ -340,7 +351,7 @@ mod tests {
     fn disclosure_view_includes_only_disclosed_links() {
         let personas = vec![Persona {
             id: "persona-a1".into(),
-            root_id: "root-a".into(),
+            parent_id: "root-a".into(),
             label: "work".into(),
             disclosure_profile: Some("persona.professional".into()),
             survival_mode: SurvivalMode::Strict,

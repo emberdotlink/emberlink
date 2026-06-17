@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember-relay-vm` — Linux-VM side of the yolo VM bridge.
 //!

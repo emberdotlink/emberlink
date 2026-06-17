@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `README.md`, `QUICKSTART.md`, `project design notes`, `release-notes`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Support Levels and Release Posture
 
 The public docs site intentionally separates **what exists** from **what is
@@ -20,9 +20,9 @@ That is why pages on this site carry one of three labels:
 
 Use `Supported` to mean:
 
+- start here first
 - this is part of the current public operator or developer contract
 - the docs are expected to stay reasonably stable
-- the team intends this to be a real user-facing surface, not just a prototype
 
 On the current site, examples include core CLI/operator guidance and the
 receipt/audit evidence model.
@@ -32,9 +32,8 @@ receipt/audit evidence model.
 Use `Preview` to mean:
 
 - the surface is real and useful
-- it is still pre-release or still tightening around the edges
-- the contract is truthful, but it may still shift before the first broadly
-  supported public build
+- the contract is truthful
+- the details may still shift before the first broadly supported public build
 
 This is the most common current posture for Emberlink’s public story.
 
@@ -44,7 +43,8 @@ Use `Experimental` to mean:
 
 - the surface exists or is publishable enough to document
 - the contract is still moving faster than the main product path
-- advanced users can evaluate it, but they should expect churn
+- advanced users can evaluate it, but they should expect churn and should not
+  treat it as the default path
 
 The SDK pages currently sit here on purpose.
 
@@ -62,7 +62,8 @@ That means public visibility does **not** imply full self-serve support yet.
 
 ## What users should do today
 
-There are two honest entry paths right now:
+If you are deciding how to evaluate Ember today, there are two honest entry
+paths:
 
 ### 1. Friendly-preview operator path
 
@@ -89,6 +90,12 @@ ember init --for claude
 
 This path is real, but it is still a pre-release source-build path rather than
 the long-term supported public installer story.
+
+If you only want the shortest supported-first reading order on this site, use:
+
+1. [Install and first run](./install-and-first-run/)
+2. [CLI and troubleshooting](../use/cli-and-troubleshooting/)
+3. [CLI reference](../reference/cli-reference/)
 
 ## Why this distinction matters
 

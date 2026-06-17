@@ -1,10 +1,17 @@
-//! `ember trust backup --to <path>` — encrypted IR export.
+//! `ember trust backup --to <path>` — encrypted operator authority export.
 //!
-//! Per design §Component 4 and implementation-note-32. Reads the
-//! operator-IR + dev-IR private seeds from the macOS Keychain, builds
-//! a [`BackupEnvelope`] (CBOR), and seals it with a passphrase
-//! supplied by the operator via no-echo TTY prompt. Touch ID confirms
-//! the export before the sealed blob hits the disk.
+//! Per design §Component 4, reinterpreted by design's Principal /
+//! Persona unification, this compatibility surface reads exportable
+//! keychain-held operator-role Durable Persona material plus the
+//! optional workstation Durable Persona seed, builds a [`BackupEnvelope`]
+//! (CBOR), and seals it with a passphrase supplied by the operator via
+//! no-echo TTY prompt. Touch ID confirms the export before the sealed
+//! blob hits the disk.
+//!
+//! Current design operator authority is device-rooted. Hosts that no
+//! longer have keychain-held operator material cannot use this command
+//! as operator-authority recovery evidence; they must prove recovery
+//! through enrolled recovery recipients / backup presence devices.
 //!
 //! The sealed-blob substrate lives in
 //! `core-crypto::backup_envelope` — this module is the operator UX
@@ -16,7 +23,7 @@
 //!
 //! - The sealed blob on disk is encrypted with XChaCha20-Poly1305 +
 //!   Argon2id over the operator-chosen passphrase. Anyone who holds
-//!   the blob but not the passphrase cannot recover the IR seeds.
+//!   the blob but not the passphrase cannot recover the exported seeds.
 //! - The blob's metadata (created_at / hostname / daemon_mode /
 //!   operator pubkey) is not separately signed — the AEAD covers it
 //!   inside the envelope, so tampering changes the ciphertext.
@@ -37,34 +44,30 @@ use core_crypto::backup_envelope::{
 use ed25519_dalek::SigningKey;
 
 use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
+use crate::trust::principal_keychain;
 
-// trust_backup_restore_landed — checkpoint anchoring this PR (implementation-note-32).
+pub use crate::trust::principal_keychain::{
+    KEYCHAIN_SERVICE, OPERATOR_ROLE_PERSONA_KEYCHAIN_LABEL as OPERATOR_IR_KEYCHAIN_LABEL,
+    WORKSTATION_PERSONA_KEYCHAIN_LABEL as DEV_IR_KEYCHAIN_LABEL,
+};
+
+// trust_backup_restore_landed — checkpoint anchoring this PR (implementation-note-34).
 // Used by the failing-test grep `grep -c trust_backup_restore_landed ...` in the brief.
 
-/// Canonical macOS Keychain label for the operator IdentityRoot
-/// private seed. Mirrors the `sh.emberlink.*` namespace established
-/// by `dev/identity_root.rs::KEYCHAIN_LABEL` (`sh.emberlink.dev-identity-root`).
-/// Operator IR is the production lane; dev IR is the test lane.
-pub const OPERATOR_IR_KEYCHAIN_LABEL: &str = "sh.emberlink.operator-identity-root";
-
-/// Canonical macOS Keychain label for the dev IdentityRoot — same as
-/// `crate::dev::identity_root::KEYCHAIN_LABEL`. Restated here so the
-/// backup/restore surface has its own typed constant and stays
-/// self-contained if the dev module renames its label later.
-pub const DEV_IR_KEYCHAIN_LABEL: &str = "sh.emberlink.dev-identity-root";
-
-/// Keychain service namespace shared across all `sh.emberlink.*`
-/// labels. Same as `crate::dev::identity_root::KEYCHAIN_SERVICE`.
-pub const KEYCHAIN_SERVICE: &str = "sh.emberlink";
+// Compatibility aliases for the backup/restore V1 envelope vocabulary.
+// The encrypted envelope still calls the two optional slots
+// `operator_ir_seed` and `dev_ir_seed`; the live keychain labels are
+// the design target-state Durable Persona labels. Legacy
+// `*-identity-root` labels remain import/fallback sources inside
+// `principal_keychain`, not new write targets.
 
 /// Errors surfaced by `ember trust backup`.
 #[derive(Debug, thiserror::Error)]
 pub enum TrustBackupError {
-    /// Could not read a required IR seed from the Keychain. Operator
-    /// IR is mandatory; dev IR is optional (we surface the empty
-    /// case as `MissingOperatorIr` only).
-    #[error("operator IdentityRoot not found in Keychain: {0}")]
-    MissingOperatorIr(String),
+    /// Could not read the required operator-role signing seed from
+    /// the Keychain. Workstation persona seed is optional.
+    #[error("operator signing Principal not found in Keychain: {0}")]
+    MissingOperatorPrincipal(String),
     /// Keychain access errored for a reason other than "not found".
     #[error("Keychain error: {0}")]
     Keychain(String),
@@ -93,55 +96,35 @@ pub enum TrustBackupError {
     OutputExists(PathBuf),
 }
 
-/// Read the operator-IR private seed from the macOS Keychain. Returns
-/// the raw 32-byte seed bytes. On non-macOS targets keyring-core
-/// silently falls back to whichever store was registered at startup;
-/// the substrate itself is platform-agnostic.
-fn read_operator_ir_seed() -> Result<[u8; 32], TrustBackupError> {
-    let entry = keyring_core::Entry::new(KEYCHAIN_SERVICE, OPERATOR_IR_KEYCHAIN_LABEL)
-        .map_err(|e| TrustBackupError::Keychain(format!("open operator IR entry: {e}")))?;
-    let hex_seed = match entry.get_password() {
-        Ok(s) => s,
-        Err(keyring_core::Error::NoEntry) => {
-            return Err(TrustBackupError::MissingOperatorIr(format!(
-                "no Keychain entry at {OPERATOR_IR_KEYCHAIN_LABEL}; \
-                 enrol an operator IdentityRoot first"
-            )));
-        }
-        Err(e) => {
-            return Err(TrustBackupError::Keychain(format!(
-                "read operator IR seed: {e}"
-            )));
-        }
-    };
-    decode_hex_seed(&hex_seed)
-}
-
-/// Read the dev-IR private seed from the macOS Keychain. Returns
-/// `None` when the entry is absent (no dev IR enrolled) — the backup
-/// envelope tolerates an empty `dev_ir_seed`.
-fn read_dev_ir_seed() -> Result<Option<[u8; 32]>, TrustBackupError> {
-    let entry = keyring_core::Entry::new(KEYCHAIN_SERVICE, DEV_IR_KEYCHAIN_LABEL)
-        .map_err(|e| TrustBackupError::Keychain(format!("open dev IR entry: {e}")))?;
-    match entry.get_password() {
-        Ok(hex_seed) => Ok(Some(decode_hex_seed(&hex_seed)?)),
-        Err(keyring_core::Error::NoEntry) => Ok(None),
-        Err(e) => Err(TrustBackupError::Keychain(format!("read dev IR seed: {e}"))),
+/// Read the operator-role Durable Persona seed from the macOS
+/// Keychain. The principal-keychain accessor owns the target-label
+/// lookup and legacy `operator-identity-root` fallback.
+fn read_operator_backup_seed() -> Result<[u8; 32], TrustBackupError> {
+    match principal_keychain::read_operator_role_persona_seed().map_err(|e| {
+        TrustBackupError::Keychain(format!("read operator-role Durable Persona seed: {e}"))
+    })? {
+        Some(seed) => Ok(seed),
+        None => Err(TrustBackupError::MissingOperatorPrincipal(format!(
+            "no exportable Keychain entry at {} or legacy {}. Current design \
+             operator authority is device-rooted; `trust backup` can only export \
+             legacy/transitional keychain-held authority. Use `ember device list` \
+             and the backup-presence-device surface for operator-authority \
+             recovery evidence; recovery-code recipients cover decryption \
+             recovery, not signing authority.",
+            principal_keychain::OPERATOR_ROLE_PERSONA_KEYCHAIN_LABEL,
+            principal_keychain::LEGACY_OPERATOR_IR_KEYCHAIN_LABEL
+        ))),
     }
 }
 
-fn decode_hex_seed(hex_seed: &str) -> Result<[u8; 32], TrustBackupError> {
-    let bytes = hex::decode(hex_seed.trim())
-        .map_err(|e| TrustBackupError::Keychain(format!("seed not hex: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(TrustBackupError::Keychain(format!(
-            "seed has wrong length: {} (expected 32)",
-            bytes.len()
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+/// Read the workstation Durable Persona seed from the macOS Keychain.
+/// Returns `None` when neither the target label nor legacy dev-IR
+/// import label exists — the backup envelope tolerates an empty
+/// `dev_ir_seed` for compatibility with V1 backups.
+fn read_workstation_backup_seed() -> Result<Option<[u8; 32]>, TrustBackupError> {
+    principal_keychain::read_workstation_persona_seed().map_err(|e| {
+        TrustBackupError::Keychain(format!("read workstation Durable Persona seed: {e}"))
+    })
 }
 
 /// Prompt the operator for a passphrase on the TTY with no-echo +
@@ -157,9 +140,7 @@ fn prompt_passphrase_with_confirmation() -> Result<String, TrustBackupError> {
                 .to_string(),
         ));
     }
-    let prompt_a = format!(
-        "Enter backup passphrase (min {MIN_PASSPHRASE_LEN} chars): "
-    );
+    let prompt_a = format!("Enter backup passphrase (min {MIN_PASSPHRASE_LEN} chars): ");
     let pass_a = rpassword::prompt_password(&prompt_a)
         .map_err(|e| TrustBackupError::Prompt(format!("first prompt: {e}")))?;
     if pass_a.chars().count() < MIN_PASSPHRASE_LEN {
@@ -227,7 +208,8 @@ pub struct BackupOutcome {
     /// Number of bytes written. Useful for "did this actually
     /// happen?" sanity-checks at the operator end.
     pub bytes_written: usize,
-    /// Whether a dev IR was included alongside the operator IR.
+    /// Whether the workstation Durable Persona was included alongside
+    /// the operator-role Durable Persona.
     pub included_dev_ir: bool,
     /// Whether the Touch ID prompt fired (false = skipped via test
     /// gate or `--no-biometric`).
@@ -238,7 +220,7 @@ pub struct BackupOutcome {
 /// `Backup` arm of `TrustAction` in `bin/ember.rs`.
 ///
 /// Side-effects:
-/// 1. Reads operator IR + (optional) dev IR seeds from Keychain.
+/// 1. Reads operator-role + (optional) workstation Durable Persona seeds from Keychain.
 /// 2. Prompts the operator for a passphrase (≥ [`MIN_PASSPHRASE_LEN`]
 ///    chars) with confirmation.
 /// 3. Asks for biometric confirmation (Touch ID on macOS, no-op on
@@ -262,8 +244,8 @@ pub fn run_backup(
     }
 
     // 2. Read seeds.
-    let operator_seed = read_operator_ir_seed()?;
-    let dev_seed = read_dev_ir_seed()?;
+    let operator_seed = read_operator_backup_seed()?;
+    let dev_seed = read_workstation_backup_seed()?;
     let included_dev_ir = dev_seed.is_some();
 
     // 3. Passphrase prompt with confirmation.
@@ -271,7 +253,7 @@ pub fn run_backup(
 
     // 4. Biometric (Touch ID) gate.
     let biometric_outcome = require_biometric(
-        "Authorize export of operator + dev IdentityRoot keys to backup file",
+        "Authorize export of operator-role + workstation Principal keys to backup file",
         no_biometric,
     )
     .map_err(|e: BiometricError| TrustBackupError::Biometric(e.to_string()))?;
@@ -328,7 +310,7 @@ fn write_backup_file(path: &Path, bytes: &[u8]) -> Result<(), TrustBackupError> 
 /// block) so all three surfaces read consistently.
 pub fn render_outcome(outcome: &BackupOutcome) -> String {
     format!(
-        "Trust backup written:\n  Path:              {}\n  Path hash (sha256): {}\n  Bytes:             {}\n  Includes dev IR:   {}\n  Biometric verified: {}\n",
+        "Trust backup written:\n  Path:                         {}\n  Path hash (sha256):           {}\n  Bytes:                        {}\n  Includes workstation Persona: {}\n  Biometric verified:           {}\n",
         outcome.written_to.display(),
         outcome.path_hash_hex,
         outcome.bytes_written,
@@ -363,8 +345,43 @@ pub fn run(to: &Path, force: bool, no_biometric: bool, daemon_mode: &str, hostna
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::principal_keychain::{
+        KEYCHAIN_TEST_LOCK, LEGACY_DEV_IR_KEYCHAIN_LABEL, LEGACY_OPERATOR_IR_KEYCHAIN_LABEL,
+        OPERATOR_ROLE_PERSONA_KEYCHAIN_LABEL, WORKSTATION_PERSONA_KEYCHAIN_LABEL, write_seed,
+    };
+    use keyring_core::mock;
     use std::fs;
     use tempfile::TempDir;
+
+    fn install_mock_store() {
+        keyring_core::set_default_store(mock::Store::new().expect("mock store"));
+    }
+
+    fn clear_backup_seed_labels() {
+        for label in [
+            OPERATOR_ROLE_PERSONA_KEYCHAIN_LABEL,
+            WORKSTATION_PERSONA_KEYCHAIN_LABEL,
+            LEGACY_OPERATOR_IR_KEYCHAIN_LABEL,
+            LEGACY_DEV_IR_KEYCHAIN_LABEL,
+        ] {
+            if let Ok(entry) = keyring_core::Entry::new(KEYCHAIN_SERVICE, label) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+
+    #[test]
+    fn backup_seed_readers_accept_target_principal_labels() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        install_mock_store();
+        clear_backup_seed_labels();
+
+        write_seed(OPERATOR_ROLE_PERSONA_KEYCHAIN_LABEL, &[0x44; 32]).expect("operator-role seed");
+        write_seed(WORKSTATION_PERSONA_KEYCHAIN_LABEL, &[0x55; 32]).expect("workstation seed");
+
+        assert_eq!(read_operator_backup_seed().unwrap(), [0x44; 32]);
+        assert_eq!(read_workstation_backup_seed().unwrap(), Some([0x55; 32]));
+    }
 
     /// `build_envelope` produces a CBOR-shaped envelope whose
     /// metadata reflects the inputs, and whose public-key field
@@ -436,8 +453,8 @@ mod tests {
         assert!(s.contains("Path:"));
         assert!(s.contains("Path hash (sha256):"));
         assert!(s.contains("Bytes:"));
-        assert!(s.contains("Includes dev IR:   true"));
-        assert!(s.contains("Biometric verified: false"));
+        assert!(s.contains("Includes workstation Persona: true"));
+        assert!(s.contains("Biometric verified:           false"));
         assert!(s.contains(&"ab".repeat(32)));
     }
 
@@ -480,15 +497,15 @@ mod tests {
         // 3. On machine B (target):
         //      ember trust restore --from /tmp/ember-ir-backup.embk
         //    Enter the same passphrase from step 1. The CLI shows
-        //    "Restore IRs from backup created on <hostname-A> on
-        //    <created_at>. Proceed?" and fires Touch ID. If Machine
-        //    B already has Keychain entries for operator-ir /
-        //    dev-ir, an extra confirmation prompt asks before
+        //    "Restore operator authority from backup created on
+        //    <hostname-A> on <created_at>. Proceed?" and fires Touch
+        //    ID. If Machine B already has target-state Keychain
+        //    entries, an extra confirmation prompt asks before
         //    overwrite.
         //
         // 4. After restore, verify with:
         //      ember trust list
-        //    The trust roots derived from the restored IR should
+        //    The trust roots derived from the restored Persona seeds should
         //    appear in the daemon's snapshot.
         //
         // 5. The daemon emits a `trust.restore` Receipt on machine B

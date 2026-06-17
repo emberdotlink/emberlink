@@ -6,9 +6,11 @@
 //!
 //! 1. Generates a fresh Ed25519 Daemon Persona keypair.
 //! 2. Derives the X25519 recipient pubkey from the seed via
-//!    `HKDF-SHA256(seed, "ember-seal-v1")` × Curve25519 basepoint — this is
-//!    the `recipientPubkey` field in the EmberSeal CR (per design §The
-//!    primitive).
+//!    `HKDF-SHA256(seed, "emberlink/v1/ember-seal/x25519-scalar")`
+//!    × Curve25519 basepoint — this is the `recipientPubkey` field in the
+//!    EmberSeal CR (per design §The primitive and the `core_crypto` HKDF
+//!    registry; security review H2 split this info string from the
+//!    `ember-seal/snapshot-key` symmetric lane).
 //! 3. Stores the **privkey seed** (hex-encoded) in the operator's vault
 //!    under `cluster-daemon-persona/<cluster-id>`.
 //! 4. Prints the Ed25519 pubkey (hex) and the X25519 recipient pubkey (hex)
@@ -97,7 +99,7 @@ pub fn cmd_cluster_bootstrap(
             process::exit(1);
         }
     };
-    let vault = match Vault::open_from_config(config) {
+    let vault = match Vault::open_from_config(config, &store) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: failed to open vault: {e}");
@@ -209,7 +211,7 @@ pub fn cmd_cluster_restore(
             process::exit(1);
         }
     };
-    let vault = match Vault::open_from_config(config) {
+    let vault = match Vault::open_from_config(config, &store) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: failed to open vault: {e}");

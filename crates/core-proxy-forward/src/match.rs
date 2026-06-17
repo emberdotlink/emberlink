@@ -1,6 +1,7 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Pure URL / scope / glob matching primitives extracted from
-//! `ember-daemon/src/infra/proxy.rs` (implementation-note-71).
+//! `ember-daemon/src/infra/proxy.rs` (implementation-note-81).
 //!
 //! These functions have no daemon-state coupling — no `&self`, no DB, no
 //! Vault, no runtime config. They take plain strings (or byte slices) and
@@ -149,6 +150,13 @@ pub fn request_to_action_resource(
             )
         } else if host_matches_domain(host, "api.anthropic.com") {
             ("llm", "generate", Some("anthropic"))
+        } else if host_matches_domain(host, "chatgpt.com") {
+            // Codex GPT-plan lane (-S2): ChatGPT *subscription* inference via
+            // `chatgpt.com/backend-api/codex/responses`. Same `llm:generate`
+            // verb as Anthropic, `openai` slug → statements scope via the
+            // `openai/*` glob (symmetric with `anthropic/*`). This is the OpenAI
+            // branch the comment above anticipated.
+            ("llm", "generate", Some("openai"))
         } else {
             (
                 "generic",
@@ -191,9 +199,16 @@ pub fn request_to_action_resource(
 /// fall out of the match surface, while `api.github.com` and `github.com`
 /// still resolve.
 ///
-/// Inputs are assumed lowercased by the caller (match `hyper::Uri::host()`
-/// semantics). `domain` must NOT start with `.`; the helper adds it.
+/// Host matching is ASCII-case-insensitive (DNS names are case-insensitive per
+/// RFC 4343). Normalized HERE rather than trusting a caller invariant:
+/// `request_to_action_resource` feeds `hyper::Uri::host()` verbatim and
+/// `Uri::host()` does NOT lowercase, so `Host: API.GitHub.com` would otherwise
+/// miss `github.com` and misclassify a real GitHub call as the `generic`
+/// provider — breaking `github:*` grant-scope matching. (Sweep 3 finding
+/// S-HOST.) `domain` must NOT start with `.`; the helper adds it.
 pub fn host_matches_domain(host: &str, domain: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let domain = domain.to_ascii_lowercase();
     if host == domain {
         return true;
     }
@@ -620,6 +635,36 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    // ---- request_to_action_resource provider classification ----
+
+    #[test]
+    fn request_to_action_resource_classifies_llm_providers() {
+        let post = http::Method::POST;
+
+        // Anthropic → llm:generate, anthropic-slugged resource.
+        let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "anthropic/v1/messages".to_string()
+            ))
+        );
+
+        // ChatGPT plan backend (codex GPT-plan lane) → llm:generate,
+        // openai-slugged resource → covered by an `openai/*` statement glob.
+        let uri: http::Uri = "https://chatgpt.com/backend-api/codex/responses"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "openai/backend-api/codex/responses".to_string()
+            ))
+        );
+    }
+
     // ---- is_git_smart_http_path examples ----
 
     #[test]
@@ -666,6 +711,13 @@ mod tests {
         assert!(!host_matches_domain("github.io", "github.com"));
         assert!(!host_matches_domain("", "github.com"));
         assert!(!host_matches_domain("github.com.", "github.com"));
+
+        // ASCII-case-insensitive (DNS is case-insensitive; `Uri::host()` does
+        // not lowercase) — regression for Sweep 3 finding S-HOST.
+        assert!(host_matches_domain("API.GitHub.com", "github.com"));
+        assert!(host_matches_domain("GITHUB.COM", "github.com"));
+        assert!(host_matches_domain("api.github.com", "GitHub.com"));
+        assert!(!host_matches_domain("EVILGITHUB.COM", "github.com"));
     }
 
     // ---- extract_host_from_url examples ----

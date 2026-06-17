@@ -1,6 +1,6 @@
 //! AWS STS `Broker` implementation — issues short-lived AWS credentials
-//! (access key id + secret access key + session token) scoped to caller-
-//! supplied role / policy via `AssumeRole` or `GetSessionToken`, returns
+//! (access key id + secret access key + session token) scoped to daemon-
+//! derived STS scope via `AssumeRole`, `GetSessionToken`, or web identity, returns
 //! them as [`BrokeredCredential`] with a JSON-encoded credential bundle
 //! the consumer (`broker_exec` / `apply_credential_to_env`) can split into
 //! `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` + `AWS_SESSION_TOKEN` env
@@ -14,11 +14,11 @@
 //!
 //! ## Mode selection
 //!
-//! - `role_arn = Some(arn)` → `AssumeRole` (preferred for IAM-based
-//!   delegation; supports cross-account via `external_id`).
-//! - `role_arn = None`      → `GetSessionToken` (MFA-bearer for the
+//! - `mode = AssumeRole`       → `AssumeRole` (preferred for IAM-based
+//!   delegation; supports `role_arn` and cross-account `external_id`).
+//! - `mode = GetSessionToken`  → `GetSessionToken` (MFA-bearer for the
 //!   long-lived credentials' own permissions).
-//! - `mode = WebIdentity`   → `AssumeRoleWithWebIdentity` (OIDC-based
+//! - `mode = WebIdentity`      → `AssumeRoleWithWebIdentity` (OIDC-based
 //!   path that swaps an OIDC token — k8s SA projection, GitHub Actions
 //!   OIDC, EKS IRSA — for STS credentials. Bypasses long-lived AWS
 //!   keys entirely; the OIDC token IS the authentication.).
@@ -49,7 +49,10 @@ use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4;
 use chrono::{DateTime, Utc};
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+pub use core_broker::project::{AwsStsMode, AwsStsScope};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, IdentityRef, MintStamp,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -71,243 +74,6 @@ pub struct AwsLongLivedCredentials {
     /// AWS region for the STS endpoint. The STS service is regional —
     /// `sts.<region>.amazonaws.com` — and signing scope embeds it.
     pub region: String,
-}
-
-/// Provider-specific scope payload for the AWS STS broker.
-///
-/// Deserialized from the opaque `BrokerRequest::scope` (`serde_json::Value`)
-/// inside `issue()`. Three modes are supported:
-///
-/// - [`AwsStsScope::AssumeRole`] — IAM-based delegation, signed with
-///   SigV4 against the long-lived credentials.
-/// - [`AwsStsScope::GetSessionToken`] — MFA-bearer scope for the
-///   long-lived credentials' own permissions.
-/// - [`AwsStsScope::WebIdentity`] — OIDC-based exchange (k8s SA
-///   projection, GitHub Actions OIDC, EKS IRSA). Unsigned (the OIDC
-///   token is the authentication).
-///
-/// ## JSON wire shape & back-compat
-///
-/// New callers SHOULD include a `"mode"` discriminant
-/// (`"assume_role"` / `"get_session_token"` / `"web_identity"`).
-/// Legacy callers that omit `mode` continue to work via the custom
-/// [`Deserialize`] impl below: presence of `role_arn` selects
-/// `AssumeRole`, absence selects `GetSessionToken`. `web_identity`
-/// requires the explicit `mode` discriminant (we don't infer it from
-/// `oidc_token` presence — that would silently change semantics if a
-/// future scope grows an unrelated OIDC field).
-#[derive(Debug, Clone)]
-pub enum AwsStsScope {
-    /// `AssumeRole` request. SigV4-signed against the broker's
-    /// long-lived credentials.
-    AssumeRole {
-        /// IAM role to assume. `None` falls back to the broker's
-        /// `default_role_arn` if configured; otherwise `issue()`
-        /// rejects the request.
-        role_arn: Option<String>,
-        /// `RoleSessionName` — also used as part of the
-        /// materialization id so the audit trail names the session.
-        session_name: String,
-        /// Requested credential lifetime. STS clamps to provider
-        /// min/max (15 min – 12 h for AssumeRole). We pass through.
-        ttl_seconds: u64,
-        /// Managed policy ARNs to attach as a session-scope filter
-        /// (`PolicyArns.member.N`).
-        policy_arns: Vec<String>,
-        /// Inline IAM policy document (JSON string) to attach as the
-        /// session policy (`Policy`).
-        inline_policy: Option<String>,
-        /// `ExternalId` for cross-account AssumeRole.
-        external_id: Option<String>,
-    },
-    /// `GetSessionToken` request. SigV4-signed against the broker's
-    /// long-lived credentials. Returns session credentials with the
-    /// same effective permissions as the long-lived IAM user.
-    GetSessionToken {
-        /// Used as part of the materialization id so the audit trail
-        /// names the session.
-        session_name: String,
-        /// Requested credential lifetime. STS clamps to 15 min – 36 h
-        /// for GetSessionToken.
-        ttl_seconds: u64,
-    },
-    /// `AssumeRoleWithWebIdentity` request. Unsigned — the OIDC token
-    /// is the authentication. Used by k8s SA projection, GitHub
-    /// Actions OIDC, EKS IRSA, and any other OIDC-issuing identity
-    /// federation.
-    WebIdentity {
-        /// IAM role to assume.
-        role_arn: String,
-        /// OIDC token (already loaded from disk / env / projected SA
-        /// volume by the caller). Held as [`SecretString`] so a Debug
-        /// print won't leak it. The daemon-side `aws_sts_config`
-        /// loads this from `oidc_token_path` (see follow-up wireup)
-        /// and hands it to the broker as the request scope.
-        oidc_token: SecretString,
-        /// `RoleSessionName` — used as part of the materialization
-        /// id so the audit trail names the session.
-        session_name: String,
-        /// Requested credential lifetime. STS clamps to 15 min – 12 h
-        /// for AssumeRoleWithWebIdentity.
-        ttl_seconds: u64,
-    },
-}
-
-/// JSON discriminant for [`AwsStsScope`]. Serialized as snake_case so
-/// the wire shape is `"assume_role"` / `"get_session_token"` /
-/// `"web_identity"` — matches the AWS STS Action names in lower-snake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AwsStsMode {
-    AssumeRole,
-    GetSessionToken,
-    WebIdentity,
-}
-
-impl AwsStsScope {
-    /// `session_name` accessor — every variant carries one.
-    pub fn session_name(&self) -> &str {
-        match self {
-            AwsStsScope::AssumeRole { session_name, .. }
-            | AwsStsScope::GetSessionToken { session_name, .. }
-            | AwsStsScope::WebIdentity { session_name, .. } => session_name,
-        }
-    }
-
-    /// `ttl_seconds` accessor — every variant carries one.
-    pub fn ttl_seconds(&self) -> u64 {
-        match self {
-            AwsStsScope::AssumeRole { ttl_seconds, .. }
-            | AwsStsScope::GetSessionToken { ttl_seconds, .. }
-            | AwsStsScope::WebIdentity { ttl_seconds, .. } => *ttl_seconds,
-        }
-    }
-
-    /// Discriminant — the [`AwsStsMode`] this variant corresponds to.
-    pub fn mode(&self) -> AwsStsMode {
-        match self {
-            AwsStsScope::AssumeRole { .. } => AwsStsMode::AssumeRole,
-            AwsStsScope::GetSessionToken { .. } => AwsStsMode::GetSessionToken,
-            AwsStsScope::WebIdentity { .. } => AwsStsMode::WebIdentity,
-        }
-    }
-}
-
-/// Internal flat-JSON shape used by the custom [`Deserialize`] /
-/// [`Serialize`] impls. Every field is optional so a single shape
-/// covers all three variants; the `mode` discriminant (or, for
-/// legacy callers, presence of `role_arn`) selects the variant.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct AwsStsScopeRaw {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mode: Option<AwsStsMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    role_arn: Option<String>,
-    session_name: String,
-    ttl_seconds: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    policy_arns: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inline_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    external_id: Option<String>,
-    /// OIDC token for `web_identity` mode. Plaintext on the wire (the
-    /// scope is already inside the daemon's trust boundary by the
-    /// time it deserializes); wrapped in [`SecretString`] in memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    oidc_token: Option<String>,
-}
-
-impl Serialize for AwsStsScope {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let raw = match self {
-            AwsStsScope::AssumeRole {
-                role_arn,
-                session_name,
-                ttl_seconds,
-                policy_arns,
-                inline_policy,
-                external_id,
-            } => AwsStsScopeRaw {
-                mode: Some(AwsStsMode::AssumeRole),
-                role_arn: role_arn.clone(),
-                session_name: session_name.clone(),
-                ttl_seconds: *ttl_seconds,
-                policy_arns: policy_arns.clone(),
-                inline_policy: inline_policy.clone(),
-                external_id: external_id.clone(),
-                oidc_token: None,
-            },
-            AwsStsScope::GetSessionToken {
-                session_name,
-                ttl_seconds,
-            } => AwsStsScopeRaw {
-                mode: Some(AwsStsMode::GetSessionToken),
-                session_name: session_name.clone(),
-                ttl_seconds: *ttl_seconds,
-                ..Default::default()
-            },
-            AwsStsScope::WebIdentity {
-                role_arn,
-                oidc_token,
-                session_name,
-                ttl_seconds,
-            } => AwsStsScopeRaw {
-                mode: Some(AwsStsMode::WebIdentity),
-                role_arn: Some(role_arn.clone()),
-                session_name: session_name.clone(),
-                ttl_seconds: *ttl_seconds,
-                oidc_token: Some(oidc_token.expose_secret().to_string()),
-                ..Default::default()
-            },
-        };
-        raw.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for AwsStsScope {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = AwsStsScopeRaw::deserialize(deserializer)?;
-        // Mode resolution: explicit `mode` wins; fall back to legacy
-        // role_arn-presence-based dispatch when omitted. We do NOT
-        // infer `web_identity` from `oidc_token` presence — that
-        // requires the explicit discriminant.
-        let mode = raw.mode.unwrap_or_else(|| {
-            if raw.role_arn.is_some() {
-                AwsStsMode::AssumeRole
-            } else {
-                AwsStsMode::GetSessionToken
-            }
-        });
-        match mode {
-            AwsStsMode::AssumeRole => Ok(AwsStsScope::AssumeRole {
-                role_arn: raw.role_arn,
-                session_name: raw.session_name,
-                ttl_seconds: raw.ttl_seconds,
-                policy_arns: raw.policy_arns,
-                inline_policy: raw.inline_policy,
-                external_id: raw.external_id,
-            }),
-            AwsStsMode::GetSessionToken => Ok(AwsStsScope::GetSessionToken {
-                session_name: raw.session_name,
-                ttl_seconds: raw.ttl_seconds,
-            }),
-            AwsStsMode::WebIdentity => {
-                let role_arn = raw.role_arn.ok_or_else(|| {
-                    serde::de::Error::custom("web_identity mode requires role_arn")
-                })?;
-                let oidc_token = raw.oidc_token.ok_or_else(|| {
-                    serde::de::Error::custom("web_identity mode requires oidc_token")
-                })?;
-                Ok(AwsStsScope::WebIdentity {
-                    role_arn,
-                    oidc_token: SecretString::from(oidc_token),
-                    session_name: raw.session_name,
-                    ttl_seconds: raw.ttl_seconds,
-                })
-            }
-        }
-    }
 }
 
 /// Vended STS credentials in the JSON shape the consumer (`broker_exec` /
@@ -591,6 +357,176 @@ fn parse_sts_credentials(
     })
 }
 
+/// Minimal tag-slice helper. STS responses are deterministic AWS-produced XML,
+/// not user input, so a tag match is sufficient (same approach as
+/// [`parse_sts_credentials`]). Returns the slice between the first `open` tag and
+/// the next `close` tag, or `None` if either is absent.
+fn slice_between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = haystack.find(open)? + open.len();
+    let end = haystack[start..].find(close)?;
+    Some(&haystack[start..start + end])
+}
+
+/// Extract `<AssumedRoleUser><Arn>...</Arn>` from an STS `AssumeRole` /
+/// `AssumeRoleWithWebIdentity` response. `None` for a `GetSessionToken` response
+/// (which carries no `AssumedRoleUser`) or a malformed body.
+fn parse_assumed_role_arn(body: &str) -> Option<String> {
+    let block = slice_between(body, "<AssumedRoleUser>", "</AssumedRoleUser>")?;
+    slice_between(block, "<Arn>", "</Arn>").map(str::to_string)
+}
+
+/// Parse `(partition, account_id, role_name)` from an IAM role ARN
+/// (`arn:<partition>:iam::<account>:role/<path?><name>`). The partition is parsed
+/// generically (`aws`, `aws-us-gov`, `aws-cn`, …) rather than hardcoded, so a
+/// GovCloud/China role compares correctly against its assumed-role response. The
+/// role name is the final path segment — STS drops any IAM path in the
+/// assumed-role ARN, so the terminal name is the comparable identity. `None` if
+/// not a well-formed IAM role ARN.
+fn parse_iam_role_identity(arn: &str) -> Option<(&str, &str, &str)> {
+    // arn:<partition>:iam::<account>:role/<path?><name>
+    let mut parts = arn.splitn(6, ':');
+    if parts.next()? != "arn" {
+        return None;
+    }
+    let partition = parts.next()?;
+    if parts.next()? != "iam" {
+        return None;
+    }
+    let _region = parts.next()?; // empty for IAM
+    let account = parts.next()?;
+    let path_and_name = parts.next()?.strip_prefix("role/")?;
+    let name = path_and_name.rsplit('/').next()?;
+    (!partition.is_empty() && !account.is_empty() && !name.is_empty())
+        .then_some((partition, account, name))
+}
+
+/// Parse `(partition, account_id, role_name)` from an STS assumed-role ARN
+/// (`arn:<partition>:sts::<account>:assumed-role/<role_name>/<session>`). The
+/// partition is parsed generically (GovCloud/China safe). The role name is the
+/// segment between `assumed-role/` and the session suffix. `None` if not a
+/// well-formed assumed-role ARN.
+fn parse_assumed_role_identity(arn: &str) -> Option<(&str, &str, &str)> {
+    // arn:<partition>:sts::<account>:assumed-role/<role_name>/<session>
+    let mut parts = arn.splitn(6, ':');
+    if parts.next()? != "arn" {
+        return None;
+    }
+    let partition = parts.next()?;
+    if parts.next()? != "sts" {
+        return None;
+    }
+    let _region = parts.next()?; // empty for STS
+    let account = parts.next()?;
+    let name = parts
+        .next()?
+        .strip_prefix("assumed-role/")?
+        .split('/')
+        .next()?;
+    (!partition.is_empty() && !account.is_empty() && !name.is_empty())
+        .then_some((partition, account, name))
+}
+
+/// Build the AWS STS provider-scope echo (design amendment 2 / design §B) from
+/// the minted scope and the STS response's attested assumed-role identity.
+///
+/// **STS attests the role IDENTITY, not the effective permissions.** The mint
+/// response carries `<AssumedRoleUser><Arn>` (which role was assumed) but never
+/// the effective session permissions — the inline session policy is request-side;
+/// STS applies it but does not echo it back. So the echo is a **role-identity
+/// attestation only** (`{ "assumed_role_arn": <arn> }`). It deliberately does NOT
+/// carry the request's inline policy: copying our own permission claim into the
+/// echo would let a request-side policy masquerade as provider-attested scope on
+/// the materialization audit event. AWS sits in the identity-attestable tier; the
+/// permission bound is enforced upstream by `need ⊆ grant` plus the STS-applied
+/// session policy, not by this echo.
+///
+/// `None` ⇒ no attestable echo, consistent with the github "unbounded ⇒ None"
+/// rule:
+/// - non-`AssumeRole` mints (`GetSessionToken` / `WebIdentity`) carry no bounded
+///   identity the daemon clamp consumes;
+/// - a full-role `AssumeRole` (no inline session policy) is unbounded;
+/// - a response with no parseable `AssumedRoleUser` (anomalous for `AssumeRole`)
+///   yields no role identity to attest — degrade to `None` rather than fabricate.
+///
+/// On a role-identity MISMATCH (STS assumed a different role than minted — a
+/// provider/projector anomaly), the echo carries the role STS ACTUALLY assumed so
+/// the daemon clamp's role-identity check fails closed and revokes the credential.
+fn aws_mint_stamp(
+    scope: &AwsStsScope,
+    effective_role_arn: &str,
+    assumed_role_arn: Option<&str>,
+) -> Result<MintStamp, BrokerError> {
+    // Non-AssumeRole mints (GetSessionToken / WebIdentity) and AssumeRole
+    // without inline_policy carry NO bounded identity the daemon clamp can
+    // verify; they yield MintStamp::Unbounded (the G3 "request shape
+    // carries no narrow bound" variant). This is policy-distinct from a
+    // bounded mint with an unobservable echo (H-1 fail-closed path below).
+    let AwsStsScope::AssumeRole {
+        inline_policy: Some(_),
+        ..
+    } = scope
+    else {
+        return Ok(MintStamp::Unbounded);
+    };
+
+    // Below: bounded AssumeRole mint. STS SHOULD have attested an
+    // <AssumedRoleUser>; if it didn't, the mint succeeded but provider
+    // truth is unobservable — REFUSE the mint at the broker rather than
+    // silently degrading the audit to G3 with a live bounded credential
+    // attached (adversarial finding H-1 fail-closed).
+    let Some(assumed) = assumed_role_arn else {
+        return Err(BrokerError::Upstream(
+            "aws provider echo: AssumeRole succeeded with inline session policy but \
+             STS response carried no parseable <AssumedRoleUser> — refusing mint \
+             rather than recording unverified bounded credential as G3 \
+             (design §D4 / H-1)"
+                .to_string(),
+        ));
+    };
+    let Some((sts_partition, sts_account, sts_role)) = parse_assumed_role_identity(assumed) else {
+        return Err(BrokerError::Upstream(format!(
+            "aws provider echo: <AssumedRoleUser> ARN '{assumed}' unparseable \
+             (expected arn:<partition>:sts::<account>:assumed-role/<name>/<session>) \
+             — refusing mint (design §D4 / H-1)"
+        )));
+    };
+    let Some((minted_partition, minted_account, minted_role)) =
+        parse_iam_role_identity(effective_role_arn)
+    else {
+        return Err(BrokerError::Upstream(format!(
+            "aws provider echo: minted IAM role ARN '{effective_role_arn}' unparseable \
+             — refusing mint (design §D4 / H-1)"
+        )));
+    };
+
+    let attested_role_arn = if sts_partition == minted_partition
+        && sts_account == minted_account
+        && sts_role == minted_role
+    {
+        // STS confirmed exactly the minted role — echo the minted IAM role ARN
+        // (preserves any IAM path the assumed-role ARN drops).
+        effective_role_arn.to_string()
+    } else {
+        // STS assumed a different role/partition/account than minted — echo what
+        // STS attested so the daemon clamp catches the discrepancy. Best-effort IAM
+        // ARN: the identity already differs, so the dropped path cannot mask it.
+        format!("arn:{sts_partition}:iam::{sts_account}:role/{sts_role}")
+    };
+
+    // design §D4 G2 — AWS attests WHICH identity was minted, not its
+    // permissions. `IdentityRef` is a closed shape (no permission field by
+    // type, AC-4): the request-side session policy is structurally
+    // unrepresentable here, which is the load-bearing invariant that
+    // prevents the AWS request-policy masquerade (#5734 caught the runtime
+    // form of this; D4 makes it unrepresentable).
+    Ok(MintStamp::Identity {
+        identity: IdentityRef {
+            provider: BrokerProvider::AwsSts,
+            identity: attested_role_arn,
+        },
+    })
+}
+
 /// STS `<ErrorResponse><Error><Code>...</Code></Error></ErrorResponse>`
 /// shape. Map well-known codes to the closest [`BrokerError`] variant.
 fn map_sts_error(status: u16, body: &str) -> BrokerError {
@@ -753,7 +689,12 @@ impl Broker for AwsStsBroker {
         // token is the authentication).
         let url = self.endpoint_url();
         let now = SystemTime::now();
-        let (action, body, headers) = match &scope {
+        // `effective_role_arn` is the IAM role ARN actually sent to STS for an
+        // `AssumeRole` mint (after the `default_role_arn` fallback). It is the
+        // minted role identity the provider-scope echo cross-checks against the
+        // STS `<AssumedRoleUser>`. `None` for `GetSessionToken` / `WebIdentity`,
+        // which carry no attestable PermissionSpec-bounded echo.
+        let (action, body, headers, effective_role_arn) = match &scope {
             AwsStsScope::AssumeRole {
                 role_arn,
                 session_name,
@@ -778,12 +719,12 @@ impl Broker for AwsStsBroker {
                     external_id.as_deref(),
                 );
                 let headers = build_signed_headers(&self.creds, &url, &body, now)?;
-                (StsAction::AssumeRole, body, headers)
+                (StsAction::AssumeRole, body, headers, Some(arn))
             }
             AwsStsScope::GetSessionToken { ttl_seconds, .. } => {
                 let body = build_get_session_token_body(*ttl_seconds);
                 let headers = build_signed_headers(&self.creds, &url, &body, now)?;
-                (StsAction::GetSessionToken, body, headers)
+                (StsAction::GetSessionToken, body, headers, None)
             }
             AwsStsScope::WebIdentity {
                 role_arn,
@@ -797,7 +738,7 @@ impl Broker for AwsStsBroker {
                 // the OIDC token directly against the role's trust
                 // policy.
                 let headers: Vec<(String, String)> = Vec::new();
-                (StsAction::AssumeRoleWithWebIdentity, body, headers)
+                (StsAction::AssumeRoleWithWebIdentity, body, headers, None)
             }
         };
 
@@ -819,6 +760,31 @@ impl Broker for AwsStsBroker {
         }
 
         let vended = parse_sts_credentials(&resp_body, action)?;
+
+        // design amendment 2 / design §B / design §D4 — the provider-scope
+        // echo. STS attests which role it assumed via `<AssumedRoleUser>`;
+        // build the typed variant from that identity. Variant semantics:
+        //   MintStamp::Identity { … }     — AssumeRole + inline_policy +
+        //                                       parseable AssumedRoleUser (G2)
+        //   MintStamp::Unbounded          — non-AssumeRole / full-role
+        //                                       AssumeRole (G3 unbounded)
+        //   Err(BrokerError::Upstream)       — bounded AssumeRole but STS
+        //                                       failed to attest the role
+        //                                       (anomaly — refuse the mint,
+        //                                       H-1 fail-closed)
+        //
+        // The mint is refused via `?` so a live bounded credential is NEVER
+        // injected without provider-truth verification.
+        //
+        // Built BEFORE the token string is moved into the `SecretString`.
+        let mint_stamp = match effective_role_arn.as_deref() {
+            Some(role) => {
+                aws_mint_stamp(&scope, role, parse_assumed_role_arn(&resp_body).as_deref())?
+            }
+            // No effective role to attest (GetSessionToken / WebIdentity
+            // without a resolved role): unbounded by request shape.
+            None => MintStamp::Unbounded,
+        };
 
         // STS Expiration is RFC3339; parse to SystemTime for the
         // BrokeredCredential. Fall back to TTL-from-now if parse fails
@@ -849,6 +815,7 @@ impl Broker for AwsStsBroker {
             token: SecretString::from(token_json),
             expires_at,
             materialization_id,
+            mint_stamp,
         })
     }
 
@@ -912,6 +879,13 @@ mod tests {
             provider: BrokerProvider::AwsSts,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -1077,6 +1051,7 @@ mod tests {
         );
         let req = sts_request(
             serde_json::json!({
+                "mode": "assume_role",
                 "role_arn": "arn:aws:iam::111122223333:role/dev",
                 "session_name": "agent-1",
                 "ttl_seconds": 3600,
@@ -1112,6 +1087,7 @@ mod tests {
         );
         let req = sts_request(
             serde_json::json!({
+                "mode": "get_session_token",
                 "session_name": "agent-2",
                 "ttl_seconds": 1800,
             }),
@@ -1137,6 +1113,7 @@ mod tests {
         );
         let req = sts_request(
             serde_json::json!({
+                "mode": "assume_role",
                 "session_name": "agent-3",
                 "ttl_seconds": 3600,
             }),
@@ -1161,6 +1138,7 @@ mod tests {
         );
         let req = sts_request(
             serde_json::json!({
+                "mode": "assume_role",
                 "role_arn": "arn:aws:iam::111122223333:role/dev",
                 "session_name": "agent-1",
                 "ttl_seconds": 3600,
@@ -1186,6 +1164,7 @@ mod tests {
         );
         let req = sts_request(
             serde_json::json!({
+                "mode": "get_session_token",
                 "session_name": "agent-1",
                 "ttl_seconds": 3600,
             }),
@@ -1208,7 +1187,7 @@ mod tests {
                 body: assume_role_ok_xml(),
             }),
         );
-        // session_name is required (no default) — leaving it out is a parse error.
+        // mode and session_name are required — leaving them out is a parse error.
         let req = sts_request(serde_json::json!({"ttl_seconds": 3600}), 3600);
         let err = Broker::issue(&broker, req).await.unwrap_err();
         assert!(
@@ -1229,6 +1208,7 @@ mod tests {
         );
         let mut req = sts_request(
             serde_json::json!({
+                "mode": "get_session_token",
                 "session_name": "agent-1",
                 "ttl_seconds": 3600,
             }),
@@ -1253,6 +1233,7 @@ mod tests {
             &broker,
             sts_request(
                 serde_json::json!({
+                    "mode": "assume_role",
                     "role_arn": "arn:aws:iam::111122223333:role/dev",
                     "session_name": "agent-1",
                     "ttl_seconds": 3600,
@@ -1313,7 +1294,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AssumeRoleWithWebIdentity — implementation-note-77 tests
+    // AssumeRoleWithWebIdentity — implementation-note-87 tests
     // -----------------------------------------------------------------
 
     fn assume_role_with_web_identity_ok_xml() -> String {
@@ -1405,23 +1386,27 @@ mod tests {
     }
 
     #[test]
-    fn aws_sts_scope_legacy_json_without_mode_still_deserializes() {
-        // Backward-compat: a legacy caller that omits `mode` and
-        // includes `role_arn` should resolve to AssumeRole.
+    fn aws_sts_scope_without_mode_is_rejected() {
         let raw = serde_json::json!({
             "role_arn": "arn:aws:iam::111122223333:role/dev",
-            "session_name": "legacy",
+            "session_name": "missing-mode",
             "ttl_seconds": 3600,
         });
-        let scope: AwsStsScope = serde_json::from_value(raw).expect("legacy deserialize");
-        assert!(matches!(scope, AwsStsScope::AssumeRole { .. }));
-        // And without role_arn → GetSessionToken.
+        let err = serde_json::from_value::<AwsStsScope>(raw).expect_err("mode is required");
+        assert!(
+            err.to_string().contains("mode"),
+            "error should name missing mode, got: {err}"
+        );
+
         let raw = serde_json::json!({
-            "session_name": "legacy",
+            "session_name": "missing-mode",
             "ttl_seconds": 3600,
         });
-        let scope: AwsStsScope = serde_json::from_value(raw).expect("legacy deserialize");
-        assert!(matches!(scope, AwsStsScope::GetSessionToken { .. }));
+        let err = serde_json::from_value::<AwsStsScope>(raw).expect_err("mode is required");
+        assert!(
+            err.to_string().contains("mode"),
+            "error should name missing mode, got: {err}"
+        );
     }
 
     #[test]
@@ -1595,5 +1580,358 @@ mod tests {
             matches!(err, BrokerError::InvalidScope(_)),
             "expected InvalidScope when oidc_token is missing, got {err:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // design amendment 2 / design §B — provider-scope echo. AWS is the
+    // identity-attestable tier: STS attests WHICH role it assumed (not the
+    // permissions), so the echo is a role-identity attestation
+    // (`{ "assumed_role_arn": <arn> }`) the daemon I7 clamp compares against the
+    // minted role. It deliberately carries NO permission claim.
+    // ---------------------------------------------------------------------
+
+    /// A bounded inline session policy (PermissionSpec-derived shape). Its
+    /// presence gates echo emission; it is deliberately NOT carried in the echo.
+    const TEST_INLINE_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::ember-test-bucket/agent/report.txt"]}]}"#;
+
+    /// A minted `AssumeRole` scope shaped exactly like the projector's output:
+    /// explicit role ARN + a PermissionSpec-derived inline session policy.
+    fn minted_assume_role_scope(role_arn: &str) -> AwsStsScope {
+        AwsStsScope::AssumeRole {
+            role_arn: Some(role_arn.to_string()),
+            session_name: "agent-1".to_string(),
+            ttl_seconds: 900,
+            policy_arns: Vec::new(),
+            inline_policy: Some(TEST_INLINE_POLICY.to_string()),
+            external_id: None,
+        }
+    }
+
+    /// Realistic STS `AssumeRole` response carrying the `<AssumedRoleUser>` block
+    /// real STS always returns (the `assume_role_ok_xml` fixture omits it).
+    fn assume_role_xml_with_assumed_user(assumed_role_arn: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<AssumeRoleResponse>
+  <AssumeRoleResult>
+    <AssumedRoleUser>
+      <AssumedRoleId>AROAEXAMPLEID:agent-1</AssumedRoleId>
+      <Arn>{assumed_role_arn}</Arn>
+    </AssumedRoleUser>
+    <Credentials>
+      <AccessKeyId>ASIATESTACCESSKEY</AccessKeyId>
+      <SecretAccessKey>testSecretAccessKeyValue</SecretAccessKey>
+      <SessionToken>testSessionTokenValue</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleResult>
+</AssumeRoleResponse>"#
+        )
+    }
+
+    /// Unwrap a `MintStamp::Identity` and return the attested identity (role
+    /// ARN), or panic if the echo is the wrong variant. The closed `IdentityRef`
+    /// shape is the AC-4 invariant; this helper exists so test reads of the
+    /// echoed identity stay one line.
+    fn echo_role(echo: &MintStamp) -> &str {
+        match echo {
+            MintStamp::Identity { identity } => {
+                assert_eq!(
+                    identity.provider,
+                    BrokerProvider::AwsSts,
+                    "AWS echo must bind BrokerProvider::AwsSts"
+                );
+                &identity.identity
+            }
+            other => panic!("expected MintStamp::Identity, got: {other:?}"),
+        }
+    }
+
+    /// Test-only helper: unwrap the successful echo or panic with the broker
+    /// error. Tests that exercise the H-1 fail-closed path call `_err` on
+    /// the raw `Result` directly.
+    fn echo_ok(result: Result<MintStamp, BrokerError>) -> MintStamp {
+        result.expect("aws_mint_stamp must succeed for this fixture")
+    }
+
+    #[test]
+    fn parse_assumed_role_arn_extracts_from_assume_role_response() {
+        let body = assume_role_xml_with_assumed_user(
+            "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1",
+        );
+        assert_eq!(
+            parse_assumed_role_arn(&body).as_deref(),
+            Some("arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1")
+        );
+    }
+
+    #[test]
+    fn parse_assumed_role_arn_none_for_get_session_token_response() {
+        // GetSessionToken responses carry no <AssumedRoleUser>.
+        assert_eq!(parse_assumed_role_arn(&get_session_token_ok_xml()), None);
+    }
+
+    #[test]
+    fn parse_iam_role_identity_handles_partition_path_and_rejects() {
+        assert_eq!(
+            parse_iam_role_identity("arn:aws:iam::123456789012:role/ember-agent"),
+            Some(("aws", "123456789012", "ember-agent"))
+        );
+        // An IAM path is dropped to the terminal role name (STS drops it too in
+        // the assumed-role ARN), so the terminal name is the comparable identity.
+        assert_eq!(
+            parse_iam_role_identity("arn:aws:iam::123456789012:role/team/sub/ember-agent"),
+            Some(("aws", "123456789012", "ember-agent"))
+        );
+        // GovCloud / China partitions parse (finding-2 coverage).
+        assert_eq!(
+            parse_iam_role_identity("arn:aws-us-gov:iam::123456789012:role/ember-agent"),
+            Some(("aws-us-gov", "123456789012", "ember-agent"))
+        );
+        assert_eq!(
+            parse_iam_role_identity("arn:aws:sts::1:assumed-role/x/y"),
+            None
+        );
+        assert_eq!(parse_iam_role_identity("not-an-arn"), None);
+    }
+
+    #[test]
+    fn parse_assumed_role_identity_extracts_partition_account_role() {
+        assert_eq!(
+            parse_assumed_role_identity(
+                "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1"
+            ),
+            Some(("aws", "123456789012", "ember-agent"))
+        );
+        assert_eq!(
+            parse_assumed_role_identity(
+                "arn:aws-us-gov:sts::123456789012:assumed-role/ember-agent/s"
+            ),
+            Some(("aws-us-gov", "123456789012", "ember-agent"))
+        );
+        assert_eq!(parse_assumed_role_identity("arn:aws:iam::1:role/x"), None);
+    }
+
+    #[test]
+    fn aws_mint_stamp_attests_minted_role_only() {
+        let role = "arn:aws:iam::123456789012:role/ember-agent";
+        let minted = minted_assume_role_scope(role);
+        let assumed = "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1";
+
+        let echo = echo_ok(aws_mint_stamp(&minted, role, Some(assumed)));
+        assert_eq!(echo_role(&echo), role);
+    }
+
+    #[test]
+    fn aws_mint_stamp_carries_no_permission_claim() {
+        // The echo must NOT carry the request-side inline policy / permissions —
+        // AWS attests identity, not permissions (G2). The AC-4 invariant is now
+        // type-enforced (`IdentityRef` has no permission field), but the
+        // serialization guard remains so a future serde rename of `IdentityRef`
+        // can't silently smuggle the inline policy through the audit JSON.
+        let role = "arn:aws:iam::123456789012:role/ember-agent";
+        let minted = minted_assume_role_scope(role);
+        let assumed = "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1";
+
+        let echo = echo_ok(aws_mint_stamp(&minted, role, Some(assumed)));
+        match &echo {
+            MintStamp::Identity { identity } => {
+                assert_eq!(identity.provider, BrokerProvider::AwsSts);
+                assert!(!identity.identity.is_empty(), "identity must be populated");
+            }
+            other => panic!("expected MintStamp::Identity, got: {other:?}"),
+        }
+        let serialized = serde_json::to_string(&echo).expect("MintStamp must serialize as JSON");
+        assert!(
+            !serialized.contains("Statement") && !serialized.contains("s3:PutObject"),
+            "echo must not contain the request inline policy: {serialized}"
+        );
+    }
+
+    #[test]
+    fn aws_mint_stamp_preserves_iam_path_on_match() {
+        // The STS assumed-role ARN drops the IAM path; on a match the echo must
+        // carry the minted IAM ARN (path intact) so the clamp does not
+        // false-positive on a legitimate pathed role.
+        let role = "arn:aws:iam::123456789012:role/team/ember-agent";
+        let minted = minted_assume_role_scope(role);
+        let assumed = "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1";
+
+        let echo = echo_ok(aws_mint_stamp(&minted, role, Some(assumed)));
+        assert_eq!(
+            echo_role(&echo),
+            role,
+            "echo must preserve the full IAM path"
+        );
+    }
+
+    #[test]
+    fn aws_mint_stamp_matches_across_govcloud_partition() {
+        // Finding-2 coverage: a GovCloud role + its GovCloud assumed-role response
+        // must match and emit an echo (the prior hardcoded `arn:aws:` prefix
+        // silently dropped the echo for non-standard partitions).
+        let role = "arn:aws-us-gov:iam::123456789012:role/ember-agent";
+        let minted = minted_assume_role_scope(role);
+        let assumed = "arn:aws-us-gov:sts::123456789012:assumed-role/ember-agent/agent-1";
+
+        let echo = echo_ok(aws_mint_stamp(&minted, role, Some(assumed)));
+        assert_eq!(echo_role(&echo), role);
+    }
+
+    #[test]
+    fn aws_mint_stamp_carries_sts_role_on_mismatch_so_clamp_catches_it() {
+        // STS attests a DIFFERENT role than minted — the echo must carry the role
+        // STS actually assumed so the daemon clamp's role comparison fails closed.
+        let minted_role = "arn:aws:iam::123456789012:role/ember-agent";
+        let minted = minted_assume_role_scope(minted_role);
+        let assumed_other = "arn:aws:sts::123456789012:assumed-role/admin-role/agent-1";
+
+        let echo = echo_ok(aws_mint_stamp(&minted, minted_role, Some(assumed_other)));
+        assert_ne!(
+            echo_role(&echo),
+            minted_role,
+            "a role mismatch must surface in the echo so the I7 clamp revokes"
+        );
+        assert_eq!(
+            echo_role(&echo),
+            "arn:aws:iam::123456789012:role/admin-role"
+        );
+    }
+
+    #[test]
+    fn aws_mint_stamp_refuses_mint_without_assumed_role_user_h1() {
+        // H-1 fail-closed (adversarial finding): an AssumeRole mint with
+        // inline_policy that returned no parseable <AssumedRoleUser> must
+        // REFUSE the mint via BrokerError::Upstream — not silently degrade
+        // to G3 with the live bounded credential attached. The prior
+        // behaviour (MintStamp::None) collapsed into the same audit
+        // discriminator as anthropic-by-design, hiding the anomaly.
+        let role = "arn:aws:iam::123456789012:role/ember-agent";
+        let minted = minted_assume_role_scope(role);
+        let err = aws_mint_stamp(&minted, role, None)
+            .expect_err("missing <AssumedRoleUser> on bounded AssumeRole must refuse mint");
+        match err {
+            BrokerError::Upstream(msg) => assert!(
+                msg.contains("AssumedRoleUser") || msg.contains("H-1"),
+                "error must name the anomaly: {msg}"
+            ),
+            other => panic!("expected BrokerError::Upstream, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aws_mint_stamp_refuses_mint_with_unparseable_assumed_role_arn_h1() {
+        // H-1 sibling: parseable AssumedRoleUser but a malformed ARN — also
+        // refuse the mint rather than silently degrading.
+        let role = "arn:aws:iam::123456789012:role/ember-agent";
+        let minted = minted_assume_role_scope(role);
+        let garbage_arn = "not-an-arn-at-all";
+        let err = aws_mint_stamp(&minted, role, Some(garbage_arn))
+            .expect_err("unparseable AssumedRoleUser ARN must refuse mint");
+        assert!(matches!(err, BrokerError::Upstream(_)));
+    }
+
+    #[test]
+    fn aws_mint_stamp_unbounded_for_full_role_assume_role() {
+        // No inline session policy ⇒ unbounded full-role mint ⇒
+        // MintStamp::Unbounded (the explicit G3 "request shape carries
+        // no narrow bound" variant, design §D4). Mirrors github's
+        // repository_selection=all path.
+        let role = "arn:aws:iam::123456789012:role/ember-agent";
+        let full_role = AwsStsScope::AssumeRole {
+            role_arn: Some(role.to_string()),
+            session_name: "agent-1".to_string(),
+            ttl_seconds: 900,
+            policy_arns: Vec::new(),
+            inline_policy: None,
+            external_id: None,
+        };
+        let assumed = "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1";
+        let echo = echo_ok(aws_mint_stamp(&full_role, role, Some(assumed)));
+        assert!(matches!(echo, MintStamp::Unbounded));
+    }
+
+    #[test]
+    fn aws_mint_stamp_unbounded_for_get_session_token() {
+        let scope = AwsStsScope::GetSessionToken {
+            session_name: "agent-1".to_string(),
+            ttl_seconds: 900,
+        };
+        // A non-AssumeRole mint has no PermissionSpec-bounded echo.
+        let echo = echo_ok(aws_mint_stamp(&scope, "arn:aws:iam::1:role/x", None));
+        assert!(matches!(echo, MintStamp::Unbounded));
+    }
+
+    #[tokio::test]
+    async fn issue_assume_role_populates_mint_stamp_from_assumed_role_user() {
+        let role = "arn:aws:iam::123456789012:role/ember-agent";
+        let broker = AwsStsBroker::with_client(
+            fixture_creds(),
+            None,
+            Arc::new(MockStsClient {
+                status: 200,
+                body: assume_role_xml_with_assumed_user(
+                    "arn:aws:sts::123456789012:assumed-role/ember-agent/agent-1",
+                ),
+            }),
+        );
+        let req = sts_request(
+            serde_json::json!({
+                "mode": "assume_role",
+                "role_arn": role,
+                "session_name": "agent-1",
+                "ttl_seconds": 900,
+                "policy_arns": [],
+                "inline_policy": TEST_INLINE_POLICY,
+                "external_id": null,
+            }),
+            900,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        assert_eq!(echo_role(&cred.mint_stamp), role);
+    }
+
+    #[tokio::test]
+    async fn issue_assume_role_refuses_mint_when_response_omits_assumed_role_user_h1() {
+        // H-1 (adversarial finding) — the legacy fixture omits
+        // <AssumedRoleUser>; pre-D4 the echo degraded to `MintStamp::None`
+        // (silent G3 with a live bounded credential attached). D4 promotes
+        // this anomaly to a hard mint refusal at the broker boundary, so the
+        // daemon never sees a credential it can't clamp-verify. This test is
+        // the integration-level guard that the AwsStsBroker::issue path
+        // actually propagates the error rather than recording the
+        // pre-refusal failure as a silent G3 mint.
+        let broker = AwsStsBroker::with_client(
+            fixture_creds(),
+            None,
+            Arc::new(MockStsClient {
+                status: 200,
+                body: assume_role_ok_xml(),
+            }),
+        );
+        let req = sts_request(
+            serde_json::json!({
+                "mode": "assume_role",
+                "role_arn": "arn:aws:iam::123456789012:role/ember-agent",
+                "session_name": "agent-1",
+                "ttl_seconds": 900,
+                "policy_arns": [],
+                "inline_policy": TEST_INLINE_POLICY,
+                "external_id": null,
+            }),
+            900,
+        );
+        let err = Broker::issue(&broker, req)
+            .await
+            .expect_err("missing <AssumedRoleUser> on bounded AssumeRole must refuse mint");
+        match err {
+            BrokerError::Upstream(msg) => assert!(
+                msg.contains("AssumedRoleUser") || msg.contains("H-1"),
+                "broker error must name the anomaly: {msg}"
+            ),
+            other => panic!("expected BrokerError::Upstream, got: {other:?}"),
+        }
     }
 }

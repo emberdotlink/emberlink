@@ -1,3 +1,4 @@
+
 # The Emberlink Manifesto
 
 ## What we believe
@@ -11,6 +12,8 @@ The current answer is dangerous and binary. Hand the agent your API key and hope
 A grant is the fundamental primitive: scoped, time-bound, persona-bound, budgeted, revocable delegation of authority from one identity to another. The recipient gets authority to *act*, not the key. When the grant ends, a signed **Grant Receipt** records who delegated what to whom, what was narrowed, what the agent did, and when it ended. Durable. Exportable. Verifiable.
 
 The same primitive that lets an AI agent hit your GitHub token also lets a friend share a login, a partner pay on your behalf, a guardian recover your identity, or a coalition prove something collectively without revealing individual data. We are building the authorization layer for the agent era *as a general trust protocol*, because the shape is general.
+
+Emberlink's Grant protocol is intentionally small and generic; the same envelope spans credentials, payments, sessions, compute, time, and future authority surfaces — extensible by adding ResourceType variants, not by shipping plugins.
 
 Credentials are the doorway. Delegated authority is the category. Signed receipts are the proof.
 
@@ -69,7 +72,9 @@ Free, open, and permissionless. Forever.
 - **The grant protocol.** Structure, signing, exchange, revocation. Open standard.
 - **The core libraries.** Identity, event log, grants, vault, recovery, sync, trust, storage. Open source, Apache-2.0.
 - **The relay protocol.** Accept, store, deliver encrypted envelopes. Open spec with reference implementation.
-- **The reference applications.** CLI (`ember`), daemon (`emberd`), proxy (`ember-proxy`), sandbox (`ember-sandbox`), dashboard (`ember-dashboard`), forge (`headless-runtime`). All open source.
+- **The reference applications.** CLI (`ember`), daemon (`emberd`),
+  proxy/runtime mediation, sandbox, dashboard, MCP server, and SDKs. All open
+  source.
 
 This can never be taken away, locked down, or enshittified.
 
@@ -146,17 +151,18 @@ The ember daemon is this philosophy made concrete.
 It runs on your device. It holds your keys. It knows your policies. When an agent asks for something, your daemon is the one who answers.
 
 ```
-$ ember daemon start
+$ ember status
 
-  ember daemon v0.2.x
+  ember daemon v0.3.x
   The Grant Warden for AI agents
 
-  Socket:    ~/.ember/run/daemon.sock
-  Dashboard: http://localhost:3141
+  Status: running
+  Vault:  locked or unlocked by local policy
+  Audit:  receipt history available locally
 ```
 
 Every credential encrypted. Every access scoped and time-bound. Every action logged. Every grant signed. Every termination receipted.
 
 Not "trust us." Trust yourself.
 
-Install path and the three-tier integration gradient: `project documentation`.
+Install path and the three-tier integration gradient: [QUICKSTART.md](QUICKSTART.md).

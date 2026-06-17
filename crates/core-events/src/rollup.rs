@@ -2,21 +2,25 @@
 //!
 //! Implements the read-time rollup design at
 //! [`docs/construct-receipt-rollup.md`](../../../docs/construct-receipt-rollup.md):
-//! a single Construct invocation produces 4+ Receipts under the daemon-as-process-supervisor
-//! lifecycle (design §1 step 4) — `broker.materialization` + `broker.resolution` +
-//! `session.construct_invocation` + `broker.revocation`. The dashboard's default view
-//! and the `ember receipt rollup` CLI verb collapse them into one row keyed by
-//! `materialization_id`, with sub-Receipt detail one click / flag away.
+//! a single Construct invocation currently produces 4+ Receipts as it crosses
+//! design's authority-space / execution-space boundary — `broker.materialization`
+//! + `broker.resolution` + `session.construct_invocation` + `broker.revocation`.
+//!
+//! The dashboard's default view and the `ember receipt rollup` CLI verb
+//! collapse them into one row keyed by `materialization_id`, with sub-Receipt
+//! detail one click / flag away.
 //!
 //! This module is the **type surface** (envelope shape + outcome enum + sub-Receipt
 //! reference) plus the rollup computation. Sub-Receipt types themselves live in
 //! [`crate::receipt`]; this module just references them by `(kind, ts, hash)`.
 //!
-//! Tracks **AP-CONSTRUCT-RECEIPT-ROLLUP-VIEW** (/M). v0.1 scaffold here; dashboard
-//! and CLI wire-up land in follow-up PRs once the daemon-supervisor lifecycle is on
-//! main (gated on T-CONSTRUCT-DAEMON-EXEC-RPC).
+//! Tracks **AP-CONSTRUCT-RECEIPT-ROLLUP-VIEW** (/M). The four-receipt shape is
+//! an implementation detail; the architecture framing is design's split between
+//! agent space, authority space, and execution space.
 
 use std::collections::HashMap;
+
+use core_event_types::ActionRef;
 
 /// Outcome of a Construct invocation, derived from the chained sub-Receipts.
 ///
@@ -59,9 +63,20 @@ pub struct SubReceiptRef {
 pub struct ConstructInvocationRollup {
     /// Join key shared across all sub-Receipts in this rollup.
     pub materialization_id: String,
+    /// Canonical structured action identity when the receipt chain carries it.
+    pub action_ref: Option<ActionRef>,
     /// Action identifier (e.g. `gh.pr_create`, `git.push`) — taken from
-    /// `session.construct_invocation.action_name`.
+    /// `action_ref` when present, otherwise from the legacy action string.
     pub action: String,
+    /// Selected runner class, when any sub-Receipt carries design §13
+    /// placement truth.
+    pub runner_class: Option<String>,
+    /// Selected execution domain, when any sub-Receipt carries design §13
+    /// placement truth.
+    pub execution_domain: Option<String>,
+    /// Materialization class actually used, when any sub-Receipt carries
+    /// design §13 placement truth.
+    pub materialization_class: Option<String>,
     /// Persona that authored the dispatch.
     pub persona: String,
     /// Earliest sub-Receipt timestamp.
@@ -86,6 +101,16 @@ pub trait RollupReceiptView {
     fn receipt_hash(&self) -> &str;
     fn persona(&self) -> Option<&str>;
     fn action(&self) -> Option<&str>;
+    fn action_ref(&self) -> Option<&ActionRef>;
+    fn runner_class(&self) -> Option<&str> {
+        None
+    }
+    fn execution_domain(&self) -> Option<&str> {
+        None
+    }
+    fn materialization_class(&self) -> Option<&str> {
+        None
+    }
     fn exit_code(&self) -> Option<i32>;
     fn denied_reason(&self) -> Option<&str>;
 }
@@ -127,10 +152,21 @@ fn build_rollup<R: RollupReceiptView>(
         .collect();
     sub_receipts.sort_by(|a, b| a.ts.cmp(&b.ts));
 
-    let action = group
-        .iter()
-        .find_map(|r| r.action().map(|s| s.to_string()))
+    let action_ref = group.iter().find_map(|r| r.action_ref().cloned());
+    let action = action_ref
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| group.iter().find_map(|r| r.action().map(|s| s.to_string())))
         .unwrap_or_else(|| "<unknown>".to_string());
+    let runner_class = group
+        .iter()
+        .find_map(|r| r.runner_class().map(str::to_string));
+    let execution_domain = group
+        .iter()
+        .find_map(|r| r.execution_domain().map(str::to_string));
+    let materialization_class = group
+        .iter()
+        .find_map(|r| r.materialization_class().map(str::to_string));
     let persona = group
         .iter()
         .find_map(|r| r.persona().map(|s| s.to_string()))
@@ -177,7 +213,11 @@ fn build_rollup<R: RollupReceiptView>(
 
     ConstructInvocationRollup {
         materialization_id: materialization_id.to_string(),
+        action_ref,
         action,
+        runner_class,
+        execution_domain,
+        materialization_class,
         persona,
         started_at,
         ended_at,
@@ -199,6 +239,10 @@ mod tests {
         hash: String,
         persona: Option<String>,
         action: Option<String>,
+        action_ref: Option<ActionRef>,
+        runner_class: Option<String>,
+        execution_domain: Option<String>,
+        materialization_class: Option<String>,
         exit_code: Option<i32>,
         denied: Option<String>,
     }
@@ -222,6 +266,18 @@ mod tests {
         fn action(&self) -> Option<&str> {
             self.action.as_deref()
         }
+        fn action_ref(&self) -> Option<&ActionRef> {
+            self.action_ref.as_ref()
+        }
+        fn runner_class(&self) -> Option<&str> {
+            self.runner_class.as_deref()
+        }
+        fn execution_domain(&self) -> Option<&str> {
+            self.execution_domain.as_deref()
+        }
+        fn materialization_class(&self) -> Option<&str> {
+            self.materialization_class.as_deref()
+        }
         fn exit_code(&self) -> Option<i32> {
             self.exit_code
         }
@@ -237,6 +293,7 @@ mod tests {
         hash: &str,
         persona: Option<&str>,
         action: Option<&str>,
+        action_ref: Option<ActionRef>,
         exit_code: Option<i32>,
         denied: Option<&str>,
     ) -> FixtureReceipt {
@@ -247,9 +304,25 @@ mod tests {
             hash: hash.to_string(),
             persona: persona.map(String::from),
             action: action.map(String::from),
+            action_ref,
+            runner_class: None,
+            execution_domain: None,
+            materialization_class: None,
             exit_code,
             denied: denied.map(String::from),
         }
+    }
+
+    fn fx_with_placement(
+        mut receipt: FixtureReceipt,
+        runner_class: Option<&str>,
+        execution_domain: Option<&str>,
+        materialization_class: Option<&str>,
+    ) -> FixtureReceipt {
+        receipt.runner_class = runner_class.map(String::from);
+        receipt.execution_domain = execution_domain.map(String::from);
+        receipt.materialization_class = materialization_class.map(String::from);
+        receipt
     }
 
     #[test]
@@ -264,12 +337,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_abc",
                 "broker.resolution",
                 "2026-05-05T13:01:22Z",
                 "blake3:9f81",
+                None,
                 None,
                 None,
                 None,
@@ -281,7 +356,12 @@ mod tests {
                 "2026-05-05T13:01:24Z",
                 "blake3:b3f9",
                 None,
-                Some("gh.pr_create"),
+                None,
+                Some(ActionRef::new(
+                    "registry.ember.systems/ember-systems/ember-gh",
+                    "pr_create",
+                    "v1",
+                )),
                 Some(0),
                 None,
             ),
@@ -294,19 +374,91 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
         ];
         let rollups = compute_rollups(&receipts);
         assert_eq!(rollups.len(), 1);
         let r = &rollups[0];
         assert_eq!(r.materialization_id, "m_abc");
-        assert_eq!(r.action, "gh.pr_create");
+        assert_eq!(
+            r.action,
+            "registry.ember.systems/ember-systems/ember-gh/pr_create@v1"
+        );
+        assert_eq!(
+            r.action_ref,
+            Some(ActionRef::new(
+                "registry.ember.systems/ember-systems/ember-gh",
+                "pr_create",
+                "v1",
+            ))
+        );
         assert_eq!(r.persona, "dev");
         assert_eq!(r.outcome, RollupOutcome::Success);
         assert_eq!(r.receipt_count, 4);
+        assert_eq!(r.runner_class, None);
+        assert_eq!(r.execution_domain, None);
+        assert_eq!(r.materialization_class, None);
         assert_eq!(r.started_at, "2026-05-05T13:01:22Z");
         assert_eq!(r.ended_at, Some("2026-05-05T13:01:24Z".to_string()));
         assert_eq!(r.sub_receipts.len(), 4);
+    }
+
+    #[test]
+    fn rollup_carries_first_available_placement_truth() {
+        let receipts = vec![
+            fx(
+                "m_place",
+                "broker.materialization",
+                "2026-05-05T13:01:22Z",
+                "blake3:7c2a",
+                Some("dev"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx_with_placement(
+                fx(
+                    "m_place",
+                    "session.construct_invocation",
+                    "2026-05-05T13:01:23Z",
+                    "blake3:b3f9",
+                    None,
+                    None,
+                    Some(ActionRef::new(
+                        "registry.ember.systems/ember-systems/ember-gh",
+                        "pr_create",
+                        "v1",
+                    )),
+                    Some(0),
+                    None,
+                ),
+                Some("local_trusted"),
+                Some("host"),
+                Some("brokered_credential"),
+            ),
+            fx(
+                "m_place",
+                "broker.revocation",
+                "2026-05-05T13:01:24Z",
+                "blake3:e1d8",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        let rollups = compute_rollups(&receipts);
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].runner_class.as_deref(), Some("local_trusted"));
+        assert_eq!(rollups[0].execution_domain.as_deref(), Some("host"));
+        assert_eq!(
+            rollups[0].materialization_class.as_deref(),
+            Some("brokered_credential")
+        );
     }
 
     #[test]
@@ -321,6 +473,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_def",
@@ -329,6 +482,7 @@ mod tests {
                 "blake3:222",
                 None,
                 Some("git.push"),
+                None,
                 None,
                 Some("rate_limited"),
             ),
@@ -353,12 +507,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_inflight",
                 "broker.resolution",
                 "2026-05-05T13:03:00Z",
                 "blake3:b",
+                None,
                 None,
                 None,
                 None,
@@ -371,6 +527,7 @@ mod tests {
                 "blake3:c",
                 None,
                 Some("kubectl.apply"),
+                None,
                 None,
                 None,
             ),
@@ -394,12 +551,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_crash",
                 "broker.resolution",
                 "2026-05-05T13:04:00Z",
                 "blake3:y",
+                None,
                 None,
                 None,
                 None,
@@ -424,12 +583,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_err",
                 "broker.resolution",
                 "2026-05-05T13:05:00Z",
                 "blake3:q",
+                None,
                 None,
                 None,
                 None,
@@ -442,6 +603,7 @@ mod tests {
                 "blake3:r",
                 None,
                 Some("git.push"),
+                None,
                 Some(128),
                 None,
             ),
@@ -450,6 +612,7 @@ mod tests {
                 "broker.revocation",
                 "2026-05-05T13:05:02Z",
                 "blake3:s",
+                None,
                 None,
                 None,
                 None,
@@ -485,6 +648,9 @@ mod tests {
             fn action(&self) -> Option<&str> {
                 None
             }
+            fn action_ref(&self) -> Option<&ActionRef> {
+                None
+            }
             fn exit_code(&self) -> Option<i32> {
                 None
             }
@@ -508,12 +674,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_one",
                 "broker.resolution",
                 "2026-05-05T13:00:00Z",
                 "blake3:b",
+                None,
                 None,
                 None,
                 None,
@@ -526,6 +694,7 @@ mod tests {
                 "blake3:c",
                 None,
                 Some("gh.pr_create"),
+                None,
                 Some(0),
                 None,
             ),
@@ -534,6 +703,7 @@ mod tests {
                 "broker.revocation",
                 "2026-05-05T13:00:01Z",
                 "blake3:d",
+                None,
                 None,
                 None,
                 None,
@@ -548,12 +718,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             fx(
                 "m_two",
                 "broker.resolution",
                 "2026-05-05T13:00:05Z",
                 "blake3:f",
+                None,
                 None,
                 None,
                 None,
@@ -566,6 +738,7 @@ mod tests {
                 "blake3:g",
                 None,
                 Some("git.push"),
+                None,
                 Some(0),
                 None,
             ),
@@ -574,6 +747,7 @@ mod tests {
                 "broker.revocation",
                 "2026-05-05T13:00:06Z",
                 "blake3:h",
+                None,
                 None,
                 None,
                 None,

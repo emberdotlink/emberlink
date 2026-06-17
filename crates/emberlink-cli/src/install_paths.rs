@@ -7,10 +7,10 @@
 //!
 //! This module is the canonical source-of-truth for those path constants. It
 //! is consumed by:
-//! - `ember dev install` (implementation-note-488) — provisions
+//! - `ember dev install` (implementation-note-420) — provisions
 //!   the dev daemon end-to-end
 //! - `ember daemon install` — provisions the prod daemon
-//! - `dev_install::install_plist` (implementation-note-496) —
+//! - `dev_install::install_plist` (implementation-note-425) —
 //!   renders the dev LaunchDaemon plist with these paths
 //! - `dev-install.sh` developer-loop script (deprecated in this PR; pointer to
 //!   `ember dev install` instead of the old `/usr/local/bin/emberd` symlink)
@@ -25,9 +25,24 @@ pub const PROD_INSTALL_ROOT: &str = "/usr/local/lib/ember";
 /// `{DEV_INSTALL_ROOT}/emberd.app/Contents/MacOS/emberd` on macOS.
 pub const DEV_INSTALL_ROOT: &str = "/usr/local/lib/ember-dev";
 
-/// Prod daemon Unix-domain socket path (relative to operator home).
-/// Absolute path is `~/.ember/run/daemon.sock`.
-pub const PROD_DAEMON_SOCKET_REL: &str = ".ember/run/daemon.sock";
+/// Prod daemon Unix-domain socket — absolute system path.
+/// macOS: `/Library/Application Support/Emberlink/run/daemon.sock`.
+/// Linux: `/run/ember/daemon.sock`.
+///
+/// Delegates to [`ember_daemon::paths::DaemonPaths::system`] so the
+/// per-OS system-path map lives in exactly one place; replaces the
+/// pre-design `~/.ember/run/daemon.sock` relative constant that
+/// callers used to join against the operator's `$HOME`.
+pub fn prod_daemon_socket_path() -> std::path::PathBuf {
+    ember_daemon::paths::DaemonPaths::system().socket_path
+}
+
+/// Prod daemon at-rest state root per design — same delegation as
+/// [`prod_daemon_socket_path`]. Callers that previously did
+/// `home.join(".ember").join("data")` get this instead.
+pub fn prod_state_root() -> std::path::PathBuf {
+    ember_daemon::paths::DaemonPaths::system().state_root
+}
 
 /// Dev daemon Unix-domain socket path (relative to operator home).
 /// Absolute path is `~/.ember/run/daemon.dev.sock`.
@@ -92,7 +107,22 @@ mod tests {
 
     #[test]
     fn prod_and_dev_socket_paths_are_disjoint() {
-        assert_ne!(PROD_DAEMON_SOCKET_REL, DEV_DAEMON_SOCKET_REL);
+        let prod = prod_daemon_socket_path();
+        let dev = DEV_DAEMON_SOCKET_REL;
+        assert_ne!(prod.to_string_lossy(), dev);
+        // design boundary: prod is an absolute system path, NOT under
+        // any user's $HOME. Dev still lives under operator HOME pending
+        // its own follow-up design rewire.
+        assert!(prod.is_absolute(), "prod socket must be absolute: {prod:?}");
+        let prod_str = prod.to_string_lossy();
+        assert!(
+            !prod_str.starts_with("/Users/") && !prod_str.starts_with("/home/"),
+            "design boundary violated: prod socket at {prod_str} is under a user HOME"
+        );
+        assert!(
+            !prod_str.contains("/.ember/"),
+            "legacy ~/.ember/run/ leaked into prod socket: {prod_str}"
+        );
     }
 
     #[test]

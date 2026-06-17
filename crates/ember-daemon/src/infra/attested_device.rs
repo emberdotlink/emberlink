@@ -32,7 +32,7 @@
 //! with `Error::LegacyUnwrappedFormat` so the operator re-enrolls under
 //! the wrapped scheme rather than silently consuming an insecure entry.
 //!
-//! ## Scope (implementation-note-192)
+//! ## Scope (implementation-note-169)
 //!
 //! - Generate keychain-backed storage for one MEK per persona-enrollment.
 //! - Persist the single active-enrollment metadata slot under the daemon
@@ -48,7 +48,7 @@
 //! - CLI commands (slice C).
 //! - MEK-source selection from the vault.
 //!
-//! CLASSIFICATION: INTERNAL
+//! CLASSIFICATION: PUBLIC
 
 use std::collections::HashMap;
 use std::fs;
@@ -59,8 +59,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead, aead::Payload};
+use core_events::receipt::HeadlessDelegatedMaterial;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Keychain service used for headless attested-device entries.
 ///
@@ -73,7 +74,7 @@ pub const KEYCHAIN_SERVICE: &str = "ember-daemon-headless";
 /// headless-enrollment metadata record.
 pub const ACTIVE_ENROLLMENT_FILE: &str = "headless/active-enrollment.json";
 
-const ACTIVE_ENROLLMENT_VERSION: u8 = 1;
+const ACTIVE_ENROLLMENT_VERSION: u8 = 2;
 
 /// Prefix on the keychain account name for the per-enrollment wrap-key
 /// companion entry. Per ATTESTED-DEVICE-MEK-WRAP (B2): the wrap-key
@@ -101,7 +102,10 @@ pub enum Error {
     Decode(String),
     Encode(String),
     Io(String),
-    EnrollmentIdMismatch { requested: String, active: String },
+    EnrollmentIdMismatch {
+        requested: String,
+        active: String,
+    },
     UnsupportedSize,
     /// Encountered a pre-B2 raw-MEK entry that must be re-enrolled under
     /// the AEAD-wrapped scheme before it can be read. The operator
@@ -199,8 +203,16 @@ fn keychain_get(account: &str) -> Result<String, Error> {
 
     let entry = keyring_core::Entry::new(&service, &resolved_account)
         .map_err(|e| Error::Keychain(format!("new: {e}")))?;
-    match entry.get_password() {
-        Ok(password) => Ok(password),
+    // Wrap at the third-party `keyring_core::Entry::get_password()` boundary
+    // so the bare `String` never escapes the call expression into a
+    // longer-lived local allocation (N6-deeper item 3). The wrapped MEK
+    // value is base64 (semi-sensitive — it's AEAD ciphertext, but the
+    // wrap-key entry next to it is the secret half); zeroizing the bare
+    // form here matches the discipline applied to vault_macos. Unwrap via
+    // `std::mem::take` to satisfy the bare-String return contract without
+    // cascading the type through callers.
+    match entry.get_password().map(Zeroizing::new) {
+        Ok(mut password) => Ok(std::mem::take(&mut *password)),
         Err(keyring_core::Error::NoEntry) => Err(Error::NotFound),
         Err(e) => Err(Error::Keychain(format!("read: {e}"))),
     }
@@ -241,6 +253,20 @@ pub struct AttestedDevice {
     pub account: String,
     pub enrolled_at: SystemTime,
     pub expiry: SystemTime,
+    pub template_snapshot_hash: String,
+    pub delegated_authority_refs: Vec<String>,
+    pub delegated_material: HeadlessDelegatedMaterial,
+    pub attested_device_ref: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollmentMetadata {
+    pub template_snapshot_hash: String,
+    #[serde(default)]
+    pub delegated_authority_refs: Vec<String>,
+    #[serde(default)]
+    pub delegated_material: HeadlessDelegatedMaterial,
+    pub attested_device_ref: String,
 }
 
 impl AttestedDevice {
@@ -264,6 +290,23 @@ impl AttestedDevice {
     /// Caller is responsible for running any biometric / Touch ID prompt
     /// BEFORE calling this function — `enroll` itself does not prompt.
     pub fn enroll(persona: &str, duration: Duration, mek: &[u8; 32]) -> Result<Self, Error> {
+        Self::enroll_with_metadata(
+            persona,
+            duration,
+            mek,
+            EnrollmentMetadata {
+                attested_device_ref: default_attested_device_ref(persona),
+                ..EnrollmentMetadata::default()
+            },
+        )
+    }
+
+    pub fn enroll_with_metadata(
+        persona: &str,
+        duration: Duration,
+        mek: &[u8; 32],
+        metadata: EnrollmentMetadata,
+    ) -> Result<Self, Error> {
         let account = persona.to_string();
         // Generate a fresh per-enrollment wrap-key. The wrap-key NEVER
         // leaves this function in unwrapped form — it lands in keychain
@@ -322,6 +365,10 @@ impl AttestedDevice {
             account,
             enrolled_at: now,
             expiry: now + duration,
+            template_snapshot_hash: metadata.template_snapshot_hash,
+            delegated_authority_refs: metadata.delegated_authority_refs,
+            delegated_material: metadata.delegated_material,
+            attested_device_ref: metadata.attested_device_ref,
         })
     }
 
@@ -335,6 +382,18 @@ impl AttestedDevice {
         mek: &[u8; 32],
     ) -> Result<Self, Error> {
         let device = Self::enroll(persona, duration, mek)?;
+        device.store_active(data_dir)?;
+        Ok(device)
+    }
+
+    pub fn enroll_active_with_metadata(
+        data_dir: &Path,
+        persona: &str,
+        duration: Duration,
+        mek: &[u8; 32],
+        metadata: EnrollmentMetadata,
+    ) -> Result<Self, Error> {
+        let device = Self::enroll_with_metadata(persona, duration, mek, metadata)?;
         device.store_active(data_dir)?;
         Ok(device)
     }
@@ -537,6 +596,10 @@ impl AttestedDevice {
             persona: device.persona.clone(),
             duration_remaining_seconds: device.duration_remaining().as_secs(),
             expiry_unix: device.expiry_unix(),
+            template_snapshot_hash: device.template_snapshot_hash.clone(),
+            delegated_authority_refs: device.delegated_authority_refs.clone(),
+            delegated_material: device.delegated_material.clone(),
+            attested_device_ref: device.attested_device_ref.clone(),
         }))
     }
 }
@@ -549,6 +612,10 @@ pub struct ActiveEnrollmentStatus {
     pub persona: String,
     pub duration_remaining_seconds: u64,
     pub expiry_unix: i64,
+    pub template_snapshot_hash: String,
+    pub delegated_authority_refs: Vec<String>,
+    pub delegated_material: HeadlessDelegatedMaterial,
+    pub attested_device_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +626,14 @@ struct PersistedActiveEnrollment {
     account: String,
     enrolled_at_unix: i64,
     expiry_unix: i64,
+    #[serde(default)]
+    template_snapshot_hash: String,
+    #[serde(default)]
+    delegated_authority_refs: Vec<String>,
+    #[serde(default)]
+    delegated_material: HeadlessDelegatedMaterial,
+    #[serde(default)]
+    attested_device_ref: String,
 }
 
 impl PersistedActiveEnrollment {
@@ -570,24 +645,42 @@ impl PersistedActiveEnrollment {
             account: device.account.clone(),
             enrolled_at_unix: system_time_to_unix(device.enrolled_at),
             expiry_unix: device.expiry_unix(),
+            template_snapshot_hash: device.template_snapshot_hash.clone(),
+            delegated_authority_refs: device.delegated_authority_refs.clone(),
+            delegated_material: device.delegated_material.clone(),
+            attested_device_ref: device.attested_device_ref.clone(),
         }
     }
 
     fn into_device(self) -> Result<AttestedDevice, Error> {
-        if self.version != ACTIVE_ENROLLMENT_VERSION {
+        if self.version != 1 && self.version != ACTIVE_ENROLLMENT_VERSION {
             return Err(Error::Decode(format!(
                 "unsupported active enrollment metadata version {}",
                 self.version
             )));
         }
+        let account = self.account;
+        let attested_device_ref = if self.version == 1 || self.attested_device_ref.is_empty() {
+            default_attested_device_ref(&account)
+        } else {
+            self.attested_device_ref
+        };
         Ok(AttestedDevice {
             enrollment_id: self.enrollment_id,
             persona: self.persona,
-            account: self.account,
+            account,
             enrolled_at: unix_to_system_time(self.enrolled_at_unix, "enrolled_at_unix")?,
             expiry: unix_to_system_time(self.expiry_unix, "expiry_unix")?,
+            template_snapshot_hash: self.template_snapshot_hash,
+            delegated_authority_refs: self.delegated_authority_refs,
+            delegated_material: self.delegated_material,
+            attested_device_ref,
         })
     }
+}
+
+fn default_attested_device_ref(account: &str) -> String {
+    format!("keychain:{KEYCHAIN_SERVICE}:{account}")
 }
 
 fn persist_active_metadata(data_dir: &Path, device: &AttestedDevice) -> Result<(), Error> {
@@ -682,6 +775,10 @@ mod tests {
             account: persona.to_string(),
             enrolled_at: SystemTime::now(),
             expiry: SystemTime::now() + Duration::from_secs(60),
+            template_snapshot_hash: String::new(),
+            delegated_authority_refs: Vec::new(),
+            delegated_material: HeadlessDelegatedMaterial::default(),
+            attested_device_ref: default_attested_device_ref(persona),
         };
         // No entry exists; revoke should still succeed.
         device.revoke().expect("revoke succeeds on missing entry");
@@ -695,6 +792,10 @@ mod tests {
             account: "test-expired".into(),
             enrolled_at: SystemTime::now() - Duration::from_secs(120),
             expiry: SystemTime::now() - Duration::from_secs(60),
+            template_snapshot_hash: String::new(),
+            delegated_authority_refs: Vec::new(),
+            delegated_material: HeadlessDelegatedMaterial::default(),
+            attested_device_ref: default_attested_device_ref("test-expired"),
         };
         assert!(device.is_expired());
         assert_eq!(device.duration_remaining(), Duration::ZERO);
@@ -708,6 +809,10 @@ mod tests {
             account: "test-future".into(),
             enrolled_at: SystemTime::now(),
             expiry: SystemTime::now() + Duration::from_secs(3600),
+            template_snapshot_hash: String::new(),
+            delegated_authority_refs: Vec::new(),
+            delegated_material: HeadlessDelegatedMaterial::default(),
+            attested_device_ref: default_attested_device_ref("test-future"),
         };
         assert!(!device.is_expired());
         assert!(device.duration_remaining().as_secs() > 3500);
@@ -909,6 +1014,10 @@ mod tests {
             account: persona.to_string(),
             enrolled_at: SystemTime::now(),
             expiry: SystemTime::now() + Duration::from_secs(3600),
+            template_snapshot_hash: String::new(),
+            delegated_authority_refs: Vec::new(),
+            delegated_material: HeadlessDelegatedMaterial::default(),
+            attested_device_ref: default_attested_device_ref(persona),
         };
         match device.unwrap_mek() {
             Err(Error::LegacyUnwrappedFormat) => {}
@@ -942,7 +1051,7 @@ mod tests {
     }
 }
 
-// implementation-note-193 anchor: this constant marks
+// implementation-note-170 anchor: this constant marks
 // the crate-level B1+B2 landing for grep-time auditability.
 #[doc(hidden)]
 pub const VAULT_SCOPE_MEK_SPLIT_CRYPTOGRAPHIC_LANDED: &str =

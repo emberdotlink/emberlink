@@ -390,10 +390,11 @@ fn looks_like_managed_worktree_root(path: &Path) -> bool {
     let Some(grandparent) = parent.parent() else {
         return false;
     };
-    parent.file_name().is_some_and(|name| name == WORKTREE_DIR_BASENAME)
+    parent
+        .file_name()
+        .is_some_and(|name| name == WORKTREE_DIR_BASENAME)
         && grandparent.file_name().is_some_and(|name| {
-            name == MANAGED_WORKTREE_ROOT_BASENAME
-                || name == LEGACY_MANAGED_WORKTREE_ROOT_BASENAME
+            name == MANAGED_WORKTREE_ROOT_BASENAME || name == LEGACY_MANAGED_WORKTREE_ROOT_BASENAME
         })
 }
 
@@ -458,7 +459,10 @@ mod tests {
             RuntimeSelectionSource::SharedDefault,
         );
         assert_eq!(runtime.worktree_id, SHARED_DEV_RUNTIME_ID);
-        assert_eq!(runtime.install_root, PathBuf::from("/usr/local/lib/ember-dev"));
+        assert_eq!(
+            runtime.install_root,
+            PathBuf::from("/usr/local/lib/ember-dev")
+        );
         assert_eq!(
             runtime.socket_path,
             PathBuf::from("/home/tester/.ember/run/daemon.dev.sock")

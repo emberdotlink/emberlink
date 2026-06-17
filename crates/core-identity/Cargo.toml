@@ -10,3 +10,5 @@ core-types = { path = "../core-types" }
 core-principals = { path = "../core-principals" }
 core-event-types = { path = "../core-event-types" }
 
+[lints]
+workspace = true

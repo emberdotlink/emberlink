@@ -1,5 +1,5 @@
 //! Integration tests for `ember vault list/get/put/export/import`
-//! (implementation-note-458).
+//! (implementation-note-470).
 //!
 //! The argv-parsing surface lives in `bin/ember.rs`; the round-trip
 //! semantics live in `emberlink_cli::vault_io`. These tests exercise:
@@ -88,7 +88,7 @@ fn put_then_list_then_get_round_trip() {
     let raw = vault
         .get(VaultScope::Interactive, &store, "azure/tenant-id")
         .expect("get succeeded");
-    assert_eq!(raw, b"tnt-123-XYZQ");
+    assert_eq!(raw.as_slice(), b"tnt-123-XYZQ");
     assert_eq!(mask_credential_for_display(&raw), "****XYZQ");
 }
 
@@ -162,7 +162,7 @@ fn export_import_round_trip() {
     let mut pairs: Vec<(String, Vec<u8>)> = Vec::new();
     for c in &creds {
         let v = vault.get(VaultScope::Interactive, &store, &c.name).unwrap();
-        pairs.push((c.name.clone(), v));
+        pairs.push((c.name.clone(), v.to_vec()));
     }
     let envelope = encode_export_envelope(&kp.public_key, &pairs, "2026-05-10T00:00:00Z".into())
         .expect("encode envelope");
@@ -213,7 +213,7 @@ fn export_import_round_trip() {
     // Verify all three round-tripped byte-for-byte.
     for (name, expected) in &entries {
         let got = vault.get(VaultScope::Interactive, &store, name).unwrap();
-        assert_eq!(&got, expected, "{name} did not round-trip");
+        assert_eq!(got.as_slice(), expected, "{name} did not round-trip");
     }
 }
 

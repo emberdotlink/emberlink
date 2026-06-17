@@ -1,4 +1,4 @@
-//! implementation-note-232 regression coverage.
+//! implementation-note-209 regression coverage.
 //!
 //! Pre-fix the simple-grant CLI path called `store.create_grant(...)` (which
 //! built the canonical block-zero statement with `budget = None`) and then
@@ -33,8 +33,7 @@ use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// Deterministic vault key for these tests. Stable across the binary so the
 /// persona-secret encrypt/decrypt round-trips.
@@ -177,12 +176,10 @@ async fn api_grants_includes_budget_when_set() {
         without_budget_id = without_budget.id;
     } // Drop store before run_dashboard re-opens the DB.
 
-    // 2. Bind an ephemeral port, drop the listener, hand the addr to run_dashboard.
-    let ephemeral = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = ephemeral.local_addr().unwrap();
-    drop(ephemeral);
-
+    // 2. Let run_dashboard own the ephemeral bind to avoid nextest port races.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (bind_tx, bind_rx) = oneshot::channel();
+    let requested_addr = "127.0.0.1:0".parse().expect("loopback addr");
     let db = db_path.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -192,12 +189,21 @@ async fn api_grants_includes_budget_when_set() {
         let local = tokio::task::LocalSet::new();
         local.block_on(
             &rt,
-            run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None),
+            run_dashboard(
+                requested_addr,
+                db,
+                "0.0.0-test".to_string(),
+                None,
+                shutdown_rx,
+                Some(bind_tx),
+            ),
         );
     });
-
-    // Give the listener time to bind.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let addr = tokio::time::timeout(Duration::from_secs(2), bind_rx)
+        .await
+        .expect("dashboard bind timed out")
+        .expect("dashboard bind channel closed")
+        .expect("dashboard bind failed");
 
     // 3. GET /api/grants and parse the JSON body.
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();

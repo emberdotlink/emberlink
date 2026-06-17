@@ -42,7 +42,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, MintStamp,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -411,6 +413,7 @@ impl Broker for VercelBroker {
             token: SecretString::from(token),
             expires_at,
             materialization_id,
+            mint_stamp: MintStamp::Opaque,
         })
     }
 
@@ -602,6 +605,13 @@ mod tests {
             provider: BrokerProvider::Vercel,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -1098,5 +1108,26 @@ mod tests {
     fn map_vercel_error_422_returns_upstream() {
         let err = map_vercel_error(422, &invalid_expiration_body());
         assert!(matches!(err, BrokerError::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn issue_mint_stamp_is_opaque() {
+        let mock = Arc::new(MockVercelClient::new().with_response(
+            200,
+            create_ok_body("tok-1", "ember-test", "vercel-token-value"),
+        ));
+        let broker = VercelBroker::with_client(fixture_parent(), mock);
+        let req = vercel_request(
+            serde_json::json!({ "expiration_seconds": 3600, "name": "ember-test-token" }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        assert!(
+            matches!(cred.mint_stamp, MintStamp::Opaque),
+            "Vercel mint_stamp should be Opaque, got {:?}",
+            cred.mint_stamp
+        );
     }
 }

@@ -4,9 +4,36 @@
 //! Entry point: [`verify_construct_signature`].
 
 use base64::Engine as _;
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
+
+static GLOBAL_CACHE: Lazy<VerifierCache> = Lazy::new(VerifierCache::new);
+
+/// Global binary-hash cache shared across all `verify_construct_sidecar` calls.
+pub fn verifier_cache() -> &'static VerifierCache {
+    &GLOBAL_CACHE
+}
+
+/// The verifier's interface for reading trust-graph state from the store.
+/// Implemented by `DaemonStore`; defined here so the verifier file imports
+/// zero backend-specific types, preserving design backend portability.
+pub trait TrustStore {
+    /// Read active (non-revoked) publisher trust delegations.
+    fn list_active_publisher_trusts(
+        &self,
+    ) -> Result<Vec<crate::trust_graph::PublisherTrustDelegation>, TrustStoreError>;
+
+    /// Opaque revision counter — must change on any mutation to the trust
+    /// delegation table visible through this store.
+    fn trust_graph_revision(&self) -> u64;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("trust store: {0}")]
+pub struct TrustStoreError(pub String);
 
 /// Deserialized sidecar JSON envelope. Schema matches what
 /// emberlink-cli's `ember construct sign` writes (see
@@ -41,6 +68,8 @@ pub enum VerifyError {
     SignatureAlgUnsupported(String),
     #[error("trust_graph error: {0}")]
     TrustGraph(#[from] crate::trust_graph::TrustGraphError),
+    #[error("trust_store: {0}")]
+    TrustStoreRead(#[from] TrustStoreError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("serde: {0}")]
@@ -49,16 +78,32 @@ pub enum VerifyError {
     Base64(String),
     #[error("hex: {0}")]
     Hex(String),
+    /// Pre-release security review M7: refuse to verify any sidecar
+    /// against a trust anchor that is still the dev0 placeholder
+    /// (derived from the committed `keys/dev0-construct-signing.seed`).
+    /// The placeholder seed in the public mirror lets anyone forge
+    /// signatures that validate against this anchor, so verification
+    /// MUST fail-closed until the operator cutover (production key
+    /// installed + seed file deleted) lands. See
+    /// `trust_graph::is_placeholder_trust_anchor`.
+    #[error(
+        "placeholder_trust_anchor: anchor pubkey {anchor_hex} still traces to \
+         the dev0 placeholder seed; AC-7 enforcement must not be enabled until \
+         the production publisher-trust key replaces it"
+    )]
+    PlaceholderTrustAnchor { anchor_hex: String },
 }
 
-/// Cache key: (blake3_hex, trust_graph_version). Cache flush happens on
-/// trust-graph mutation by bumping the trust_graph_version.
-type CacheKey = (String, u64);
+/// Binary-hash cache. Keys on file identity `(path, mtime_secs, file_size)`;
+/// values are `blake3_hex` of `binary_bytes || construct_toml_bytes`. The cache
+/// memoizes only the expensive file-hash recomputation; trust-graph state is
+/// never cached here — delegations are read fresh from the store on every
+/// `verify_construct_signature` call, so a revoked delegation immediately
+/// stops verifying with zero explicit cache invalidation.
+type BinaryCacheKey = (PathBuf, i64, u64);
 
-/// In-process cache for verified sidecars. Fail-closed: an unknown key
-/// requires a full re-verification.
 pub struct VerifierCache {
-    inner: RwLock<HashMap<CacheKey, ()>>,
+    inner: RwLock<HashMap<BinaryCacheKey, String>>,
 }
 
 impl Default for VerifierCache {
@@ -69,9 +114,22 @@ impl Default for VerifierCache {
     }
 }
 
+// len() is a cache-size metric, not a collection emptiness check; adding is_empty() is out of scope for the lint-clear.
+#[allow(clippy::len_without_is_empty)]
 impl VerifierCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn get(&self, path: &std::path::Path, mtime: i64, file_size: u64) -> Option<String> {
+        let key = (path.to_path_buf(), mtime, file_size);
+        self.inner.read().ok()?.get(&key).cloned()
+    }
+
+    pub fn insert(&self, path: PathBuf, mtime: i64, file_size: u64, blake3_hex: String) {
+        if let Ok(mut g) = self.inner.write() {
+            g.insert((path, mtime, file_size), blake3_hex);
+        }
     }
 
     pub fn flush(&self) {
@@ -79,25 +137,28 @@ impl VerifierCache {
             g.clear();
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().map(|g| g.len()).unwrap_or(0)
+    }
 }
 
 /// Top-level verifier entry point.
 ///
 /// Steps (per docs/construct-signing-pipeline.md §Verification flow):
-/// 1. Validate schema_version and signature_alg, then check cache.
-/// 2. Re-compute blake3 over `binary_bytes || construct_toml_bytes`
-///    and compare with `sidecar.blake3` (strip "blake3:" prefix).
-/// 3. Resolve publisher's pubkey via `trust_graph::resolve_publisher_pubkey`.
-/// 4. Build canonical payload (JCS) over
-///    {publisher_did, name, version, blake3, build_ts}
-///    and Ed25519-verify the signature against the resolved pubkey.
-/// 5. On success, insert into cache keyed by (blake3, trust_graph_version).
+/// 1. Validate schema_version and signature_alg.
+/// 2. Compare the caller-supplied `computed_blake3_hex` (which the caller
+///    MUST have computed from the actual `binary_bytes || construct_toml_bytes`)
+///    with the sidecar's `blake3` claim.
+/// 3. Read active publisher delegations from `trust_store` (**fresh on
+///    every call** — no trust-state caching).
+/// 4. Resolve publisher's pubkey via `trust_graph::resolve_publisher_pubkey`.
+/// 5. Build canonical payload (JCS), Ed25519-verify against the resolved
+///    pubkey.
 pub fn verify_construct_signature(
     sidecar: &SidecarEnvelope,
-    binary_bytes: &[u8],
-    construct_toml_bytes: &[u8],
-    cache: &VerifierCache,
-    trust_graph_version: u64,
+    computed_blake3_hex: &str,
+    trust_store: &dyn TrustStore,
 ) -> Result<(), VerifyError> {
     // Step 1 — schema + alg gate.
     if sidecar.schema_version != 1 {
@@ -109,30 +170,21 @@ pub fn verify_construct_signature(
         ));
     }
 
-    // Step 2 — cache lookup before any crypto.
-    let blake3_hex_only = sidecar
+    // Step 2 — binary pin: compare the CALLER-COMPUTED hash with the
+    // sidecar's self-asserted claim.
+    let sidecar_blake3 = sidecar
         .blake3
         .strip_prefix("blake3:")
-        .unwrap_or(&sidecar.blake3)
-        .to_string();
-    let cache_key: CacheKey = (blake3_hex_only.clone(), trust_graph_version);
-    if let Ok(g) = cache.inner.read()
-        && g.contains_key(&cache_key)
-    {
-        return Ok(());
-    }
-
-    // Step 3 — re-compute blake3.
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(binary_bytes);
-    hasher.update(construct_toml_bytes);
-    let computed = hex::encode(hasher.finalize().as_bytes());
-    if computed != blake3_hex_only {
+        .unwrap_or(&sidecar.blake3);
+    if computed_blake3_hex != sidecar_blake3 {
         return Err(VerifyError::BinaryPinMismatch {
-            sidecar: blake3_hex_only,
-            computed,
+            sidecar: sidecar_blake3.to_string(),
+            computed: computed_blake3_hex.to_string(),
         });
     }
+
+    // Step 3 — read delegations fresh from the store on every call.
+    let delegations = trust_store.list_active_publisher_trusts()?;
 
     // Step 4 — resolve publisher key.
     let build_ts_epoch = chrono::DateTime::parse_from_rfc3339(&sidecar.build_ts)
@@ -140,8 +192,28 @@ pub fn verify_construct_signature(
             reason: format!("build_ts parse: {e}"),
         })?
         .timestamp();
-    let publisher_key =
-        crate::trust_graph::resolve_publisher_pubkey(&sidecar.publisher_did, build_ts_epoch)?;
+    let publisher_key = crate::trust_graph::resolve_publisher_pubkey(
+        &sidecar.publisher_did,
+        build_ts_epoch,
+        &delegations,
+    )?;
+
+    // M7 (pre-release security review): refuse to verify against the
+    // dev0 placeholder anchor. `keys/dev0-construct-signing.seed` is
+    // committed to git and derives `EMBER_SYSTEMS_PUBKEY_BYTES`; a public
+    // mirror would ship the seed, letting anyone forge signatures that
+    // validate against this key. The check is byte-comparison and
+    // applies to BOTH the pinned `did:emberlink` path and any installed
+    // delegation whose pubkey happens to equal the placeholder — either
+    // would be equally forgeable. The operator cutover (replace
+    // `EMBER_SYSTEMS_PUBKEY_BYTES` + delete the seed file) turns this
+    // back into a no-op without any verifier-side code change.
+    let anchor_bytes = publisher_key.pubkey.to_bytes();
+    if crate::trust_graph::is_placeholder_trust_anchor(&anchor_bytes) {
+        return Err(VerifyError::PlaceholderTrustAnchor {
+            anchor_hex: hex::encode(anchor_bytes),
+        });
+    }
 
     // Step 5 — JCS canonical payload + Ed25519 verify.
     let canonical_payload_value = serde_json::json!({
@@ -177,20 +249,42 @@ pub fn verify_construct_signature(
             reason: format!("ed25519 verify: {e}"),
         })?;
 
-    // Cache the successful verification.
-    if let Ok(mut g) = cache.inner.write() {
-        g.insert(cache_key, ());
-    }
-
     Ok(())
+}
+
+/// Compute blake3 over `binary_bytes || construct_toml_bytes`.
+pub fn compute_blake3_hex(binary_bytes: &[u8], construct_toml_bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(binary_bytes);
+    hasher.update(construct_toml_bytes);
+    hex::encode(hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a sidecar + matching binary/toml bytes using a fresh Ed25519 key.
-    /// Returns (sidecar, binary_bytes, toml_bytes, signing_key).
+    struct TestTrustStore {
+        delegations: Vec<crate::trust_graph::PublisherTrustDelegation>,
+    }
+
+    impl TrustStore for TestTrustStore {
+        fn list_active_publisher_trusts(
+            &self,
+        ) -> Result<Vec<crate::trust_graph::PublisherTrustDelegation>, TrustStoreError> {
+            Ok(self
+                .delegations
+                .iter()
+                .filter(|d| d.revoked_at.is_none())
+                .cloned()
+                .collect())
+        }
+
+        fn trust_graph_revision(&self) -> u64 {
+            1
+        }
+    }
+
     fn make_valid_sidecar(
         signing_key: &ed25519_dalek::SigningKey,
     ) -> (SidecarEnvelope, Vec<u8>, Vec<u8>) {
@@ -199,10 +293,7 @@ mod tests {
         let binary_bytes = b"fake-binary-content".to_vec();
         let toml_bytes = b"[meta]\npublisher = \"did:test\"\nname = \"test-construct\"\n".to_vec();
 
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&binary_bytes);
-        hasher.update(&toml_bytes);
-        let blake3_hex = hex::encode(hasher.finalize().as_bytes());
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
         let blake3_field = format!("blake3:{blake3_hex}");
 
         let build_ts = "2026-05-05T13:42:08Z".to_string();
@@ -232,88 +323,11 @@ mod tests {
         (sidecar, binary_bytes, toml_bytes)
     }
 
-    /// Stub trust graph lookup using a caller-supplied pubkey — bypasses
-    /// resolve_publisher_pubkey's DID-based lookup so tests exercise the
-    /// crypto path with a real key pair.
-    fn verify_with_stub_pubkey(
-        sidecar: &SidecarEnvelope,
-        binary_bytes: &[u8],
-        construct_toml_bytes: &[u8],
-        pubkey: ed25519_dalek::VerifyingKey,
-        cache: &VerifierCache,
-        trust_graph_version: u64,
-    ) -> Result<(), VerifyError> {
-        if sidecar.schema_version != 1 {
-            return Err(VerifyError::SchemaUnsupported(sidecar.schema_version));
-        }
-        if sidecar.signature_alg != "ed25519" {
-            return Err(VerifyError::SignatureAlgUnsupported(
-                sidecar.signature_alg.clone(),
-            ));
-        }
-
-        let blake3_hex_only = sidecar
-            .blake3
-            .strip_prefix("blake3:")
-            .unwrap_or(&sidecar.blake3)
-            .to_string();
-        let cache_key: CacheKey = (blake3_hex_only.clone(), trust_graph_version);
-        if let Ok(g) = cache.inner.read() {
-            if g.contains_key(&cache_key) {
-                return Ok(());
-            }
-        }
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(binary_bytes);
-        hasher.update(construct_toml_bytes);
-        let computed = hex::encode(hasher.finalize().as_bytes());
-        if computed != blake3_hex_only {
-            return Err(VerifyError::BinaryPinMismatch {
-                sidecar: blake3_hex_only,
-                computed,
-            });
-        }
-
-        let canonical_payload_value = serde_json::json!({
-            "blake3": sidecar.blake3,
-            "build_ts": sidecar.build_ts,
-            "name": sidecar.name,
-            "publisher_did": sidecar.publisher_did,
-            "version": sidecar.version,
-        });
-        let canonical_bytes =
-            core_crypto::canonicalize_jcs(&canonical_payload_value).map_err(|e| {
-                VerifyError::SignatureInvalid {
-                    reason: format!("jcs: {e}"),
-                }
-            })?;
-
-        let sig_b64 = sidecar
-            .signature
-            .strip_prefix("ed25519:")
-            .unwrap_or(&sidecar.signature);
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(sig_b64)
-            .map_err(|e| VerifyError::Base64(e.to_string()))?;
-        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).map_err(|e| {
-            VerifyError::SignatureInvalid {
-                reason: format!("sig parse: {e}"),
-            }
-        })?;
-
-        pubkey.verify_strict(&canonical_bytes, &sig).map_err(|e| {
-            VerifyError::SignatureInvalid {
-                reason: format!("ed25519 verify: {e}"),
-            }
-        })?;
-
-        if let Ok(mut g) = cache.inner.write() {
-            g.insert(cache_key, ());
-        }
-        Ok(())
-    }
-
+    /// Signing key derived from the committed dev0 seed (raw `[1..=32]`).
+    /// Its verifying key equals `EMBER_SYSTEMS_PUBKEY_BYTES` and is
+    /// therefore recognized as the placeholder anchor. Use this ONLY in
+    /// tests that exercise the M7 placeholder-refusal path; everything
+    /// else uses `non_placeholder_signing_key()`.
     fn test_signing_key() -> ed25519_dalek::SigningKey {
         let seed: [u8; 32] = {
             let mut s = [0u8; 32];
@@ -325,22 +339,73 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&seed)
     }
 
-    #[test]
-    fn happy_path_verifies_cleanly() {
-        let signing_key = test_signing_key();
-        let verifying_key = signing_key.verifying_key();
-        let cache = VerifierCache::new();
-        let (sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
-
-        let result = verify_with_stub_pubkey(
-            &sidecar,
-            &binary_bytes,
-            &toml_bytes,
-            verifying_key,
-            &cache,
-            1,
+    /// Signing key whose verifying key is distinct from
+    /// `EMBER_SYSTEMS_PUBKEY_BYTES`. Used by every test that expects
+    /// `verify_construct_signature` to make it past the M7 placeholder
+    /// guard.
+    fn non_placeholder_signing_key() -> ed25519_dalek::SigningKey {
+        let mut seed = [0u8; 32];
+        seed[0] = 0xa5;
+        seed[31] = 0x5a;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        debug_assert_ne!(
+            sk.verifying_key().to_bytes(),
+            crate::trust_graph::EMBER_SYSTEMS_PUBKEY_BYTES,
+            "non_placeholder_signing_key must not collide with the placeholder anchor"
         );
-        assert!(result.is_ok(), "happy path must succeed: {result:?}");
+        sk
+    }
+
+    fn make_delegation_for_did(
+        did: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> crate::trust_graph::PublisherTrustDelegation {
+        crate::trust_graph::PublisherTrustDelegation {
+            id: "test-deleg".to_string(),
+            publisher_did: did.to_string(),
+            pubkey_bytes: signing_key.verifying_key().to_bytes(),
+            valid_from: 0,
+            valid_until: None,
+            installed_at: 1000,
+            revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn happy_path_with_delegation_verifies_cleanly() {
+        // Uses non_placeholder_signing_key so the M7 placeholder guard
+        // doesn't refuse — the goal of this test is to confirm the
+        // delegation-backed verify path works end-to-end with a real
+        // (non-placeholder) trust anchor.
+        let signing_key = non_placeholder_signing_key();
+        let (sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
+        let deleg = make_delegation_for_did("did:test", &signing_key);
+        let store = TestTrustStore {
+            delegations: vec![deleg],
+        };
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
+
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
+        assert!(
+            result.is_ok(),
+            "delegation-backed verify must succeed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn no_delegation_for_publisher_fails_closed() {
+        let signing_key = test_signing_key();
+        let (sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
+        let store = TestTrustStore {
+            delegations: vec![],
+        };
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
+
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
+        assert!(
+            matches!(result, Err(VerifyError::TrustGraph(_))),
+            "no delegation must fail closed: {result:?}"
+        );
     }
 
     #[test]
@@ -348,9 +413,12 @@ mod tests {
         let signing_key = test_signing_key();
         let (mut sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
         sidecar.schema_version = 99;
+        let store = TestTrustStore {
+            delegations: vec![],
+        };
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
 
-        let cache = VerifierCache::new();
-        let result = verify_construct_signature(&sidecar, &binary_bytes, &toml_bytes, &cache, 1);
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
         match result {
             Err(VerifyError::SchemaUnsupported(99)) => {}
             other => panic!("expected SchemaUnsupported(99), got {other:?}"),
@@ -362,9 +430,12 @@ mod tests {
         let signing_key = test_signing_key();
         let (mut sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
         sidecar.signature_alg = "rsa".to_string();
+        let store = TestTrustStore {
+            delegations: vec![],
+        };
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
 
-        let cache = VerifierCache::new();
-        let result = verify_construct_signature(&sidecar, &binary_bytes, &toml_bytes, &cache, 1);
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
         match result {
             Err(VerifyError::SignatureAlgUnsupported(ref alg)) if alg == "rsa" => {}
             other => panic!("expected SignatureAlgUnsupported(rsa), got {other:?}"),
@@ -375,11 +446,12 @@ mod tests {
     fn blake3_mismatch_returns_binary_pin_mismatch() {
         let signing_key = test_signing_key();
         let (sidecar, _binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
+        let store = TestTrustStore {
+            delegations: vec![],
+        };
+        let wrong_hash = compute_blake3_hex(b"tampered-binary-content", &toml_bytes);
 
-        // Pass different binary bytes — the blake3 won't match.
-        let tampered_binary = b"tampered-binary-content";
-        let cache = VerifierCache::new();
-        let result = verify_construct_signature(&sidecar, tampered_binary, &toml_bytes, &cache, 1);
+        let result = verify_construct_signature(&sidecar, &wrong_hash, &store);
         match result {
             Err(VerifyError::BinaryPinMismatch { .. }) => {}
             other => panic!("expected BinaryPinMismatch, got {other:?}"),
@@ -387,34 +459,157 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_skips_crypto_on_second_call() {
+    fn revoked_delegation_fails_signature_verification() {
         let signing_key = test_signing_key();
-        let verifying_key = signing_key.verifying_key();
-        let cache = VerifierCache::new();
         let (sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
+        let mut deleg = make_delegation_for_did("did:test", &signing_key);
+        deleg.revoked_at = Some(1735000000);
+        let store = TestTrustStore {
+            delegations: vec![deleg],
+        };
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
 
-        // First call — populates cache.
-        verify_with_stub_pubkey(
-            &sidecar,
-            &binary_bytes,
-            &toml_bytes,
-            verifying_key,
-            &cache,
-            1,
-        )
-        .expect("first call must succeed");
-
-        // Second call with tampered binary — would normally fail blake3, but
-        // cache hit returns Ok before reaching the crypto path.
-        let tampered_binary = b"completely-different-bytes";
-        let result = verify_with_stub_pubkey(
-            &sidecar,
-            tampered_binary,
-            &toml_bytes,
-            verifying_key,
-            &cache,
-            1,
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
+        assert!(
+            matches!(result, Err(VerifyError::TrustGraph(_))),
+            "revoked delegation must fail: {result:?}"
         );
-        assert!(result.is_ok(), "cache hit must short-circuit: {result:?}");
+    }
+
+    fn make_did_emberlink_sidecar(
+        signing_key: &ed25519_dalek::SigningKey,
+        binary_bytes: &[u8],
+        toml_bytes: &[u8],
+    ) -> SidecarEnvelope {
+        use ed25519_dalek::Signer as _;
+
+        let blake3_hex = compute_blake3_hex(binary_bytes, toml_bytes);
+        let blake3_field = format!("blake3:{blake3_hex}");
+        let build_ts = "2026-06-09T12:00:00Z".to_string();
+
+        let payload_value = serde_json::json!({
+            "blake3": blake3_field,
+            "build_ts": build_ts,
+            "name": "gh",
+            "publisher_did": "did:emberlink",
+            "version": "0.3.0",
+        });
+        let canonical_bytes = core_crypto::canonicalize_jcs(&payload_value).unwrap();
+        let signature = signing_key.sign(&canonical_bytes);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+
+        SidecarEnvelope {
+            schema_version: 1,
+            publisher_did: "did:emberlink".to_string(),
+            name: "gh".to_string(),
+            version: "0.3.0".to_string(),
+            blake3: blake3_field,
+            build_ts,
+            signature: format!("ed25519:{sig_b64}"),
+            signature_alg: "ed25519".to_string(),
+        }
+    }
+
+    /// M7: a sidecar signed by the placeholder dev0 key and verified
+    /// through the pinned `did:emberlink` path MUST be refused. The
+    /// signature itself would be valid (the daemon could decode it and
+    /// `verify_strict` would succeed), but the verifier refuses earlier
+    /// — the trust anchor is the placeholder whose seed is committed to
+    /// git, so any verification through this path is forgeable.
+    #[test]
+    fn verify_construct_signature_refuses_when_trust_anchor_is_placeholder() {
+        let signing_key = test_signing_key(); // placeholder dev0 key
+        let binary_bytes = b"bundled-construct-binary";
+        let toml_bytes = b"[meta]\npublisher = \"did:emberlink\"\nname = \"gh\"\n";
+        let sidecar = make_did_emberlink_sidecar(&signing_key, binary_bytes, toml_bytes);
+        let store = TestTrustStore {
+            delegations: vec![],
+        };
+        let blake3_hex = compute_blake3_hex(binary_bytes, toml_bytes);
+
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
+        match result {
+            Err(VerifyError::PlaceholderTrustAnchor { ref anchor_hex }) => {
+                assert_eq!(
+                    anchor_hex,
+                    &hex::encode(crate::trust_graph::EMBER_SYSTEMS_PUBKEY_BYTES),
+                    "anchor_hex must report the resolved (placeholder) trust anchor"
+                );
+            }
+            other => panic!(
+                "expected PlaceholderTrustAnchor refusal for did:emberlink with \
+                 placeholder anchor, got {other:?}"
+            ),
+        }
+    }
+
+    /// M7: when the trust anchor is NOT the placeholder (a freshly
+    /// generated test key installed via a delegation), the placeholder
+    /// guard does NOT blanket-refuse — verification proceeds and either
+    /// passes or fails on its own merits. This test asserts the guard
+    /// only triggers on the placeholder byte-pattern.
+    #[test]
+    fn verify_construct_signature_proceeds_when_trust_anchor_is_not_placeholder() {
+        let signing_key = non_placeholder_signing_key();
+        let (sidecar, binary_bytes, toml_bytes) = make_valid_sidecar(&signing_key);
+        let deleg = make_delegation_for_did("did:test", &signing_key);
+        let store = TestTrustStore {
+            delegations: vec![deleg],
+        };
+        let blake3_hex = compute_blake3_hex(&binary_bytes, &toml_bytes);
+
+        let result = verify_construct_signature(&sidecar, &blake3_hex, &store);
+        // Either Ok (full verify passes) or some non-placeholder error —
+        // the load-bearing assertion is that we do NOT get the
+        // PlaceholderTrustAnchor refusal.
+        assert!(
+            !matches!(result, Err(VerifyError::PlaceholderTrustAnchor { .. })),
+            "non-placeholder anchor must not be refused by the M7 guard: {result:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "valid signature with non-placeholder anchor must verify cleanly: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tampered_binary_fails_did_emberlink() {
+        let signing_key = test_signing_key();
+        let binary_bytes = b"bundled-construct-binary";
+        let toml_bytes = b"[meta]\npublisher = \"did:emberlink\"\nname = \"gh\"\n";
+        let sidecar = make_did_emberlink_sidecar(&signing_key, binary_bytes, toml_bytes);
+        let store = TestTrustStore {
+            delegations: vec![],
+        };
+        let tampered_hash = compute_blake3_hex(b"tampered-binary", toml_bytes);
+
+        let result = verify_construct_signature(&sidecar, &tampered_hash, &store);
+        assert!(
+            matches!(result, Err(VerifyError::BinaryPinMismatch { .. })),
+            "tampered binary must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn cache_key_shape_is_path_mtime_size() {
+        let cache = VerifierCache::new();
+        let path = PathBuf::from("/some/binary");
+        cache.insert(path.clone(), 1234, 5678, "abc123".to_string());
+        assert_eq!(cache.get(&path, 1234, 5678), Some("abc123".to_string()));
+        assert_eq!(
+            cache.get(&path, 1234, 9999),
+            None,
+            "different size must miss"
+        );
+        assert_eq!(
+            cache.get(&path, 9999, 5678),
+            None,
+            "different mtime must miss"
+        );
+        assert_eq!(
+            cache.get(&PathBuf::from("/other/binary"), 1234, 5678),
+            None,
+            "different path must miss"
+        );
     }
 }

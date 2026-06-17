@@ -1,5 +1,6 @@
 //! core-principals — identity primitive type definitions.
 //!
+//! CLASSIFICATION: PUBLIC
 //!
 //! Holds the type definitions for the actor layer: persona, identity,
 //! recovery, trust, credential-delivery, network endpoints, and the

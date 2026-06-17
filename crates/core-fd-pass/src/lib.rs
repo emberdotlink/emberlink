@@ -1,8 +1,9 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `core-fd-pass` — SCM_RIGHTS + sealed-memfd cross-process fd-passing
 //! primitive. Helper crate for the `ember-rpc` plaintext lane
-//! (implementation-note-52; depends on
-//! META-design-AMEND-EXTEND-TO-implementation-note-53 Phase D).
+//! (implementation-note-59; depends on
+//! META-design-AMEND-EXTEND-TO-implementation-note-60 Phase D).
 //!
 //! ## checkpoint
 //!
@@ -13,7 +14,7 @@
 //!
 //! The existing `ember-daemon::broker::exec_env` covers the
 //! `fork(2) + execve(2)` fd-inheritance case (Phase 1 of
-//! implementation-note-54). That path can NOT hand an fd to
+//! implementation-note-61). That path can NOT hand an fd to
 //! a cross-process peer over a Unix domain socket because the receiver
 //! never shared a parent fd-table with the sender.
 //!
@@ -114,6 +115,12 @@ pub fn recv_fds(stream: &UnixStream, max_fds: usize) -> io::Result<(Vec<u8>, Vec
     // CMSG_SPACE(sizeof(int) * n) is the right answer. We use a
     // generous upper bound (CMSG_SPACE alignment is at most 32B
     // overhead on any reasonable libc) — overshoot is harmless.
+    //
+    // The buffer must have real LENGTH, not just capacity: nix ≥0.30's
+    // `recvmsg` treats the ancillary buffer as a slice and sizes
+    // `msg_controllen` from its `.len()` (older nix used spare capacity).
+    // A zero-length buffer leaves no room for the `SCM_RIGHTS` cmsg, so the
+    // fds are silently dropped — hence `vec![0u8; …]`, not `with_capacity`.
     let cmsg_capacity = std::mem::size_of::<RawFd>() * capped_fds + 64;
     let mut cmsg_buf: Vec<u8> = vec![0u8; cmsg_capacity];
 

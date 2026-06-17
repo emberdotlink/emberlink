@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `docs/cli-reference.md`, `docs/current-architecture.md`, `docs/emberlink-github-app-manifest.md`, `docs/launch/v0.3.0-operator-rc-runbook.md`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # GitHub Setup and Auth
 
 The current GitHub story is **App-first**.
@@ -94,4 +94,3 @@ ember status --troubleshoot
 
 If GitHub is the only missing part of your install, those commands are the
 right first repair path.
-

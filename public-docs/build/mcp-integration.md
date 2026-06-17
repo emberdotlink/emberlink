@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `docs/current-architecture.md`, `crates/emberlink-mcp/README.md`, `docs/cli-reference.md`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # MCP Integration
 
 `emberlink-mcp` is the MCP server for Emberlink’s daemon-backed authority

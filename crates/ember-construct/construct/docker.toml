@@ -1,99 +1,234 @@
-# Construct manifest for ember-docker per design §2.
-# Action schema: each [[actions]] declares an allowed action_key, optional
-# budget caps, biometric requirement, and a permit/deny default. The daemon's
-# broker.resolve consults this to decide whether the action requires a
-# credential mint, an existing grant, or refuses.
-#
-# Per-registry keys (`docker.push.<host>`, `docker.login.<host>`) are
-# matched by family-prefix at policy time when no exact key is declared here —
-# see design §3 (server-side reclassification). Current runtime still relies
-# on caller-supplied registry auth via env/file passthrough (`DOCKER_CONFIG`,
-# `DOCKER_CERT_PATH`, etc.); canonical broker materialization for registry creds
-# is follow-up work.
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-docker per design.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
 
 [meta]
 name = "ember-docker"
-version = "0.1.0"
+plugin_address = "registry.ember.systems/ember-systems/ember-docker"
+plugin_version = "0.1.0"
 publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Docker CLI Construct"
 description = "Docker CLI Construct. Gates `docker` invocations through ember's action policy: push/login/logout/run/build/exec/cp and cleanup verbs are classified and gated; read-only verbs (ps, images, inspect, logs, stats) are passthrough. Current runtime still relies on caller-supplied registry auth via DOCKER_CONFIG / related env/file passthrough rather than broker-minted registry credentials. Privileged invocations (--privileged, --pid=host, --network=host, host-root volume mounts) are refused outright."
-headless_requirements = ["env_passthrough_authority"]
 
-# Default policy for unlisted action keys.
-default = "deny"
+[defaults]
+materialization_class = "declared_host_material"
+material_classes = [{ kind = "file_env", name = "DOCKER_CONFIG" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
 
-# --- registry write surface (push) ---
+[runtime.cli]
+wrapped_binary = "docker"
 
 [[actions]]
 key = "docker.push.dockerhub"
+action_version = "v1"
+summary = "Run docker.push.dockerhub"
+input_schema = { kind = "argv", classifier = "push dockerhub *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.push.dockerhub"
+semantic_labels = ["docker.push.dockerhub"]
 
 [[actions]]
 key = "docker.push"
-default = "permit"          # family fallback for any docker.push.<host>
-
-# --- registry auth (login/logout) ---
-# auth flows through ember-kms; we never delegate to docker's keychain.
+action_version = "v1"
+summary = "Run docker.push"
+input_schema = { kind = "argv", classifier = "push *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.push"
+semantic_labels = ["docker.push"]
 
 [[actions]]
 key = "docker.login"
+action_version = "v1"
+summary = "Run docker.login"
+input_schema = { kind = "argv", classifier = "login *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "deny"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.login"
+semantic_labels = ["docker.login"]
 
 [[actions]]
 key = "docker.logout"
+action_version = "v1"
+summary = "Run docker.logout"
+input_schema = { kind = "argv", classifier = "logout *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
-
-# --- container lifecycle ---
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.logout"
+semantic_labels = ["docker.logout"]
 
 [[actions]]
 key = "docker.run"
+action_version = "v1"
+summary = "Run docker.run"
+input_schema = { kind = "argv", classifier = "run *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.run"
+semantic_labels = ["docker.run"]
 
 [[actions]]
 key = "docker.run.privileged"
-default = "deny"            # never auto-permit; requires explicit elevation
+action_version = "v1"
+summary = "Run docker.run.privileged"
+input_schema = { kind = "argv", classifier = "run privileged *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "deny"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.run.privileged"
+semantic_labels = ["docker.run.privileged"]
 
 [[actions]]
 key = "docker.build"
+action_version = "v1"
+summary = "Run docker.build"
+input_schema = { kind = "argv", classifier = "build *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.build"
+semantic_labels = ["docker.build"]
 
 [[actions]]
 key = "docker.exec"
+action_version = "v1"
+summary = "Run docker.exec"
+input_schema = { kind = "argv", classifier = "exec *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.exec"
+semantic_labels = ["docker.exec"]
 
 [[actions]]
 key = "docker.cp"
-default = "prompt"          # cross-boundary file copy; requires approval
-
-# --- container lifecycle (cleanup verbs) ---
-# These are commonly invoked during agent cleanup workflows. Absent classification
-# causes mid-session denials under default = "deny" — H2 exposure (audit 2026-05-09).
+action_version = "v1"
+summary = "Run docker.cp"
+input_schema = { kind = "argv", classifier = "cp *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.cp"
+semantic_labels = ["docker.cp"]
 
 [[actions]]
 key = "docker.stop"
-default = "prompt"          # stops a running container; reversible (container still exists)
+action_version = "v1"
+summary = "Run docker.stop"
+input_schema = { kind = "argv", classifier = "stop *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.stop"
+semantic_labels = ["docker.stop"]
 
 [[actions]]
 key = "docker.start"
-default = "prompt"          # starts a stopped container; reversible, low blast radius
+action_version = "v1"
+summary = "Run docker.start"
+input_schema = { kind = "argv", classifier = "start *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.start"
+semantic_labels = ["docker.start"]
 
 [[actions]]
 key = "docker.kill"
-default = "prompt"          # sends signal to a container; reversible but abrupt — prompt
+action_version = "v1"
+summary = "Run docker.kill"
+input_schema = { kind = "argv", classifier = "kill *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.kill"
+semantic_labels = ["docker.kill"]
 
 [[actions]]
 key = "docker.rm"
-default = "prompt"          # removes a stopped container; irreversible but typically intentional
+action_version = "v1"
+summary = "Run docker.rm"
+input_schema = { kind = "argv", classifier = "rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.rm"
+semantic_labels = ["docker.rm"]
 
 [[actions]]
 key = "docker.rmi"
-default = "prompt"          # removes an image; can break running containers if image in use
-
-# --- image management ---
+action_version = "v1"
+summary = "Run docker.rmi"
+input_schema = { kind = "argv", classifier = "rmi *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.rmi"
+semantic_labels = ["docker.rmi"]
 
 [[actions]]
 key = "docker.pull"
-default = "prompt"          # credentialed read — touches registry token + writes to local disk
+action_version = "v1"
+summary = "Run docker.pull"
+input_schema = { kind = "argv", classifier = "pull *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.pull"
+semantic_labels = ["docker.pull"]
 
 [[actions]]
 key = "docker.tag"
-default = "prompt"          # local-only state mutation; no remote effect but mutates image refs
+action_version = "v1"
+summary = "Run docker.tag"
+input_schema = { kind = "argv", classifier = "tag *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:docker.tag"
+semantic_labels = ["docker.tag"]

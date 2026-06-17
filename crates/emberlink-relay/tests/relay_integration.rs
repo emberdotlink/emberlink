@@ -5,20 +5,21 @@ use std::time::{Duration, Instant};
 
 use emberlink_relay::{
     AdmittedRequest, Command, RelayConfig, RelayState, ShutdownNotice, StoredOffer, admission,
-    admit_submission_payload, handle_claim_offer, handle_deposit_offer,
-    handle_fetch_and_claim_offer, handle_fetch_grant_requests, handle_fetch_offer,
-    handle_request_grant, handle_respond_grant_request, now_epoch_secs, offer_admission_ok,
-    parse_command, run_health_server, run_ws_listener,
+    admit_submission_payload, auxiliary_bind_host, dispatch_command, handle_claim_offer,
+    handle_deposit_offer, handle_fetch_and_claim_offer, handle_fetch_grant_requests,
+    handle_fetch_offer, handle_request_grant, handle_respond_grant_request, now_epoch_secs,
+    offer_admission_ok, parse_command, run_health_server,
     tls::{self, RelayStream, TlsMode},
 };
 
 fn test_admitted(persona: &str, scope: &str) -> AdmittedRequest {
     admission::gate(None, Some(persona), Some(scope)).expect("test gate admits")
 }
-use core_crypto::{FixtureSigner, Signer as CryptoSigner};
+use core_crypto::{FixtureSigner, PublicKey, Signature, Signer as CryptoSigner};
 use core_principals::AdmissionToken;
 use core_principals::{RelayMode, TrustThreshold};
 use core_sync::wrap_for_relay;
+use emberlink_relay::{RESPOND_GRANT_REQUEST_NONCE_BYTES, respond_grant_request_signing_payload};
 
 fn signed_admission_token(
     signer: &FixtureSigner,
@@ -52,6 +53,7 @@ fn config_defaults_to_open_mode() {
     assert!(config.threshold.is_none());
     assert!(config.allowlist.is_empty());
     assert!(config.trusted_issuer_keys.is_empty());
+    assert_eq!(config.ws_port, None);
 }
 
 #[test]
@@ -141,9 +143,8 @@ fn frame_round_trips() {
 
 #[test]
 fn parse_drain_request_extracts_target_peer_id() {
-    // No admin token configured — original format works
     assert!(
-        matches!(parse_command(b"DRAIN peer:/tmp/client-b.tsv", None), Command::Drain(id) if id == "peer:/tmp/client-b.tsv")
+        matches!(parse_command(b"DRAIN peer:/tmp/client-b.tsv tok", Some("tok")), Command::Drain(id) if id == "peer:/tmp/client-b.tsv")
     );
     // Bare DRAIN with no peer id falls through to Submission
     assert!(matches!(parse_command(b"DRAIN", None), Command::Submission));
@@ -165,13 +166,18 @@ fn parse_drain_requires_token_when_configured() {
         parse_command(b"DRAIN my-peer", Some("s3cr3t")),
         Command::AdminRequired
     ));
-    // No admin token configured — still works without token
-    assert!(matches!(parse_command(b"DRAIN my-peer", None), Command::Drain(id) if id == "my-peer"));
+    assert!(matches!(
+        parse_command(b"DRAIN my-peer", None),
+        Command::AdminRequired
+    ));
 }
 
 #[test]
 fn parse_stats_requires_token_when_configured() {
-    assert!(matches!(parse_command(b"STATS", None), Command::Stats));
+    assert!(matches!(
+        parse_command(b"STATS", None),
+        Command::AdminRequired
+    ));
     assert!(matches!(
         parse_command(b"STATS tok", Some("tok")),
         Command::Stats
@@ -190,7 +196,7 @@ fn parse_stats_requires_token_when_configured() {
 fn parse_shutdown_requires_token_when_configured() {
     assert!(matches!(
         parse_command(b"SHUTDOWN", None),
-        Command::Shutdown
+        Command::AdminRequired
     ));
     assert!(matches!(
         parse_command(b"SHUTDOWN tok", Some("tok")),
@@ -355,11 +361,48 @@ fn config_defaults_to_self_signed_tls() {
     assert!(matches!(config.tls_mode, TlsMode::SelfSigned));
 }
 
+/// implementation-note-490 Tier A §A4: when the
+/// `insecure-no-tls` cargo feature is OFF (default), `--no-tls` is
+/// rejected by `from_args` rather than silently downgrading to plain
+/// TCP. Production builds compile without the feature; an operator who
+/// types `--no-tls` sees an error referring to the implementation-note-493 ticket.
+#[cfg(not(feature = "insecure-no-tls"))]
 #[test]
-fn config_parses_no_tls_flag() {
+fn config_rejects_no_tls_in_production_build() {
+    let args: Vec<String> = vec!["--no-tls"].into_iter().map(String::from).collect();
+    let err = RelayConfig::from_args(&args).unwrap_err();
+    assert!(
+        err.contains("--no-tls is rejected"),
+        "expected production refusal, got: {err}"
+    );
+    assert!(
+        err.contains("implementation-note-493"),
+        "expected ticket reference in error, got: {err}"
+    );
+}
+
+/// implementation-note-490 Tier A §A4: when the
+/// `insecure-no-tls` cargo feature is ON (test loopback rigs only),
+/// `--no-tls` is accepted to keep `core-sim/tests/agent_e2e.rs` workable.
+#[cfg(feature = "insecure-no-tls")]
+#[test]
+fn config_parses_no_tls_flag_when_feature_enabled() {
     let args: Vec<String> = vec!["--no-tls"].into_iter().map(String::from).collect();
     let config = RelayConfig::from_args(&args).unwrap();
     assert!(matches!(config.tls_mode, TlsMode::Plain));
+}
+
+#[test]
+fn config_accepts_ws_port_as_disabled_compatibility_noop() {
+    let args: Vec<String> = vec!["--ws-port", "9200"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let config = RelayConfig::from_args(&args).unwrap();
+    assert_eq!(
+        config.ws_port, None,
+        "v0.3.0 release containment must not enable the cleartext WS command surface"
+    );
 }
 
 #[test]
@@ -426,7 +469,10 @@ fn plain_tls_config_returns_none() {
 
 #[test]
 fn parse_shutdown_notice_extracts_reason_and_deadline() {
-    let cmd = parse_command(b"SHUTDOWN-NOTICE legal-compliance 1700000000", None);
+    let cmd = parse_command(
+        b"SHUTDOWN-NOTICE tok legal-compliance 1700000000",
+        Some("tok"),
+    );
     let Command::ShutdownNotice(notice) = cmd else {
         panic!("expected ShutdownNotice")
     };
@@ -437,8 +483,8 @@ fn parse_shutdown_notice_extracts_reason_and_deadline() {
 #[test]
 fn parse_shutdown_notice_allows_multi_word_reason() {
     let cmd = parse_command(
-        b"SHUTDOWN-NOTICE server maintenance window 1700000000",
-        None,
+        b"SHUTDOWN-NOTICE tok server maintenance window 1700000000",
+        Some("tok"),
     );
     let Command::ShutdownNotice(notice) = cmd else {
         panic!("expected ShutdownNotice")
@@ -454,7 +500,11 @@ fn parse_shutdown_notice_rejects_missing_deadline() {
         Command::Submission
     ));
     assert!(matches!(
-        parse_command(b"SHUTDOWN-NOTICE ", None),
+        parse_command(b"SHUTDOWN-NOTICE ", Some("tok")),
+        Command::AdminRequired
+    ));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN-NOTICE tok ", Some("tok")),
         Command::Submission
     ));
 }
@@ -462,7 +512,7 @@ fn parse_shutdown_notice_rejects_missing_deadline() {
 #[test]
 fn parse_shutdown_notice_rejects_non_numeric_deadline() {
     assert!(matches!(
-        parse_command(b"SHUTDOWN-NOTICE reason not-a-number", None),
+        parse_command(b"SHUTDOWN-NOTICE tok reason not-a-number", Some("tok")),
         Command::Submission
     ));
 }
@@ -470,8 +520,16 @@ fn parse_shutdown_notice_rejects_non_numeric_deadline() {
 #[test]
 fn parse_shutdown_notice_rejects_empty_reason() {
     assert!(matches!(
-        parse_command(b"SHUTDOWN-NOTICE  1700000000", None),
+        parse_command(b"SHUTDOWN-NOTICE tok  1700000000", Some("tok")),
         Command::Submission
+    ));
+}
+
+#[test]
+fn parse_shutdown_notice_requires_configured_token() {
+    assert!(matches!(
+        parse_command(b"SHUTDOWN-NOTICE maintenance 1700000000", None),
+        Command::AdminRequired
     ));
 }
 
@@ -1322,53 +1380,15 @@ fn health_endpoint_returns_404_for_unknown_path() {
     );
 }
 
-/// WebSocket: send a STATS command over WS Binary, receive a valid STATS response.
+/// WebSocket: v0.3.0 release containment disables the listener by default.
 #[test]
-fn ws_stats_command_returns_valid_response() {
-    use std::net::TcpListener;
-    use std::sync::atomic::AtomicUsize;
-    use tungstenite::{Message, connect};
-
-    let state = Arc::new(Mutex::new(RelayState::default()));
-    let config = Arc::new(RelayConfig {
-        ws_port: None, // irrelevant, we bind manually
-        ..test_offer_config()
-    });
-    let active = Arc::new(AtomicUsize::new(0));
-
-    // Bind a WS listener on an ephemeral port.
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
-    let ws_config = Arc::clone(&config);
-    let ws_state = Arc::clone(&state);
-    let ws_active = Arc::clone(&active);
-    thread::spawn(move || run_ws_listener(port, ws_config, ws_state, ws_active));
-    thread::sleep(Duration::from_millis(50));
-
-    // Connect via tungstenite client.
-    let (mut ws, _resp) = connect(format!("ws://127.0.0.1:{port}")).expect("ws connect failed");
-
-    // Send STATS as a Binary message (no length prefix — WS provides framing).
-    ws.send(Message::Binary(b"STATS".to_vec().into()))
-        .expect("ws send failed");
-
-    // Read the response — should be a Binary message containing the
-    // length-prefixed STATS response (same wire format as TCP).
-    let msg = ws.read().expect("ws read failed");
-    let data = match msg {
-        Message::Binary(b) => b.to_vec(),
-        other => panic!("expected Binary, got: {other:?}"),
-    };
-
-    // The response is length-prefixed (4 bytes BE + payload), same as TCP.
-    assert!(data.len() > 4, "response too short: {} bytes", data.len());
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let payload = std::str::from_utf8(&data[4..4 + len]).expect("invalid utf-8");
-    assert!(
-        payload.starts_with("STATS accepted="),
-        "unexpected stats response: {payload}"
+fn ws_listener_is_disabled_by_default() {
+    assert_eq!(RelayConfig::from_args(&[]).unwrap().ws_port, None);
+    assert_eq!(
+        RelayConfig::from_args(&["--ws-port".into(), "9200".into()])
+            .unwrap()
+            .ws_port,
+        None
     );
 }
 
@@ -1399,27 +1419,94 @@ fn health_endpoint_includes_ws_port() {
     );
 }
 
+#[test]
+fn auxiliary_bind_host_respects_main_bind_scope() {
+    assert_eq!(auxiliary_bind_host("127.0.0.1:9100"), "127.0.0.1");
+    assert_eq!(auxiliary_bind_host("0.0.0.0:9100"), "0.0.0.0");
+    assert_eq!(auxiliary_bind_host("[::1]:9100"), "[::1]");
+}
+
+#[test]
+fn dispatch_rejects_legacy_credential_commands_for_release_containment() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let config = test_offer_config();
+
+    for payload in [
+        b"DEPOSIT_CREDENTIAL grant-1 deadbeef".as_slice(),
+        b"FETCH_CREDENTIAL grant-1".as_slice(),
+    ] {
+        let mut buf = Vec::new();
+        dispatch_command(&mut buf, payload, &config, &state);
+        let resp = read_response(&buf);
+        assert!(
+            resp.contains("disabled for v0.3.0 release containment"),
+            "expected release containment rejection for {:?}, got: {resp}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+#[test]
+fn dispatch_rejects_legacy_grant_request_commands_for_release_containment() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let config = test_offer_config();
+
+    // Use the post-implementation-note-493 wire shapes so the dispatch refusal proves
+    // the gate fires AFTER parse (containment, not parse-failure).
+    let nonce_hex = hex::encode([0u8; RESPOND_GRANT_REQUEST_NONCE_BYTES]);
+    let request_grant = format!(
+        "REQUEST_GRANT human-alice ed25519:00 {sealed}",
+        sealed = hex::encode(b"sealed-bytes"),
+    );
+    let respond = format!("RESPOND_GRANT_REQUEST gr-1 approved {nonce_hex} ed25519sig:cafe");
+    let payloads: &[&[u8]] = &[
+        request_grant.as_bytes(),
+        b"FETCH_GRANT_REQUESTS human-alice".as_slice(),
+        respond.as_bytes(),
+    ];
+
+    for payload in payloads {
+        let mut buf = Vec::new();
+        dispatch_command(&mut buf, payload, &config, &state);
+        let resp = read_response(&buf);
+        assert!(
+            resp.contains("disabled for v0.3.0 release containment"),
+            "expected release containment rejection for {:?}, got: {resp}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
 // ── Grant request protocol tests ────────────────────────────────────────
 
 #[test]
 fn parse_request_grant_valid() {
+    let pubkey_hex = "ed25519:00112233";
+    let sealed_hex = hex::encode(b"sealed-bytes");
     let cmd = parse_command(
-        b"REQUEST_GRANT human-alice agent-bot netflix-password need to stream movies",
+        format!("REQUEST_GRANT human-alice {pubkey_hex} {sealed_hex}").as_bytes(),
         None,
     );
     assert!(matches!(
         cmd,
-        Command::RequestGrant { target_id, requester_id, scope, justification }
+        Command::RequestGrant { target_id, target_signing_pubkey, sealed_payload }
             if target_id == "human-alice"
-                && requester_id == "agent-bot"
-                && scope == "netflix-password"
-                && justification == "need to stream movies"
+                && target_signing_pubkey.0 == pubkey_hex
+                && sealed_payload == b"sealed-bytes"
     ));
 }
 
 #[test]
-fn parse_request_grant_missing_justification() {
-    let cmd = parse_command(b"REQUEST_GRANT human-alice agent-bot scope", None);
+fn parse_request_grant_missing_sealed_payload() {
+    // Two fields → no sealed payload → falls through to Submission.
+    let cmd = parse_command(b"REQUEST_GRANT human-alice ed25519:00", None);
+    assert!(matches!(cmd, Command::Submission));
+}
+
+#[test]
+fn parse_request_grant_rejects_bad_hex() {
+    // Third positional must decode as hex.
+    let cmd = parse_command(b"REQUEST_GRANT human-alice ed25519:00 notvalidhex!", None);
     assert!(matches!(cmd, Command::Submission));
 }
 
@@ -1431,48 +1518,105 @@ fn parse_fetch_grant_requests_valid() {
 
 #[test]
 fn parse_respond_grant_request_approved() {
-    let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 approved", None);
+    let nonce_hex = hex::encode([0xAAu8; RESPOND_GRANT_REQUEST_NONCE_BYTES]);
+    let sig_hex = "ed25519sig:deadbeef";
+    let cmd = parse_command(
+        format!("RESPOND_GRANT_REQUEST gr-0 approved {nonce_hex} {sig_hex}").as_bytes(),
+        None,
+    );
     assert!(
-        matches!(cmd, Command::RespondGrantRequest { request_id, approved }
+        matches!(cmd, Command::RespondGrantRequest { request_id, approved, .. }
         if request_id == "gr-0" && approved)
     );
 }
 
 #[test]
 fn parse_respond_grant_request_denied() {
-    let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 denied", None);
+    let nonce_hex = hex::encode([0xBBu8; RESPOND_GRANT_REQUEST_NONCE_BYTES]);
+    let sig_hex = "ed25519sig:deadbeef";
+    let cmd = parse_command(
+        format!("RESPOND_GRANT_REQUEST gr-0 denied {nonce_hex} {sig_hex}").as_bytes(),
+        None,
+    );
     assert!(
-        matches!(cmd, Command::RespondGrantRequest { request_id, approved }
+        matches!(cmd, Command::RespondGrantRequest { request_id, approved, .. }
         if request_id == "gr-0" && !approved)
     );
 }
 
 #[test]
 fn parse_respond_grant_request_invalid_verdict() {
-    let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 maybe", None);
+    let nonce_hex = hex::encode([0xCCu8; RESPOND_GRANT_REQUEST_NONCE_BYTES]);
+    let cmd = parse_command(
+        format!("RESPOND_GRANT_REQUEST gr-0 maybe {nonce_hex} ed25519sig:ab").as_bytes(),
+        None,
+    );
     assert!(matches!(cmd, Command::Submission));
+}
+
+#[test]
+fn parse_respond_grant_request_rejects_short_nonce() {
+    // Nonce must be exactly RESPOND_GRANT_REQUEST_NONCE_BYTES * 2 hex chars.
+    let cmd = parse_command(
+        b"RESPOND_GRANT_REQUEST gr-0 approved aabb ed25519sig:cd",
+        None,
+    );
+    assert!(matches!(cmd, Command::Submission));
+}
+
+#[test]
+fn parse_respond_grant_request_rejects_missing_signature() {
+    let nonce_hex = hex::encode([0xDDu8; RESPOND_GRANT_REQUEST_NONCE_BYTES]);
+    let cmd = parse_command(
+        format!("RESPOND_GRANT_REQUEST gr-0 approved {nonce_hex}").as_bytes(),
+        None,
+    );
+    assert!(matches!(cmd, Command::Submission));
+}
+
+/// Build a fresh responder fixture + the bound pubkey we pass to
+/// `handle_request_grant` so the matching `RESPOND_GRANT_REQUEST`
+/// signature verifies under `Ed25519Verifier`.
+fn responder_fixture(label: &str) -> (FixtureSigner, PublicKey) {
+    let signer = FixtureSigner::new(label);
+    let pubkey = signer.public_key();
+    (signer, pubkey)
+}
+
+/// Sign a `RESPOND_GRANT_REQUEST` payload using a `FixtureSigner` and
+/// return `(nonce_hex, signature)` ready to feed into
+/// `handle_respond_grant_request`. The nonce is deterministic per call
+/// in tests so a re-run picks the same value, but each helper invocation
+/// generates a distinct nonce so replay tests stay meaningful.
+fn signed_respond_frame(
+    signer: &FixtureSigner,
+    request_id: &str,
+    approved: bool,
+    nonce: [u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+) -> (String, Signature) {
+    let payload = respond_grant_request_signing_payload(request_id, approved, &nonce);
+    let signature = signer.sign(&payload);
+    (hex::encode(nonce), signature)
 }
 
 #[test]
 fn grant_request_deposit_fetch_lifecycle() {
     let state = Arc::new(Mutex::new(RelayState::default()));
+    let (_, pubkey) = responder_fixture("relay-responder-fetch-lifecycle");
 
-    // Deposit a grant request.
+    // Deposit a grant request. The relay never sees plaintext payload.
+    let sealed = b"sealed:requester=agent-bot;scope=netflix;justification=streaming".to_vec();
     let s = Arc::clone(&state);
+    let pk = pubkey.clone();
+    let sealed_clone = sealed.clone();
     let buf = with_loopback(move |stream| {
-        handle_request_grant(
-            stream,
-            &s,
-            "human-alice".into(),
-            "agent-bot".into(),
-            "netflix-password".into(),
-            "need to stream movies".into(),
-        );
+        handle_request_grant(stream, &s, "human-alice".into(), pk, sealed_clone);
     });
     let resp = read_response(&buf);
     assert!(resp.starts_with("OK gr-"), "got: {resp}");
 
-    // Fetch grant requests for alice.
+    // Fetch grant requests for alice — the response carries only the
+    // routing-cleartext fields and the opaque sealed payload as hex.
     let s = Arc::clone(&state);
     let buf = with_loopback(move |stream| {
         handle_fetch_grant_requests(stream, &s, "human-alice");
@@ -1480,38 +1624,51 @@ fn grant_request_deposit_fetch_lifecycle() {
     let resp = read_response(&buf);
     assert!(resp.contains("\"request_id\":\"gr-"), "got: {resp}");
     assert!(
-        resp.contains("\"scope\":\"netflix-password\""),
+        resp.contains(&format!("\"sealed_payload\":\"{}\"", hex::encode(&sealed))),
         "got: {resp}"
     );
+    // Plaintext fields MUST NOT appear (implementation-note-491).
+    assert!(!resp.contains("\"requester_id\""), "got: {resp}");
+    assert!(!resp.contains("\"justification\""), "got: {resp}");
+    assert!(!resp.contains("\"scope\""), "got: {resp}");
     assert!(resp.contains("\"status\":\"pending\""), "got: {resp}");
     assert!(resp.ends_with("\nEND"), "got: {resp}");
 }
 
 #[test]
-fn grant_request_respond_approved() {
+fn grant_request_respond_approved_with_valid_signature() {
     let state = Arc::new(Mutex::new(RelayState::default()));
+    let (signer, pubkey) = responder_fixture("relay-responder-respond-approved");
 
     // Deposit a request.
     let s = Arc::clone(&state);
+    let pk = pubkey.clone();
     let buf = with_loopback(move |stream| {
         handle_request_grant(
             stream,
             &s,
             "human-alice".into(),
-            "agent-bot".into(),
-            "ssh-key".into(),
-            "deploying".into(),
+            pk,
+            b"sealed:requester=agent-bot;scope=ssh-key".to_vec(),
         );
     });
     let resp = read_response(&buf);
     let request_id = resp.strip_prefix("OK ").unwrap().to_string();
     assert!(request_id.starts_with("gr-"), "got: {resp}");
 
-    // Approve it.
+    // Approve it with a fresh signed nonce.
+    let (nonce_hex, signature) = signed_respond_frame(
+        &signer,
+        &request_id,
+        true,
+        [0xA1u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+    );
     let rid = request_id.clone();
+    let nh = nonce_hex.clone();
+    let sig = signature.clone();
     let s = Arc::clone(&state);
     let buf = with_loopback(move |stream| {
-        handle_respond_grant_request(stream, &s, &rid, true);
+        handle_respond_grant_request(stream, &s, &rid, true, &nh, &sig);
     });
     let resp = read_response(&buf);
     assert_eq!(resp, "OK", "got: {resp}");
@@ -1523,6 +1680,173 @@ fn grant_request_respond_approved() {
     });
     let resp = read_response(&buf);
     assert!(resp.contains("\"status\":\"approved\""), "got: {resp}");
+}
+
+/// implementation-note-493 acceptance #2: a captured `RESPOND_GRANT_REQUEST` frame
+/// MUST NOT verify when replayed. The relay tombstones the nonce so the
+/// second frame is refused with `REJECTED nonce replay`.
+#[test]
+fn grant_request_respond_rejects_nonce_replay() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let (signer, pubkey) = responder_fixture("relay-responder-replay");
+
+    // Deposit two requests so replay surface is non-trivial.
+    let s = Arc::clone(&state);
+    let pk = pubkey.clone();
+    let buf = with_loopback(move |stream| {
+        handle_request_grant(stream, &s, "human-alice".into(), pk, b"sealed-1".to_vec());
+    });
+    let request_id = read_response(&buf).strip_prefix("OK ").unwrap().to_string();
+
+    let (nonce_hex, signature) = signed_respond_frame(
+        &signer,
+        &request_id,
+        true,
+        [0xB2u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+    );
+
+    // First call verifies.
+    let s = Arc::clone(&state);
+    let rid = request_id.clone();
+    let nh = nonce_hex.clone();
+    let sig = signature.clone();
+    let buf = with_loopback(move |stream| {
+        handle_respond_grant_request(stream, &s, &rid, true, &nh, &sig);
+    });
+    assert_eq!(read_response(&buf), "OK");
+
+    // Replay the same nonce against a different request id (or even the
+    // same one) — refused before the signature check runs.
+    let s = Arc::clone(&state);
+    let nh = nonce_hex.clone();
+    let sig = signature.clone();
+    let buf = with_loopback(move |stream| {
+        handle_respond_grant_request(stream, &s, "gr-fakeid", true, &nh, &sig);
+    });
+    assert_eq!(read_response(&buf), "REJECTED nonce replay");
+}
+
+/// implementation-note-493 acceptance #2: a tampered nonce flips the signed payload
+/// so the signature stops verifying. Refused with
+/// `REJECTED signature verification failed` and the grant request stays
+/// `Pending`.
+#[test]
+fn grant_request_respond_rejects_tampered_nonce() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let (signer, pubkey) = responder_fixture("relay-responder-tampered");
+
+    let s = Arc::clone(&state);
+    let pk = pubkey.clone();
+    let buf = with_loopback(move |stream| {
+        handle_request_grant(stream, &s, "human-alice".into(), pk, b"sealed-2".to_vec());
+    });
+    let request_id = read_response(&buf).strip_prefix("OK ").unwrap().to_string();
+
+    let (good_nonce, signature) = signed_respond_frame(
+        &signer,
+        &request_id,
+        true,
+        [0xC3u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+    );
+    // Tamper a single byte in the nonce — keep length valid hex so the
+    // shape passes parser-level checks.
+    let mut tampered = good_nonce.clone().into_bytes();
+    tampered[0] = if tampered[0] == b'0' { b'1' } else { b'0' };
+    let tampered_nonce = String::from_utf8(tampered).unwrap();
+
+    let s = Arc::clone(&state);
+    let rid = request_id.clone();
+    let sig = signature.clone();
+    let buf = with_loopback(move |stream| {
+        handle_respond_grant_request(stream, &s, &rid, true, &tampered_nonce, &sig);
+    });
+    assert_eq!(
+        read_response(&buf),
+        "REJECTED signature verification failed"
+    );
+
+    // Verdict didn't move.
+    let s = Arc::clone(&state);
+    let buf = with_loopback(move |stream| {
+        handle_fetch_grant_requests(stream, &s, "human-alice");
+    });
+    let resp = read_response(&buf);
+    assert!(resp.contains("\"status\":\"pending\""), "got: {resp}");
+}
+
+/// implementation-note-493 acceptance #2: flipping the verdict byte (signed for
+/// `denied`, replayed as `approved`) must fail the signature check.
+/// Defends against the canonical "captured deny → reuse as approve"
+/// authority-bearing attack.
+#[test]
+fn grant_request_respond_rejects_verdict_flip() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let (signer, pubkey) = responder_fixture("relay-responder-verdict-flip");
+
+    let s = Arc::clone(&state);
+    let pk = pubkey.clone();
+    let buf = with_loopback(move |stream| {
+        handle_request_grant(stream, &s, "human-alice".into(), pk, b"sealed-3".to_vec());
+    });
+    let request_id = read_response(&buf).strip_prefix("OK ").unwrap().to_string();
+
+    // Sign for `denied`, replay as `approved`.
+    let (nonce_hex, signature) = signed_respond_frame(
+        &signer,
+        &request_id,
+        false,
+        [0xD4u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+    );
+
+    let s = Arc::clone(&state);
+    let rid = request_id.clone();
+    let nh = nonce_hex.clone();
+    let sig = signature.clone();
+    let buf = with_loopback(move |stream| {
+        // approved=true here, but the signature was made over approved=false.
+        handle_respond_grant_request(stream, &s, &rid, true, &nh, &sig);
+    });
+    assert_eq!(
+        read_response(&buf),
+        "REJECTED signature verification failed"
+    );
+}
+
+/// implementation-note-493 acceptance #2: a signature produced by a different key
+/// (the wrong responder, or a forged claimant) does not verify against
+/// the bound pubkey. The relay refuses without mutating state.
+#[test]
+fn grant_request_respond_rejects_wrong_signer() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let (_, bound_pubkey) = responder_fixture("relay-responder-bound");
+    let (other_signer, _) = responder_fixture("relay-responder-impostor");
+
+    let s = Arc::clone(&state);
+    let pk = bound_pubkey.clone();
+    let buf = with_loopback(move |stream| {
+        handle_request_grant(stream, &s, "human-alice".into(), pk, b"sealed-4".to_vec());
+    });
+    let request_id = read_response(&buf).strip_prefix("OK ").unwrap().to_string();
+
+    // Impostor signs the correctly-formatted payload.
+    let (nonce_hex, signature) = signed_respond_frame(
+        &other_signer,
+        &request_id,
+        true,
+        [0xE5u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+    );
+
+    let s = Arc::clone(&state);
+    let rid = request_id.clone();
+    let nh = nonce_hex.clone();
+    let sig = signature.clone();
+    let buf = with_loopback(move |stream| {
+        handle_respond_grant_request(stream, &s, &rid, true, &nh, &sig);
+    });
+    assert_eq!(
+        read_response(&buf),
+        "REJECTED signature verification failed"
+    );
 }
 
 #[test]
@@ -1539,9 +1863,19 @@ fn grant_request_fetch_unknown_target_returns_none() {
 #[test]
 fn grant_request_respond_unknown_returns_not_found() {
     let state = Arc::new(Mutex::new(RelayState::default()));
+    let (signer, _) = responder_fixture("relay-responder-not-found");
+    let (nonce_hex, signature) = signed_respond_frame(
+        &signer,
+        "gr-999",
+        true,
+        [0xF6u8; RESPOND_GRANT_REQUEST_NONCE_BYTES],
+    );
+
     let s = Arc::clone(&state);
+    let nh = nonce_hex.clone();
+    let sig = signature.clone();
     let buf = with_loopback(move |stream| {
-        handle_respond_grant_request(stream, &s, "gr-999", true);
+        handle_respond_grant_request(stream, &s, "gr-999", true, &nh, &sig);
     });
     let resp = read_response(&buf);
     assert_eq!(resp, "NOT_FOUND", "got: {resp}");
@@ -1550,31 +1884,21 @@ fn grant_request_respond_unknown_returns_not_found() {
 #[test]
 fn grant_request_ids_are_unique() {
     let state = Arc::new(Mutex::new(RelayState::default()));
+    let (_, pubkey_a) = responder_fixture("relay-responder-uniq-a");
+    let (_, pubkey_b) = responder_fixture("relay-responder-uniq-b");
 
     // Deposit two requests.
     let s = Arc::clone(&state);
+    let pk = pubkey_a.clone();
     let buf = with_loopback(move |stream| {
-        handle_request_grant(
-            stream,
-            &s,
-            "alice".into(),
-            "bot-a".into(),
-            "s1".into(),
-            "j1".into(),
-        );
+        handle_request_grant(stream, &s, "alice".into(), pk, b"sealed-a".to_vec());
     });
     let resp1 = read_response(&buf);
 
     let s = Arc::clone(&state);
+    let pk = pubkey_b.clone();
     let buf = with_loopback(move |stream| {
-        handle_request_grant(
-            stream,
-            &s,
-            "bob".into(),
-            "bot-b".into(),
-            "s2".into(),
-            "j2".into(),
-        );
+        handle_request_grant(stream, &s, "bob".into(), pk, b"sealed-b".to_vec());
     });
     let resp2 = read_response(&buf);
 

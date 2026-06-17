@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! T1 unit tests for `parse_spiffe_uri_container` — the typed parser that
 //! accepts both SPIFFE URI shapes specified by design §Component 2
@@ -5,7 +6,7 @@
 //! `spiffe://emberd/container/<container-ref>`).
 //!
 //! Anchor: `parse_spiffe_uri_container` —
-//! implementation-note-33.
+//! implementation-note-35.
 //!
 //! Pure tests — no filesystem, no network, no `SystemTime::now()`.
 

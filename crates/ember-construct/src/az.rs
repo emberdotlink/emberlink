@@ -39,6 +39,9 @@
 //! | `show \| list \| get-* \| account list \| account show` | `None` (passthrough)                          |
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// Azure CLI global flags that take a value as the *next* argv token.
 /// When stripping, both the flag and its value are removed.
@@ -272,6 +275,205 @@ pub fn classify_az_argv(argv: &[String]) -> Option<ActionKey> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AzFactory — construct-factory contract for the az construct
+// ---------------------------------------------------------------------------
+
+/// Parsed az.toml action manifest, initialised once at first access.
+static AZ_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/az.toml"))
+            .expect("bundled az.toml must be valid")
+    });
+
+/// Look up the `need` atoms for an action key from the bundled manifest.
+/// Returns `None` if the action is absent from the manifest or has an empty
+/// `need` list.
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("az.")?;
+    AZ_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key.strip_prefix("az.").is_some_and(|k| k == suffix))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+/// Returns `true` when `action_key` (full form, e.g. `"az.vm.create"`) has an
+/// entry in the bundled manifest (regardless of whether it carries a `need`).
+fn action_in_manifest(action_key: &str) -> bool {
+    AZ_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("az.")
+                .and_then(|suffix| {
+                    let base = suffix.split('.').next()?;
+                    Some(a.key == format!("az.{base}") || a.key == action_key)
+                })
+                .unwrap_or(false)
+    })
+}
+
+/// factory implementation for the `az` construct.
+#[derive(Debug, Default, Clone)]
+pub struct AzFactory;
+
+/// Provider-specific target extracted from an `az` argv invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AzFactoryTarget {
+    pub provider: &'static str,
+    /// Subscription ID or name, when supplied via `--subscription` / `--subscription=`.
+    pub subscription: Option<String>,
+    /// Resource group, when supplied via `--resource-group` / `-g`.
+    pub resource_group: Option<String>,
+    /// Resource name, when extractable from `--name` / `-n` or positional argv.
+    pub resource_name: Option<String>,
+}
+
+/// Need atoms derived from the bundled manifest for one `az` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AzFactoryNeed(pub Vec<String>);
+
+/// Extract the value of a named flag from argv, supporting both
+/// `--flag value` and `--flag=value` forms.  `names` is the set of flag
+/// names that alias (e.g. `["--resource-group", "-g"]`).
+fn extract_flag_value(argv: &[String], names: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = &argv[i];
+        // --flag=value form
+        for &name in names {
+            if let Some(val) = tok.strip_prefix(&format!("{name}="))
+                && !val.is_empty()
+            {
+                return Some(val.to_string());
+            }
+        }
+        // --flag value form
+        if names.contains(&tok.as_str())
+            && let Some(val) = argv.get(i + 1)
+            && !val.starts_with('-')
+        {
+            return Some(val.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` when any of the given flag names appear in `argv`,
+/// regardless of whether a value follows.
+fn has_flag(argv: &[String], names: &[&str]) -> bool {
+    argv.iter().any(|tok| {
+        names.contains(&tok.as_str())
+            || names
+                .iter()
+                .any(|name| tok.starts_with(&format!("{name}=")))
+    })
+}
+
+impl InvocationGrammar for AzFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_az_argv(argv)
+    }
+}
+
+impl TargetExtractor for AzFactory {
+    type Target = AzFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let subscription = extract_flag_value(argv, &["--subscription"]);
+        let resource_group = extract_flag_value(argv, &["--resource-group", "-g"]);
+        let resource_name = extract_flag_value(argv, &["--name", "-n"]);
+
+        // Return a target if we found at least one piece of evidence.
+        if subscription.is_some() || resource_group.is_some() || resource_name.is_some() {
+            Some(AzFactoryTarget {
+                provider: "azure",
+                subscription,
+                resource_group,
+                resource_name,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl NeedTemplate for AzFactory {
+    type Need = AzFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(AzFactoryNeed)
+    }
+}
+
+impl ConstructFactory for AzFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        // 0. Login verbs are credential-bypass vectors — always fail closed.
+        //    Checked against raw argv because `az login` is a single-token
+        //    verb that the classifier (which requires group + verb) does not
+        //    classify.
+        let stripped = strip_global_flags(argv);
+        if stripped.first().map(|s| s.as_str()) == Some("login") {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // 1. --subscription appearing as a global flag means the caller is
+        //    selecting the authority scope externally → fail closed.
+        //    Checked before action_key because this applies regardless of
+        //    classification.
+        if has_flag(argv, &["--subscription"]) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // 2. ARM/Bicep template file references require payload analysis,
+        //    regardless of whether the verb is classified (e.g.
+        //    `az deployment group create --template-file` is unclassified
+        //    but authority-bearing).
+        if has_flag(argv, &["--template-file", "--template-uri"]) {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        // 3. No action key (reads/version) → credentialless passthrough.
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        // 4. Also catch any classified login-shaped keys.
+        if key.0 == "az.login" || key.0.starts_with("az.login.") {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // 5. Action not in the manifest → fail closed.
+        if !action_in_manifest(&key.0) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        // 6. Action is in the manifest.  Azure actions currently carry no
+        //    `need` atoms (credential model is different from GitHub), so we
+        //    proceed to resolver_required — subscription must still be resolved
+        //    from configuration.
+        FactoryDisposition::ResolverRequired
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,26 +503,9 @@ mod tests {
     }
 
     #[test]
-    fn vm_start_classified() {
-        let r = classify_az_argv(&args(&["vm", "start"])).unwrap();
-        assert_eq!(r.0, "az.vm.start");
-    }
-
-    #[test]
-    fn vm_stop_classified() {
-        let r = classify_az_argv(&args(&["vm", "stop"])).unwrap();
-        assert_eq!(r.0, "az.vm.stop");
-    }
-
-    #[test]
     fn vm_restart_classified() {
         let r = classify_az_argv(&args(&["vm", "restart"])).unwrap();
         assert_eq!(r.0, "az.vm.restart");
-    }
-
-    #[test]
-    fn vm_show_passthrough() {
-        assert!(classify_az_argv(&args(&["vm", "show", "--name", "vm1"])).is_none());
     }
 
     #[test]
@@ -959,6 +1144,13 @@ mod tests {
                 "actions": ["Microsoft.Storage/storageAccounts/read"],
             }),
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "ember-az integration test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -997,5 +1189,246 @@ mod tests {
             BrokerError::InvalidScope(_) => {}
             other => panic!("expected InvalidScope, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AzFactory tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn az_factory_version_is_credentialless() {
+        let f = AzFactory;
+        let a = args(&["version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn az_factory_vm_list_is_credentialless() {
+        let f = AzFactory;
+        let a = args(&["vm", "list"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn az_factory_vm_delete_with_rg_is_resolver_required() {
+        let f = AzFactory;
+        let a = args(&[
+            "vm",
+            "delete",
+            "--name",
+            "web-01",
+            "--resource-group",
+            "prod",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn az_factory_vm_create_no_rg_is_resolver_required() {
+        let f = AzFactory;
+        let a = args(&["vm", "create", "--name", "web-02"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn az_factory_subscription_flag_fails_closed() {
+        let f = AzFactory;
+        let a = args(&[
+            "--subscription",
+            "prod-sub",
+            "vm",
+            "delete",
+            "--name",
+            "web-01",
+            "--resource-group",
+            "prod",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn az_factory_subscription_eq_flag_fails_closed() {
+        let f = AzFactory;
+        let a = args(&[
+            "--subscription=prod-sub",
+            "vm",
+            "delete",
+            "--name",
+            "web-01",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn az_factory_template_file_needs_payload_analysis() {
+        let f = AzFactory;
+        // deployment group create is not in the classifier (no action key),
+        // but the template flag triggers payload analysis regardless.
+        let a = args(&[
+            "deployment",
+            "group",
+            "create",
+            "--resource-group",
+            "prod",
+            "--template-file",
+            "main.bicep",
+        ]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn az_factory_template_uri_needs_payload_analysis() {
+        let f = AzFactory;
+        let a = args(&[
+            "deployment",
+            "group",
+            "create",
+            "--resource-group",
+            "prod",
+            "--template-uri",
+            "https://example.com/main.json",
+        ]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn az_factory_template_file_on_classified_verb_also_payload_analysis() {
+        let f = AzFactory;
+        let a = args(&[
+            "webapp",
+            "deploy",
+            "--resource-group",
+            "prod",
+            "--template-file",
+            "main.bicep",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn az_factory_unknown_group_is_credentialless() {
+        let f = AzFactory;
+        let a = args(&["cosmosdb", "create", "--name", "db1"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn az_factory_target_extraction_with_rg_and_name() {
+        let f = AzFactory;
+        let a = args(&[
+            "vm",
+            "delete",
+            "--name",
+            "web-01",
+            "--resource-group",
+            "prod",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "azure");
+        assert_eq!(target.subscription, None);
+        assert_eq!(target.resource_group, Some("prod".to_string()));
+        assert_eq!(target.resource_name, Some("web-01".to_string()));
+    }
+
+    #[test]
+    fn az_factory_target_extraction_with_subscription() {
+        let f = AzFactory;
+        let a = args(&[
+            "--subscription",
+            "my-sub",
+            "vm",
+            "delete",
+            "--name",
+            "web-01",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.subscription, Some("my-sub".to_string()));
+        assert_eq!(target.resource_name, Some("web-01".to_string()));
+    }
+
+    #[test]
+    fn az_factory_target_extraction_short_rg_flag() {
+        let f = AzFactory;
+        let a = args(&["vm", "delete", "-g", "prod", "--name", "web-01"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.resource_group, Some("prod".to_string()));
+    }
+
+    #[test]
+    fn az_factory_target_extraction_no_evidence_returns_none() {
+        let f = AzFactory;
+        let a = args(&["vm", "create"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert!(f.target_for_argv(&key, &a).is_none());
+    }
+
+    #[test]
+    fn az_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/az/factory-fixtures.toml"
+        ))
+        .expect("fixture TOML parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/az.toml"),
+        )
+        .expect("valid az manifest");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &AzFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

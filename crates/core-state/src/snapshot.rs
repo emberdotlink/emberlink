@@ -44,10 +44,14 @@ mod tests {
     use core_eventlog::MemoryEventLog;
 
     #[test]
-    fn events_since_empty_log() {
+    fn events_since_on_empty_log_is_empty_for_any_watermark() {
+        // The `start >= len` early-return collapses every watermark to an empty
+        // delta when the log is empty — watermark 0 (first-snapshot) and a
+        // watermark past the end both hit the same guard.
         let log = MemoryEventLog::default();
-        let result = events_since(&log, 0, 100);
-        assert!(result.is_empty());
+        for watermark in [0, 5, u64::MAX] {
+            assert!(events_since(&log, watermark, 100).is_empty());
+        }
     }
 
     #[test]
@@ -56,12 +60,13 @@ mod tests {
         assert_eq!(current_event_watermark(&log), 0);
     }
 
-    #[test]
-    fn events_since_watermark_past_end_is_empty() {
-        // With an empty MemoryEventLog, any watermark ≥ 0 gives empty delta.
-        let log = MemoryEventLog::default();
-        assert!(events_since(&log, 5, 100).is_empty());
-    }
+    // NOTE: `events_since` against a *populated* log — mid-log watermark
+    // returning the tail delta, and `max_events` capping the slice — is still
+    // uncovered. `events_since_slice_logic_via_events_method` (below) stubs
+    // `events()` as empty, so the `all[start..end]` slice math never runs on
+    // real data. Exercising it needs a signed-event fixture (FixtureSigner +
+    // identity seed per core-eventlog's `setup_identity`); tracked as a
+    // follow-up rather than faked with an empty stub.
 
     #[test]
     fn events_since_slice_logic_via_events_method() {

@@ -1,4 +1,5 @@
 //! Trusted-principal and ConnectOnly persona-scoping helpers.
+//! CLASSIFICATION: PUBLIC
 
 use serde_json::Value;
 
@@ -19,7 +20,7 @@ pub(crate) fn trusted_request_persona(
             Err(other) => return Err(other),
         }
     }
-    if let Some(mtls) = &ctx.mtls_principal {
+    if let Some(mtls) = ctx.mtls_principal() {
         return Ok(Some(mtls.persona_id.clone()));
     }
     Ok(None)

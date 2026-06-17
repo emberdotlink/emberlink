@@ -108,7 +108,7 @@ impl Drop for PidFile {
     }
 }
 
-/// `daemon_status_pid_liveness_check` — implementation-note-306.
+/// `daemon_status_pid_liveness_check` — implementation-note-285.
 ///
 /// Discriminate `kill(0)` errno states so cross-uid daemons aren't
 /// misclassified as gone under design separate-uid posture:
@@ -157,6 +157,38 @@ pub fn process_exists(pid: u32) -> bool {
     raw != libc::ESRCH
 }
 
+const MAX_PROCESS_ANCESTRY_HOPS: usize = 128;
+
+/// Best-effort process-lineage check for session-bound broker authority.
+///
+/// Returns true when `pid == ancestor_pid` or when repeatedly following the
+/// process parent chain from `pid` reaches `ancestor_pid` within
+/// `MAX_PROCESS_ANCESTRY_HOPS`. Missing process metadata, kernel refusals, or
+/// looped / truncated parent chains fail closed as `false`.
+pub fn process_is_same_or_descendant(pid: u32, ancestor_pid: u32) -> bool {
+    if pid == 0 || ancestor_pid == 0 {
+        return false;
+    }
+    if pid == ancestor_pid {
+        return true;
+    }
+
+    let mut current = pid;
+    for _ in 0..MAX_PROCESS_ANCESTRY_HOPS {
+        let Some(parent_pid) = process_parent_pid(current) else {
+            return false;
+        };
+        if parent_pid == ancestor_pid {
+            return true;
+        }
+        if parent_pid <= 1 || parent_pid == current {
+            return false;
+        }
+        current = parent_pid;
+    }
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn process_exists_via_proc_pidpath(pid: u32) -> bool {
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
@@ -166,14 +198,78 @@ fn process_exists_via_proc_pidpath(pid: u32) -> bool {
     }
 
     let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
-    let n = unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) };
+    let n = unsafe {
+        proc_pidpath(
+            pid as c_int,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as u32,
+        )
+    };
     n > 0
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("PPid:")?.trim();
+        value.parse::<u32>().ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_parent_pid(pid: u32) -> Option<u32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let want = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            want,
+        )
+    };
+    if got != want {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_ppid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_parent_pid(_pid: u32) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Child, Command};
     use tempfile::tempdir;
+
+    struct TestChild(Child);
+
+    impl TestChild {
+        fn spawn() -> Self {
+            let child = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep child");
+            Self(child)
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     #[test]
     fn write_read_matches_current_pid() {
@@ -202,6 +298,31 @@ mod tests {
     #[test]
     fn process_exists_false_for_unused_high_pid() {
         assert!(!process_exists(0x7FFF_FFFE));
+    }
+
+    #[test]
+    fn process_is_same_or_descendant_accepts_self() {
+        let pid = std::process::id();
+        assert!(process_is_same_or_descendant(pid, pid));
+    }
+
+    #[test]
+    fn process_is_same_or_descendant_accepts_child() {
+        let child = TestChild::spawn();
+        assert!(process_is_same_or_descendant(
+            child.pid(),
+            std::process::id()
+        ));
+    }
+
+    #[test]
+    fn process_is_same_or_descendant_rejects_sibling() {
+        let launcher = TestChild::spawn();
+        let sibling = TestChild::spawn();
+        assert!(
+            !process_is_same_or_descendant(sibling.pid(), launcher.pid()),
+            "a sibling process must not be treated as part of the launcher's process family"
+        );
     }
 
     #[test]
@@ -297,7 +418,7 @@ mod tests {
         assert_eq!(writer.read().unwrap(), Some(std::process::id()));
     }
 
-    /// implementation-note-306 — regression test
+    /// implementation-note-285 — regression test
     /// for the cross-uid case under design separate-uid posture.
     ///
     /// PID 1 (init/launchd) always exists and is owned by root. When the

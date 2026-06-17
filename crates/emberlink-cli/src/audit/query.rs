@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember audit query` — direct-SQLite Receipt query path.
 //!
@@ -18,7 +19,7 @@
 //! ## MVP filter surface (this module)
 //!
 //! - `--since DUR` / `--since ISO` — lower bound on `created_at`.
-//! - `--workflow NAME` — match `workflow_id` OR `workflow_template`
+//! - `--delegated NAME` — match `delegation_id` OR `delegation_template`
 //!   extracted from `receipt_json` via SQLite JSON1.
 //! - `--persona ID` — exact match on `persona_id`.
 //! - `--limit N` — cap rows returned (default 100; same default as the
@@ -47,11 +48,11 @@ pub struct QueryFilter {
     /// ISO-8601 lower bound on `created_at`. Caller is responsible for
     /// parsing user input via [`parse_since`] and rendering to RFC3339.
     pub since_iso: Option<String>,
-    /// Exact match on either `workflow_id` or `workflow_template`
+    /// Exact match on either `delegation_id` or `delegation_template`
     /// extracted from `receipt_json` via JSON1. Operators typically pass
     /// a template name (e.g. `emberd-development`); falling back to the
-    /// ULID `workflow_id` lets per-run drilldowns work too.
-    pub workflow: Option<String>,
+    /// ULID `delegation_id` lets per-run drilldowns work too.
+    pub delegation: Option<String>,
     /// Exact match on `persona_id`.
     pub persona: Option<String>,
     /// Exact match on `receipts.kind`. Per design, the kind catalog
@@ -60,7 +61,7 @@ pub struct QueryFilter {
     /// `binding.registered`. The validation surface (well-known catalog
     /// check at parse time) lives in the CLI arg parser; this library
     /// layer accepts any non-empty string so future kinds work without
-    /// a library change. Anchors `implementation-note-441-
+    /// a library change. Anchors `implementation-note-398-
     /// KIND-FILTER` (design §C8 M12 dogfood-gate prerequisite).
     pub kind: Option<String>,
     /// Maximum rows. Defaults to 100 when `None`.
@@ -80,11 +81,11 @@ pub struct ReceiptSummary {
     pub kind: String,
     /// Persona id of the actor that triggered this Receipt.
     pub persona_id: String,
-    /// Workflow grant id from the Receipt body (`None` for system-class
+    /// Delegation grant id from the Receipt body (`None` for system-class
     /// Receipts and pre-rollout rows).
-    pub workflow_id: Option<String>,
-    /// Workflow template name from the Receipt body.
-    pub workflow_template: Option<String>,
+    pub delegation_id: Option<String>,
+    /// Delegation template name from the Receipt body.
+    pub delegation_template: Option<String>,
     /// ISO-8601 timestamp from `receipts.created_at`.
     pub created_at: String,
     /// Terminal reason (JSON-encoded — passed through verbatim).
@@ -106,7 +107,10 @@ pub enum QueryError {
     /// `receipt_json` column held bytes that didn't deserialize as JSON.
     /// We surface this rather than silently dropping the row so a
     /// corrupted Receipt is visible to the operator.
-    InvalidReceiptJson { id: String, source: serde_json::Error },
+    InvalidReceiptJson {
+        id: String,
+        source: serde_json::Error,
+    },
 }
 
 impl std::fmt::Display for QueryError {
@@ -138,7 +142,7 @@ impl From<rusqlite::Error> for QueryError {
 /// and so the CLI cannot accidentally mutate the audit trail.
 ///
 /// The query AND-combines filters. Workflow filtering uses SQLite JSON1
-/// to extract `workflow_id` / `workflow_template` from `receipt_json`
+/// to extract `delegation_id` / `delegation_template` from `receipt_json`
 /// without requiring a schema migration. Rows whose `receipt_json` is
 /// well-formed JSON but missing the workflow fields are excluded when
 /// the workflow filter is set — operators expect zero hits when the
@@ -177,21 +181,21 @@ pub fn run_audit_query_direct(
         clauses.push(format!("kind = ?{}", params.len() + 1));
         params.push(kind.to_string());
     }
-    if let Some(workflow) = filter.workflow.as_deref() {
-        // JSON1 extraction — match either the ULID workflow_id or the
-        // human-readable workflow_template. AND-combined with the other
+    if let Some(delegation) = filter.delegation.as_deref() {
+        // JSON1 extraction — match either the ULID delegation_id or the
+        // human-readable delegation_template. AND-combined with the other
         // filters; OR-combined internally so operators can pass either
         // shape without knowing which one is populated for a given row.
         let p1 = params.len() + 1;
         let p2 = params.len() + 2;
         clauses.push(format!(
-            "(json_extract(receipt_json, '$.body.workflow_id') = ?{p1} \
-              OR json_extract(receipt_json, '$.body.workflow_template') = ?{p1} \
-              OR json_extract(receipt_json, '$.workflow_id') = ?{p2} \
-              OR json_extract(receipt_json, '$.workflow_template') = ?{p2})"
+            "(json_extract(receipt_json, '$.body.delegation_id') = ?{p1} \
+              OR json_extract(receipt_json, '$.body.delegation_template') = ?{p1} \
+              OR json_extract(receipt_json, '$.delegation_id') = ?{p2} \
+              OR json_extract(receipt_json, '$.delegation_template') = ?{p2})"
         ));
-        params.push(workflow.to_string());
-        params.push(workflow.to_string());
+        params.push(delegation.to_string());
+        params.push(delegation.to_string());
     }
 
     let where_clause = if clauses.is_empty() {
@@ -222,21 +226,22 @@ pub fn run_audit_query_direct(
         let (id, kind, persona_id, terminal_reason, created_at, receipt_json) = r?;
         // Parse just enough of receipt_json to surface the workflow
         // fields. We tolerate either v1 (top-level) or v2 (nested under
-        // `body`) shapes — `extract_workflow_fields` returns `(None,
+        // `body`) shapes — `extract_delegation_fields` returns `(None,
         // None)` if neither matches, which is fine for system-class
         // Receipts.
-        let (workflow_id, workflow_template) = match serde_json::from_str::<Value>(&receipt_json) {
-            Ok(v) => extract_workflow_fields(&v),
-            Err(e) => {
-                return Err(QueryError::InvalidReceiptJson { id, source: e });
-            }
-        };
+        let (delegation_id, delegation_template) =
+            match serde_json::from_str::<Value>(&receipt_json) {
+                Ok(v) => extract_delegation_fields(&v),
+                Err(e) => {
+                    return Err(QueryError::InvalidReceiptJson { id, source: e });
+                }
+            };
         out.push(ReceiptSummary {
             id,
             kind,
             persona_id,
-            workflow_id,
-            workflow_template,
+            delegation_id,
+            delegation_template,
             created_at,
             terminal_reason,
         });
@@ -244,28 +249,28 @@ pub fn run_audit_query_direct(
     Ok(out)
 }
 
-/// Extract `(workflow_id, workflow_template)` from a parsed Receipt
-/// JSON value. Tries the v2 `body.workflow_id` path first, then the
+/// Extract `(delegation_id, delegation_template)` from a parsed Receipt
+/// JSON value. Tries the v2 `body.delegation_id` path first, then the
 /// v1 top-level path. Returns `(None, None)` for rows that carry
 /// neither (system-class Receipts, pre-rollout rows).
-fn extract_workflow_fields(v: &Value) -> (Option<String>, Option<String>) {
+fn extract_delegation_fields(v: &Value) -> (Option<String>, Option<String>) {
     let body_wid = v
-        .pointer("/body/workflow_id")
+        .pointer("/body/delegation_id")
         .and_then(|x| x.as_str())
         .map(str::to_string);
     let body_tmpl = v
-        .pointer("/body/workflow_template")
+        .pointer("/body/delegation_template")
         .and_then(|x| x.as_str())
         .map(str::to_string);
     if body_wid.is_some() || body_tmpl.is_some() {
         return (body_wid, body_tmpl);
     }
     let top_wid = v
-        .get("workflow_id")
+        .get("delegation_id")
         .and_then(|x| x.as_str())
         .map(str::to_string);
     let top_tmpl = v
-        .get("workflow_template")
+        .get("delegation_template")
         .and_then(|x| x.as_str())
         .map(str::to_string);
     (top_wid, top_tmpl)
@@ -333,17 +338,17 @@ pub fn format_summaries_pretty(rows: &[ReceiptSummary]) -> String {
     let mut out = String::new();
     let h_kind = "KIND";
     let h_persona = "PERSONA";
-    let h_workflow = "WORKFLOW";
+    let h_delegation = "DELEGATION";
     let h_when = "CREATED_AT";
     let h_reason = "REASON";
     out.push_str(&format!(
-        "{h_kind:<22}  {h_persona:<22}  {h_workflow:<32}  {h_when:<28}  {h_reason}\n"
+        "{h_kind:<22}  {h_persona:<22}  {h_delegation:<32}  {h_when:<28}  {h_reason}\n"
     ));
     for r in rows {
         let workflow = r
-            .workflow_template
+            .delegation_template
             .as_deref()
-            .or(r.workflow_id.as_deref())
+            .or(r.delegation_id.as_deref())
             .unwrap_or("-");
         let reason_short: String = r.terminal_reason.chars().take(40).collect();
         out.push_str(&format!(
@@ -384,7 +389,7 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// This is the read-side primitive consumed by the future
 /// `ember receipt verify --offline` chain-walking path
-/// (implementation-note-442). The
+/// (implementation-note-399). The
 /// CLI's verify dispatch will materialize these envelopes into
 /// [`core_events::receipt::sign::RotationWitnessEntry`] values
 /// (filling in `prior_identity_pub` / `new_identity_pub` from the
@@ -399,9 +404,7 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// Opens the store read-only so concurrent daemon writes don't
 /// contend and the CLI cannot accidentally mutate the audit trail.
-pub fn load_rotation_witness_envelopes(
-    db_path: &Path,
-) -> Result<Vec<ReceiptEnvelope>, QueryError> {
+pub fn load_rotation_witness_envelopes(db_path: &Path) -> Result<Vec<ReceiptEnvelope>, QueryError> {
     let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -417,21 +420,16 @@ pub fn load_rotation_witness_envelopes(
     // dependency on the const just to compare — drift is caught by
     // the round-trip test that emits via the canonical constant and
     // expects the loader to return that envelope.
-    let mut stmt =
-        conn.prepare("SELECT receipt_json FROM receipts WHERE kind = ?1")?;
-    let rows = stmt.query_map(["identity.rotation_witness"], |row| {
-        row.get::<_, String>(0)
-    })?;
+    let mut stmt = conn.prepare("SELECT receipt_json FROM receipts WHERE kind = ?1")?;
+    let rows = stmt.query_map(["identity.rotation_witness"], |row| row.get::<_, String>(0))?;
 
     let mut sortable: Vec<(u64, ReceiptEnvelope)> = Vec::new();
     for r in rows {
         let receipt_json = r?;
         let envelope: ReceiptEnvelope =
-            serde_json::from_str(&receipt_json).map_err(|e| {
-                QueryError::InvalidReceiptJson {
-                    id: "<rotation_witness>".to_string(),
-                    source: e,
-                }
+            serde_json::from_str(&receipt_json).map_err(|e| QueryError::InvalidReceiptJson {
+                id: "<rotation_witness>".to_string(),
+                source: e,
             })?;
         // Extract `rotated_at_epoch_secs` from the body JSON. Bodies
         // that aren't shaped like an IdentityRotationWitnessBody (e.g.
@@ -490,10 +488,10 @@ mod tests {
     #[test]
     fn extracts_workflow_from_v2_body() {
         let v: Value = serde_json::from_str(
-            r#"{"body":{"workflow_id":"wfg_01HQ0EXAMPLE","workflow_template":"emberd-development"}}"#,
+            r#"{"body":{"delegation_id":"wfg_01HQ0EXAMPLE","delegation_template":"emberd-development"}}"#,
         )
         .unwrap();
-        let (wid, tmpl) = extract_workflow_fields(&v);
+        let (wid, tmpl) = extract_delegation_fields(&v);
         assert_eq!(wid.as_deref(), Some("wfg_01HQ0EXAMPLE"));
         assert_eq!(tmpl.as_deref(), Some("emberd-development"));
     }
@@ -501,9 +499,9 @@ mod tests {
     #[test]
     fn extracts_workflow_from_v1_top_level() {
         let v: Value =
-            serde_json::from_str(r#"{"workflow_id":"wfg_top","workflow_template":"top-tmpl"}"#)
+            serde_json::from_str(r#"{"delegation_id":"wfg_top","delegation_template":"top-tmpl"}"#)
                 .unwrap();
-        let (wid, tmpl) = extract_workflow_fields(&v);
+        let (wid, tmpl) = extract_delegation_fields(&v);
         assert_eq!(wid.as_deref(), Some("wfg_top"));
         assert_eq!(tmpl.as_deref(), Some("top-tmpl"));
     }
@@ -511,7 +509,7 @@ mod tests {
     #[test]
     fn extracts_workflow_returns_none_for_system_receipts() {
         let v: Value = serde_json::from_str(r#"{"body":{"claim_events":[]}}"#).unwrap();
-        let (wid, tmpl) = extract_workflow_fields(&v);
+        let (wid, tmpl) = extract_delegation_fields(&v);
         assert_eq!(wid, None);
         assert_eq!(tmpl, None);
     }
@@ -561,7 +559,7 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-19T12:00:00Z",
-            r#"{"body":{"workflow_id":"w1","workflow_template":"tmpl1"}}"#,
+            r#"{"body":{"delegation_id":"w1","delegation_template":"tmpl1"}}"#,
         );
         insert(
             &conn,
@@ -569,17 +567,16 @@ mod tests {
             "persona-b",
             "grant",
             "2026-05-20T12:00:00Z",
-            r#"{"body":{"workflow_id":"w2","workflow_template":"tmpl2"}}"#,
+            r#"{"body":{"delegation_id":"w2","delegation_template":"tmpl2"}}"#,
         );
         drop(conn);
-        let rows =
-            run_audit_query_direct(&db, &QueryFilter::default()).expect("query");
+        let rows = run_audit_query_direct(&db, &QueryFilter::default()).expect("query");
         assert_eq!(rows.len(), 2);
         // ORDER BY created_at DESC
         assert_eq!(rows[0].id, "r2");
         assert_eq!(rows[1].id, "r1");
-        assert_eq!(rows[0].workflow_id.as_deref(), Some("w2"));
-        assert_eq!(rows[0].workflow_template.as_deref(), Some("tmpl2"));
+        assert_eq!(rows[0].delegation_id.as_deref(), Some("w2"));
+        assert_eq!(rows[0].delegation_template.as_deref(), Some("tmpl2"));
     }
 
     #[test]
@@ -651,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_query_filters_by_workflow_template() {
+    fn direct_query_filters_by_delegation_template() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let db = dir.path().join("daemon.db");
         let conn = make_db(&db);
@@ -661,7 +658,7 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-19T12:00:00Z",
-            r#"{"body":{"workflow_id":"w1","workflow_template":"emberd-development"}}"#,
+            r#"{"body":{"delegation_id":"w1","delegation_template":"emberd-development"}}"#,
         );
         insert(
             &conn,
@@ -669,7 +666,7 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-20T12:00:00Z",
-            r#"{"body":{"workflow_id":"w2","workflow_template":"emberd-staging"}}"#,
+            r#"{"body":{"delegation_id":"w2","delegation_template":"emberd-staging"}}"#,
         );
         insert(
             &conn,
@@ -683,7 +680,7 @@ mod tests {
         let rows = run_audit_query_direct(
             &db,
             &QueryFilter {
-                workflow: Some("emberd-development".to_string()),
+                delegation: Some("emberd-development".to_string()),
                 ..Default::default()
             },
         )
@@ -693,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_query_filters_by_workflow_id() {
+    fn direct_query_filters_by_delegation_id() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let db = dir.path().join("daemon.db");
         let conn = make_db(&db);
@@ -703,7 +700,7 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-19T12:00:00Z",
-            r#"{"body":{"workflow_id":"wfg_01HQ0EXAMPLE","workflow_template":"tmpl"}}"#,
+            r#"{"body":{"delegation_id":"wfg_01HQ0EXAMPLE","delegation_template":"tmpl"}}"#,
         );
         insert(
             &conn,
@@ -711,13 +708,13 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-20T12:00:00Z",
-            r#"{"body":{"workflow_id":"wfg_OTHER","workflow_template":"tmpl"}}"#,
+            r#"{"body":{"delegation_id":"wfg_OTHER","delegation_template":"tmpl"}}"#,
         );
         drop(conn);
         let rows = run_audit_query_direct(
             &db,
             &QueryFilter {
-                workflow: Some("wfg_01HQ0EXAMPLE".to_string()),
+                delegation: Some("wfg_01HQ0EXAMPLE".to_string()),
                 ..Default::default()
             },
         )
@@ -728,7 +725,7 @@ mod tests {
 
     #[test]
     fn direct_query_filters_by_kind() {
-        // implementation-note-443:
+        // implementation-note-400:
         // The library path filters on `receipts.kind` so an M12-style
         // dogfood-gate query like
         //   `--kind bridge.cert_refresh_failed --since 7d`
@@ -776,7 +773,7 @@ mod tests {
 
     #[test]
     fn direct_query_kind_composes_with_since_and_persona() {
-        // implementation-note-443:
+        // implementation-note-400:
         // Verify the brief's "composes with --since DUR and --persona ID"
         // AND-combine requirement at the library layer.
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -832,7 +829,7 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-19T12:00:00Z",
-            r#"{"body":{"workflow_template":"tmpl"}}"#,
+            r#"{"body":{"delegation_template":"tmpl"}}"#,
         );
         insert(
             &conn,
@@ -840,14 +837,14 @@ mod tests {
             "persona-b",
             "grant",
             "2026-05-20T12:00:00Z",
-            r#"{"body":{"workflow_template":"tmpl"}}"#,
+            r#"{"body":{"delegation_template":"tmpl"}}"#,
         );
         drop(conn);
         let rows = run_audit_query_direct(
             &db,
             &QueryFilter {
                 persona: Some("persona-a".to_string()),
-                workflow: Some("tmpl".to_string()),
+                delegation: Some("tmpl".to_string()),
                 ..Default::default()
             },
         )
@@ -887,8 +884,7 @@ mod tests {
     fn direct_query_missing_db_returns_open_error() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let db = dir.path().join("nonexistent.db");
-        let err = run_audit_query_direct(&db, &QueryFilter::default())
-            .expect_err("must error");
+        let err = run_audit_query_direct(&db, &QueryFilter::default()).expect_err("must error");
         assert!(matches!(err, QueryError::OpenStore { .. }));
     }
 
@@ -904,20 +900,20 @@ mod tests {
             id: "r1".to_string(),
             kind: "grant".to_string(),
             persona_id: "persona-a".to_string(),
-            workflow_id: Some("w1".to_string()),
-            workflow_template: Some("tmpl1".to_string()),
+            delegation_id: Some("w1".to_string()),
+            delegation_template: Some("tmpl1".to_string()),
             created_at: "2026-05-20T12:00:00Z".to_string(),
             terminal_reason: "\"expired\"".to_string(),
         }];
         let s = format_summaries_pretty(&rows);
         assert!(s.contains("KIND"));
         assert!(s.contains("PERSONA"));
-        assert!(s.contains("WORKFLOW"));
+        assert!(s.contains("DELEGATION"));
         assert!(s.contains("tmpl1"));
         assert!(s.contains("total: 1"));
     }
 
-    /// implementation-note-442:
+    /// implementation-note-399:
     /// `load_rotation_witness_envelopes` returns an empty vec when no
     /// witnesses are stored. This is the normal case for fresh installs
     /// and must not error.
@@ -938,12 +934,11 @@ mod tests {
             r#"{"body":{}}"#,
         );
         drop(conn);
-        let envelopes =
-            load_rotation_witness_envelopes(&db).expect("loader must not error");
+        let envelopes = load_rotation_witness_envelopes(&db).expect("loader must not error");
         assert!(envelopes.is_empty());
     }
 
-    /// implementation-note-442:
+    /// implementation-note-399:
     /// Multiple witnesses are returned sorted ascending by
     /// `rotated_at_epoch_secs` regardless of insertion order. The chain
     /// walker (`verify_receipt_v2_with_rotation_chain`) requires
@@ -1021,7 +1016,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-442:
+    /// implementation-note-399:
     /// Non-`identity.rotation_witness` kinds are excluded — the chain
     /// walker would reject a non-witness anyway, but filtering at the
     /// loader keeps the chain shape clean.
@@ -1074,8 +1069,8 @@ mod tests {
             id: "r1".to_string(),
             kind: "grant".to_string(),
             persona_id: "persona-a".to_string(),
-            workflow_id: None,
-            workflow_template: None,
+            delegation_id: None,
+            delegation_template: None,
             created_at: "2026-05-20T12:00:00Z".to_string(),
             terminal_reason: "\"expired\"".to_string(),
         }];

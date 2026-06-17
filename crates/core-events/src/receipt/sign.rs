@@ -52,13 +52,13 @@ pub enum SignError {
     #[error("spawn.witness parent_signature verification failed")]
     SpawnWitnessParentSignatureInvalid,
     /// Rotation-chain walk could not reach the signer of the target Receipt.
-    /// Per implementation-note-50 §"Errors:".
+    /// Per implementation-note-57 §"Errors:".
     #[error("untrusted signer: rotation chain did not reach the receipt signer")]
     UntrustedSigner,
     /// A witness in the rotation chain failed its own signature check, or the
     /// chain order is wrong (witness signed by a key not yet in the trust set,
     /// or `rotated_at` not monotonically ascending).
-    /// Per implementation-note-50 §"Errors:".
+    /// Per implementation-note-57 §"Errors:".
     #[error("broken chain: witness {index} failed verification: {reason}")]
     BrokenChain { index: usize, reason: String },
 }
@@ -234,7 +234,7 @@ pub fn verify_spawn_witness_parent_signature(
 }
 
 // identity_rotation_witness_chain_verified —
-// implementation-note-50 checkpoint. The chain-walk verifier
+// implementation-note-57 checkpoint. The chain-walk verifier
 // below threads the caller's trust set forward through a sorted slice
 // of `identity.rotation_witness` Receipts so a Receipt signed by an
 // identity not in the caller's initial trust set still verifies, so
@@ -282,44 +282,41 @@ pub struct RotationWitnessEntry {
 /// `witness_chain` slice.
 ///
 /// **Pre:**
-///   - `trusted_identities` is non-empty (at least one anchor). An empty
-///     anchor set cannot witness any receipt.
-///   - `witness_chain` is sorted by `rotation_at` ascending. The walker
-///     enforces the invariant and rejects out-of-order chains.
+/// - `trusted_identities` is non-empty (at least one anchor). An empty
+///   anchor set cannot witness any receipt.
+/// - `witness_chain` is sorted by `rotation_at` ascending. The walker
+///   enforces the invariant and rejects out-of-order chains.
 ///
 /// **Post:**
-///   - Returns `Ok(())` iff:
-///     (a) `envelope`'s outer signature verifies against some
-///         `signer_pub` AND
-///     (b) `signer_pub` is in `trusted_identities` OR a `witness_chain`
-///         walk from a trusted identity reaches `signer_pub` via a
-///         contiguous chain of valid witnesses.
-///   - Each witness in `witness_chain` MUST itself verify against the
-///     trust set built up by the prior witnesses; the walker rejects
-///     any chain where this transitive invariant breaks.
-///   - The caller's `trusted_identities` slice is unmodified — the
-///     trust set extension is local to this call.
+/// - Returns `Ok(())` iff:
+///   (a) `envelope`'s outer signature verifies against some
+///   `signer_pub` AND
+///   (b) `signer_pub` is in `trusted_identities` OR a `witness_chain`
+///   walk from a trusted identity reaches `signer_pub` via a
+///   contiguous chain of valid witnesses.
+/// - Each witness in `witness_chain` MUST itself verify against the
+///   trust set built up by the prior witnesses; the walker rejects
+///   any chain where this transitive invariant breaks.
+/// - The caller's `trusted_identities` slice is unmodified — the
+///   trust set extension is local to this call.
 ///
 /// **Errors:**
-///   - [`SignError::UntrustedSigner`] if no key in the final trust set
-///     verifies the target `envelope`. This is the canonical "the
-///     signer is not in the chain" failure.
-///   - [`SignError::BrokenChain`] if any witness fails its own
-///     signature check, the witness `kind` field is wrong, the chain
-///     ordering is non-monotonic, or `trusted_identities` is empty.
-///   - All errors propagated from [`verify_receipt_v2`] (canonicalize,
-///     serialize, receipt_id-mismatch) on the per-envelope check.
+/// - [`SignError::UntrustedSigner`] if no key in the final trust set
+///   verifies the target `envelope`. This is the canonical "the
+///   signer is not in the chain" failure.
+/// - [`SignError::BrokenChain`] if any witness fails its own
+///   signature check, the witness `kind` field is wrong, the chain
+///   ordering is non-monotonic, or `trusted_identities` is empty.
+/// - All errors propagated from [`verify_receipt_v2`] (canonicalize,
+///   serialize, receipt_id-mismatch) on the per-envelope check.
 ///
 /// **Algorithm:**
 /// 1. Start with `trust_set = trusted_identities` (cloned).
 /// 2. For each witness `w_i` in `witness_chain` (in slice order, which
-///    MUST be `rotation_at` ascending):
-///    a. Assert `w_i.prior_identity_pub` is already in `trust_set` —
-///       otherwise the chain cannot extend from this anchor.
-///    b. Verify `w_i.envelope` via [`verify_receipt_v2`] under
-///       `w_i.prior_identity_pub`.
-///    c. Assert `w_i.envelope.kind == RECEIPT_KIND_IDENTITY_ROTATION_WITNESS`.
-///    d. Add `w_i.new_identity_pub` to `trust_set`.
+///    MUST be `rotation_at` ascending), require `w_i.prior_identity_pub`
+///    to be in `trust_set`, verify `w_i.envelope` under that prior key,
+///    require the identity-rotation witness kind, then add
+///    `w_i.new_identity_pub` to `trust_set`.
 /// 3. Verify the target `envelope` against `trust_set` — try each pub
 ///    in turn; first success returns `Ok(())`. If none succeed, return
 ///    [`SignError::UntrustedSigner`].
@@ -345,16 +342,16 @@ pub fn verify_receipt_v2_with_rotation_chain(
 
     for (index, witness) in witness_chain.iter().enumerate() {
         // Pre: chain is sorted ascending by rotation_at.
-        if let Some(prev_ts) = last_rotation_at {
-            if witness.rotation_at < prev_ts {
-                return Err(SignError::BrokenChain {
-                    index,
-                    reason: format!(
-                        "out-of-order witness chain: rotation_at={} < prior={}",
-                        witness.rotation_at, prev_ts
-                    ),
-                });
-            }
+        if let Some(prev_ts) = last_rotation_at
+            && witness.rotation_at < prev_ts
+        {
+            return Err(SignError::BrokenChain {
+                index,
+                reason: format!(
+                    "out-of-order witness chain: rotation_at={} < prior={}",
+                    witness.rotation_at, prev_ts
+                ),
+            });
         }
         last_rotation_at = Some(witness.rotation_at);
 
@@ -558,7 +555,7 @@ mod tests {
     }
 
     // ===== Rotation-chain walk tests
-    // (implementation-note-50) =====
+    // (implementation-note-57) =====
     //
     // Anchor: identity_rotation_witness_chain_verified
 
@@ -602,9 +599,7 @@ mod tests {
 
     /// Three-epoch chain helper. Returns (epoch0_pub, witnesses_in_order,
     /// epoch_n_signer). Useful for building chains of arbitrary length.
-    fn build_chain(
-        epoch_count: usize,
-    ) -> (PublicKey, Vec<RotationWitnessEntry>, FixtureSigner) {
+    fn build_chain(epoch_count: usize) -> (PublicKey, Vec<RotationWitnessEntry>, FixtureSigner) {
         assert!(epoch_count >= 2, "chain must bridge at least two epochs");
         let signers: Vec<FixtureSigner> = (0..epoch_count)
             .map(|i| FixtureSigner::new(format!("chain-epoch-{i}")))
@@ -637,13 +632,8 @@ mod tests {
         let mut target = sample_envelope();
         target.body = json!({"tool":"echo","args":{}});
         sign_receipt_v2(&mut target, &epoch1_signer).unwrap();
-        verify_receipt_v2_with_rotation_chain(
-            &target,
-            &[epoch0_pub],
-            &chain,
-            &FixtureVerifier,
-        )
-        .expect("single-hop rotation chain must verify");
+        verify_receipt_v2_with_rotation_chain(&target, &[epoch0_pub], &chain, &FixtureVerifier)
+            .expect("single-hop rotation chain must verify");
     }
 
     #[test]
@@ -653,13 +643,8 @@ mod tests {
         let (epoch0_pub, chain, last_signer) = build_chain(5);
         let mut target = sample_envelope();
         sign_receipt_v2(&mut target, &last_signer).unwrap();
-        verify_receipt_v2_with_rotation_chain(
-            &target,
-            &[epoch0_pub],
-            &chain,
-            &FixtureVerifier,
-        )
-        .expect("multi-hop rotation chain must verify");
+        verify_receipt_v2_with_rotation_chain(&target, &[epoch0_pub], &chain, &FixtureVerifier)
+            .expect("multi-hop rotation chain must verify");
     }
 
     #[test]
@@ -687,13 +672,9 @@ mod tests {
         chain.swap(1, 2);
         let mut target = sample_envelope();
         sign_receipt_v2(&mut target, &last_signer).unwrap();
-        let err = verify_receipt_v2_with_rotation_chain(
-            &target,
-            &[epoch0_pub],
-            &chain,
-            &FixtureVerifier,
-        )
-        .expect_err("out-of-order witness chain must fail");
+        let err =
+            verify_receipt_v2_with_rotation_chain(&target, &[epoch0_pub], &chain, &FixtureVerifier)
+                .expect_err("out-of-order witness chain must fail");
         match err {
             SignError::BrokenChain { reason, .. } => {
                 assert!(
@@ -715,13 +696,9 @@ mod tests {
         chain[1].envelope.body = json!({"tampered": true});
         let mut target = sample_envelope();
         sign_receipt_v2(&mut target, &last_signer).unwrap();
-        let err = verify_receipt_v2_with_rotation_chain(
-            &target,
-            &[epoch0_pub],
-            &chain,
-            &FixtureVerifier,
-        )
-        .expect_err("tampered witness body must fail");
+        let err =
+            verify_receipt_v2_with_rotation_chain(&target, &[epoch0_pub], &chain, &FixtureVerifier)
+                .expect_err("tampered witness body must fail");
         assert!(
             matches!(err, SignError::BrokenChain { .. }),
             "expected BrokenChain; got {err:?}"
@@ -737,13 +714,9 @@ mod tests {
         let foreign_signer = FixtureSigner::new("foreign-never-rotated");
         let mut target = sample_envelope();
         sign_receipt_v2(&mut target, &foreign_signer).unwrap();
-        let err = verify_receipt_v2_with_rotation_chain(
-            &target,
-            &[epoch0_pub],
-            &chain,
-            &FixtureVerifier,
-        )
-        .expect_err("foreign signer must not verify");
+        let err =
+            verify_receipt_v2_with_rotation_chain(&target, &[epoch0_pub], &chain, &FixtureVerifier)
+                .expect_err("foreign signer must not verify");
         assert!(
             matches!(err, SignError::UntrustedSigner),
             "expected UntrustedSigner; got {err:?}"
@@ -758,13 +731,8 @@ mod tests {
         let signer = FixtureSigner::new("any");
         let mut target = sample_envelope();
         sign_receipt_v2(&mut target, &signer).unwrap();
-        let err = verify_receipt_v2_with_rotation_chain(
-            &target,
-            &[],
-            &[],
-            &FixtureVerifier,
-        )
-        .expect_err("empty trust set must be rejected");
+        let err = verify_receipt_v2_with_rotation_chain(&target, &[], &[], &FixtureVerifier)
+            .expect_err("empty trust set must be rejected");
         assert!(
             matches!(err, SignError::BrokenChain { .. }),
             "expected BrokenChain; got {err:?}"

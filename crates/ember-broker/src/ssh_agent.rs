@@ -1,4 +1,4 @@
-//! Tier-0 daemon-managed ssh-agent (implementation-note-85).
+//! Tier-0 daemon-managed ssh-agent (implementation-note-93).
 //!
 //! Per the 2026-05-05 grill (Angle A1): the daemon IS the ssh-agent for a
 //! session. A fresh ed25519 keypair is minted in the daemon's address space,
@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use secrecy::ExposeSecret;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use zeroize::Zeroize;
@@ -59,16 +60,19 @@ use zeroize::Zeroize;
 // OpenSSH agent wire constants
 // ---------------------------------------------------------------------------
 
+// `pub(crate)` so the lease-gated bridge (`ssh_agent_bridge.rs`) can recognize
+// message types when it inspects/relays OpenSSH agent frames — it reuses these
+// constants rather than re-declaring the protocol (compose, don't rebuild).
 /// Client → agent: list identities.
-const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
+pub(crate) const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 /// Agent → client: identity list response.
-const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
+pub(crate) const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 /// Client → agent: sign a blob.
-const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+pub(crate) const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 /// Agent → client: signature response.
-const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
+pub(crate) const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 /// Agent → client: generic failure.
-const SSH_AGENT_FAILURE: u8 = 5;
+pub(crate) const SSH_AGENT_FAILURE: u8 = 5;
 
 /// Ed25519 key type string as used in OpenSSH wire format.
 const KEY_TYPE_ED25519: &str = "ssh-ed25519";
@@ -82,7 +86,10 @@ const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 // ---------------------------------------------------------------------------
 
 /// Encode a length-prefixed string (SSH `string` type).
-fn encode_string(s: &[u8]) -> Vec<u8> {
+///
+/// `pub(crate)`: the bridge's tests build OpenSSH key blobs / sign requests with
+/// the same encoder the agent uses, rather than re-deriving the wire shape.
+pub(crate) fn encode_string(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + s.len());
     let len = s.len() as u32;
     out.extend_from_slice(&len.to_be_bytes());
@@ -92,7 +99,11 @@ fn encode_string(s: &[u8]) -> Vec<u8> {
 
 /// Decode a length-prefixed string from `buf` starting at `offset`.
 /// Returns `(value, new_offset)`.
-fn decode_string(buf: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+///
+/// `pub(crate)`: the bridge reuses it to parse the host agent's
+/// `SSH_AGENT_IDENTITIES_ANSWER` (to learn the session pubkey blob) and to
+/// shape-check responses — the same bounds-checked parser, not a second copy.
+pub(crate) fn decode_string(buf: &[u8], offset: usize) -> Option<(&[u8], usize)> {
     if offset + 4 > buf.len() {
         return None;
     }
@@ -106,7 +117,9 @@ fn decode_string(buf: &[u8], offset: usize) -> Option<(&[u8], usize)> {
 }
 
 /// Decode a u32 from `buf` at `offset`. Returns `(value, new_offset)`.
-fn decode_u32(buf: &[u8], offset: usize) -> Option<(u32, usize)> {
+///
+/// `pub(crate)`: reused by the bridge's identities-answer parser.
+pub(crate) fn decode_u32(buf: &[u8], offset: usize) -> Option<(u32, usize)> {
     if offset + 4 > buf.len() {
         return None;
     }
@@ -197,6 +210,73 @@ pub fn decode_sign_request<'a>(
     Some((data, flags))
 }
 
+/// RFC 4252 `SSH_MSG_USERAUTH_REQUEST` message number — the second field of a
+/// publickey sign blob, used to recognize an auth-attribution blob.
+const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+
+/// Parseable userauth attribution fields recovered from a publickey sign blob
+/// (ssh-agent-over-bridge S3 audit fidelity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshUserauthFields {
+    /// The authenticating user name.
+    pub user: String,
+    /// The SSH service name (normally `ssh-connection`).
+    pub service: String,
+    /// The auth method name (normally `publickey`).
+    pub method: String,
+    /// The public-key algorithm name (e.g. `ssh-ed25519`).
+    pub pubkey_algo: String,
+}
+
+/// Best-effort parse of an OpenSSH publickey **sign blob** (`data` from a
+/// [`decode_sign_request`]) into its RFC 4252 userauth fields, for audit
+/// attribution.
+///
+/// The layout signed for `publickey` userauth is:
+///
+/// ```text
+/// string  session identifier
+/// byte    SSH_MSG_USERAUTH_REQUEST (50)
+/// string  user name
+/// string  service name
+/// string  method name ("publickey")
+/// boolean TRUE
+/// string  public key algorithm name
+/// string  public key blob
+/// ```
+///
+/// The agent protocol allows a client to ask the host agent to sign **arbitrary**
+/// bytes, so this is **advisory** (audit-only), never a gate: a blob that is not
+/// a recognizable publickey userauth request returns `None`, and the sign is
+/// still audited by `data` hash. The opaque-`data` limitation (an audit row alone
+/// can't say which host/repo — the repo isn't in the SSH handshake) is covered by
+/// correlating the **egress** log, per the S3 spec.
+pub fn parse_sign_userauth(data: &[u8]) -> Option<SshUserauthFields> {
+    // string  session identifier
+    let (_session_id, offset) = decode_string(data, 0)?;
+    // byte    SSH_MSG_USERAUTH_REQUEST
+    if *data.get(offset)? != SSH_MSG_USERAUTH_REQUEST {
+        return None;
+    }
+    let offset = offset + 1;
+    // string  user name
+    let (user, offset) = decode_string(data, offset)?;
+    // string  service name
+    let (service, offset) = decode_string(data, offset)?;
+    // string  method name
+    let (method, offset) = decode_string(data, offset)?;
+    // boolean (present for a real signature attempt; not hard-required)
+    let offset = offset + 1;
+    // string  public key algorithm name
+    let (algo, _offset) = decode_string(data, offset)?;
+    Some(SshUserauthFields {
+        user: String::from_utf8_lossy(user).into_owned(),
+        service: String::from_utf8_lossy(service).into_owned(),
+        method: String::from_utf8_lossy(method).into_owned(),
+        pubkey_algo: String::from_utf8_lossy(algo).into_owned(),
+    })
+}
+
 /// Build `SSH_AGENT_SIGN_RESPONSE` for an ed25519 signature.
 ///
 /// ```text
@@ -248,6 +328,21 @@ impl SessionKey {
             signing_key,
             verifying_key,
         })
+    }
+
+    /// Build a key from a caller-supplied 32-byte ed25519 seed. Test-only: the
+    /// bridge's "private key never crosses the wire" test needs to know the
+    /// exact secret bytes so it can assert they are absent from every captured
+    /// frame. Production keys are always `generate`d from OS entropy.
+    #[cfg(test)]
+    pub(crate) fn from_seed(seed: [u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        Self {
+            seed: seed.to_vec(),
+            signing_key,
+            verifying_key,
+        }
     }
 
     /// Sign `data` and return the 64-byte raw signature.
@@ -409,10 +504,7 @@ pub struct DeployKeyHandle {
     pub repo: String,
     /// Title used when registering: `"ember session <session-id>"`.
     pub key_title: String,
-    /// Installation token used for the DELETE call. Kept as a plain String
-    /// here (no SecretString) because Drop cannot hold references and the
-    /// token's TTL is already ~1 hour (GH App installation token bound).
-    bearer_token: String,
+    bearer_token: secrecy::SecretString,
     client: Arc<dyn DeployKeyHttpClient>,
 }
 
@@ -433,15 +525,28 @@ impl Drop for DeployKeyHandle {
             "https://api.github.com/repos/{}/{}/keys/{}",
             self.owner, self.repo, self.key_id
         );
-        let bearer = self.bearer_token.clone();
+        let bearer = self.bearer_token.expose_secret().to_string();
         let client = Arc::clone(&self.client);
         let key_id = self.key_id;
         let owner = self.owner.clone();
         let repo = self.repo.clone();
-        // Best-effort: spawn on the current runtime if one is available.
-        // If no runtime is running (e.g. drop in a sync context) the spawn
-        // returns immediately with a JoinError which we swallow.
-        let _handle = tokio::spawn(async move {
+        // Best-effort async deregister. `tokio::spawn` PANICS when no runtime
+        // is active — it does NOT return a JoinError as the previous comment
+        // claimed — and a panic in Drop can abort the process (fatal if the
+        // drop runs during unwinding). Guard with `Handle::try_current()` and
+        // skip the spawn when there is no runtime (drop in a sync context, or
+        // during shutdown after the runtime has gone away). The token's ~1h
+        // TTL is the real safety net for a skipped best-effort DELETE.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(
+                key_id,
+                owner,
+                repo,
+                "no tokio runtime at DeployKeyHandle drop; skipping best-effort deploy-key DELETE (token TTL-bound)"
+            );
+            return;
+        };
+        let _handle = handle.spawn(async move {
             match client.delete_bearer(&url, &bearer).await {
                 Ok((204, _)) | Ok((404, _)) => {
                     tracing::debug!(key_id, owner, repo, "deploy-key deregistered");
@@ -518,6 +623,19 @@ impl Drop for AgentGuard {
     }
 }
 
+impl Drop for SshAgentHandle {
+    fn drop(&mut self) {
+        // Abort the accept loop. Without this the spawned task (which holds its
+        // own `Arc<AgentGuard>`) never ends, so the `AgentGuard` never drops and
+        // the agent socket is never unlinked — leaking a live, ungated signer
+        // after teardown / on a partial-bind failure. Aborting the task releases
+        // its `Arc`, and the `AgentGuard` then unlinks the socket. This makes the
+        // type's "dropping it stops the agent task and unlinks the socket"
+        // contract real (load-bearing for the ssh-bridge per-session teardown).
+        self._task.abort();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SshAgentHandle — deploy-key registration impl
 // ---------------------------------------------------------------------------
@@ -576,7 +694,7 @@ impl SshAgentHandle {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                     key_title,
-                    bearer_token: bearer_token.to_string(),
+                    bearer_token: secrecy::SecretString::from(bearer_token.to_string()),
                     client: Arc::clone(&self.deploy_key_client),
                 });
             }
@@ -628,7 +746,7 @@ impl SshAgentHandle {
             owner: owner.to_string(),
             repo: repo.to_string(),
             key_title,
-            bearer_token: bearer_token.to_string(),
+            bearer_token: secrecy::SecretString::from(bearer_token.to_string()),
             client: Arc::clone(&self.deploy_key_client),
         })
     }
@@ -791,7 +909,7 @@ fn binary_has_se_entitlement() -> bool {
 /// `SSH_AUTH_SOCK=<handle.auth_sock_path>` in the child process environment.
 ///
 /// The socket is created at `~/.ember/run/ssh-agent-<session_id>.sock`
-/// (mode 0660) and is only accessible to the owning user.
+/// (mode 0600, owner-only) — the in-daemon ssh-bridge is its only client.
 ///
 /// # Errors
 ///
@@ -899,8 +1017,12 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind ssh-agent socket: {}", socket_path.display()))?;
 
-    // Mode 0660: owner rw, group rw, other none.
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))
+    // Mode 0600: owner-only. The in-daemon ssh-bridge is the ONLY client of this
+    // raw signer socket; group access (the former `0660`) existed solely for the
+    // retired broker_exec cross-uid child. Owner-only keeps the ungated raw signer
+    // unreachable to any non-daemon principal, so the lease-gated bridge is the
+    // only sign path a (different-uid) client can reach.
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .context("set socket permissions")?;
 
     let session_key = Arc::new(SessionKey::generate()?);
@@ -910,6 +1032,50 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
     let guard_clone = Arc::clone(&guard);
     let session_key_clone = Arc::clone(&session_key);
 
+    let task = tokio::spawn(agent_accept_loop(listener, session_key, guard_clone));
+
+    Ok(SshAgentHandle {
+        auth_sock_path: socket_path,
+        _task: task,
+        _guard: guard,
+        session_id: session_id.to_string(),
+        session_key: session_key_clone,
+        gh_creds: None,
+        deploy_key_client: Arc::new(ReqwestDeployKeyClient::default()),
+        deploy_key_registry: Mutex::new(HashMap::new()),
+        retained_deploy_keys: Mutex::new(Vec::new()),
+        deploy_key_registration_failed: Mutex::new(None),
+    })
+}
+
+/// Test-only: bind a Tier-0 host agent for `session_id` keyed by a caller-known
+/// ed25519 `seed`, unconditionally (no Secure Enclave probe). The bridge's
+/// "key never crosses the wire" test uses this so it can assert the exact 32
+/// secret bytes never appear in any captured frame. The socket lands under a
+/// caller-chosen `run_dir` (a tempdir in tests) so concurrent tests don't
+/// collide on `~/.ember/run`.
+#[cfg(test)]
+pub(crate) fn spawn_tier0_ssh_agent_with_seed(
+    session_id: &str,
+    seed: [u8; 32],
+    run_dir: &std::path::Path,
+) -> Result<SshAgentHandle> {
+    std::fs::create_dir_all(run_dir).context("create test ssh-agent run dir")?;
+    let socket_path = run_dir.join(format!("ssh-agent-{session_id}.sock"));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind ssh-agent socket: {}", socket_path.display()))?;
+    // 0600 owner-only — mirrors the production path (the bridge is the only client).
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .context("set socket permissions")?;
+
+    let session_key = Arc::new(SessionKey::from_seed(seed));
+    let guard = Arc::new(AgentGuard {
+        socket_path: socket_path.clone(),
+    });
+    let guard_clone = Arc::clone(&guard);
+    let session_key_clone = Arc::clone(&session_key);
     let task = tokio::spawn(agent_accept_loop(listener, session_key, guard_clone));
 
     Ok(SshAgentHandle {
@@ -1090,6 +1256,53 @@ mod tests {
         assert!(decode_string(&buf, 0).is_none());
     }
 
+    // --- S3 audit: userauth field parsing ---
+
+    fn build_userauth_sign_blob(
+        user: &[u8],
+        service: &[u8],
+        method: &[u8],
+        algo: &[u8],
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&encode_string(b"session-id-bytes")); // session identifier
+        b.push(SSH_MSG_USERAUTH_REQUEST); // byte 50
+        b.extend_from_slice(&encode_string(user));
+        b.extend_from_slice(&encode_string(service));
+        b.extend_from_slice(&encode_string(method));
+        b.push(1); // boolean TRUE
+        b.extend_from_slice(&encode_string(algo));
+        b.extend_from_slice(&encode_string(b"<pubkey-blob>"));
+        b
+    }
+
+    #[test]
+    fn parse_sign_userauth_extracts_attribution_fields() {
+        let blob = build_userauth_sign_blob(
+            b"deploy-bot",
+            b"ssh-connection",
+            b"publickey",
+            b"ssh-ed25519",
+        );
+        let fields = parse_sign_userauth(&blob).expect("a publickey userauth blob");
+        assert_eq!(fields.user, "deploy-bot");
+        assert_eq!(fields.service, "ssh-connection");
+        assert_eq!(fields.method, "publickey");
+        assert_eq!(fields.pubkey_algo, "ssh-ed25519");
+    }
+
+    #[test]
+    fn parse_sign_userauth_returns_none_for_non_userauth_bytes() {
+        // The agent can be asked to sign arbitrary bytes; those are audited by
+        // `data` hash, not by parsed fields. A blob whose second field is not
+        // SSH_MSG_USERAUTH_REQUEST, or that is truncated, yields None (advisory).
+        assert!(parse_sign_userauth(b"not an ssh userauth blob at all").is_none());
+        let mut almost = encode_string(b"session"); // valid string...
+        almost.push(99); // ...wrong message number
+        assert!(parse_sign_userauth(&almost).is_none());
+        assert!(parse_sign_userauth(&[]).is_none());
+    }
+
     #[test]
     fn decode_string_rejects_truncated_body() {
         let mut buf = encode_string(b"hello");
@@ -1222,7 +1435,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deploy-key T1 tests (implementation-note-86)
+    // Deploy-key T1 tests (implementation-note-94)
     // -----------------------------------------------------------------------
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1400,6 +1613,31 @@ mod tests {
             mock.last_delete_url().as_deref(),
             Some("https://api.github.com/repos/test-owner/test-repo/keys/42"),
             "DELETE URL must target the registered key"
+        );
+    }
+
+    /// T2b — dropping a `DeployKeyHandle` OUTSIDE a tokio runtime must not
+    /// panic. The Drop impl spawns a best-effort DELETE; `tokio::spawn`
+    /// panics ("no reactor running") with no runtime, and a panic in Drop
+    /// can abort the process. The `Handle::try_current()` guard turns the
+    /// spawn into a no-op skip instead. (Synchronous `#[test]` = no runtime.)
+    #[test]
+    fn test_drop_without_runtime_does_not_panic() {
+        let mock = RecordingMockClient::new(201, "{}".to_string(), 204);
+        let handle = DeployKeyHandle {
+            key_id: 7,
+            owner: "test-owner".to_string(),
+            repo: "test-repo".to_string(),
+            key_title: "ember session no-rt".to_string(),
+            bearer_token: secrecy::SecretString::from("ghs_fixture_token".to_string()),
+            client: Arc::clone(&mock) as Arc<dyn DeployKeyHttpClient>,
+        };
+        // Before the fix this panics; after, it returns early.
+        drop(handle);
+        assert_eq!(
+            mock.delete_count(),
+            0,
+            "no DELETE should fire without a runtime"
         );
     }
 

@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Supported**.
-> Source truth: `docs/cli-reference.md`, `docs/current-architecture.md`, `QUICKSTART.md`, `crates/emberlink-cli/src/bin/ember.rs`.
+> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
+
 # Evidence Reference
 
 Emberlink's current evidence surface has two layers:
@@ -134,4 +134,3 @@ For the common case:
 3. export the latest receipt if you need a shareable artifact
 4. run `ember audit show --limit 20` for recent local history
 5. run `ember audit verify` if you are investigating evidence integrity
-

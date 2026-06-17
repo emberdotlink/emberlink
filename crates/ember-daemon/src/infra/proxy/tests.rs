@@ -22,7 +22,16 @@ fn install_sink(state: &Arc<ProxyState>) {
 fn make_state() -> Arc<ProxyState> {
     let store = DaemonStore::open_in_memory().unwrap();
     store.set_vault(std::rc::Rc::new(Vault::new(test_key())));
-    let state = Arc::new(ProxyState::new(store));
+    let state = Arc::new(ProxyState::new(store, None));
+    install_sink(&state);
+    state
+}
+
+fn make_state_with_data_dir(data_dir: &std::path::Path) -> Arc<ProxyState> {
+    std::fs::create_dir_all(data_dir).expect("create daemon data dir");
+    let store = DaemonStore::open(&data_dir.join("daemon.db")).unwrap();
+    store.set_vault(std::rc::Rc::new(Vault::new(test_key())));
+    let state = Arc::new(ProxyState::new(store, None));
     install_sink(&state);
     state
 }
@@ -38,7 +47,7 @@ fn make_git_echo_state(
 ) -> (Arc<ProxyState>, String, String) {
     let store = DaemonStore::open_in_memory().unwrap();
     store.set_vault(std::rc::Rc::new(Vault::new(test_key())));
-    let state = Arc::new(ProxyState::new(store));
+    let state = Arc::new(ProxyState::new(store, None));
     install_sink(&state);
     let persona = state.store.create_persona(persona_name).unwrap();
     state
@@ -139,11 +148,6 @@ async fn handle_request_boxed(
 ) -> Result<Response<ProxyBody>, ProxyError> {
     let headers = req.headers();
 
-    let persona_id = match headers.get("x-ember-persona").and_then(|v| v.to_str().ok()) {
-        Some(v) => v.to_string(),
-        None => return Ok(bad_request("missing X-Ember-Persona header")),
-    };
-
     let credential_name = match headers
         .get("x-ember-credential")
         .and_then(|v| v.to_str().ok())
@@ -157,6 +161,52 @@ async fn handle_request_boxed(
         None => return Ok(bad_request("missing X-Ember-Target header")),
     };
 
+    if headers.get("x-ember-grant-id").is_some() {
+        return Ok(bad_request(
+            "X-Ember-Grant-Id is no longer accepted; use attachment endpoint headers",
+        ));
+    }
+
+    let attachment_authority =
+        match crate::infra::attachment::attachment_endpoint_from_headers(headers) {
+            Some((attachment_id, endpoint_token)) => {
+                let Some(sessions_dir) = state.sessions_dir.as_deref() else {
+                    return Ok(bad_request("attachment endpoint resolution unavailable"));
+                };
+                match crate::infra::attachment::resolve_attachment_authority(
+                    sessions_dir,
+                    attachment_id,
+                    endpoint_token,
+                )
+                .await
+                {
+                    Ok(authority) => Some(authority),
+                    Err((_code, message)) => return Ok(forbidden(&message)),
+                }
+            }
+            None => None,
+        };
+
+    let persona_id = match attachment_authority.as_ref() {
+        Some(authority) => {
+            if let Some(asserted) = headers
+                .get("x-ember-persona")
+                .and_then(|v| v.to_str().ok())
+                .filter(|value| !value.is_empty())
+                && asserted != authority.runtime_persona_id
+            {
+                return Ok(forbidden(
+                    "X-Ember-Persona does not match attachment authority",
+                ));
+            }
+            authority.runtime_persona_id.clone()
+        }
+        None => match headers.get("x-ember-persona").and_then(|v| v.to_str().ok()) {
+            Some(v) => v.to_string(),
+            None => return Ok(bad_request("missing X-Ember-Persona header")),
+        },
+    };
+
     // Mirror the production C-1 fix: derive the single authoritative URI
     // used for scope + action resolution from `X-Ember-Target`.
     let effective_uri = match effective_scope_uri(&target_url, req.uri()) {
@@ -164,14 +214,11 @@ async fn handle_request_boxed(
         Err(msg) => return Ok(bad_request(&msg)),
     };
 
-    // implementation-note-307 test parity — pin grant by id
-    // when the header is present (mirrors production handle_request).
-    let pinned_grant_id = headers
-        .get("x-ember-grant-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let resolved_grant_id = attachment_authority
+        .as_ref()
+        .map(|authority| &authority.grant_id);
 
-    let grant = if let Some(ref gid) = pinned_grant_id {
+    let grant = if let Some(gid) = resolved_grant_id {
         match state.store.get_grant(gid) {
             Ok(g) => {
                 if g.persona_id != persona_id {
@@ -191,7 +238,7 @@ async fn handle_request_boxed(
                 g
             }
             Err(StoreError::NotFound) => {
-                return Ok(forbidden("no active grant for X-Ember-Grant-Id"));
+                return Ok(forbidden("attachment resolved to a missing grant"));
             }
             Err(e) => return Err(ProxyError::Store(e)),
         }
@@ -252,6 +299,21 @@ async fn handle_request_boxed(
                     "denied_subtarget_scope",
                     Some(&format!(
                         "action={action} resource={resource} subtarget_glob={subtarget_glob}"
+                    )),
+                ) {
+                    tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, action = %action, resource = %resource, "log_event failed");
+                }
+                return Ok(scope_violation_response());
+            }
+            ResolveOutcome::UnevaluableCondition { conditions } => {
+                // design seam 8B — fail closed (test harness mirror).
+                if let Err(e) = state.store.log_event(
+                    Some(&persona_id),
+                    "credential.access",
+                    Some(&credential_name),
+                    "denied_unevaluable_condition",
+                    Some(&format!(
+                        "action={action} resource={resource} conditions={conditions}"
                     )),
                 ) {
                     tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, action = %action, resource = %resource, "log_event failed");
@@ -348,7 +410,7 @@ async fn handle_request_boxed(
             .vault
             .get(VaultScope::Interactive, &state.store, &credential_name)
         {
-            Ok(b) => Zeroizing::new(b),
+            Ok(b) => b,
             Err(VaultError::NotFound) => {
                 return Ok(internal_error("credential not found in vault"));
             }
@@ -419,7 +481,7 @@ async fn handle_request_boxed(
     // Post-flight meter (test parity with production).
     let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
     if let Some(mut delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
-        // T-implementation-note-308: production
+        // T-implementation-note-286: production
         // metering folds in `record_upstream_request` to mint the
         // billable request count. The test harness always returns
         // 200, so success is unconditional — match the production
@@ -619,754 +681,7 @@ async fn credential_not_in_vault_returns_500() {
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
-// ------------------------------------------------------------------
-// Scope enforcement tests (69E.5)
-// ------------------------------------------------------------------
-
-#[tokio::test]
-async fn scope_read_denies_post() {
-    let state = make_state();
-
-    let persona = state.store.create_persona("scope-read-post").unwrap();
-    state
-        .vault
-        .add(
-            VaultScope::Interactive,
-            &state.store,
-            "gh-token",
-            b"ghp_secret",
-            None,
-        )
-        .unwrap();
-    state
-        .store
-        .create_grant(&persona.id, "gh-token", "*:read", None)
-        .unwrap();
-
-    let req = proxy_request_with_method_and_uri(
-        "POST",
-        "https://api.github.com/repos/emberdotlink/emberlink/issues",
-        Some(&persona.id),
-        Some("gh-token"),
-        Some("https://api.github.com"),
-    );
-
-    let resp = call(state, req).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    // Per design a POST to a github endpoint under a read-only
-    // statement has zero applicable statements (the statement's
-    // action is "read", the request's action is "github:push"),
-    // so this denies at the statement-resolution layer. The body
-    // must not leak the selector string.
-    let err = json["error"].as_str().unwrap_or("");
-    assert_eq!(err, "no_applicable_statement", "unexpected error shape: {err}");
-    // The response must NOT leak the scope string.
-    let body_str = std::str::from_utf8(&body).unwrap();
-    assert!(
-        !body_str.contains("read"),
-        "response body leaked scope detail: {body_str}"
-    );
-}
-
-#[tokio::test]
-async fn scope_read_allows_get() {
-    // The check function itself is the load-bearing piece; the full
-    // forward path doesn't need to work in tests.
-    let uri: hyper::Uri = "https://api.github.com/repos/emberdotlink/emberlink"
-        .parse()
-        .unwrap();
-    assert!(check_scope("*:read", &hyper::Method::GET, &uri).is_ok());
-    assert!(check_scope("*:read", &hyper::Method::HEAD, &uri).is_ok());
-    // V0 scope grammar requires provider:action — bare action is gone.
-    assert!(check_scope("read", &hyper::Method::GET, &uri).is_err());
-}
-
-#[tokio::test]
-async fn scope_github_push_specific_repo() {
-    // Allowed: push to the exact repo.
-    let ok_uri: hyper::Uri = "https://api.github.com/repos/emberdotlink/emberlink/issues"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope(
-            "github:push:emberdotlink/emberlink",
-            &hyper::Method::POST,
-            &ok_uri
-        )
-        .is_ok()
-    );
-
-    // Denied: push to a different repo.
-    let bad_uri: hyper::Uri = "https://api.github.com/repos/other/repo/issues"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope(
-            "github:push:emberdotlink/emberlink",
-            &hyper::Method::POST,
-            &bad_uri
-        )
-        .is_err()
-    );
-
-    // Also denied: the host isn't github.
-    let wrong_host: hyper::Uri = "https://api.example.com/repos/emberdotlink/emberlink/issues"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope(
-            "github:push:emberdotlink/emberlink",
-            &hyper::Method::POST,
-            &wrong_host
-        )
-        .is_err()
-    );
-
-    // Also denied: a read-tier method with a push-only scope.
-    assert!(
-        check_scope(
-            "github:push:emberdotlink/emberlink",
-            &hyper::Method::GET,
-            &ok_uri
-        )
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn scope_wildcard_allows_anything() {
-    let uri: hyper::Uri = "https://api.example.com/anything".parse().unwrap();
-    assert!(check_scope("*", &hyper::Method::GET, &uri).is_ok());
-    assert!(check_scope("*", &hyper::Method::POST, &uri).is_ok());
-    assert!(check_scope("*:*", &hyper::Method::DELETE, &uri).is_ok());
-    assert!(check_scope("*:*:*", &hyper::Method::PATCH, &uri).is_ok());
-}
-
-#[tokio::test]
-async fn scope_unknown_format_denies() {
-    let uri: hyper::Uri = "https://api.github.com/repos/a/b".parse().unwrap();
-
-    // Empty scope.
-    assert!(check_scope("", &hyper::Method::GET, &uri).is_err());
-    // Whitespace-only.
-    assert!(check_scope("   ", &hyper::Method::GET, &uri).is_err());
-    // Trailing/double colons (empty segments).
-    assert!(check_scope("garbled::::", &hyper::Method::GET, &uri).is_err());
-    assert!(check_scope("github::push", &hyper::Method::POST, &uri).is_err());
-    // Too many segments.
-    assert!(check_scope("a:b:c:d:e", &hyper::Method::GET, &uri).is_err());
-    // Unknown provider.
-    assert!(check_scope("quux:read", &hyper::Method::GET, &uri).is_err());
-    // Unknown action.
-    assert!(check_scope("github:frobnicate", &hyper::Method::POST, &uri).is_err());
-    // Unknown HTTP method (CONNECT/TRACE etc.) fails closed even under "*".
-    assert!(check_scope("*", &hyper::Method::CONNECT, &uri).is_err());
-}
-
-#[tokio::test]
-async fn scope_read_denies_post_e2e_logs_denial() {
-    // End-to-end: denial also writes an audit entry when no statement
-    // covers the request.
-    let state = make_state();
-    let persona = state.store.create_persona("scope-audit").unwrap();
-    state
-        .vault
-        .add(VaultScope::Interactive, &state.store, "tok", b"s", None)
-        .unwrap();
-    state
-        .store
-        .create_grant(&persona.id, "tok", "*:read", None)
-        .unwrap();
-
-    let req = proxy_request_with_method_and_uri(
-        "POST",
-        "https://api.github.com/repos/a/b/issues",
-        Some(&persona.id),
-        Some("tok"),
-        Some("https://api.github.com"),
-    );
-
-    let resp = call(Arc::clone(&state), req).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    let entries = state
-        .store
-        .query_audit(&crate::infra::audit::AuditFilter::default())
-        .unwrap();
-    assert!(entries.iter().any(|e| e.action == "credential.access"
-        && e.outcome == "denied_no_applicable_statement"));
-}
-
-#[tokio::test]
-async fn successful_request_logs_audit_event() {
-    let state = make_state();
-
-    let persona = state.store.create_persona("audit-agent").unwrap();
-    state
-        .vault
-        .add(
-            VaultScope::Interactive,
-            &state.store,
-            "audit-token",
-            b"tok_secret",
-            None,
-        )
-        .unwrap();
-    state
-        .store
-        .create_grant(&persona.id, "audit-token", "generic:read", None)
-        .unwrap();
-
-    let req = proxy_request_with_headers(
-        Some(&persona.id),
-        Some("audit-token"),
-        Some("https://api.example.com"),
-    );
-
-    let resp = call(Arc::clone(&state), req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let entries = state
-        .store
-        .query_audit(&crate::infra::audit::AuditFilter::default())
-        .unwrap();
-    // grant.minted from create_grant + credential.access from the proxy request = 2
-    assert_eq!(entries.len(), 2);
-    // query_audit orders by timestamp DESC; credential.access is most recent
-    assert_eq!(entries[0].action, "credential.access");
-    assert_eq!(entries[0].outcome, "allowed");
-    assert_eq!(entries[0].credential.as_deref(), Some("audit-token"));
-    assert_eq!(entries[1].action, "grant.minted");
-}
-
-// ------------------------------------------------------------------
-// Subtarget (branch-pattern) enforcement tests (69E.5b)
-// ------------------------------------------------------------------
-
-#[tokio::test]
-async fn scope_subtarget_branches_path_glob_match() {
-    // feat/* glob matches feat/foo branch.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/feat/foo"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_ok(),
-        "feat/* should match feat/foo via /branches/ path"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_branches_path_glob_mismatch() {
-    // feat/* glob does NOT match main.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/main"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_err(),
-        "feat/* should not match main branch"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_git_refs_heads_glob_match() {
-    // feat/* glob matches feat/anything via /git/refs/heads/.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/git/refs/heads/feat/anything"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:x/y:feat/*", &hyper::Method::PATCH, &uri).is_ok(),
-        "feat/* should match feat/anything via /git/refs/heads/"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_non_branch_path_denied() {
-    // Path has no branch in it — should fail closed.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/issues".parse().unwrap();
-    let result = check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri);
-    assert!(
-        result.is_err(),
-        "scope with subtarget must fail closed when path has no /branches/ or /git/refs/heads/"
-    );
-    let err_msg = result.unwrap_err().message;
-    assert!(
-        err_msg.contains("/branches/") || err_msg.contains("/git/refs/heads/"),
-        "error message should explain why: {err_msg}"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_exact_match() {
-    let main_uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/main"
-        .parse()
-        .unwrap();
-    let dev_uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/develop"
-        .parse()
-        .unwrap();
-
-    // Exact match succeeds.
-    assert!(
-        check_scope("github:push:x/y:main", &hyper::Method::DELETE, &main_uri).is_ok(),
-        "exact subtarget 'main' should match /branches/main"
-    );
-    // Exact match fails on a different branch.
-    assert!(
-        check_scope("github:push:x/y:main", &hyper::Method::DELETE, &dev_uri).is_err(),
-        "exact subtarget 'main' should not match /branches/develop"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_empty_segment_rejected() {
-    // A trailing colon (empty subtarget) must be rejected as a malformed scope.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/main"
-        .parse()
-        .unwrap();
-    let result = check_scope("github:push:x/y:", &hyper::Method::POST, &uri);
-    assert!(
-        result.is_err(),
-        "empty subtarget segment (trailing colon) must be rejected"
-    );
-    let err_msg = result.unwrap_err().message;
-    assert!(
-        err_msg.contains("malformed"),
-        "error should say malformed: {err_msg}"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_protection_subresource() {
-    // /branches/{branch}/protection — branch is still the segment after /branches/.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/main/protection"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:x/y:main", &hyper::Method::PUT, &uri).is_ok(),
-        "subtarget 'main' should match /branches/main/protection"
-    );
-}
-
-// ------------------------------------------------------------------
-// Percent-encoded branch name tests (adversarial review finding)
-// ------------------------------------------------------------------
-
-#[tokio::test]
-async fn scope_subtarget_percent_encoded_slash_in_branch() {
-    // feat%2Ffoo in the URI path should match the glob feat/* after decoding.
-    // hyper parses the raw path; `%2F` is NOT decoded to `/` by `uri.path()`.
-    // We must decode it ourselves before matching.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/feat%2Ffoo"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_ok(),
-        "feat/* should match branch feat/foo delivered as feat%2Ffoo in path"
-    );
-}
-
-#[tokio::test]
-async fn scope_subtarget_heavily_percent_encoded_branch() {
-    // %66eat%2Fbar decodes to feat/bar, which should match feat/*.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/%66eat%2Fbar"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_ok(),
-        "feat/* should match branch feat/bar delivered as %66eat%2Fbar in path"
-    );
-}
-
-// ------------------------------------------------------------------
-// 69E.5b required acceptance tests
-// ------------------------------------------------------------------
-
-#[tokio::test]
-async fn subtarget_glob_allows_matching_branch() {
-    // feat/* matches feat/foo on POST /branches/feat/foo.
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/feat/foo"
-        .parse()
-        .unwrap();
-    assert!(check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).is_ok(),);
-}
-
-#[tokio::test]
-async fn subtarget_glob_denies_main_branch_when_scope_limits_to_feat() {
-    // feat/* does NOT match main.
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
-        .parse()
-        .unwrap();
-    assert!(check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).is_err(),);
-}
-
-#[tokio::test]
-async fn subtarget_glob_allows_nested_via_double_star() {
-    // release/** matches release/v2/hotfix via /git/refs/heads/.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/git/refs/heads/release/v2/hotfix"
-            .parse()
-            .unwrap();
-    assert!(
-        check_scope(
-            "github:push:owner/repo:release/**",
-            &hyper::Method::POST,
-            &uri,
-        )
-        .is_ok(),
-        "release/** should match release/v2/hotfix"
-    );
-
-    // Single-star should NOT match nested paths: release/* matches
-    // release/v2 but not release/v2/hotfix.
-    let nested: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/git/refs/heads/release/v2/hotfix"
-            .parse()
-            .unwrap();
-    assert!(
-        check_scope(
-            "github:push:owner/repo:release/*",
-            &hyper::Method::POST,
-            &nested,
-        )
-        .is_err(),
-        "release/* must NOT match release/v2/hotfix — that's the point of **",
-    );
-}
-
-#[tokio::test]
-async fn subtarget_no_glob_falls_through_to_target_match() {
-    // A scope with no subtarget (three segments) must allow any branch
-    // once the target (owner/repo) matches.
-    let uri_main: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
-        .parse()
-        .unwrap();
-    let uri_feat: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/feat/foo"
-        .parse()
-        .unwrap();
-    let uri_issues: hyper::Uri = "https://api.github.com/repos/owner/repo/issues"
-        .parse()
-        .unwrap();
-
-    for uri in [&uri_main, &uri_feat, &uri_issues] {
-        assert!(
-            check_scope("github:push:owner/repo", &hyper::Method::POST, uri).is_ok(),
-            "scope without subtarget must allow {uri}",
-        );
-    }
-}
-
-#[tokio::test]
-async fn subtarget_contents_endpoint_uses_ref_query_param() {
-    // PUT /repos/owner/repo/contents/file.txt?ref=feat/foo
-    // — branch is the ref query param, not anywhere in the path.
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/contents/file.txt?ref=feat/foo"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_ok(),
-        "feat/* should match ?ref=feat/foo on /contents/ endpoint"
-    );
-}
-
-#[tokio::test]
-async fn subtarget_denies_contents_with_main_ref() {
-    // Same scope, but ?ref=main — should deny.
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/contents/file.txt?ref=main"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_err(),
-        "feat/* must not match ?ref=main on /contents/ endpoint"
-    );
-}
-
-#[tokio::test]
-async fn subtarget_contents_percent_encoded_ref() {
-    // ?ref=feat%2Ffoo decodes to feat/foo, matching feat/*.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/contents/file.txt?ref=feat%2Ffoo"
-            .parse()
-            .unwrap();
-    assert!(
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_ok(),
-        "percent-encoded ref value must decode before matching"
-    );
-}
-
-#[tokio::test]
-async fn subtarget_contents_no_ref_query_denies() {
-    // /contents/ without ?ref= — we cannot determine which branch is
-    // targeted, so fail closed.
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/contents/file.txt"
-        .parse()
-        .unwrap();
-    assert!(
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_err(),
-        "missing ?ref= must fail closed when scope has subtarget"
-    );
-}
-
-// ------------------------------------------------------------------
-// Glob semantics — unit tests now live in
-// `core-proxy-forward::r#match::tests` (implementation-note-71).
-// The two end-to-end scope tests below stay here because they exercise
-// `check_scope` against a full `hyper::Uri`, not the matcher alone.
-// ------------------------------------------------------------------
-
-#[test]
-fn subtarget_violation_carries_subtarget_audit_outcome() {
-    // The ScopeViolation returned by a subtarget mismatch reports the
-    // `denied_subtarget_scope` audit outcome, distinct from the generic
-    // `denied_scope` used elsewhere. This is how the audit log
-    // distinguishes a branch-scope denial from any other scope reason.
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
-        .parse()
-        .unwrap();
-    let violation =
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).unwrap_err();
-    assert_eq!(violation.kind, ScopeViolationKind::Subtarget);
-    assert_eq!(violation.audit_outcome(), "denied_subtarget_scope");
-
-    // Also verify a generic (non-subtarget) violation reports the legacy
-    // outcome. Use a read-tier scope hitting a write method — not a
-    // subtarget reason.
-    let generic_uri: hyper::Uri = "https://api.github.com/repos/owner/repo/issues"
-        .parse()
-        .unwrap();
-    let generic = check_scope("read", &hyper::Method::POST, &generic_uri).unwrap_err();
-    assert_eq!(generic.kind, ScopeViolationKind::General);
-    assert_eq!(generic.audit_outcome(), "denied_scope");
-}
-
-// ------------------------------------------------------------------
-// P69E.5c — Composite selector subtarget routing
-// ------------------------------------------------------------------
-//
-// A 4-segment legacy scope (`github:push:owner/repo:feat/*`) used to
-// build a flat `ResourceSelector::Glob { pattern: "owner/repo:feat/*" }`,
-// which a request resource like `owner/repo` could never match — the
-// resolver always returned `NoApplicable` and the deny path emitted
-// `denied_no_applicable_statement` instead of the more-specific
-// `denied_subtarget_scope`. The fix: emit a structured
-// `GlobWithSubtarget` and route the resolver to verify the subtarget
-// glob against the request URI's branch.
-
-fn grant_with_subtarget_scope(scope: &str) -> core_grant_types::AccessGrant {
-    use core_event_types::PresentationAudienceKind;
-    use core_grant_types::{
-        AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile,
-        ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
-    };
-    // Mirror what `scope_to_actions_and_selector` produces for the
-    // 4-segment shape — a single statement with `GlobWithSubtarget`.
-    let parts: Vec<&str> = scope.split(':').collect();
-    assert_eq!(parts.len(), 4, "test fixture requires 4-segment scope");
-    let stmt = Statement {
-        sid: "S0".into(),
-        resource_type: ResourceType::Credential,
-        actions: vec![format!("{}:{}", parts[0], parts[1])],
-        resource: ResourceSelector::GlobWithSubtarget {
-            primary_glob: parts[2].into(),
-            subtarget_glob: parts[3].into(),
-        },
-        budget: None,
-        usage: Usage::default(),
-        conditions: Vec::new(),
-    };
-    let block = Block {
-        statements: vec![stmt],
-        nbf: None,
-        expires_at: None,
-        issued_by: "persona-sub".into(),
-        issued_at: 0,
-        approval: None,
-        note: None,
-    };
-    AccessGrant {
-        id: "grant-sub".into(),
-        version: 1,
-        issuing_persona_id: "persona-sub".into(),
-        recipient_kind: PresentationAudienceKind::Service,
-        recipient_id: "agent".into(),
-        recipient_profile: RecipientProfile::Agent,
-        status: GrantStatus::Active,
-        mode: GrantMode::OneShot,
-        blocks: vec![SignedBlock {
-            block,
-            pubkey_next: "x".into(),
-            signature: "x".into(),
-        }],
-        attestation: AttestationBinding::default(),
-        created_at: 0,
-        updated_at: 0,
-        revoked_at: None,
-        revoked_reason: None,
-        last_used_at: None,
-        label: None,
-    }
-}
-
-#[test]
-fn subtarget_present_in_scope_routes_to_subtarget_match() {
-    // Scope `github:push:owner/repo:feat/*` against a request that
-    // targets `owner/repo` on branch `feat/foo`. The primary glob
-    // `owner/repo` matches the resource AND `feat/*` matches the
-    // branch — resolver should return `Match`, not `SubtargetMiss`
-    // and not `NoApplicable`.
-    let grant = grant_with_subtarget_scope("github:push:owner/repo:feat/*");
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/feat/foo"
-        .parse()
-        .unwrap();
-    let outcome = resolve_statement_for_request_with_uri(&grant, "github:push", "owner/repo", &uri);
-    match outcome {
-        ResolveOutcome::Match { stmt, .. } => {
-            assert_eq!(stmt.sid, "S0");
-        }
-        other => panic!("expected Match for primary+subtarget hit, got {:?}", other),
-    }
-}
-
-#[test]
-fn subtarget_miss_returns_denied_subtarget_scope_not_no_applicable_statement() {
-    // Same scope, but the request branch `main` does NOT satisfy
-    // `feat/*`. Pre-fix the resolver returned `NoApplicable` because
-    // the flat glob could not match the colon-joined pattern at all;
-    // post-fix the resolver routes through the structured
-    // `GlobWithSubtarget` and reports `SubtargetMiss` so the deny
-    // path can emit `denied_subtarget_scope`.
-    let grant = grant_with_subtarget_scope("github:push:owner/repo:feat/*");
-    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
-        .parse()
-        .unwrap();
-    let outcome = resolve_statement_for_request_with_uri(&grant, "github:push", "owner/repo", &uri);
-    match outcome {
-        ResolveOutcome::SubtargetMiss { subtarget_glob } => {
-            assert_eq!(subtarget_glob, "feat/*");
-        }
-        ResolveOutcome::NoApplicable => panic!(
-            "regression: subtarget mismatch fell through to NoApplicable; \
-             the audit log would emit denied_no_applicable_statement \
-             instead of denied_subtarget_scope"
-        ),
-        ResolveOutcome::Match { .. } => {
-            panic!("subtarget did not match branch — should not be Match");
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// Per-Statement resolution tests (design / P69K-A2)
-// ------------------------------------------------------------------
-
-#[test]
-fn resolve_statement_picks_first_applicable() {
-    use core_event_types::PresentationAudienceKind;
-    use core_grant_types::{
-        AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile,
-        ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
-    };
-    // V0: Statement actions are fully qualified (`provider:action`).
-    // Bare-action tolerance was a back-compat wart and is gone.
-    let stmt_read = Statement {
-        sid: "S0".into(),
-        resource_type: ResourceType::Credential,
-        actions: vec!["github:read".into()],
-        resource: ResourceSelector::Glob {
-            pattern: "emberdotlink/*".into(),
-        },
-        budget: None,
-        usage: Usage::default(),
-        conditions: Vec::new(),
-    };
-    let stmt_push = Statement {
-        sid: "S1".into(),
-        resource_type: ResourceType::Credential,
-        actions: vec!["github:push".into()],
-        resource: ResourceSelector::Exact {
-            value: "emberdotlink/widgets".into(),
-        },
-        budget: None,
-        usage: Usage::default(),
-        conditions: Vec::new(),
-    };
-    let block = Block {
-        statements: vec![stmt_read, stmt_push],
-        nbf: None,
-        expires_at: None,
-        issued_by: "persona-a".into(),
-        issued_at: 0,
-        approval: None,
-        note: None,
-    };
-    let grant = AccessGrant {
-        id: "grant-x".into(),
-        version: 1,
-        issuing_persona_id: "persona-a".into(),
-        recipient_kind: PresentationAudienceKind::Service,
-        recipient_id: "agent".into(),
-        recipient_profile: RecipientProfile::Agent,
-        status: GrantStatus::Active,
-        mode: GrantMode::OneShot,
-        blocks: vec![SignedBlock {
-            block,
-            pubkey_next: "x".into(),
-            signature: "x".into(),
-        }],
-        attestation: AttestationBinding::default(),
-        created_at: 0,
-        updated_at: 0,
-        revoked_at: None,
-        revoked_reason: None,
-        last_used_at: None,
-        label: None,
-    };
-    // github:read matches stmt_read via glob.
-    let hit = resolve_statement_for_request(&grant, "github:read", "emberdotlink/ember");
-    assert!(hit.is_some(), "github:read should match stmt_read");
-    assert_eq!(hit.unwrap().1.sid, "S0");
-    // github:push on the exact resource matches stmt_push.
-    let hit = resolve_statement_for_request(&grant, "github:push", "emberdotlink/widgets");
-    assert!(
-        hit.is_some(),
-        "github:push on widgets should match stmt_push"
-    );
-    assert_eq!(hit.unwrap().1.sid, "S1");
-    // github:push to a different repo matches nothing — read glob is
-    // action=read only and push selector is exact.
-    let hit = resolve_statement_for_request(&grant, "github:push", "emberdotlink/other");
-    assert!(hit.is_none(), "other repo with push must have no match");
-}
-
-#[tokio::test]
-async fn per_statement_denies_unmatched_action() {
-    // A read-scoped grant with a path-style selector. POST under
-    // read action produces no applicable statement → deny.
-    let state = make_state();
-    let persona = state.store.create_persona("per-stmt-1").unwrap();
-    state
-        .vault
-        .add(VaultScope::Interactive, &state.store, "tok", b"s", None)
-        .unwrap();
-    state
-        .store
-        .create_grant(&persona.id, "tok", "generic:read:/api/foo", None)
-        .unwrap();
-
-    let req = proxy_request_with_method_and_uri(
-        "POST",
-        "https://example.com/api/foo",
-        Some(&persona.id),
-        Some("tok"),
-        Some("https://example.com"),
-    );
-    let resp = call(state, req).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "no_applicable_statement");
-}
+mod scope_tests;
 
 // ------------------------------------------------------------------
 // Stream C — per-Statement token + cent metering (P69K-C)
@@ -1421,6 +736,7 @@ fn stmt_credential(sid: &str) -> Statement {
         budget: None,
         usage: Usage::default(),
         conditions: Vec::new(),
+        can_delegate: None,
     }
 }
 
@@ -1439,6 +755,7 @@ fn stmt_session(sid: &str, tokens: u64) -> Statement {
         }),
         usage: Usage::default(),
         conditions: Vec::new(),
+        can_delegate: None,
     }
 }
 
@@ -1454,6 +771,7 @@ fn stmt_time(sid: &str, wall_clock_secs: u64) -> Statement {
         }),
         usage: Usage::default(),
         conditions: Vec::new(),
+        can_delegate: None,
     }
 }
 
@@ -1868,6 +1186,7 @@ async fn proxy_non_llm_target_skips_token_meters() {
         budget: None,
         usage: Usage::default(),
         conditions: Vec::new(),
+        can_delegate: None,
     };
     let grant_id = seed_composite_grant(&state, &persona.id, "gh-token", vec![stmt]);
 
@@ -2063,8 +1382,8 @@ fn threshold_warning_broadcasts_to_subscribers() {
     store.set_vault(std::rc::Rc::new(crate::infra::vault::Vault::new(
         [0x42u8; 32],
     )));
-    let state = Arc::new(ProxyState::new(store));
-    // implementation-note-309: the broadcast channel + threshold
+    let state = Arc::new(ProxyState::new(store, None));
+    // implementation-note-287: the broadcast channel + threshold
     // debounce set now live on the sink, not on `ProxyState`. Install
     // the sink immediately after construction. `OnceLock::set` returns
     // `Result<(), Arc<DaemonEventSink>>` whose Err variant does not
@@ -2154,8 +1473,8 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
     store.set_vault(std::rc::Rc::new(crate::infra::vault::Vault::new(
         [0x42u8; 32],
     )));
-    let state = Arc::new(ProxyState::new(store));
-    // implementation-note-309: see sibling test — sink ownership of
+    let state = Arc::new(ProxyState::new(store, None));
+    // implementation-note-287: see sibling test — sink ownership of
     // events_tx + threshold_emitted moved out of ProxyState.
     let sink = Arc::new(DaemonEventSink::new(state.clone(), Some(events_tx.clone())));
     let _ = state.event_sink.set(sink.clone());
@@ -2206,7 +1525,7 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
 }
 
 // P69L spike Day-1 pure-function tests for git echo helpers moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-71).
+// `core-proxy-forward::r#match::tests` (implementation-note-81).
 
 #[test]
 fn base64_std_encode_matches_rfc_vectors() {
@@ -2372,6 +1691,310 @@ async fn git_echo_streams_large_body_without_collect() {
     assert_eq!(
         resp_body, payload,
         "response body content must match the sent payload"
+    );
+}
+
+/// Sweep 3 S-REVOKE regression: a per-statement revocation on the git-push
+/// echo lane must DENY (parity with the LLM lane). Before the fix,
+/// `handle_git_echo` resolved a statement but never consulted
+/// `get_revoked_sids`, so a credential the operator had scoped-down via
+/// per-statement revoke still injected and pushed. No upstream server is bound
+/// because the revocation denial returns 403 before any upstream contact.
+#[tokio::test]
+async fn git_echo_denies_revoked_statement() {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    ensure_rustls_provider();
+    let _gate = streaming_gate_test_lock();
+
+    let (echo_state, persona_id, cred_name) =
+        make_git_echo_state("revoke-persona", "revoke-cred", "ghp_secret");
+
+    // Revoke every statement on the persona's grant for this credential, via
+    // the real store path (same write `revoke_grant_statement` the daemon RPC
+    // uses). After this, the matched github:push statement is revoked.
+    let grant = echo_state
+        .store
+        .evaluate_grant(&persona_id, &cred_name)
+        .expect("grant exists");
+    let access_grant = echo_state
+        .store
+        .get_access_grant(&grant.id)
+        .expect("access grant loads");
+    let sids: Vec<String> = access_grant
+        .statements()
+        .map(|(_, stmt)| stmt.sid.clone())
+        .collect();
+    assert!(
+        !sids.is_empty(),
+        "test grant must carry at least one statement"
+    );
+    for sid in &sids {
+        echo_state
+            .store
+            .revoke_grant_statement(&grant.id, sid)
+            .expect("revoke statement");
+    }
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    // upstream_host is never contacted (denial precedes upstream).
+    let upstream_host = "127.0.0.1:9";
+    let config = Arc::new(GitEchoConfig {
+        bind_addr: proxy_addr,
+        upstream_host: upstream_host.to_string(),
+        state: echo_state,
+        upstream_scheme: Scheme::Http,
+    });
+
+    let local = tokio::task::LocalSet::new();
+    let cfg_for_server = Arc::clone(&config);
+    local.spawn_local(async move {
+        if let Ok((stream, _)) = proxy_listener.accept().await {
+            let io = TokioIo::new(stream);
+            let cfg = Arc::clone(&cfg_for_server);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let cfg = Arc::clone(&cfg);
+                        async move { handle_git_echo(cfg, req).await }
+                    }),
+                )
+                .await;
+        }
+    });
+
+    let proxy_url = format!(
+        "http://127.0.0.1:{}/{}/acme/widgets.git/git-receive-pack",
+        proxy_addr.port(),
+        upstream_host,
+    );
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(&proxy_url)
+        .header("x-ember-persona", persona_id.as_str())
+        .header("x-ember-credential", cred_name.as_str())
+        .header("content-type", "application/x-git-receive-pack-request")
+        .body(Full::new(Bytes::from_static(b"0000")))
+        .unwrap();
+
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        local.run_until(async move { client.request(req).await.unwrap().status() }),
+    )
+    .await
+    .expect("revoked git-echo round-trip timed out");
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "git-echo must deny a revoked statement (S-REVOKE parity)"
+    );
+}
+
+/// BKR-4b (design §A.4): the git-echo lane now walks grant ancestry. A child
+/// grant whose PARENT was revoked without the eager `cascade_revoke_children`
+/// write reaching it (crash mid-cascade / race / presented embed-chain) must be
+/// denied — even though the child is active and its statement covers the push.
+/// Before this, `handle_git_echo` walked no ancestry, so a revoked-ancestor
+/// grant could still inject a git-push credential (the same class #5708 closed
+/// at the construct mint; parity with the LLM lane's existing §A.4 check). No
+/// upstream is bound — the denial precedes upstream contact.
+#[tokio::test]
+async fn git_echo_denies_revoked_grant_ancestor() {
+    use http_body_util::Full;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    ensure_rustls_provider();
+    let _gate = streaming_gate_test_lock();
+
+    let (echo_state, persona_id, cred_name) =
+        make_git_echo_state("ancestry-persona", "ancestry-cred", "ghp_secret");
+
+    // The grant make_git_echo_state created is the apex; treat it as the parent.
+    let parent = echo_state
+        .store
+        .evaluate_grant(&persona_id, &cred_name)
+        .expect("apex grant exists");
+    // Active child grant for the same persona+credential, descending from parent.
+    let child = echo_state
+        .store
+        .create_grant(&persona_id, &cred_name, "*", None)
+        .expect("create child grant");
+    echo_state
+        .store
+        .conn()
+        .execute(
+            "UPDATE grants SET parent_grant_id = ?1 WHERE id = ?2",
+            rusqlite::params![parent.id, child.id],
+        )
+        .unwrap();
+    // Revoke ONLY the parent (simulate the missed cascade); child stays active.
+    echo_state
+        .store
+        .conn()
+        .execute(
+            "UPDATE grants SET status = 'revoked' WHERE id = ?1",
+            rusqlite::params![parent.id],
+        )
+        .unwrap();
+    assert_eq!(
+        echo_state.store.get_grant(&child.id).unwrap().status,
+        "active",
+        "child must stay active so the denial is purely the §A.4 walk"
+    );
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    // upstream_host is never contacted (denial precedes upstream).
+    let upstream_host = "127.0.0.1:9";
+    let config = Arc::new(GitEchoConfig {
+        bind_addr: proxy_addr,
+        upstream_host: upstream_host.to_string(),
+        state: echo_state,
+        upstream_scheme: Scheme::Http,
+    });
+
+    let local = tokio::task::LocalSet::new();
+    let cfg_for_server = Arc::clone(&config);
+    local.spawn_local(async move {
+        if let Ok((stream, _)) = proxy_listener.accept().await {
+            let io = TokioIo::new(stream);
+            let cfg = Arc::clone(&cfg_for_server);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let cfg = Arc::clone(&cfg);
+                        async move { handle_git_echo(cfg, req).await }
+                    }),
+                )
+                .await;
+        }
+    });
+
+    let proxy_url = format!(
+        "http://127.0.0.1:{}/{}/acme/widgets.git/git-receive-pack",
+        proxy_addr.port(),
+        upstream_host,
+    );
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(&proxy_url)
+        .header("x-ember-persona", persona_id.as_str())
+        .header("x-ember-credential", cred_name.as_str())
+        .header("content-type", "application/x-git-receive-pack-request")
+        .body(Full::new(Bytes::from_static(b"0000")))
+        .unwrap();
+
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        local.run_until(async move { client.request(req).await.unwrap().status() }),
+    )
+    .await
+    .expect("ancestor-revoked git-echo round-trip timed out");
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "git-echo must deny a grant with a revoked ancestor (§A.4 walk)"
+    );
+}
+
+/// design §1/AC-2 parity for the git echo lane: an active grant row is not
+/// enough authority-to-act once its grant-scoped live lease is gone. Deny
+/// before statement resolution, vault reads, or upstream contact.
+#[tokio::test]
+async fn git_echo_denies_active_grant_without_live_lease() {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    ensure_rustls_provider();
+    let _gate = streaming_gate_test_lock();
+
+    let (echo_state, persona_id, cred_name) =
+        make_git_echo_state("no-lease-persona", "no-lease-cred", "ghp_secret");
+    let grant = echo_state
+        .store
+        .evaluate_grant(&persona_id, &cred_name)
+        .expect("grant exists");
+    assert!(
+        echo_state.store.leases().drop_lease(&grant.id),
+        "test setup must remove the live lease while leaving the grant active"
+    );
+    assert_eq!(
+        echo_state.store.get_grant(&grant.id).unwrap().status,
+        "active",
+        "row remains active; refusal must come from missing lease authority"
+    );
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let upstream_host = "127.0.0.1:9";
+    let config = Arc::new(GitEchoConfig {
+        bind_addr: proxy_addr,
+        upstream_host: upstream_host.to_string(),
+        state: echo_state,
+        upstream_scheme: Scheme::Http,
+    });
+
+    let local = tokio::task::LocalSet::new();
+    let cfg_for_server = Arc::clone(&config);
+    local.spawn_local(async move {
+        if let Ok((stream, _)) = proxy_listener.accept().await {
+            let io = TokioIo::new(stream);
+            let cfg = Arc::clone(&cfg_for_server);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let cfg = Arc::clone(&cfg);
+                        async move { handle_git_echo(cfg, req).await }
+                    }),
+                )
+                .await;
+        }
+    });
+
+    let proxy_url = format!(
+        "http://127.0.0.1:{}/{}/acme/widgets.git/git-receive-pack",
+        proxy_addr.port(),
+        upstream_host,
+    );
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(&proxy_url)
+        .header("x-ember-persona", persona_id.as_str())
+        .header("x-ember-credential", cred_name.as_str())
+        .header("content-type", "application/x-git-receive-pack-request")
+        .body(Full::new(Bytes::from_static(b"0000")))
+        .unwrap();
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        local.run_until(async move {
+            let resp = client.request(req).await.unwrap();
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }),
+    )
+    .await
+    .expect("no-lease git-echo round-trip timed out");
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let body_str = std::str::from_utf8(&body[..]).expect("body must be utf-8");
+    assert!(
+        body_str.starts_with("grant_inactive:no_live_lease:"),
+        "git-echo no-live-lease body must include grant_id suffix, got: {body_str}"
     );
 }
 
@@ -3200,10 +2823,10 @@ fn filter_drops_proxy_authorization_forwarded_via_te_trailer_connection() {
 }
 
 // development milestone: strict host-suffix matching unit tests moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-71).
+// `core-proxy-forward::r#match::tests` (implementation-note-81).
 
 // ------------------------------------------------------------------
-// implementation-note-202 — FINDING B: provider-aware auth
+// implementation-note-196 — FINDING B: provider-aware auth
 // injection. Mirrors `git_echo_grant_backed_lookup_injects_correct_auth`
 // for the LLM proxy path, but tests the helper directly because
 // `handle_request` consults the target URL for the live TCP connection
@@ -4110,6 +3733,65 @@ async fn tee_body_meter_matches_buffered_path() {
     assert!(summary.saw_message_stop, "complete SSE stream is Complete");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn tee_body_meter_meters_openai_responses_sse() {
+    let body = openai_responses_sse_complete("gpt-4o-mini", 2_000, 754);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mock = ChannelBody { rx };
+
+    let captured: Arc<std::sync::Mutex<Option<pricing::UsageSummary>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cap_inner = Arc::clone(&captured);
+    let meter = TeeMeterCallback::new(
+        move |summary: pricing::UsageSummary, _outcome: StreamOutcome| {
+            *cap_inner.lock().unwrap() = Some(summary);
+        },
+    );
+
+    let mut tee = TeeBody::new(mock, MAX_STREAMING_RESPONSE_BYTES, meter);
+
+    let bytes = body.as_bytes();
+    let third = bytes.len() / 3;
+    for chunk in [
+        &bytes[..third],
+        &bytes[third..2 * third],
+        &bytes[2 * third..],
+    ] {
+        tx.send(Ok(Frame::data(Bytes::copy_from_slice(chunk))))
+            .unwrap();
+    }
+    drop(tx);
+
+    loop {
+        let f = std::future::poll_fn(|cx| std::pin::Pin::new(&mut tee).poll_frame(cx)).await;
+        if f.is_none() {
+            break;
+        }
+    }
+
+    let summary = captured.lock().unwrap().clone().expect("meter must fire");
+    let from_streamed = usage_from_summary("api.openai.com", &summary).expect("metered");
+    let from_buffered = meter_response("api.openai.com", body.as_bytes()).expect("parsable");
+
+    assert_eq!(summary.model.as_deref(), Some("gpt-4o-mini"));
+    assert!(summary.saw_any_usage);
+    assert!(summary.saw_message_stop);
+    assert_eq!(from_streamed.tokens, 2_754);
+    assert_eq!(
+        from_streamed.tokens, from_buffered.tokens,
+        "OpenAI streamed metering must match buffered token metering"
+    );
+    assert_eq!(
+        from_streamed.cents_micro, from_buffered.cents_micro,
+        "OpenAI streamed metering must match buffered cents metering"
+    );
+    assert!(
+        from_streamed.cents_micro > 0,
+        "known OpenAI model must not price as unknown"
+    );
+}
+
 #[tokio::test]
 async fn composite_template_scope_does_not_block_anthropic_proxy_flow() {
     let state = make_state();
@@ -4127,12 +3809,7 @@ async fn composite_template_scope_does_not_block_anthropic_proxy_flow() {
 
     let grant = state
         .store
-        .create_grant(
-            &persona.id,
-            "anthropic-key",
-            "claude-code-default-v1",
-            None,
-        )
+        .create_grant(&persona.id, "anthropic-key", "claude-code-default-v1", None)
         .unwrap();
     let root = state.store.persona_root_keypair(&persona.id).unwrap();
     let ag = crate::trust::grant::access_grant_from_statements(
@@ -4150,6 +3827,7 @@ async fn composite_template_scope_does_not_block_anthropic_proxy_flow() {
                 budget: None,
                 usage: Usage::default(),
                 conditions: Vec::new(),
+                can_delegate: None,
             },
             stmt_session("S1", 10_000),
         ],
@@ -4209,6 +3887,43 @@ fn anthropic_sse_complete(model: &str, input_tokens: u64, delta_outputs: &[u64])
     out.push_str(&sse_frame(
         "message_stop",
         serde_json::json!({"type": "message_stop"}),
+    ));
+    out
+}
+
+fn openai_responses_sse_complete(model: &str, input_tokens: u64, output_tokens: u64) -> String {
+    let mut out = String::new();
+    out.push_str(&sse_frame(
+        "response.created",
+        serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_test",
+                "model": model,
+            },
+        }),
+    ));
+    out.push_str(&sse_frame(
+        "response.output_text.delta",
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hello",
+        }),
+    ));
+    out.push_str(&sse_frame(
+        "response.completed",
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_test",
+                "model": model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens.saturating_add(output_tokens),
+                },
+            },
+        }),
     ));
     out
 }
@@ -4538,7 +4253,7 @@ fn test_non_streaming_unchanged() {
     );
 }
 
-/// C44-implementation-note-310 regression guard — the proxy.meter audit event
+/// C44-implementation-note-288 regression guard — the proxy.meter audit event
 /// must NOT emit the raw credential alias in any field. Readers of the
 /// audit log must not be able to correlate persona → credential by
 /// scanning rows. The raw alias stays in `statement_usage`/grant rows;
@@ -5677,19 +5392,17 @@ async fn body_over_limit_returns_413() {
 // -------------------------------------------------------------------------
 
 // -------------------------------------------------------------------------
-// implementation-note-307 — X-Ember-Grant-Id header support
+// Attachment-scoped proxy authority resolution
 // -------------------------------------------------------------------------
 
-/// Build a request with an explicit X-Ember-Grant-Id header so the test
-/// can pin the grant by id rather than letting `evaluate_grant` resolve
-/// it from the persona/credential pair.
-fn proxy_request_with_grant_id(
+fn proxy_request_with_attachment(
     method: &str,
     uri: &str,
     persona: Option<&str>,
     credential: Option<&str>,
     target: Option<&str>,
-    grant_id: Option<&str>,
+    attachment_id: Option<&str>,
+    endpoint_token: Option<&str>,
 ) -> Request<Empty<Bytes>> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(p) = persona {
@@ -5701,21 +5414,20 @@ fn proxy_request_with_grant_id(
     if let Some(t) = target {
         builder = builder.header("X-Ember-Target", t);
     }
-    if let Some(g) = grant_id {
-        builder = builder.header("X-Ember-Grant-Id", g);
+    if let Some(attachment_id) = attachment_id {
+        builder = builder.header("X-Ember-Attachment-Id", attachment_id);
+    }
+    if let Some(endpoint_token) = endpoint_token {
+        builder = builder.header("X-Ember-Endpoint-Token", endpoint_token);
     }
     builder.body(Empty::new()).unwrap()
 }
 
-/// Composite grant with two Credential statements for two distinct
-/// upstream services. The X-Ember-Grant-Id header should resolve both
-/// requests via the same grant id without going through evaluate_grant
-/// (which would have to know which credential_name to look up).
 #[tokio::test]
-async fn x_ember_grant_id_header_resolves_composite_grant() {
-    let state = make_state();
+async fn attachment_endpoint_headers_resolve_current_grant() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = make_state_with_data_dir(&tmp.path().join("data"));
     let persona = state.store.create_persona("composite-agent").unwrap();
-    // Two credentials sharing one composite grant.
     state
         .vault
         .add(
@@ -5736,9 +5448,6 @@ async fn x_ember_grant_id_header_resolves_composite_grant() {
             None,
         )
         .unwrap();
-    // Single composite grant carries Statements for both credentials.
-    // The grant row's credential_name is github-token (the row's flat
-    // projection), but the chain has Statements for both credentials.
     let grant = state
         .store
         .create_grant(&persona.id, "github-token", "*", None)
@@ -5751,6 +5460,7 @@ async fn x_ember_grant_id_header_resolves_composite_grant() {
         budget: None,
         usage: Usage::default(),
         conditions: Vec::new(),
+        can_delegate: None,
     };
     let stmt_anthropic = Statement {
         sid: "S1".into(),
@@ -5760,6 +5470,7 @@ async fn x_ember_grant_id_header_resolves_composite_grant() {
         budget: None,
         usage: Usage::default(),
         conditions: Vec::new(),
+        can_delegate: None,
     };
     let root = state.store.persona_root_keypair(&persona.id).unwrap();
     let ag = crate::trust::grant::access_grant_from_statements(
@@ -5774,53 +5485,75 @@ async fn x_ember_grant_id_header_resolves_composite_grant() {
     .unwrap();
     state.store.overwrite_grant_blocks(&grant.id, &ag).unwrap();
 
-    // Pin via X-Ember-Grant-Id and request the github credential.
-    let req_a = proxy_request_with_grant_id(
+    let sessions = core_state::sessions::SessionStore::new(
+        state
+            .sessions_dir
+            .clone()
+            .expect("persistent state has sessions dir"),
+    );
+    let session_id = "sess-proxy-attachment";
+    sessions
+        .create(&core_state::sessions::SessionMeta {
+            session_id: session_id.to_string(),
+            persona: persona.id.clone(),
+            grant_id: grant.id.clone(),
+            started_at: chrono::Utc::now(),
+            launcher_pid: std::process::id(),
+            authority_strict: false,
+            delegation_id: None,
+            delegation_template: None,
+            durable_persona: Some("durable-proxy-persona".to_string()),
+            caller_binding_id: Some("binding-proxy-001".to_string()),
+        })
+        .unwrap();
+    sessions
+        .write_attachment_endpoint(
+            session_id,
+            &core_state::sessions::AttachmentEndpoint::active(
+                "att-proxy-001".to_string(),
+                "ep-proxy-001".to_string(),
+            ),
+        )
+        .unwrap();
+
+    let req_a = proxy_request_with_attachment(
         "GET",
         "https://api.github.com/repos/x/y",
-        Some(&persona.id),
+        None,
         Some("github-token"),
         Some("https://api.github.com"),
-        Some(&grant.id),
+        Some("att-proxy-001"),
+        Some("ep-proxy-001"),
     );
     let resp_a = call(Arc::clone(&state), req_a).await;
     assert_eq!(
         resp_a.status(),
         StatusCode::OK,
-        "first credential request should succeed via X-Ember-Grant-Id"
+        "credential request should succeed through attachment-scoped authority"
     );
 
-    // Pin via X-Ember-Grant-Id and request the anthropic credential —
-    // the same grant_id authorizes the second credential because the
-    // composite chain carries a Credential Statement for it.
-    // For this test we vary credential_name but reuse the same grant.
-    // NB: the grant's row credential_name is github-token, so this test
-    // also asserts that the row's flat credential_name doesn't gate the
-    // pin lookup — production handle_request rejects cross-credential
-    // pins. The validation that the ID-pinned grant matches the
-    // credential header is intentional defense-in-depth, so reuse the
-    // matching credential in this assertion.
-    let req_b = proxy_request_with_grant_id(
+    let req_b = proxy_request_with_attachment(
         "GET",
         "https://api.github.com/repos/x/y",
-        Some(&persona.id),
+        Some("different-runtime-persona"),
         Some("github-token"),
         Some("https://api.github.com"),
-        Some(&grant.id),
+        Some("att-proxy-001"),
+        Some("ep-proxy-001"),
     );
     let resp_b = call(Arc::clone(&state), req_b).await;
     assert_eq!(
         resp_b.status(),
-        StatusCode::OK,
-        "second pinned-id request should still succeed"
+        StatusCode::FORBIDDEN,
+        "asserted persona headers must not override attachment authority"
     );
 }
 
-/// Regression: the existing single-credential flow (no X-Ember-Grant-Id
-/// header) keeps working. evaluate_grant resolves the grant from the
-/// persona/credential pair as before.
+/// Regression: the existing single-credential flow without attachment
+/// headers keeps working for non-session callers. evaluate_grant resolves
+/// the grant from the persona/credential pair as before.
 #[tokio::test]
-async fn x_ember_grant_id_absent_falls_back_to_evaluate_grant() {
+async fn attachment_headers_absent_falls_back_to_evaluate_grant() {
     let state = make_state();
     let persona = state.store.create_persona("legacy-agent").unwrap();
     state
@@ -5849,22 +5582,44 @@ async fn x_ember_grant_id_absent_falls_back_to_evaluate_grant() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// Pinning with a grant_id that doesn't exist returns 403, not 5xx.
+/// Pinned grant headers are no longer accepted as the proxy authority seam.
 #[tokio::test]
-async fn x_ember_grant_id_unknown_id_is_forbidden() {
+async fn x_ember_grant_id_header_is_rejected() {
     let state = make_state();
     let persona = state.store.create_persona("nogrant-agent").unwrap();
     state
         .vault
         .add(VaultScope::Interactive, &state.store, "tok", b"v", None)
         .unwrap();
-    let req = proxy_request_with_grant_id(
+    let req = Request::builder()
+        .method("GET")
+        .uri("https://api.github.com/repos/x/y")
+        .header("X-Ember-Persona", persona.id.as_str())
+        .header("X-Ember-Credential", "tok")
+        .header("X-Ember-Target", "https://api.github.com")
+        .header("X-Ember-Grant-Id", "grant-does-not-exist")
+        .body(Empty::new())
+        .unwrap();
+    let resp = call(Arc::clone(&state), req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn unknown_attachment_endpoint_is_forbidden() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = make_state_with_data_dir(&tmp.path().join("data"));
+    state
+        .vault
+        .add(VaultScope::Interactive, &state.store, "tok", b"v", None)
+        .unwrap();
+    let req = proxy_request_with_attachment(
         "GET",
         "https://api.github.com/repos/x/y",
-        Some(&persona.id),
+        None,
         Some("tok"),
         Some("https://api.github.com"),
-        Some("grant-does-not-exist"),
+        Some("missing-att"),
+        Some("missing-token"),
     );
     let resp = call(Arc::clone(&state), req).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -5901,7 +5656,7 @@ fn credential_bytes_zeroized_on_drop() {
     unsafe { ManuallyDrop::drop(&mut md) };
 }
 
-/// T-implementation-note-308 regression guard.
+/// T-implementation-note-286 regression guard.
 ///
 /// `usage.requests` must reflect upstream-confirmed responses, not a
 /// pre-flight tally. Driving the post-flight meter once with an
@@ -6000,7 +5755,7 @@ fn record_upstream_request_only_credits_on_success() {
     assert_eq!(record_upstream_request("api.github.com", true, true), 0,);
 }
 
-/// BEAT-7-implementation-note-224 — `statement_revoked_response` emits a
+/// BEAT-7-implementation-note-191 — `statement_revoked_response` emits a
 /// structured JSON 403 naming the persona + statement so clients can
 /// distinguish revoke from a generic scope/audit denial. Locks the
 /// public shape `{"error":"statement_revoked","persona_id":..,
@@ -6022,7 +5777,396 @@ async fn statement_revoked_response_emits_structured_json_403() {
     assert_eq!(json["statement_id"], "S1");
 }
 
-// implementation-note-244: DaemonEventSink::record_threshold_crossing
+/// design §4 / design §2 — `authority_lapsed_response` is fail-closed
+/// (403, no credential) but carries the session base posture's recovery
+/// affordance so a lapsed grant degrades gracefully instead of bricking.
+/// `jit` => re-approvable; `strict` => re-delegate required. Locks the
+/// public body shape against drift.
+#[tokio::test]
+async fn authority_lapsed_response_carries_posture_recovery() {
+    // jit posture: re-approvable.
+    let resp = authority_lapsed_response("agent-worker-a", "expired", "grant-abc", false);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "authority_lapsed");
+    assert_eq!(json["persona_id"], "agent-worker-a");
+    assert_eq!(json["grant_id"], "grant-abc");
+    assert_eq!(json["grant_status"], "expired");
+    assert_eq!(json["posture"], "jit");
+    assert_eq!(json["recovery"], "reapprove");
+
+    // strict posture: re-delegate required; never silently allowed.
+    let resp = authority_lapsed_response("agent-worker-b", "revoked", "grant-xyz", true);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["grant_id"], "grant-xyz");
+    assert_eq!(json["grant_status"], "revoked");
+    assert_eq!(json["posture"], "strict");
+    assert_eq!(json["recovery"], "redelegate");
+}
+
+/// design §4 / design §2 — a grant taken out of `active` mid-session
+/// (operator revoke here) resolved on the attachment path must yield the
+/// parseable `grant_inactive:<status>` contract — NOT the legacy prose and
+/// NOT a silent allow — so the LLM lane renders the recoverable
+/// authority_lapsed response. Locks the resolve seam end-to-end.
+#[tokio::test]
+async fn resolve_grant_non_active_yields_grant_inactive_contract() {
+    use core_proxy_forward::PolicyBackend;
+
+    let state = make_state();
+    let persona = state.store.create_persona("persona-expiry").unwrap();
+    let credential_name = "anthropic/oauth-token";
+    let grant = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+    // Take the grant out of `active` mid-session.
+    state.store.grant_store().revoke_grant(&grant.id).unwrap();
+
+    let backend = DaemonPolicyBackend::new(state);
+    let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+    let err = backend
+        .resolve_grant(&persona.id, credential_name, Some(&grant.id), &uri, "POST")
+        .await
+        .expect_err("a revoked grant must not resolve");
+    match err {
+        // V030-REVOKE-ERROR-MESSAGE: the contract is now
+        // `grant_inactive:<status>:<grant_id>` so the proxy can name the
+        // offending grant in its operator-facing message.
+        core_proxy_forward::PolicyError::Forbidden(msg) => assert_eq!(
+            msg,
+            format!("grant_inactive:revoked:{}", grant.id),
+            "must emit the parseable posture contract with grant_id, got: {msg}"
+        ),
+        other => panic!("expected Forbidden(grant_inactive:..), got {other:?}"),
+    }
+}
+
+/// design §1/AC-2 — a grant can be SQL-active but inert when its
+/// grant-scoped lease is gone. The proxy resolver must refuse before upstream
+/// traffic; active row state alone is not authority-to-act.
+#[tokio::test]
+async fn resolve_grant_active_without_live_lease_yields_grant_inactive_contract() {
+    use core_proxy_forward::PolicyBackend;
+
+    let state = make_state();
+    let persona = state.store.create_persona("persona-no-live-lease").unwrap();
+    let credential_name = "anthropic/oauth-token";
+    let grant = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+    assert!(
+        state.store.leases().drop_lease(&grant.id),
+        "test setup must remove the live lease while leaving the grant active"
+    );
+    assert_eq!(
+        state.store.get_grant(&grant.id).unwrap().status,
+        "active",
+        "row remains active; refusal must come from the missing lease"
+    );
+
+    let backend = DaemonPolicyBackend::new(state);
+    let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+    let err = backend
+        .resolve_grant(&persona.id, credential_name, Some(&grant.id), &uri, "POST")
+        .await
+        .expect_err("an active grant without a live lease must not resolve");
+    match err {
+        core_proxy_forward::PolicyError::Forbidden(msg) => assert!(
+            msg.starts_with("grant_inactive:no_live_lease:"),
+            "must emit the parseable posture contract with grant_id suffix, got: {msg}"
+        ),
+        other => panic!("expected Forbidden(grant_inactive:no_live_lease:*), got {other:?}"),
+    }
+}
+
+/// -S3 / design - request-start resolution is not enough if the lease
+/// disappears before the preflight gate. The proxy must re-check the live
+/// grant-scoped lease after collecting the request body and before it can
+/// approve budget / continue toward credential injection.
+#[tokio::test]
+async fn preflight_budget_rejects_when_live_lease_drops_after_resolve() {
+    use core_proxy_forward::PolicyBackend;
+
+    let state = make_state();
+    let persona = state
+        .store
+        .create_persona("persona-preflight-lease")
+        .unwrap();
+    let credential_name = "anthropic/oauth-token";
+    let grant = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+
+    let backend = DaemonPolicyBackend::new(state.clone());
+    let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+    let resolved = backend
+        .resolve_grant(&persona.id, credential_name, Some(&grant.id), &uri, "POST")
+        .await
+        .expect("live lease should resolve before the preflight drop");
+    assert!(
+        state.store.leases().drop_lease(&grant.id),
+        "test setup must remove the lease after resolve but before preflight"
+    );
+
+    let err = backend
+        .preflight_budget(&resolved, br#"{"max_tokens":1}"#)
+        .await
+        .expect_err("preflight must fail closed after lease loss");
+    match err {
+        core_proxy_forward::PolicyError::Forbidden(msg) => assert!(
+            msg.starts_with("grant_inactive:no_live_lease:"),
+            "must emit the parseable no-live-lease contract with grant_id suffix, got: {msg}"
+        ),
+        other => panic!("expected Forbidden(grant_inactive:no_live_lease:*), got {other:?}"),
+    }
+}
+
+/// lease survival / design - resolving a grant at request start is not
+/// enough to let an in-flight proxy call survive after its lease disappears.
+/// Post-flight metering reopens the grant chain for usage accounting; when the
+/// grant-scoped lease is gone, that authority-to-act consumer must fail closed
+/// instead of silently accepting an unmetered stream/request.
+#[tokio::test]
+async fn post_flight_rejects_when_live_lease_drops_after_resolve() {
+    use core_proxy_forward::PolicyBackend;
+
+    let state = make_state();
+    let persona = state
+        .store
+        .create_persona("persona-post-flight-lease")
+        .unwrap();
+    let credential_name = "anthropic/oauth-token";
+    let grant = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+
+    let backend = DaemonPolicyBackend::new(state.clone());
+    let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+    let resolved = backend
+        .resolve_grant(&persona.id, credential_name, Some(&grant.id), &uri, "POST")
+        .await
+        .expect("live lease should resolve before the in-flight drop");
+    assert!(
+        state.store.leases().drop_lease(&grant.id),
+        "test setup must remove the lease after resolve but before post-flight"
+    );
+
+    let err = backend
+        .post_flight(
+            &resolved,
+            Some(Usage {
+                tokens: 100,
+                requests: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("post-flight metering must fail closed after lease loss");
+    match err {
+        core_proxy_forward::PolicyError::Forbidden(msg) => assert!(
+            msg.starts_with("grant_inactive:no_live_lease:"),
+            "must emit the parseable no-live-lease contract with grant_id suffix, got: {msg}"
+        ),
+        other => panic!("expected Forbidden(grant_inactive:no_live_lease:*), got {other:?}"),
+    }
+
+    let chain = state.store.get_access_grant(&grant.id).unwrap();
+    let stmt = chain
+        .statements()
+        .find(|(_, stmt)| stmt.sid == resolved.statement_sid)
+        .expect("resolved statement remains present")
+        .1;
+    assert_eq!(
+        stmt.usage.tokens, 0,
+        "failed post-flight metering must not persist usage without a live lease"
+    );
+}
+
+/// design §A.4 — the proxy boundary walks grant ancestry, not just the leaf.
+/// A child grant whose PARENT was revoked without the eager
+/// `cascade_revoke_children` write reaching it (crash mid-cascade / race /
+/// presented embed-chain) must be refused at `resolve_grant` even though the
+/// leaf itself is still `active`. Without the online walk this is the open
+/// "revoke the parent, the child's proxied requests still succeed" hole.
+#[tokio::test]
+async fn resolve_grant_refuses_when_grant_ancestor_revoked() {
+    use core_proxy_forward::PolicyBackend;
+
+    let state = make_state();
+    let persona = state.store.create_persona("persona-ancestry").unwrap();
+    let credential_name = "anthropic/oauth-token";
+    let parent = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+    let child = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+    // Link child → parent directly. The daemon sets `parent_grant_id` at
+    // delegate-time; we set it here to isolate the revocation-walk wiring from
+    // delegation attenuation (covered by the grant.rs unit tests).
+    state
+        .store
+        .conn()
+        .execute(
+            "UPDATE grants SET parent_grant_id = ?1 WHERE id = ?2",
+            rusqlite::params![parent.id, child.id],
+        )
+        .unwrap();
+
+    let backend = DaemonPolicyBackend::new(state.clone());
+    let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+
+    // Clean chain: parent active → the leaf resolves (the walk does not
+    // false-refuse).
+    let clean = backend
+        .resolve_grant(&persona.id, credential_name, Some(&child.id), &uri, "POST")
+        .await;
+    assert!(clean.is_ok(), "clean ancestry must resolve, got: {clean:?}");
+
+    // Revoke ONLY the parent's row (simulate the missed cascade); child stays
+    // `active`.
+    state
+        .store
+        .conn()
+        .execute(
+            "UPDATE grants SET status = 'revoked' WHERE id = ?1",
+            rusqlite::params![parent.id],
+        )
+        .unwrap();
+    assert_eq!(
+        state.store.get_grant(&child.id).unwrap().status,
+        "active",
+        "leaf must remain active — the refusal must come from the ancestry walk"
+    );
+
+    let err = backend
+        .resolve_grant(&persona.id, credential_name, Some(&child.id), &uri, "POST")
+        .await
+        .expect_err("a revoked ancestor must refuse the proxied request");
+    match err {
+        core_proxy_forward::PolicyError::Forbidden(msg) => assert_eq!(
+            msg,
+            format!("ancestor_revoked:{}", parent.id),
+            "must emit the parseable ancestor-revoked contract, got: {msg}"
+        ),
+        other => panic!("expected Forbidden(ancestor_revoked:..), got {other:?}"),
+    }
+}
+
+/// BKR-4b (design §A.3 parts 1+2) — the proxy boundary now root-authorizes +
+/// chain-verifies the grant on the composed `PersonaRootAuthority` seam (the
+/// same one #5708/#5718 wired at the broker mints), BEFORE per-request
+/// statement resolution. A grant whose issuing persona is NOT authorized by the
+/// root authority is refused with the `root_unauthorized` contract.
+///
+/// In the dev0 root regime this fires for an issuing persona that resolves no
+/// root key — reachable via a single-block unsigned-phase1 orphan grant (which
+/// `get_access_grant` passes through, F-07) whose persona row is gone. This is
+/// the SAME predicate that becomes load-bearing with no caller change when ADR
+/// 206 steps 1–2 anchor the root in the presence device-set: a persona the set
+/// does not authorize will yield `None` here and be refused identically.
+#[tokio::test]
+async fn resolve_grant_refuses_when_issuing_persona_root_unauthorized() {
+    use core_proxy_forward::PolicyBackend;
+
+    let state = make_state();
+    let persona = state.store.create_persona("persona-unrooted").unwrap();
+    let credential_name = "anthropic/oauth-token";
+    // Create normally so the grant carries a live grant-scoped lease (the proxy
+    // refuses no-live-lease before reaching the root/chain gate).
+    let grant = state
+        .store
+        .create_grant(&persona.id, credential_name, "*", None)
+        .unwrap();
+
+    // Replace the signed chain with a single unsigned-phase1 placeholder block
+    // (issued_by the persona) so `get_access_grant` returns it via the F-07
+    // orphan pass-through instead of erroring on a broken chain.
+    let placeholder = core_grant_types::SignedBlock {
+        block: core_grant_types::Block {
+            statements: vec![core_grant_types::Statement {
+                sid: "S0".into(),
+                resource_type: core_grant_types::ResourceType::Credential,
+                actions: vec!["*".into()],
+                resource: core_grant_types::ResourceSelector::Any,
+                budget: None,
+                usage: core_grant_types::Usage::default(),
+                conditions: vec![],
+                can_delegate: None,
+            }],
+            nbf: None,
+            expires_at: None,
+            issued_by: persona.id.clone(),
+            issued_at: 0,
+            approval: None,
+            note: None,
+        },
+        pubkey_next: core_crypto::grant_chain::UNSIGNED_PHASE1_PLACEHOLDER.into(),
+        signature: core_crypto::grant_chain::UNSIGNED_PHASE1_PLACEHOLDER.into(),
+    };
+    let blocks_json = serde_json::to_string(&[placeholder]).unwrap();
+    state
+        .store
+        .conn()
+        .execute(
+            "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
+            rusqlite::params![blocks_json, grant.id],
+        )
+        .unwrap();
+
+    // Drop the persona row so the root authority resolves no key for the
+    // issuing persona (FK off for the orphaning delete, mirroring the grant.rs
+    // orphan fixtures).
+    state
+        .store
+        .conn()
+        .execute_batch("PRAGMA foreign_keys = OFF")
+        .unwrap();
+    state
+        .store
+        .conn()
+        .execute(
+            "DELETE FROM personas WHERE id = ?1",
+            rusqlite::params![persona.id],
+        )
+        .unwrap();
+    state
+        .store
+        .conn()
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .unwrap();
+
+    let backend = DaemonPolicyBackend::new(state.clone());
+    let uri: http::Uri = "https://api.anthropic.com/v1/messages".parse().unwrap();
+    let err = backend
+        .resolve_grant(&persona.id, credential_name, Some(&grant.id), &uri, "POST")
+        .await
+        .expect_err("a grant whose issuing persona is not root-authorized must refuse");
+    match err {
+        core_proxy_forward::PolicyError::Forbidden(msg) => assert_eq!(
+            msg, "root_unauthorized",
+            "must emit the root-unauthorized contract (parts 1+2 gate), got: {msg}"
+        ),
+        other => panic!("expected Forbidden(root_unauthorized), got {other:?}"),
+    }
+}
+
+// implementation-note-215: DaemonEventSink::record_threshold_crossing
 // dedupes repeated calls on the same (grant_id, statement_sid, axis, band)
 // tuple. Mirrors the existing in-place `ProxyState.threshold_emitted`
 // semantics so the trait-routed code path is independently correct before

@@ -633,7 +633,7 @@ pub fn unwrap_manifest_key_access(
 ) -> Result<String, ValidationError> {
     let unwrapped =
         unwrap_secret_with_identity(identity_private_key, &access.wrapped_manifest_key_hex)?;
-    String::from_utf8(unwrapped)
+    String::from_utf8(unwrapped.to_vec())
         .map_err(|err| ValidationError::new(format!("manifest key is not valid utf-8: {err}")))
 }
 

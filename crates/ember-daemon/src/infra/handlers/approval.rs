@@ -1,5 +1,6 @@
 //! Approval RPC helpers for the socket-facing `list_pending_approvals` and
 //! `resolve_approval` methods.
+//! CLASSIFICATION: PUBLIC
 
 use serde_json::Value;
 
@@ -34,7 +35,7 @@ pub(crate) fn handle_list_pending(
 pub(crate) async fn handle_resolve(
     store: &DaemonStore,
     ctx: &RequestContext,
-    source: DispatchSource,
+    source: &DispatchSource,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let id = params["id"]

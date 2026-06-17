@@ -6,6 +6,53 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::spawn::runtime::RuntimeBackend;
+
+pub const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:3141";
+pub const DEFAULT_LLM_PROXY_ADDR: &str = "127.0.0.1:3142";
+pub const DEFAULT_GIT_PROXY_ADDR: &str = "127.0.0.1:3143";
+
+// V030-AUTH-LEASE-3 — single-knob per-window lease TTL (design §2 /
+// §"Tiering, threat model & residuals" / OQ-1).
+//
+// The lease TTL is the dev0 friction/risk dial: "how long the system runs
+// without me" = "max compromise window" (design §2 elegant property). One
+// knob, one place. There is intentionally NO separate "max ceiling" knob: STS
+// has two knobs because it has two principals (role owner = policy,
+// requester = operator); dev0 collapses to one principal (the operator), so a
+// separate ceiling vs default would be performative — same hand sets both
+// and the per-window TTL IS the bound. Anchor:
+// `lease_ttl_single_knob_dev0_one_principal`.
+//
+// Renewal is unbounded as long as fresh presence + active grant
+// (design §2 "renew/extend = presence (tap)"); there is no total session
+// cap. Anchor: `lease_renewal_requires_fresh_presence`.
+//
+// Bounds are typo-protection, NOT a security cap (the TTL itself is the
+// security cap). 60s lower bound rules out "ttl = 0" / sub-second floors that
+// would thrash the renewal flow. 7-day upper bound rules out
+// "30 days" / "10 years" typos that would silently disable the time-box.
+// Out-of-range fails closed at config load (`DaemonConfig::validate`).
+/// Default per-window lease TTL when no operator override is set.
+/// 1 hour matches the operator-locked dev0 dial — short enough to bound an
+/// honest compromise window, long enough that interactive operators don't
+/// re-tap inside a single working session.
+pub const DEFAULT_LEASE_TTL_SECS: u64 = 3600;
+/// Minimum permitted per-window lease TTL (typo-protection floor, not a
+/// security knob). A sub-60s lease thrashes the renewal flow and provides
+/// no honest signal that the operator chose a tight window deliberately.
+pub const MIN_LEASE_TTL_SECS: u64 = 60;
+/// Maximum permitted per-window lease TTL (typo-protection ceiling, not a
+/// security knob). 7 days is the longest reasonable dogfooding window;
+/// values above this are almost always a typo silently disabling the
+/// time-box.
+pub const MAX_LEASE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Environment-variable override for [`DaemonConfig::lease_ttl_secs`] —
+/// useful for ephemeral testing / scripted runs without editing
+/// `config.toml`. Takes precedence over the TOML field, same convention as
+/// `EMBER_BRIDGE_BIND` / `EMBER_TRUST_ROOTS`.
+pub const EMBER_LEASE_TTL_SECS_ENV: &str = "EMBER_LEASE_TTL_SECS";
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("io error: {0}")]
@@ -48,17 +95,15 @@ impl LogLevel {
 /// Default is [`DeploymentTier::Dev0`] — single operator on one machine,
 /// `ember-clients` group has exactly one human, file-ACL connect-eligibility
 /// is the auth boundary. Team0+ deployments have multiple operators
-/// sharing the same daemon and require additional authorization controls
-/// that are NOT yet wired (see the startup `team0_connect_only_per_uid_filter_pending`
-/// WARN in `runtime.rs::run` for the gap and implementation-note-200
-/// for the destination work).
+/// sharing the same daemon and require additional authorization controls:
+/// ConnectOnly persona-keyed reads must principal-scope or fail closed, and
+/// intentionally global diagnostics must be named as daemon/operator posture.
 ///
 /// The tier is declared explicitly in `config.toml` (`[daemon].tier`)
 /// rather than auto-inferred from ember-clients member count, because
 /// the count is ambiguous on dev0 (the daemon's own `ember` uid is in
 /// the group, service accounts may be too, etc.). Operators who deploy
-/// to team0 or ent0 MUST set the field; the daemon emits a startup WARN
-/// when they do, naming the unfinished invariants.
+/// to team0 or ent0 MUST set the field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeploymentTier {
@@ -67,9 +112,9 @@ pub enum DeploymentTier {
     #[default]
     Dev0,
     /// Small team sharing one daemon (operator + maintainer, 2-5
-    /// operators). Read-class methods MUST filter results by peer.uid;
-    /// this filtering is NOT yet wired. See
-    /// `team0_connect_only_per_uid_filter_pending`.
+    /// operators). Persona-keyed read-class methods MUST filter results
+    /// through the caller's daemon-bound principal; global diagnostics must
+    /// remain daemon/operator posture only.
     Team0,
     /// Enterprise multi-tenant. Same gap as Team0 + retention /
     /// compliance / SLA requirements per design.
@@ -95,10 +140,8 @@ impl DeploymentTier {
         }
     }
 
-    /// `true` for tiers that require per-uid result filtering on
-    /// read-class ConnectOnly methods. Used by `runtime.rs` to decide
-    /// whether to emit the `team0_connect_only_per_uid_filter_pending`
-    /// startup WARN.
+    /// `true` for tiers that require multi-uid authorization controls on
+    /// read-class ConnectOnly methods.
     pub fn requires_multi_uid_authz(&self) -> bool {
         match self {
             DeploymentTier::Dev0 => false,
@@ -118,32 +161,31 @@ struct RawDaemonSection {
     dashboard_addr: Option<String>,
     stale_approval_threshold_secs: Option<u64>,
     /// Bind address for the git-echo credential-injection proxy. `None` (key
-    /// absent) ⇒ default `127.0.0.1:0` (random port). Empty string ⇒ disabled.
-    /// (implementation-note-201)
+    /// absent) ⇒ default `127.0.0.1:3143` (stable loopback port). Empty
+    /// string ⇒ disabled.
     git_proxy_addr: Option<String>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request` — provider-aware auth, X-Ember-* header
-    /// protocol). `None` (key absent) ⇒ default `127.0.0.1:0`. Empty string ⇒
-    /// disabled. The Anthropic SDK demo path posts to this listener.
-    /// (implementation-note-202)
+    /// protocol). `None` (key absent) ⇒ default `127.0.0.1:3142`. Empty
+    /// string ⇒ disabled. The Anthropic SDK demo path posts to this listener.
     llm_proxy_addr: Option<String>,
     /// design: vault snapshot interval. Defaults to 3600 (1 hour). `0` disables.
     snapshot_interval_secs: Option<u64>,
-    /// implementation-note-203: interval in seconds between snapshot pull
+    /// Snapshot pull: interval in seconds between snapshot pull
     /// attempts. Defaults to 600 (10 minutes). `0` disables pulling.
     snapshot_pull_interval_secs: Option<u64>,
-    /// implementation-note-203: base URL of the remote EIC snapshot endpoint.
+    /// Snapshot pull: base URL of the remote EIC snapshot endpoint.
     /// `None` disables pulling. Example: `http://eic.tz-net.ts.net:3141`.
     snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-203: cluster id for keying pulled snapshots in the
+    /// Snapshot pull: cluster id for keying pulled snapshots in the
     /// local vault. Required when `snapshot_pull_endpoint` is set.
     snapshot_pull_cluster_id: Option<String>,
-    /// implementation-note-204: absolute path to the pre-built SCION
+    /// SCION binary hash pin: absolute path to the pre-built SCION
     /// fork binary the daemon shells out to at agent-spawn time. `None`
     /// (key absent) ⇒ pin verification is disabled (development /
     /// non-SCION installs).
     scion_binary_path: Option<String>,
-    /// implementation-note-204: operator-pinned SHA-256 of the SCION
+    /// SCION binary hash pin: operator-pinned SHA-256 of the SCION
     /// fork binary (lower-hex, 64 chars). `None` (key absent) ⇒ pin
     /// verification is disabled. When `Some`, the daemon refuses to
     /// fork-exec the binary unless its on-disk bytes hash to this value
@@ -163,27 +205,52 @@ struct RawDaemonSection {
     trust_roots: Option<String>,
     /// Deployment tier — `dev0` (default), `team0`, or `ent0`. See
     /// [`DeploymentTier`] for the operational-posture semantics. Operators
-    /// who deploy to team0 or ent0 MUST set this field; the daemon emits
-    /// a startup WARN on team0+ naming the
-    /// `team0_connect_only_per_uid_filter_pending` invariant so the
-    /// authorization gap is visible to anyone reading the log.
+    /// who deploy to team0 or ent0 MUST set this field so the daemon applies
+    /// the multi-uid ConnectOnly scoping rules.
     tier: Option<DeploymentTier>,
+    /// V030-AUTH-LEASE-3 — per-window lease TTL in seconds (design §2 /
+    /// OQ-1). `None` ⇒ [`DEFAULT_LEASE_TTL_SECS`] (3600s / 1h). Bounded by
+    /// [`MIN_LEASE_TTL_SECS`]..=[`MAX_LEASE_TTL_SECS`]; out-of-range fails
+    /// closed at config load. Env override:
+    /// [`EMBER_LEASE_TTL_SECS_ENV`] takes precedence.
+    ///
+    /// Single knob: there is no separate "default vs ceiling" — see the
+    /// module-level docs on [`DEFAULT_LEASE_TTL_SECS`] for why dev0's
+    /// one-principal model collapses STS-style two-knob configurations.
+    lease_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     daemon: Option<RawDaemonSection>,
+    runtime: Option<RawRuntimeSection>,
     keyring: Option<KeyringConfig>,
     presence: Option<PresenceConfigSection>,
     credential_store: Option<CredentialStoreConfig>,
-    /// implementation-note-166 — top-level `[spawn_pool]`
+    /// Top-level `[spawn_pool]`
     /// table. Holds the pre-provisioned uid pool that
     /// `handle_broker_exec` checks out a uid from before fork+execve
     /// to drop privileges into. Absent ⇒ pool is disabled and
-    /// `broker_exec` refuses with `-32011` (forces `ember daemon
+    /// `broker_exec` refuses with `-32021` (forces `ember daemon
     /// install` to provision the pool; the daemon will not silently
     /// fall back to spawning children as the daemon's own uid).
     spawn_pool: Option<crate::broker::uid_alloc::SpawnPoolConfig>,
+}
+
+/// Raw `[runtime]` selector.
+///
+/// ```toml
+/// [runtime]
+/// backend = "docker-engine"
+/// ```
+///
+/// Supported values are `docker-engine` (default), `apple-container`,
+/// and `none-host-resident`. The Docker-compatible baseline is the
+/// accepted design default and covers Docker Desktop,
+/// OrbStack-as-Docker-backend, colima, and Rancher Desktop.
+#[derive(Debug, Deserialize)]
+struct RawRuntimeSection {
+    backend: Option<String>,
 }
 
 /// Credential-store backend selector (design — sub-piece D).
@@ -205,7 +272,7 @@ struct RawConfig {
 /// cache_ttl_secs = 60
 /// ```
 ///
-/// For the AWS IAM auth method (implementation-note-109) the wire shape is:
+/// For the AWS IAM auth method the wire shape is:
 ///
 /// ```toml
 /// [credential_store]
@@ -222,7 +289,7 @@ struct RawConfig {
 /// / IRSA / ECS task role / Fargate). Vault re-plays a SigV4-signed
 /// `sts:GetCallerIdentity` request server-side as the proof.
 ///
-/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-205 —
+/// For HashiCorp Cloud Platform (HCP) Vault —
 /// the wire shape is:
 ///
 /// ```toml
@@ -262,14 +329,13 @@ pub struct CredentialStoreConfig {
     /// or `"hcp-service-principal"`. The `"aws"` variant uses the
     /// daemon's surrounding AWS IAM identity (env vars / instance
     /// metadata) to sign a `sts:GetCallerIdentity` request that Vault
-    /// re-plays as the proof (implementation-note-109). The
+    /// re-plays as the proof. The
     /// `"hcp-service-principal"` variant exchanges
     /// `(client_id, client_secret)` at HashiCorp Cloud Platform's
     /// OAuth2 IdP for an access_token, then uses that as
-    /// `Authorization: Bearer` against the HCP-hosted Vault cluster
-    /// (implementation-note-205). Other methods (Kubernetes SA, JWT/OIDC,
-    /// cert) are out of scope — file follow-ups as
-    /// `implementation-note-206-<METHOD>`.
+    /// `Authorization: Bearer` against the HCP-hosted Vault cluster.
+    /// Other methods (Kubernetes SA, JWT/OIDC,
+    /// cert) are out of scope.
     #[serde(default)]
     pub auth: Option<String>,
 
@@ -291,19 +357,19 @@ pub struct CredentialStoreConfig {
     /// `vault auth/aws/role/<role>`). Only consulted when
     /// `auth = "aws"`. AWS credentials themselves come from the
     /// daemon's surrounding identity (env / IMDS / IRSA / etc.), not
-    /// from this config (implementation-note-109).
+    /// from this config.
     #[serde(default)]
     pub role: Option<String>,
 
     /// HCP service-principal auth: client id (always inline —
     /// non-secret). Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-205).
+    /// `auth = "hcp-service-principal"`.
     #[serde(default)]
     pub client_id: Option<String>,
 
     /// HCP service-principal auth: client secret. Supports `@<path>`
     /// to read from a file. Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-205).
+    /// `auth = "hcp-service-principal"`.
     #[serde(default)]
     pub client_secret: Option<String>,
 
@@ -406,7 +472,7 @@ pub struct PresenceConfigSection {
 /// Daemon-level configuration loaded from `~/.ember/config.toml` (or the path
 /// resolved from `--config` / `EMBER_CONFIG`).
 ///
-/// **No `impl Default`** — per implementation-note-207, every
+/// **No `impl Default`** — every
 /// constructor must be explicit so that test partial-overrides can't silently
 /// pull user-home paths. The type system pins the rule:
 ///
@@ -430,14 +496,13 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<SocketAddr>,
     /// Bind address for the git-echo credential-injection proxy used by
     /// sandboxed agents (`EMBER_GIT_PROXY_URL`). `None` disables the proxy.
-    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-201.
+    /// Defaults to `127.0.0.1:3143` (stable loopback port).
     pub git_proxy_addr: Option<SocketAddr>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request`). Surfaced to clients as
     /// `EMBER_PROXY_URL` and `<data_dir>/run/proxy.url`. Provider-aware auth
     /// (Anthropic `x-api-key`, generic Bearer). `None` disables the listener.
-    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port).
-    /// implementation-note-202.
+    /// Defaults to `127.0.0.1:3142` (stable loopback port).
     pub llm_proxy_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,
@@ -447,13 +512,13 @@ pub struct DaemonConfig {
     /// design — vault snapshot interval in seconds. Default 3600 (1 hour).
     /// Set to 0 to disable periodic snapshots.
     pub snapshot_interval_secs: u64,
-    /// implementation-note-203 — periodic pull interval in seconds. Default
+    /// Snapshot pull — periodic pull interval in seconds. Default
     /// 600 (10 min). Set to 0 to disable pulling.
     pub snapshot_pull_interval_secs: u64,
-    /// implementation-note-203 — base URL of the remote EIC snapshot endpoint.
+    /// Snapshot pull — base URL of the remote EIC snapshot endpoint.
     /// `None` means pulling is not configured.
     pub snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-203 — cluster id used to key pulled snapshots in
+    /// Snapshot pull — cluster id used to key pulled snapshots in
     /// the local vault. Required when `snapshot_pull_endpoint` is `Some`.
     pub snapshot_pull_cluster_id: Option<String>,
     /// Per-op user-presence gate. Loaded from `[presence]`
@@ -463,12 +528,21 @@ pub struct DaemonConfig {
     /// means no `[credential_store]` section was present, which the
     /// daemon treats as `backend = "local"` (the existing vault path).
     pub credential_store: Option<CredentialStoreConfig>,
-    /// implementation-note-204 — absolute path to the pre-built
+    /// design runtime backend selector. Loaded from top-level
+    /// `[runtime].backend`; defaults to `docker-engine`.
+    ///
+    /// Supported values:
+    /// - `docker-engine` — Docker-compatible baseline (Docker Desktop,
+    ///   OrbStack-as-Docker-backend, colima, Rancher Desktop)
+    /// - `apple-container`
+    /// - `none-host-resident`
+    pub runtime_backend: RuntimeBackend,
+    /// SCION binary hash pin — absolute path to the pre-built
     /// SCION fork binary the daemon shells out to at agent-spawn time.
     /// `PathBuf::new()` (empty) means pin verification is disabled
     /// (development / non-SCION installs).
     pub scion_binary_path: PathBuf,
-    /// implementation-note-204 — operator-pinned SHA-256 of the
+    /// SCION binary hash pin — operator-pinned SHA-256 of the
     /// SCION fork binary (lower-hex, 64 chars). Empty string means
     /// pin verification is disabled. When non-empty, the spawn path
     /// calls [`crate::spawn::scion::verify_scion_binary_hash`] before
@@ -497,10 +571,10 @@ pub struct DaemonConfig {
     ///   2. `[daemon].trust_roots` config field.
     ///   3. Empty (release-only).
     pub trust_roots: String,
-    /// implementation-note-166 — pre-provisioned uid pool the
+    /// Pre-provisioned uid pool the
     /// broker_exec spawn paths drop into before execve. `None` ⇒ the
     /// pool is not configured and `handle_broker_exec` refuses with
-    /// `-32011` ("spawn pool not configured — `ember daemon install`
+    /// `-32021` ("spawn pool not configured — `ember daemon install`
     /// must provision the uid pool"). Closes Finding 14 (refuse to
     /// spawn a child as the daemon's own uid) and the cross-spawn
     /// `/proc/<pid>/environ` side-channel. See `broker/uid_alloc.rs`
@@ -514,11 +588,25 @@ pub struct DaemonConfig {
     /// ```
     pub spawn_pool: Option<crate::broker::uid_alloc::SpawnPoolConfig>,
     /// Deployment tier — see [`DeploymentTier`]. Default [`DeploymentTier::Dev0`].
-    /// Read from `[daemon].tier` in config.toml. The runtime emits a startup
-    /// WARN naming `team0_connect_only_per_uid_filter_pending` when this is
-    /// Team0 or Ent0, surfacing the in-flight ConnectOnly read-class
-    /// per-uid filtering gap.
+    /// Read from `[daemon].tier` in config.toml. Team0 and Ent0 enable
+    /// the multi-uid ConnectOnly authorization posture.
     pub tier: DeploymentTier,
+    /// V030-AUTH-LEASE-3 — per-window lease TTL in seconds (design §2 /
+    /// OQ-1 resolved). Default [`DEFAULT_LEASE_TTL_SECS`] (3600s / 1h);
+    /// bounded by [[`MIN_LEASE_TTL_SECS`], [`MAX_LEASE_TTL_SECS`]] (typo
+    /// protection, not a security cap).
+    ///
+    /// Resolution order (highest precedence first):
+    ///   1. `EMBER_LEASE_TTL_SECS` env var (operator override).
+    ///   2. `[daemon].lease_ttl_secs` config field.
+    ///   3. [`DEFAULT_LEASE_TTL_SECS`].
+    ///
+    /// Out-of-range values fail closed at [`DaemonConfig::validate`] — the
+    /// daemon refuses to start with a typo-shaped TTL rather than silently
+    /// disabling the time-box.
+    ///
+    /// Anchor: `lease_ttl_single_knob_dev0_one_principal`.
+    pub lease_ttl_secs: u64,
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
@@ -532,7 +620,7 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
     }
 }
 
-// implementation-note-208: `impl Default for DaemonConfig`
+// `impl Default for DaemonConfig`
 // is REMOVED. The May-12 25-hour leaked-daemon incident was rooted in
 // `DaemonConfig { data_dir: tmpdir.path()..., ..Default::default() }`
 // partial-overrides silently inheriting user-home paths. The type
@@ -541,43 +629,46 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
 // `DaemonConfig::load(&path)`, and `load`'s field-level fallbacks come
 // from `Self::load_defaults()` (private; see below). See doc-test on
 // the struct above for the compile_fail pin.
-//
-// implementation-note-209
 
 impl DaemonConfig {
-    /// implementation-note-210 (Phase 1 substrate) — tempdir-scoped
+    /// Tempdir-scoped
     /// test constructor. Sets every path-bearing field under `tmpdir` so a
-    /// T3 test cannot accidentally bind the operator's real
+    /// test cannot accidentally bind the operator's real
     /// `~/.ember/run/daemon.sock` (the May-12 25-hour leaked-daemon
     /// incident root cause).
     ///
     /// Tests MUST use this instead of `..Default::default()` partial-overrides.
-    /// Subtask B (implementation-note-211) migrates existing
+    /// A follow-up migrates existing
     /// callers off `Default` so the type system enforces the rule by
     /// removing `impl Default` entirely.
     ///
     /// # target_state_anchor
     ///
     /// `DaemonConfig::for_test`
-    /// implementation-note-208: private fallback ctor used by
+    /// Private fallback ctor used by
     /// `load` when the on-disk TOML omits a field. Replaces the prior
     /// `impl Default` role. Tests that previously asserted on
     /// `DaemonConfig::default()`'s shape now call this method directly via
     /// the `mod tests` re-export.
     pub(crate) fn load_defaults() -> Self {
-        let base = dirs_next::home_dir()
-            .map(|h| h.join(".ember"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/.ember"));
+        // design (operator-locked 2026-06-14): daemon at-rest state +
+        // runtime socket + config live at OS system paths, NOT under
+        // any user's $HOME. The legacy `~/.ember/...` layout this
+        // function previously returned is superseded; only the
+        // design auth model (SO_PEERCRED + ember-clients group ACL
+        // + per-method gate) stays verbatim. See
+        // `crate::paths::DaemonPaths` for the per-OS table.
+        let paths = crate::paths::DaemonPaths::system();
 
         Self {
-            socket_dir: base.join("run"),
-            data_dir: base.join("data"),
-            pid_file: base.join("run").join("emberd.pid"),
-            policy_file: base.join("policy.toml"),
+            socket_dir: paths.run_dir.clone(),
+            data_dir: paths.data_dir.clone(),
+            pid_file: paths.pid_file.clone(),
+            policy_file: paths.policy_file(),
             log_level: LogLevel::Info,
-            dashboard_addr: Some("127.0.0.1:3141".parse().expect("valid default addr")),
-            git_proxy_addr: Some("127.0.0.1:0".parse().expect("valid default addr")),
-            llm_proxy_addr: Some("127.0.0.1:0".parse().expect("valid default addr")),
+            dashboard_addr: Some(DEFAULT_DASHBOARD_ADDR.parse().expect("valid default addr")),
+            git_proxy_addr: Some(DEFAULT_GIT_PROXY_ADDR.parse().expect("valid default addr")),
+            llm_proxy_addr: Some(DEFAULT_LLM_PROXY_ADDR.parse().expect("valid default addr")),
             keyring: KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
             snapshot_interval_secs: 3600,
@@ -586,7 +677,8 @@ impl DaemonConfig {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
-            // implementation-note-204: empty defaults mean verification
+            runtime_backend: RuntimeBackend::DockerEngine,
+            // SCION binary hash pin: empty defaults mean verification
             // is opt-in — production configs MUST set both.
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
@@ -596,7 +688,7 @@ impl DaemonConfig {
             // set"; operators add dev / org roots via `EMBER_TRUST_ROOTS`
             // or `[daemon].trust_roots` without re-shipping the binary.
             trust_roots: String::new(),
-            // implementation-note-166 — default is `None`
+            // Default is `None`
             // ("pool not configured"). The installer writes
             // `[spawn_pool]` into the operator's config.toml when
             // `ember daemon install` runs; daemons running pre-
@@ -606,6 +698,9 @@ impl DaemonConfig {
             // Default tier is Dev0 — single-operator file-ACL boundary.
             // Operators deploying team0/ent0 set this in config.toml.
             tier: DeploymentTier::Dev0,
+            // V030-AUTH-LEASE-3: 1-hour default per-window lease TTL.
+            // Single knob, dev0 one-principal — see DEFAULT_LEASE_TTL_SECS.
+            lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
         }
     }
 
@@ -636,6 +731,7 @@ impl DaemonConfig {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            runtime_backend: RuntimeBackend::DockerEngine,
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             // Tests disable the bridge by default — explicit opt-in via
@@ -645,7 +741,7 @@ impl DaemonConfig {
             // compiled-in IdentityRoot). Tests that exercise dev-mode
             // trust-root semantics override explicitly.
             trust_roots: String::new(),
-            // implementation-note-166 — tests default to
+            // Tests default to
             // `None`. Broker-exec tests that need a working spawn
             // path call `uid_alloc::init_uid_pool_for_test()` directly
             // to install a process-global pool keyed on the current
@@ -655,13 +751,18 @@ impl DaemonConfig {
             // Tests default to Dev0 (the cohort A posture). Tests that
             // exercise the team0+ startup-WARN path override explicitly.
             tier: DeploymentTier::Dev0,
+            // V030-AUTH-LEASE-3: tests default to the production 1-hour
+            // window. Tests asserting a different TTL override explicitly.
+            lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
         }
     }
 
     pub fn default_config_path() -> PathBuf {
-        dirs_next::home_dir()
-            .map(|h| h.join(".ember").join("config.toml"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/.ember/config.toml"))
+        // design: config lives at the per-OS system config dir
+        // (`/Library/Application Support/Emberlink/config/` on macOS;
+        // `/etc/ember/` on Linux). Superseded the legacy
+        // `~/.ember/config.toml` location.
+        crate::paths::DaemonPaths::system().config_file()
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -688,6 +789,7 @@ impl DaemonConfig {
             bridge_bind: None,
             trust_roots: None,
             tier: None,
+            lease_ttl_secs: None,
         });
 
         let socket_dir = match section.socket_dir {
@@ -749,7 +851,20 @@ impl DaemonConfig {
 
         let credential_store = raw.credential_store;
 
-        // implementation-note-204: expand `~` so operators can write
+        // design runtime backend selection. The field intentionally
+        // lives in a top-level `[runtime]` table so container-engine
+        // selection is not confused with authority-space daemon knobs.
+        let runtime_backend = match raw.runtime.and_then(|section| section.backend) {
+            Some(value) => RuntimeBackend::parse_config_value(&value).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "runtime.backend: {e}; set one of {}",
+                    RuntimeBackend::supported_values_csv()
+                ))
+            })?,
+            None => defaults.runtime_backend,
+        };
+
+        // SCION binary hash pin: expand `~` so operators can write
         // the path naturally; empty/absent fields fall back to defaults
         // (empty path, empty hash) which disable verification — same
         // semantics as not setting the keys at all.
@@ -798,18 +913,36 @@ impl DaemonConfig {
             None => section.trust_roots.unwrap_or_default(),
         };
 
-        // implementation-note-166 — top-level `[spawn_pool]`
+        // Top-level `[spawn_pool]`
         // table is consumed verbatim. `None` (absent) ⇒ broker_exec
-        // refuses with `-32011`; `Some` ⇒ the pool is installed via
+        // refuses with `-32021`; `Some` ⇒ the pool is installed via
         // `uid_alloc::init_uid_pool` during runtime startup.
         let spawn_pool = raw.spawn_pool;
 
         // Deployment tier — `[daemon].tier`. Absent ⇒ DeploymentTier::Dev0
-        // (single-operator cohort A). The runtime startup path emits a
-        // WARN naming `team0_connect_only_per_uid_filter_pending` when this
-        // resolves to Team0/Ent0, surfacing the in-flight ConnectOnly
-        // read-class per-uid filtering gap.
+        // (single-operator cohort A). Team0/Ent0 enable multi-uid
+        // ConnectOnly authorization controls.
         let tier = section.tier.unwrap_or(DeploymentTier::Dev0);
+
+        // V030-AUTH-LEASE-3 — per-window lease TTL resolution order:
+        //   1. `EMBER_LEASE_TTL_SECS` env var (operator override, highest
+        //      precedence; matches `EMBER_BRIDGE_BIND` / `EMBER_TRUST_ROOTS`).
+        //   2. `[daemon].lease_ttl_secs` config field.
+        //   3. `DEFAULT_LEASE_TTL_SECS` (3600s / 1h).
+        //
+        // An env var that is present but not parseable as a u64 (e.g. `60s`,
+        // `abc`, empty) is rejected at load time — silently falling back to
+        // the config field or default on a typo would defeat the operator's
+        // intent. Range validation happens in `validate()` so the same gate
+        // covers all three input lanes (env / toml / default).
+        let lease_ttl_secs: u64 = match std::env::var(EMBER_LEASE_TTL_SECS_ENV).ok() {
+            Some(raw) => raw.parse().map_err(|e| {
+                ConfigError::Validation(format!(
+                    "invalid {EMBER_LEASE_TTL_SECS_ENV} env value '{raw}': {e}"
+                ))
+            })?,
+            None => section.lease_ttl_secs.unwrap_or(DEFAULT_LEASE_TTL_SECS),
+        };
 
         let cfg = DaemonConfig {
             socket_dir,
@@ -828,12 +961,14 @@ impl DaemonConfig {
             snapshot_pull_cluster_id,
             presence,
             credential_store,
+            runtime_backend,
             scion_binary_path,
             scion_binary_sha256,
             bridge_bind,
             trust_roots,
             spawn_pool,
             tier,
+            lease_ttl_secs,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -860,6 +995,19 @@ impl DaemonConfig {
                 "socket_dir and data_dir must be different".to_string(),
             ));
         }
+        // V030-AUTH-LEASE-3 — single-knob lease TTL bounds (typo protection,
+        // NOT a security cap). Out-of-range fails closed at config load
+        // rather than silently disabling the time-box. The check covers the
+        // env override, the TOML field, and the default in one place — every
+        // path runs through `validate()`.
+        if self.lease_ttl_secs < MIN_LEASE_TTL_SECS || self.lease_ttl_secs > MAX_LEASE_TTL_SECS {
+            return Err(ConfigError::Validation(format!(
+                "lease_ttl_secs ({}) out of range [{}, {}]; \
+                 set a value within bounds (1h default, 60s..7d). \
+                 The bound is typo protection — see design §2 / OQ-1.",
+                self.lease_ttl_secs, MIN_LEASE_TTL_SECS, MAX_LEASE_TTL_SECS,
+            )));
+        }
         Ok(())
     }
 
@@ -880,13 +1028,76 @@ mod tests {
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
 
+    /// design (operator-locked 2026-06-14): default paths land at OS
+    /// system roots, NOT under any user's `$HOME`. The legacy
+    /// `~/.ember/...` shape this test previously asserted is
+    /// superseded — see `crate::paths::DaemonPaths::system` and the
+    /// 2026-06-14 amendment to design.
     #[test]
-    fn default_paths_contain_ember() {
+    fn default_paths_land_at_system_root_per_adr_218() {
         let cfg = DaemonConfig::load_defaults();
-        assert!(cfg.socket_dir.to_string_lossy().contains(".ember"));
-        assert!(cfg.data_dir.to_string_lossy().contains(".ember"));
-        assert!(cfg.pid_file.to_string_lossy().contains(".ember"));
+        let socket_str = cfg.socket_dir.to_string_lossy();
+        let data_str = cfg.data_dir.to_string_lossy();
+        let pid_str = cfg.pid_file.to_string_lossy();
+
+        // Boundary rule: no daemon data under any user's HOME.
+        for s in [&socket_str, &data_str, &pid_str] {
+            assert!(
+                !s.starts_with("/Users/") && !s.starts_with("/home/"),
+                "design boundary violated: {s} is under a user HOME"
+            );
+            assert!(
+                !s.contains("/.ember/"),
+                "legacy ~/.ember/ layout leaked into default paths: {s}"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                socket_str.contains("Emberlink"),
+                "expected Emberlink in {socket_str}"
+            );
+            assert!(
+                data_str.contains("Emberlink"),
+                "expected Emberlink in {data_str}"
+            );
+            assert!(
+                pid_str.contains("Emberlink"),
+                "expected Emberlink in {pid_str}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                socket_str.contains("ember"),
+                "expected ember in {socket_str}"
+            );
+            assert!(data_str.contains("ember"), "expected ember in {data_str}");
+            assert!(pid_str.contains("ember"), "expected ember in {pid_str}");
+        }
         assert_eq!(cfg.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn default_proxy_ports_are_stable_loopback_addresses() {
+        let cfg = DaemonConfig::load_defaults();
+        assert_eq!(
+            cfg.llm_proxy_addr,
+            Some(
+                DEFAULT_LLM_PROXY_ADDR
+                    .parse()
+                    .expect("parse default llm proxy")
+            )
+        );
+        assert_eq!(
+            cfg.git_proxy_addr,
+            Some(
+                DEFAULT_GIT_PROXY_ADDR
+                    .parse()
+                    .expect("parse default git proxy")
+            )
+        );
     }
 
     // ─── DeploymentTier (MED-2 fix) ─────────────────────────────────────
@@ -1036,12 +1247,14 @@ mod tests {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            runtime_backend: RuntimeBackend::DockerEngine,
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             bridge_bind: None,
             trust_roots: String::new(),
             spawn_pool: None,
             tier: DeploymentTier::Dev0,
+            lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
         };
 
         cfg.ensure_dirs().unwrap();
@@ -1101,11 +1314,28 @@ mod tests {
         assert_eq!(loaded.data_dir, home.join(".ember/data"));
     }
 
+    /// design: default config path lives at the per-OS system config
+    /// dir (`/Library/Application Support/Emberlink/config/config.toml`
+    /// on macOS; `/etc/ember/config.toml` on Linux). The legacy
+    /// `~/.ember/config.toml` location this test previously asserted
+    /// is superseded.
     #[test]
-    fn default_config_path_contains_ember() {
+    fn default_config_path_lands_at_system_config_dir_per_adr_218() {
         let p = DaemonConfig::default_config_path();
-        assert!(p.to_string_lossy().contains(".ember"));
-        assert!(p.to_string_lossy().ends_with("config.toml"));
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("config.toml"));
+        assert!(
+            !s.starts_with("/Users/") && !s.starts_with("/home/"),
+            "design boundary violated: {s} is under a user HOME"
+        );
+        assert!(
+            !s.contains("/.ember/"),
+            "legacy ~/.ember/config.toml layout leaked: {s}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(s.contains("Emberlink"), "expected Emberlink in {s}");
+        #[cfg(not(target_os = "macos"))]
+        assert!(s.contains("ember"), "expected ember in {s}");
     }
 
     #[test]
@@ -1133,12 +1363,14 @@ mod tests {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            runtime_backend: RuntimeBackend::DockerEngine,
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             bridge_bind: None,
             trust_roots: String::new(),
             spawn_pool: None,
             tier: DeploymentTier::Dev0,
+            lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("socket_dir")));
@@ -1163,12 +1395,14 @@ mod tests {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            runtime_backend: RuntimeBackend::DockerEngine,
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             bridge_bind: None,
             trust_roots: String::new(),
             spawn_pool: None,
             tier: DeploymentTier::Dev0,
+            lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("must be different")));
@@ -1228,6 +1462,49 @@ mod tests {
         f.write_all(toml_str.as_bytes()).unwrap();
         let loaded = DaemonConfig::load(f.path()).unwrap();
         assert!(loaded.credential_store.is_none());
+    }
+
+    #[test]
+    fn runtime_backend_absent_defaults_to_docker_engine() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.runtime_backend, RuntimeBackend::DockerEngine);
+    }
+
+    #[test]
+    fn runtime_backend_loads_supported_values() {
+        for (raw, expected) in [
+            ("docker-engine", RuntimeBackend::DockerEngine),
+            ("apple-container", RuntimeBackend::AppleContainer),
+            ("none-host-resident", RuntimeBackend::NoneHostResident),
+        ] {
+            let toml_str =
+                format!("[daemon]\nlog_level = \"info\"\n\n[runtime]\nbackend = \"{raw}\"\n");
+            let mut f = NamedTempFile::new().unwrap();
+            f.write_all(toml_str.as_bytes()).unwrap();
+            let loaded = DaemonConfig::load(f.path()).unwrap();
+            assert_eq!(loaded.runtime_backend, expected);
+        }
+    }
+
+    #[test]
+    fn runtime_backend_rejects_unknown_with_supported_values() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[runtime]\nbackend = \"lima\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let err = DaemonConfig::load(f.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(msg.contains("runtime.backend"));
+        assert!(msg.contains("lima"));
+        for value in RuntimeBackend::supported_values() {
+            assert!(
+                msg.contains(value),
+                "error must list supported runtime backend {value}: {msg}",
+            );
+        }
     }
 
     #[test]
@@ -1294,7 +1571,7 @@ mod tests {
 
     #[test]
     fn scion_binary_pin_absent_gives_empty_defaults() {
-        // implementation-note-204: when neither key is set the
+        // SCION binary hash pin: when neither key is set the
         // daemon treats verification as disabled (dev installs).
         let toml_str = "[daemon]\nlog_level = \"info\"\n";
         let mut f = NamedTempFile::new().unwrap();
@@ -1306,7 +1583,7 @@ mod tests {
 
     #[test]
     fn scion_binary_pin_loaded_from_toml() {
-        // implementation-note-204: both fields round-trip through
+        // SCION binary hash pin: both fields round-trip through
         // TOML so operators can pin the binary in `config.toml`.
         let toml_str = "[daemon]\nlog_level = \"info\"\nscion_binary_path = \"/opt/scion/scion\"\nscion_binary_sha256 = \"abc123\"\n";
         let mut f = NamedTempFile::new().unwrap();
@@ -1317,7 +1594,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-166 — `[spawn_pool]` TOML deserializer.
+    // `[spawn_pool]` TOML deserializer.
     // -----------------------------------------------------------------
 
     #[test]
@@ -1361,7 +1638,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-190 — design Component 2 subuid range
+    // design Component 2 subuid range
     // round-trips through the DaemonConfig parser. The installer writes
     // this shape on modern-Linux hosts where unprivileged_userns_clone=1.
     // -----------------------------------------------------------------
@@ -1544,5 +1821,202 @@ mod tests {
                 None => std::env::remove_var("EMBER_TRUST_ROOTS"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // V030-AUTH-LEASE-3 — single-knob lease TTL (design §2 / OQ-1).
+    //
+    // Checkpoint `lease_ttl_single_knob_dev0_one_principal`: there is no
+    // separate "default vs ceiling" knob — dev0 has one principal, so one
+    // knob (default IS the ceiling within the typo-protection bounds).
+    // -----------------------------------------------------------------
+
+    /// Helper: clear `EMBER_LEASE_TTL_SECS` while the PROCESS_TEST_LOCK is
+    /// held, returning the prior value for restoration. Mirrors the
+    /// `EMBER_TRUST_ROOTS` / `EMBER_BRIDGE_BIND` pattern in this module.
+    fn take_lease_ttl_env_var() -> Option<String> {
+        let prior = std::env::var(EMBER_LEASE_TTL_SECS_ENV).ok();
+        // SAFETY: caller must hold PROCESS_TEST_LOCK before invoking.
+        unsafe { std::env::remove_var(EMBER_LEASE_TTL_SECS_ENV) };
+        prior
+    }
+
+    fn restore_lease_ttl_env_var(prior: Option<String>) {
+        // SAFETY: caller must hold PROCESS_TEST_LOCK before invoking.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(EMBER_LEASE_TTL_SECS_ENV, v),
+                None => std::env::remove_var(EMBER_LEASE_TTL_SECS_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn lease_ttl_default_is_one_hour() {
+        // The operator-locked dev0 dial: 1 hour = "max compromise window" /
+        // "how long the system runs without me." See design §2 elegant
+        // property + `DEFAULT_LEASE_TTL_SECS` doc-comment.
+        let cfg = DaemonConfig::load_defaults();
+        assert_eq!(cfg.lease_ttl_secs, 3600);
+        assert_eq!(cfg.lease_ttl_secs, DEFAULT_LEASE_TTL_SECS);
+    }
+
+    #[test]
+    fn lease_ttl_for_test_matches_default() {
+        // for_test mirrors the production posture so test grant lifecycles
+        // don't accidentally pick a value an operator would never see.
+        let tmp = TempDir::new().unwrap();
+        let cfg = DaemonConfig::for_test(tmp.path());
+        assert_eq!(cfg.lease_ttl_secs, DEFAULT_LEASE_TTL_SECS);
+    }
+
+    #[test]
+    fn lease_ttl_absent_in_toml_defaults_to_one_hour() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = take_lease_ttl_env_var();
+
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.lease_ttl_secs, DEFAULT_LEASE_TTL_SECS);
+
+        restore_lease_ttl_env_var(prior);
+    }
+
+    #[test]
+    fn lease_ttl_from_config_field() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = take_lease_ttl_env_var();
+
+        let toml_str = "[daemon]\nlog_level = \"info\"\nlease_ttl_secs = 1800\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.lease_ttl_secs, 1800);
+
+        restore_lease_ttl_env_var(prior);
+    }
+
+    #[test]
+    fn lease_ttl_env_overrides_config_field() {
+        // Env precedence matches the EMBER_BRIDGE_BIND / EMBER_TRUST_ROOTS
+        // convention — operators can dial a shorter TTL for an ephemeral
+        // session without editing config.toml.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(EMBER_LEASE_TTL_SECS_ENV).ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe { std::env::set_var(EMBER_LEASE_TTL_SECS_ENV, "300") };
+
+        let toml_str = "[daemon]\nlog_level = \"info\"\nlease_ttl_secs = 3600\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.lease_ttl_secs, 300);
+
+        restore_lease_ttl_env_var(prior);
+    }
+
+    #[test]
+    fn lease_ttl_below_minimum_fails_closed_at_load() {
+        // 30s is below the 60s typo-protection floor — config load fails
+        // closed rather than silently disabling the time-box.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = take_lease_ttl_env_var();
+
+        let toml_str = "[daemon]\nlog_level = \"info\"\nlease_ttl_secs = 30\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let err = DaemonConfig::load(f.path()).unwrap_err();
+        match err {
+            ConfigError::Validation(m) => {
+                assert!(m.contains("lease_ttl_secs"));
+                assert!(m.contains("out of range"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        restore_lease_ttl_env_var(prior);
+    }
+
+    #[test]
+    fn lease_ttl_above_maximum_fails_closed_at_load() {
+        // 30 days exceeds the 7-day typo-protection ceiling. The intent of
+        // the bound is to catch a "10 years" typo, NOT to act as a security
+        // cap — but values above 7d are almost always a mistake.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = take_lease_ttl_env_var();
+
+        let too_long = 30 * 24 * 60 * 60; // 30 days
+        let toml_str = format!("[daemon]\nlog_level = \"info\"\nlease_ttl_secs = {too_long}\n");
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let err = DaemonConfig::load(f.path()).unwrap_err();
+        match err {
+            ConfigError::Validation(m) => {
+                assert!(m.contains("lease_ttl_secs"));
+                assert!(m.contains("out of range"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        restore_lease_ttl_env_var(prior);
+    }
+
+    #[test]
+    fn lease_ttl_bounds_are_inclusive() {
+        // The exact bound values (MIN, MAX) must succeed — operators can
+        // legitimately pin to the floor (e.g. tight presence-test loops) or
+        // the ceiling (long-running dogfooding).
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = take_lease_ttl_env_var();
+
+        for ttl in [MIN_LEASE_TTL_SECS, MAX_LEASE_TTL_SECS] {
+            let toml_str = format!("[daemon]\nlog_level = \"info\"\nlease_ttl_secs = {ttl}\n");
+            let mut f = NamedTempFile::new().unwrap();
+            f.write_all(toml_str.as_bytes()).unwrap();
+            let loaded = DaemonConfig::load(f.path()).unwrap();
+            assert_eq!(loaded.lease_ttl_secs, ttl);
+        }
+
+        restore_lease_ttl_env_var(prior);
+    }
+
+    #[test]
+    fn lease_ttl_env_unparseable_fails_closed_at_load() {
+        // An env-var typo (`60s`, `abc`, empty) must NOT silently fall
+        // through to the config-file value or default — that would defeat
+        // the operator's intent (they set the env to mean "use this TTL").
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(EMBER_LEASE_TTL_SECS_ENV).ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe { std::env::set_var(EMBER_LEASE_TTL_SECS_ENV, "abc") };
+
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let err = DaemonConfig::load(f.path()).unwrap_err();
+        match err {
+            ConfigError::Validation(m) => {
+                assert!(m.contains(EMBER_LEASE_TTL_SECS_ENV));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        restore_lease_ttl_env_var(prior);
     }
 }

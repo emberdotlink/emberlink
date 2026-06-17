@@ -39,7 +39,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, MintStamp,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -469,6 +471,7 @@ impl Broker for FlyBroker {
             token: SecretString::from(token),
             expires_at,
             materialization_id,
+            mint_stamp: MintStamp::Opaque,
         })
     }
 
@@ -640,6 +643,13 @@ mod tests {
             provider: BrokerProvider::FlyIo,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -1077,5 +1087,30 @@ mod tests {
             serde_json::from_str(&not_found_errors_body()).expect("parse");
         let err = map_fly_graphql_errors(200, &not_found_errors_body(), &envelope.errors);
         assert!(matches!(err, BrokerError::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn issue_mint_stamp_is_opaque() {
+        let mock = Arc::new(MockFlyClient::new().with_response(
+            200,
+            create_ok_body("tok-1", "ember-test", "fly-token-value"),
+        ));
+        let broker = FlyBroker::with_client(fixture_parent(), mock);
+        let req = fly_request(
+            serde_json::json!({
+                "org_slug": "acme",
+                "expiry_seconds": 3600,
+                "name": "ember-test-token",
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        assert!(
+            matches!(cred.mint_stamp, MintStamp::Opaque),
+            "Fly mint_stamp should be Opaque, got {:?}",
+            cred.mint_stamp
+        );
     }
 }

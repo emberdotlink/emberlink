@@ -66,7 +66,7 @@ impl ApprovalStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub request_id: String,
-    /// Persona ID of the requester (agent or human).
+    /// Principal ID of the requester (agent or human).
     pub requester_id: String,
     /// Human-readable label (e.g., "Claude agent", "Bob's phone").
     pub requester_label: Option<String>,
@@ -80,7 +80,7 @@ pub struct ApprovalRequest {
     pub status: ApprovalStatus,
     /// Unix timestamp when the request was resolved.
     pub resolved_at: Option<u64>,
-    /// Persona ID of whoever approved/denied.
+    /// Principal ID of whoever approved/denied.
     pub resolver_id: Option<String>,
     /// If scope was narrowed on approval.
     pub narrowed_scope: Option<RequestedScope>,
@@ -152,18 +152,19 @@ pub struct ApprovalResponse {
     pub granted_duration_secs: Option<u64>,
 }
 
-/// implementation-note-55 — block-and-poll RPC request shape.
+/// implementation-note-62 — block-and-poll RPC request shape.
 ///
-/// Sent by the proxy hook (`ember-proxy/src/claude_code_hook.rs`) when the
-/// daemon's `evaluate_tool_call` returns a `RequireApproval` outcome with a
-/// `request_id`. The daemon polls `get_approval(request_id)` every 500ms
+/// Sent by a caller awaiting resolution of an approval `request_id` minted by
+/// an escalation path (e.g. the design payment lane's `evaluate_tool_call`
+/// reserve entry, which returns a `RequireApproval` outcome with a
+/// `request_id`). The daemon polls `get_approval(request_id)` every 500ms
 /// up to `timeout_secs` and returns the resolved [`ApprovalDecision`] (or
 /// [`ApprovalDecision::TimedOut`] if the deadline fires first).
 ///
 /// Wire shape is intentionally minimal — the request_id was already minted
-/// at `submit_approval` time, and the hook side does not need to re-supply
-/// the persona/tool/scope context. The default 5-minute timeout on the hook
-/// side is configurable per-call so a future EmberConfig surface can tune
+/// at `submit_approval` time, and the caller does not need to re-supply
+/// the persona/tool/scope context. The default 5-minute timeout is
+/// configurable per-call so a future EmberConfig surface can tune
 /// it without a wire-format bump.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AwaitApprovalRequest {
@@ -171,7 +172,7 @@ pub struct AwaitApprovalRequest {
     pub timeout_secs: u64,
 }
 
-/// implementation-note-55 — block-and-poll RPC response.
+/// implementation-note-62 — block-and-poll RPC response.
 ///
 /// Wraps the resolved [`ApprovalDecision`] for the awaited request. A
 /// dedicated wrapper rather than returning `ApprovalDecision` directly
@@ -398,7 +399,7 @@ mod tests {
         assert!(back.denial_reason.is_some());
     }
 
-    // ---- implementation-note-55: await_approval RPC types -----------------------
+    // ---- implementation-note-62: await_approval RPC types -----------------------
 
     #[test]
     fn await_approval_request_roundtrip() {

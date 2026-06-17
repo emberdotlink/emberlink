@@ -40,7 +40,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, MintStamp,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -472,6 +474,7 @@ impl Broker for HashiVaultBroker {
             token: SecretString::from(bundle),
             expires_at,
             materialization_id,
+            mint_stamp: MintStamp::Opaque,
         })
     }
 
@@ -657,6 +660,13 @@ mod tests {
             provider: BrokerProvider::HashiVault,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -1124,5 +1134,30 @@ mod tests {
         let msg = format!("{err}");
         assert!(matches!(err, BrokerError::Upstream(_)));
         assert!(msg.to_ascii_lowercase().contains("sealed"));
+    }
+
+    #[tokio::test]
+    async fn issue_mint_stamp_is_opaque() {
+        let mock = Arc::new(MockHttpClient::new().with_response(
+            200,
+            create_ok_body("hvs.test-child-token", 3600, &["readonly"]),
+        ));
+        let broker = HashiVaultBroker::with_client(fixture_parent(), mock);
+        let req = vault_request(
+            serde_json::json!({
+                "policies": ["readonly"],
+                "ttl_seconds": 3600,
+                "renewable": true,
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        assert!(
+            matches!(cred.mint_stamp, MintStamp::Opaque),
+            "HashiVault mint_stamp should be Opaque, got {:?}",
+            cred.mint_stamp
+        );
     }
 }

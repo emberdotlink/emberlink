@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `crates/emberlink-mcp/README.md`, `crates/emberlink-mcp/src/lib.rs`, `crates/emberlink-mcp/src/main.rs`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # MCP Tool Reference
 
 `emberlink-mcp` is a stdio JSON-RPC 2.0 server that exposes Emberlink daemon
@@ -97,4 +97,3 @@ Without a daemon link, these tools should be expected to fail:
 
 That is intentional. MCP is not supposed to invent local authority if the
 daemon is unavailable.
-

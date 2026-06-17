@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! design Phase 4 step 8: scan tool binaries, generate signed manifest.
 //!

@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember-relay-host` — macOS-host side of the yolo VM bridge.
 //!

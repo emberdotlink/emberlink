@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Experimental**.
-> Source truth: `packages/agent-sdk-ts/README.md`.
+> Support level: **Experimental**. Reviewed: 2026-06-17. Status: current.
+
 # TypeScript SDK
 
 The TypeScript package exists, but the broader SDK/headless story is still

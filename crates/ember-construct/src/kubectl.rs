@@ -28,6 +28,9 @@
 //!   `config view`                  → None (passthrough)
 //!   `config use-context staging`   → None (passthrough — local context switch)
 
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 use core_construct_runtime::{ActionKey, ClassifyArgv};
 
 /// Struct wrapper for daemon-side classify calls (design §3).
@@ -628,5 +631,188 @@ mod tests {
     #[test]
     fn empty_argv_is_passthrough() {
         assert!(classify_kubectl_argv(&[]).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KubectlFactory — construct-factory contract for the kubectl construct
+// ---------------------------------------------------------------------------
+
+static KUBECTL_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!(
+            "../construct/kubectl.toml"
+        ))
+        .expect("bundled kubectl.toml must be valid")
+    });
+
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("kubectl.")?;
+    KUBECTL_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key == format!("kubectl.{suffix}"))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+fn action_in_manifest(action_key: &str) -> bool {
+    KUBECTL_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("kubectl.")
+                .is_some_and(|suffix| a.key == format!("kubectl.{suffix}"))
+    })
+}
+
+fn has_kubeconfig_flag(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|tok| tok == "--kubeconfig" || tok.starts_with("--kubeconfig="))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct KubectlFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubectlFactoryTarget {
+    pub provider: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubectlFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for KubectlFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_kubectl_argv(argv)
+    }
+}
+
+impl TargetExtractor for KubectlFactory {
+    type Target = KubectlFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, _argv: &[String]) -> Option<Self::Target> {
+        None
+    }
+}
+
+impl NeedTemplate for KubectlFactory {
+    type Need = KubectlFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(KubectlFactoryNeed)
+    }
+}
+
+impl ConstructFactory for KubectlFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        if has_kubeconfig_flag(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        if key.0 == "kubectl.apply" {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        if action_in_manifest(&key.0) {
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        FactoryDisposition::ResolverRequired
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn kubectl_factory_version_credentialless() {
+        let f = KubectlFactory;
+        let a = argv(&["version", "--client"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn kubectl_factory_apply_is_payload_analysis() {
+        let f = KubectlFactory;
+        let a = argv(&["apply", "-f", "deployment.yaml"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn kubectl_factory_delete_is_resolver_required() {
+        let f = KubectlFactory;
+        let a = argv(&["delete", "pod", "web"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn kubectl_factory_kubeconfig_fails_closed() {
+        let f = KubectlFactory;
+        let a = argv(&["--kubeconfig", "prod.kubeconfig", "delete", "pod", "web"]);
+        let key = f.action_key_for_argv(&a);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn kubectl_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/kubectl/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/kubectl.toml"),
+        )
+        .expect("kubectl manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &KubectlFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

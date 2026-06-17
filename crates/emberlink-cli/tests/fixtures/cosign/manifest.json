@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "kind": "emberlink-test-image-manifest",
+  "image": "ghcr.io/emberdotlink/fixture-agent",
+  "digest": "sha256:9eb3c9dc6b09e97f29f47f6ba60557db4f7f9c7ccce6ec44f54f7ef2e5c488d7",
+  "version": "0.0.0-cosign-fixture"
+}

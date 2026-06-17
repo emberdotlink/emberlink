@@ -1,29 +1,16 @@
+// CLASSIFICATION: PUBLIC
 
 //! Shared protocol + helpers for the spawn-helper sibling daemon.
 //!
-//! ## Architecture lineage
+//! ## Architecture
 //!
-//! Path B reconciliation drop. Two upstream sentinels feed this crate:
-//!
-//! - `implementation-note-186`
-//!   contributed the three-module structure (lib + `hash.rs` +
-//!   `peercred.rs`), the `HelperFrame` reply-enum shape (Spawn / Exit /
-//!   HashMismatch / Refused), the hex-string `content_hash_blake3`
-//!   field, tokio-async I/O, the 16 MiB `MAX_FRAME_BYTES` cap, and
-//!   little-endian length framing.
-//! - `implementation-note-187`
-//!   contributed [`WIRE_VERSION`] as a stable invariant constant, the
-//!   `seccomp_filter` directive field (Linux-only), `invocation_id` for
-//!   Receipt-chain correlation, the explicit env-name shape validator
-//!   (`^[A-Z_][A-Z0-9_]*$`), and the structural `validate_directive`
-//!   gate that refuses out-of-pool uids before the spawn path runs.
-//!
-//! The macOS bin further rebuilds atop MACOS-PRIMITIVES Decision 5:
-//! the helper no longer runs the privileged setup chain itself (no
-//! `Command::pre_exec`). Instead it `posix_spawn`s a small shim binary
-//! (see `src/bin/emberd_spawn_shim.rs`); the shim runs as the target
-//! uid, applies the SBPL sandbox + chroot, and `execve`s the real
-//! construct binary.
+//! This crate defines the shared frame protocol, validation helpers, content
+//! hash checks, and peer-credential extraction used by the platform helpers.
+//! The Linux helper performs the setuid/chroot/seccomp/exec chain directly in
+//! its child process. The macOS helper uses `posix_spawn` to invoke a small
+//! shim binary (see `src/bin/emberd_spawn_shim.rs`); the shim runs as the target
+//! uid, applies the SBPL sandbox + chroot, and `execve`s the real construct
+//! binary.
 //!
 //! ## Trust boundary
 //!
@@ -106,6 +93,34 @@ pub const PROTOCOL_VERSION: u32 = WIRE_VERSION;
 /// bounding the helper's read buffer hard.
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Per-stream caps for the child-output tails carried in
+/// [`HelperFrame::Exit`]. The helper drains the child's stdout/stderr
+/// to EOF (so the child never blocks on a full pipe) but retains only
+/// the last N bytes — enough for a headless caller to see command
+/// output or a failure message without unbounded frame growth. The
+/// values match the daemon's inline-`Command` path so a brokered
+/// command's surfaced output is identical regardless of exec route.
+pub const STDOUT_TAIL_CAP: usize = 64 * 1024;
+pub const STDERR_TAIL_CAP: usize = 4 * 1024;
+
+/// Format a captured output tail for the wire. `retained` is the last
+/// (up to a cap) bytes of the stream; `total_seen` is the full byte
+/// count the helper observed before trimming. When the stream was
+/// trimmed, the daemon-side inline-path truncation marker is prepended
+/// so headless callers see consistent formatting across exec routes.
+pub fn format_tail(retained: &[u8], total_seen: usize) -> String {
+    let s = String::from_utf8_lossy(retained);
+    if total_seen > retained.len() {
+        format!(
+            "...[{} bytes truncated]...{}",
+            total_seen - retained.len(),
+            s
+        )
+    } else {
+        s.into_owned()
+    }
+}
+
 /// Default socket path the helper binds. Production mode is `0660 root:
 /// ember-clients` on both platforms — the daemon's `ember` uid joins
 /// `ember-clients` and connects through the group bit. Tests override
@@ -124,10 +139,10 @@ pub const DEFAULT_MACOS_SOCKET_PATH: &str = DEFAULT_SOCKET_PATH;
 /// bind so the daemon can `connect(2)` through the group bit.
 pub const DAEMON_CONNECT_GROUP: &str = "ember-clients";
 
-/// Canonical install path for the MACOS-PRIMITIVES Decision 5 shim.
-/// The macOS helper bin invokes this path via `posix_spawn(2)`; the
-/// install-time hash check verifies the on-disk shim matches the
-/// daemon-rendered `EXPECTED_SHIM_HASH` env var before any invocation.
+/// Canonical install path for the macOS spawn shim. The macOS helper bin
+/// invokes this path via `posix_spawn(2)`; the install-time hash check verifies
+/// the on-disk shim matches the daemon-rendered `EXPECTED_SHIM_HASH` env var
+/// before any invocation.
 pub const DEFAULT_SHIM_PATH: &str = "/usr/local/libexec/emberd-spawn-shim";
 
 /// A `SpawnDirective` instructs the helper to verify, privilege-drop,
@@ -230,8 +245,7 @@ pub enum RefuseReason {
     SeccompInstallFailed,
     /// `posix_spawn(2)` / `Command::spawn()` / `execve(2)` failed.
     SpawnFailed,
-    /// MACOS-PRIMITIVES Decision 5: the on-disk
-    /// `emberd-spawn-shim` blake3 hash didn't match the helper's
+    /// The on-disk `emberd-spawn-shim` blake3 hash didn't match the helper's
     /// installed `EXPECTED_SHIM_HASH` env var. Refused with no spawn.
     ShimHashMismatch,
 }
@@ -269,10 +283,26 @@ pub enum HelperFrame {
     /// helper sets `code = 128 + signum` to match shell convention.
     /// `invocation_id` echoes the directive's correlation id when
     /// set.
+    ///
+    /// `stdout_tail` / `stderr_tail` carry the child's captured output
+    /// (last [`STDOUT_TAIL_CAP`] / [`STDERR_TAIL_CAP`] bytes, UTF-8
+    /// lossy, with a truncation marker via [`format_tail`]). Both are
+    /// `#[serde(default)]` so a pre-capture helper (which omits them)
+    /// still decodes against this struct and a pre-capture daemon
+    /// ignores them — the change is additive on the wire in both
+    /// directions. Carrying terminal output back to the authority root
+    /// is the spawn-helper's slice of the execution-result contract
+    /// (design §"Receipts must capture placement truth" — terminal
+    /// outcome), closing the gap to the higher-level `ExecOutcome`
+    /// shape `core-construct-runtime` already owns.
     Exit {
         code: i32,
         #[serde(default)]
         invocation_id: Option<String>,
+        #[serde(default)]
+        stdout_tail: String,
+        #[serde(default)]
+        stderr_tail: String,
     },
     /// Helper → daemon: content_hash_blake3 didn't match. No spawn
     /// happened.
@@ -480,10 +510,20 @@ mod tests {
             HelperFrame::Exit {
                 code: 0,
                 invocation_id: None,
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
             },
             HelperFrame::Exit {
                 code: 137,
                 invocation_id: Some("01HXAMPLE".to_string()),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+            },
+            HelperFrame::Exit {
+                code: 0,
+                invocation_id: Some("01HXAMPLE".to_string()),
+                stdout_tail: "#1\topen\tfix: thing\n".to_string(),
+                stderr_tail: "warning: rate limited\n".to_string(),
             },
             HelperFrame::HashMismatch {
                 expected: "aa".to_string(),
@@ -683,6 +723,8 @@ mod tests {
         let frame = HelperFrame::Exit {
             code: 42,
             invocation_id: None,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
         };
         let mut buf = Vec::new();
         sync_io::write_frame(&mut buf, &frame).expect("encode");
@@ -691,5 +733,34 @@ mod tests {
             .expect("decode")
             .expect("Some");
         assert_eq!(decoded, frame);
+    }
+
+    /// A pre-capture helper omits `stdout_tail` / `stderr_tail` on the
+    /// wire. The `#[serde(default)]` attrs must decode that legacy
+    /// frame into empty tails rather than failing — the additive
+    /// fields are backward-compatible in the helper→daemon direction.
+    #[test]
+    fn exit_frame_decodes_legacy_without_tails() {
+        let legacy = r#"{"type":"exit","code":7,"invocation_id":"01HXAMPLE"}"#;
+        let frame: HelperFrame = serde_json::from_str(legacy).expect("legacy decode");
+        assert_eq!(
+            frame,
+            HelperFrame::Exit {
+                code: 7,
+                invocation_id: Some("01HXAMPLE".to_string()),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn format_tail_marks_truncation() {
+        // Untruncated: total_seen == retained.len() → no marker.
+        assert_eq!(format_tail(b"hello", 5), "hello");
+        // Truncated: marker reports how many bytes were dropped.
+        let out = format_tail(b"tail-bytes", 100);
+        assert!(out.starts_with("...[90 bytes truncated]..."), "{out}");
+        assert!(out.ends_with("tail-bytes"), "{out}");
     }
 }

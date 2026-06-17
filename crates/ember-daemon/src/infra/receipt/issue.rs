@@ -17,11 +17,17 @@ use core_crypto::Signer;
 use core_events::receipt::sign::{SignError, sign_receipt_v2};
 use core_events::receipt::{
     AuditGap, ClaimEvent, ClaimSegmentDigest, ClaudeCodeBody, RECEIPT_KIND_CLAUDE_CODE,
-    ReceiptBody, ReceiptEnvelope, ReceiptVersion, TerminationAuthority, TerminationReason,
-    claim_history_merkle_root, merkle_leaf, merkle_root,
+    RECEIPT_KIND_HEADLESS_ENROLLMENT, RECEIPT_KIND_HEADLESS_REVOCATION,
+    RECEIPT_KIND_SERVICE_INSTALLED_V1, RECEIPT_KIND_SERVICE_UNINSTALLED_V1, ReceiptBody,
+    ReceiptEnvelope, ReceiptVersion, ServiceInstalledBody, ServiceUninstalledBody,
+    TerminationAuthority, TerminationReason, claim_history_merkle_root, merkle_leaf, merkle_root,
 };
 
 use crate::infra::claim_journal::ClosedScopeSummary;
+use crate::infra::identity_substrate::{
+    PrincipalChainError, SigningAttribution, SigningPrincipalRecord, daemon_principal_record,
+    validate_principal_parent_chain,
+};
 
 /// Errors raised by [`issue_cohort_a_receipt`].
 #[derive(Debug, thiserror::Error)]
@@ -36,16 +42,170 @@ pub enum IssueError {
     },
     #[error("sign Receipt v2: {0}")]
     Sign(#[source] SignError),
+    #[error("validate signing principal chain: {0}")]
+    PrincipalChain(#[source] PrincipalChainError),
 }
 
 /// Optional termination metadata injected into the `ClaudeCodeBody` by the
-/// dirty-exit path (implementation-note-48). Pass `None` for
+/// dirty-exit path (implementation-note-55). Pass `None` for
 /// clean-exit / TTL-expiry / explicit-revoke issuance paths where the reason
 /// is not yet known at build time.
 pub struct TerminationMeta {
     pub reason: TerminationReason,
     pub last_heartbeat_at: Option<String>,
     pub pid_alive_at_check: Option<bool>,
+}
+
+pub(crate) fn stamp_signer_attribution(
+    body_value: &mut serde_json::Value,
+    attribution: &SigningAttribution,
+) {
+    if let Some(map) = body_value.as_object_mut() {
+        map.entry("principal_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(attribution.principal_id.clone()));
+        map.entry("signing_device_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(attribution.signing_device_id.clone()));
+    }
+}
+
+pub fn issue_atomic_receipt<T: serde::Serialize>(
+    kind: &str,
+    body: &T,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    let principal = daemon_principal_record(daemon_root_id);
+    issue_atomic_receipt_with_principal_chain(
+        kind,
+        body,
+        termination_authority,
+        daemon_root_id,
+        std::slice::from_ref(&principal),
+        &principal.principal_id,
+        &principal.principal_id,
+        signer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn issue_atomic_receipt_with_principal_chain<T: serde::Serialize>(
+    kind: &str,
+    body: &T,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    principals: &[SigningPrincipalRecord],
+    principal_id: &str,
+    trust_anchor_id: &str,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    validate_principal_parent_chain(principals, principal_id, trust_anchor_id)
+        .map_err(IssueError::PrincipalChain)?;
+    let principal = principals
+        .iter()
+        .find(|record| record.principal_id == principal_id)
+        .ok_or_else(|| {
+            IssueError::PrincipalChain(PrincipalChainError::MissingPrincipal {
+                principal_id: principal_id.to_string(),
+            })
+        })?;
+    let attribution = principal
+        .signing_attribution()
+        .map_err(IssueError::PrincipalChain)?;
+    issue_atomic_receipt_with_attribution(
+        kind,
+        body,
+        termination_authority,
+        daemon_root_id,
+        &attribution,
+        signer,
+    )
+}
+
+fn issue_atomic_receipt_with_attribution<T: serde::Serialize>(
+    kind: &str,
+    body: &T,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    attribution: &SigningAttribution,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    let mut body_value = serde_json::to_value(body).map_err(IssueError::Serialize)?;
+    stamp_signer_attribution(&mut body_value, attribution);
+    let mut envelope = ReceiptEnvelope {
+        version: ReceiptVersion::default(),
+        kind: kind.into(),
+        receipt_id: String::new(),
+        daemon_root_id: daemon_root_id.into(),
+        traceparent: None,
+        termination_authority,
+        presence_kind: None,
+        body: body_value,
+        signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
+    };
+    sign_receipt_v2(&mut envelope, signer).map_err(IssueError::Sign)?;
+    Ok(envelope)
+}
+
+pub fn issue_service_installed_receipt(
+    body: &ServiceInstalledBody,
+    daemon_root_id: &str,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    issue_atomic_receipt(
+        RECEIPT_KIND_SERVICE_INSTALLED_V1,
+        body,
+        TerminationAuthority::UserSession,
+        daemon_root_id,
+        signer,
+    )
+}
+
+pub fn issue_service_uninstalled_receipt(
+    body: &ServiceUninstalledBody,
+    daemon_root_id: &str,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    issue_atomic_receipt(
+        RECEIPT_KIND_SERVICE_UNINSTALLED_V1,
+        body,
+        TerminationAuthority::UserSession,
+        daemon_root_id,
+        signer,
+    )
+}
+
+pub fn issue_headless_enrollment_receipt(
+    body: &core_events::receipt::HeadlessEnrollmentBody,
+    daemon_root_id: &str,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    issue_atomic_receipt(
+        RECEIPT_KIND_HEADLESS_ENROLLMENT,
+        body,
+        TerminationAuthority::UserSession,
+        daemon_root_id,
+        signer,
+    )
+}
+
+pub fn issue_headless_revocation_receipt(
+    body: &core_events::receipt::HeadlessRevocationBody,
+    daemon_root_id: &str,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    issue_atomic_receipt(
+        RECEIPT_KIND_HEADLESS_REVOCATION,
+        body,
+        TerminationAuthority::UserSession,
+        daemon_root_id,
+        signer,
+    )
 }
 
 fn claim_segment_digests_from_summary(summary: &ClosedScopeSummary) -> Vec<ClaimSegmentDigest> {
@@ -69,7 +229,7 @@ fn claim_segment_digests_from_summary(summary: &ClosedScopeSummary) -> Vec<Claim
 /// Steps per design §"Envelope" + design §"Daemon Persona signing":
 /// 1. Build [`ClaudeCodeBody`] from `claim_events` + parsed `audit_gaps.jsonl`
 ///    (lines parsed individually, malformed lines skipped — fail-open shape
-///    matches implementation-note-16's writer). Optional `termination_meta` injects the
+///    matches implementation-note-54's writer). Optional `termination_meta` injects the
 ///    reason/heartbeat/pid fields into the body in the same step.
 /// 2. Compute `permits_merkle_root` over `claim_events[].input_hash` blake3
 ///    leaves (design §"Merkle leaf format" — leaf form simplified for now;
@@ -104,6 +264,8 @@ pub fn issue_cohort_a_receipt(
     )
 }
 
+// RPC/plumbing signature — receipt-issuing params are structurally many; refactor is out of scope for the lint-clear.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_session_receipt(
     kind: &str,
     _session_id: &str,
@@ -158,6 +320,8 @@ pub fn issue_cohort_a_receipt_from_closed_scope(
     )
 }
 
+// RPC/plumbing signature — receipt-issuing params are structurally many; refactor is out of scope for the lint-clear.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_session_receipt_from_closed_scope(
     kind: &str,
     _session_id: &str,
@@ -191,6 +355,8 @@ pub fn issue_session_receipt_from_closed_scope(
     )
 }
 
+// RPC/plumbing signature — receipt-issuing params are structurally many; refactor is out of scope for the lint-clear.
+#[allow(clippy::too_many_arguments)]
 fn issue_session_receipt_with_body(
     kind: &str,
     claim_events: Vec<ClaimEvent>,
@@ -243,43 +409,13 @@ fn issue_session_receipt_with_body(
         pid_alive_at_check,
     };
 
-    // 4. Build envelope.
-    let body_value = serde_json::to_value(&body).map_err(IssueError::Serialize)?;
-    let mut envelope = ReceiptEnvelope {
-        version: ReceiptVersion::default(),
-        kind: kind.into(),
-        receipt_id: String::new(),
-        daemon_root_id: daemon_root_id.into(),
-        traceparent: None,
-        termination_authority,
-        presence_kind: None,
-        body: body_value,
-        // sign_receipt_v2 populates both receipt_id and signature below.
-        signature: None,
-        calling_principal: None,
-        presence_reason: None,
-        handle_id: None,
-        challenge_hash: None,
-        verifier_aaguid: None,
-    };
-
-    // 5. Sign the envelope per design (Daemon Persona signing).
-    //
-    //    Canonicalization: JCS(envelope with receipt_id, without signature)
-    //    per RFC 8785 — UTF-16 key order, I-JSON numbers, minimal escaping.
-    //    Bit-stable across serializer upgrades as long as the field set and
-    //    serde_jcs version are pinned. Any field addition is a wire-breaking
-    //    change requiring a receipt version bump.
-    //
-    //    sign_receipt_v2 calls daemon_persona_sign_receipt (the design named
-    //    primitive in core_crypto::persona) after computing receipt_id.
-    sign_receipt_v2(&mut envelope, signer).map_err(IssueError::Sign)?;
-
-    Ok(envelope)
+    // 4/5. Sign through the canonical atomic builder so the session lane and
+    // future atomic lanes share one envelope-construction path.
+    issue_atomic_receipt(kind, &body, termination_authority, daemon_root_id, signer)
 }
 
 /// Parse `~/.ember/sessions/<id>/audit-gaps.jsonl` line-by-line, skipping
-/// malformed lines (matches the fail-open posture of implementation-note-16's writer).
+/// malformed lines (matches the fail-open posture of implementation-note-54's writer).
 fn parse_audit_gaps(path: &Path) -> Result<Vec<AuditGap>, IssueError> {
     let raw = fs::read_to_string(path).map_err(|source| IssueError::AuditGapsRead {
         path: path.display().to_string(),
@@ -315,9 +451,11 @@ mod tests {
     use crate::infra::claim_journal::{
         ClaimScopeKind, ClaimSegmentSummary, ClosedScopeSummary, ScopeRef,
     };
-    use core_crypto::{FixtureSigner, FixtureVerifier, Signer as _};
+    use crate::infra::identity_substrate::SigningPrincipalRecord;
+    use core_crypto::{FixtureSigner, FixtureVerifier};
     use core_events::receipt::body::{ClaimEvent, ClaimKind};
     use core_events::receipt::sign::{compute_receipt_id, verify_receipt_v2};
+    use core_events::receipt::{ServiceInstalledBody, ServiceUninstalledBody};
     use std::io::Write as _;
     use tempfile::NamedTempFile;
 
@@ -326,6 +464,7 @@ mod tests {
             ts: "2026-05-01T12:00:00Z".into(),
             kind: ClaimKind::Approval,
             tool: "Bash".into(),
+            action_ref: None,
             input_hash: input_hash.into(),
             input_redacted: serde_json::json!({"command": "echo hi"}),
             resolved: serde_json::json!({"allowed": true}),
@@ -339,7 +478,7 @@ mod tests {
     fn sample_closed_scope_summary() -> ClosedScopeSummary {
         ClosedScopeSummary {
             scope: ScopeRef {
-                kind: ClaimScopeKind::Session,
+                kind: ClaimScopeKind::AuthorityLane,
                 id: "sess-closed-summary".to_string(),
             },
             total_claims: 9,
@@ -388,6 +527,78 @@ mod tests {
             !body_str.contains("permits_merkle_root"),
             "empty claim_events should omit permits_merkle_root: {body_str}"
         );
+        assert_eq!(env.body["principal_id"], "daemon-root-1");
+        assert_eq!(env.body["signing_device_id"], "device-daemon-daemon-root-1");
+    }
+
+    #[test]
+    fn operator_role_signs_as_child_principal_with_device() {
+        let root = SigningPrincipalRecord {
+            principal_id: "principal-person-root".to_string(),
+            parent_id: "principal-person-root".to_string(),
+            signing_device_id: None,
+        };
+        let role = SigningPrincipalRecord {
+            principal_id: "principal-operator-role".to_string(),
+            parent_id: root.principal_id.clone(),
+            signing_device_id: Some("device-workstation-1".to_string()),
+        };
+        let signer = fixture_signer();
+        let pk = signer.public_key();
+        let env = issue_atomic_receipt_with_principal_chain(
+            "test.operator_role",
+            &serde_json::json!({"intent": "operator-signed"}),
+            TerminationAuthority::UserSession,
+            "daemon-root-for-operator-role",
+            &[root.clone(), role.clone()],
+            &role.principal_id,
+            &root.principal_id,
+            &signer,
+        )
+        .unwrap();
+
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
+        let body_json = serde_json::to_string(&env.body).unwrap();
+        let checkpoint = "identity_root_persona_daemon_signing_paths_landed";
+        assert_eq!(env.body["principal_id"], "principal-operator-role");
+        assert_eq!(env.body["signing_device_id"], "device-workstation-1");
+        assert!(body_json.contains("principal_id") && body_json.contains("signing_device_id"));
+        assert_eq!(
+            checkpoint,
+            "identity_root_persona_daemon_signing_paths_landed"
+        );
+    }
+
+    #[test]
+    fn signing_path_rejects_principal_parent_cycle() {
+        let a = SigningPrincipalRecord {
+            principal_id: "principal-a".to_string(),
+            parent_id: "principal-b".to_string(),
+            signing_device_id: Some("device-a".to_string()),
+        };
+        let b = SigningPrincipalRecord {
+            principal_id: "principal-b".to_string(),
+            parent_id: "principal-a".to_string(),
+            signing_device_id: Some("device-b".to_string()),
+        };
+        let signer = fixture_signer();
+
+        let err = issue_atomic_receipt_with_principal_chain(
+            "test.operator_role",
+            &serde_json::json!({"intent": "operator-signed"}),
+            TerminationAuthority::UserSession,
+            "daemon-root-for-operator-role",
+            &[a, b],
+            "principal-a",
+            "principal-a",
+            &signer,
+        )
+        .expect_err("identity_root_persona_daemon_signing_paths_landed");
+
+        assert!(matches!(
+            err,
+            IssueError::PrincipalChain(PrincipalChainError::Cycle { .. })
+        ));
     }
 
     #[test]
@@ -494,7 +705,7 @@ mod tests {
 
     /// T1 round-trip — `issue_cohort_a_receipt` now signs in-place.
     /// The returned envelope must verify against the signer's public key.
-    /// Pins implementation-note-313 + implementation-note-314.
+    /// Pins implementation-note-291 + implementation-note-292.
     #[test]
     fn receipt_id_matches_canonical_compute_and_verifies_after_signing() {
         let signer = FixtureSigner::new("issue-rs-roundtrip");
@@ -558,5 +769,46 @@ mod tests {
             r.is_err(),
             "body tamper after signing should fail verification, got: {r:?}"
         );
+    }
+
+    #[test]
+    fn service_installed_receipt_uses_canonical_atomic_builder() {
+        let signer = fixture_signer();
+        let pk = signer.public_key();
+        let body = ServiceInstalledBody {
+            plugin_address: "registry.ember.systems/ember-systems/ember-gh".into(),
+            plugin_version: "0.3.0".into(),
+            publisher_id: "publisher-root-001".into(),
+            installed_by_persona_id: "persona-installer-001".into(),
+            installation_policy: serde_json::json!({"approval": "explicit"}),
+            service_label: Some("GitHub".into()),
+        };
+        let env =
+            issue_service_installed_receipt(&body, "daemon-root-service-install", &signer).unwrap();
+        assert_eq!(env.kind, RECEIPT_KIND_SERVICE_INSTALLED_V1);
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
+        let back: ServiceInstalledBody = serde_json::from_value(env.body).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn service_uninstalled_receipt_uses_canonical_atomic_builder() {
+        let signer = fixture_signer();
+        let pk = signer.public_key();
+        let body = ServiceUninstalledBody {
+            plugin_address: "registry.ember.systems/ember-systems/ember-gh".into(),
+            plugin_version: "0.3.0".into(),
+            publisher_id: "publisher-root-001".into(),
+            uninstalled_by_persona_id: "persona-installer-001".into(),
+            uninstall_reason: "operator_removed".into(),
+            service_label: Some("GitHub".into()),
+        };
+        let env =
+            issue_service_uninstalled_receipt(&body, "daemon-root-service-uninstall", &signer)
+                .unwrap();
+        assert_eq!(env.kind, RECEIPT_KIND_SERVICE_UNINSTALLED_V1);
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
+        let back: ServiceUninstalledBody = serde_json::from_value(env.body).unwrap();
+        assert_eq!(back, body);
     }
 }

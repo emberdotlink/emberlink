@@ -26,12 +26,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, MintStamp,
+    PermissionBound,
+};
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
 
 use crate::github_app::{
-    GhAppCredentials, GhAppError, HttpClient, ReqwestClient, mint_installation_token_with_client,
+    GhAppCredentials, GhAppError, HttpClient, InstallationToken, ReqwestClient,
+    mint_installation_token_with_client,
 };
 
 /// Provider-specific scope payload for the GitHub broker.
@@ -47,18 +50,61 @@ use crate::github_app::{
 /// Callers SHOULD set both for least-privilege; the broker will pass an
 /// unscoped request through to GitHub if both are omitted, which produces
 /// a token with the App's full installation power.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GithubScope {
-    /// Repository names (without owner prefix) the token is restricted to.
-    /// Example: `["emberlink-dev"]` (assuming the App is installed on the
-    /// `emberdotlink` org).
-    #[serde(default)]
-    pub repositories: Vec<String>,
+/// Re-exported from `core-broker` (design): the projector and the broker
+/// share ONE typed shape so the native payload cannot drift (object-vs-tuple
+/// permissions / owner-prefix). `repositories` are bare names, `permissions`
+/// are `(name, level)` tuples; empty either field ⇒ full installation token
+/// (only reachable by callers that bypass projection).
+pub use core_broker::GithubScope;
 
-    /// Fine-grained permission pairs. Example:
-    /// `[("contents", "write"), ("pull_requests", "write")]`.
-    #[serde(default)]
-    pub permissions: Vec<(String, String)>,
+/// Build the provider scope echo (design amendment 2 / design §B / design
+/// §D4) from the installation-token response.
+///
+/// Returns [`MintStamp::Unbounded`] — the G3 "request shape carries no
+/// narrow bound" variant — whenever GitHub handed back an **unbounded**
+/// token: `repository_selection == "all"`, or empty repositories /
+/// permissions. The audit record is explicit about the unbounded-mint
+/// shape (replaces the legacy `None` collapse that conflated unbounded
+/// mints with introspection-less providers — H-2).
+///
+/// Returns [`BrokerError::Upstream`] when the bounded-scope construction
+/// itself fails (serde refuses to serialize `GithubScope`, or the
+/// validating `PermissionBound::from_native` refuses the resulting native).
+/// **The broker MUST then refuse the mint** — silently degrading to a G3
+/// audit while injecting a live bounded token was the H-3 adversarial
+/// finding: the audit would have claimed "no attestation" while the
+/// credential injected real bounded authority with zero clamp
+/// verification. Fail-closed at the boundary.
+///
+/// On a successful bounded mint, returns [`MintStamp::Permissions`] wrapping
+/// the granted permissions + repositories as the validated
+/// [`PermissionBound`] payload the daemon's I7 clamp re-parses via
+/// `GithubProjector::native_upper_bound`.
+fn github_mint_stamp(token: &InstallationToken) -> Result<MintStamp, BrokerError> {
+    if token.repository_selection.as_deref() == Some("all") {
+        return Ok(MintStamp::Unbounded);
+    }
+    if token.granted_repositories.is_empty() || token.granted_permissions.is_empty() {
+        return Ok(MintStamp::Unbounded);
+    }
+    let scope = GithubScope {
+        repositories: token.granted_repositories.clone(),
+        permissions: token.granted_permissions.clone(),
+    };
+    let native = serde_json::to_value(&scope).map_err(|e| {
+        BrokerError::Upstream(format!(
+            "github provider-echo serialization failed: {e} \
+             (refusing mint — would otherwise inject bounded credential with \
+             no clamp verification, design §D4 / H-3)"
+        ))
+    })?;
+    let bound = PermissionBound::from_native(BrokerProvider::Github, native).map_err(|e| {
+        BrokerError::Upstream(format!(
+            "github provider-echo upper-bound construction failed: {e} \
+             (refusing mint — see design §D4 / H-3)"
+        ))
+    })?;
+    Ok(MintStamp::Permissions { bound })
 }
 
 /// `Broker` impl backed by `ember_broker::github_app`.
@@ -154,10 +200,19 @@ impl Broker for GitHubBroker {
             .expect("github broker state mutex")
             .insert(materialization_id.clone(), expires_at);
 
+        // design amendment 2 / design §B / design §D4 — the provider's
+        // authoritative scope echo, typed by variant. Built BEFORE the token
+        // string is moved into the `SecretString`. A construction failure
+        // (serde error, unbounded native) propagates as `BrokerError` so
+        // the mint is REFUSED rather than silently degraded to a G3 audit
+        // with a live bounded token attached (H-3 fail-closed).
+        let mint_stamp = github_mint_stamp(&token)?;
+
         Ok(BrokeredCredential {
             token: SecretString::from(token.token),
             expires_at,
             materialization_id,
+            mint_stamp,
         })
     }
 
@@ -191,7 +246,7 @@ mod tests {
         GhAppCredentials {
             app_id: "12345".to_string(),
             installation_id: "67890".to_string(),
-            private_key_pem: FIXTURE_RSA_PEM.to_string(),
+            private_key_pem: SecretString::from(FIXTURE_RSA_PEM.to_string()),
         }
     }
 
@@ -200,6 +255,13 @@ mod tests {
             provider: BrokerProvider::Github,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -211,6 +273,21 @@ mod tests {
         serde_json::json!({
             "token": "ghs_test_token_xyz_extra_chars_for_prefix",
             "expires_at": "2099-01-01T00:00:00Z",
+        })
+        .to_string()
+    }
+
+    /// Token response carrying GitHub's authoritative scope echo
+    /// (`repository_selection`/`permissions`/`repositories`) — the real shape of
+    /// a repo-scoped installation token response (design amendment 2).
+    fn ok_token_body_with_echo() -> String {
+        serde_json::json!({
+            "token": "ghs_test_token_xyz_extra_chars_for_prefix",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "repository_selection": "selected",
+            // Deliberately unsorted to prove the broker sorts for a stable record.
+            "permissions": { "pull_requests": "write", "contents": "read" },
+            "repositories": [ { "full_name": "emberdotlink/emberlink-dev" } ],
         })
         .to_string()
     }
@@ -253,6 +330,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_captures_provider_scope_echo() {
+        let broker = GitHubBroker::with_client(
+            fixture_creds(),
+            Arc::new(MockHttpClient {
+                status: 201,
+                body: ok_token_body_with_echo(),
+            }),
+        );
+        let req = gh_request(
+            serde_json::json!({
+                "repositories": ["emberlink-dev"],
+                "permissions": [["contents", "read"]],
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+
+        // design amendment 2 / design §B / design §D4 G1 — the provider's
+        // authoritative scope echo is captured as a typed `MintStamp::Permissions`
+        // wrapping the native `GithubScope` shape, sorted for a byte-stable
+        // materialization audit record.
+        let bound = match cred.mint_stamp {
+            MintStamp::Permissions { bound } => bound,
+            other => panic!(
+                "github echo must be MintStamp::Permissions when repository_selection=selected, \
+                 got: {other:?}"
+            ),
+        };
+        assert_eq!(bound.provider(), BrokerProvider::Github);
+        let scope: GithubScope =
+            serde_json::from_value(bound.native().clone()).expect("native is a GithubScope");
+        assert_eq!(
+            scope.repositories,
+            vec!["emberdotlink/emberlink-dev".to_string()]
+        );
+        assert_eq!(
+            scope.permissions,
+            vec![
+                ("contents".to_string(), "read".to_string()),
+                ("pull_requests".to_string(), "write".to_string()),
+            ],
+            "permissions must be sorted (contents < pull_requests)"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_with_repository_selection_all_records_no_echo() {
+        let body = serde_json::json!({
+            "token": "ghs_test_token_xyz_extra_chars_for_prefix",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "repository_selection": "all",
+            "permissions": { "contents": "read" },
+        })
+        .to_string();
+        let broker = GitHubBroker::with_client(
+            fixture_creds(),
+            Arc::new(MockHttpClient { status: 201, body }),
+        );
+        let req = gh_request(
+            serde_json::json!({
+                "repositories": ["emberlink-dev"],
+                "permissions": [["contents", "read"]],
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+
+        // An all-repos token is unbounded — recorded as MintStamp::Unbounded
+        // (the explicit G3 "request shape carries no narrow bound" variant,
+        // design §D4), never as a false-narrow `Scope` claim.
+        assert!(
+            matches!(cred.mint_stamp, MintStamp::Unbounded),
+            "repository_selection=all must record MintStamp::Unbounded, got: {:?}",
+            cred.mint_stamp
+        );
+    }
+
+    #[tokio::test]
     async fn issue_with_empty_scope_succeeds() {
         let broker = GitHubBroker::with_client(
             fixture_creds(),
@@ -265,6 +424,75 @@ mod tests {
         Broker::issue(&broker, req)
             .await
             .expect("empty scope must succeed");
+    }
+
+    /// Records the JSON body the broker would POST to GitHub, so the
+    /// projector → broker → wire chain can be asserted end-to-end.
+    struct CapturingClient {
+        status: u16,
+        body: String,
+        captured: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for CapturingClient {
+        async fn post_json_bearer(
+            &self,
+            _url: &str,
+            _bearer: &str,
+            body: &str,
+        ) -> Result<(u16, String), GhAppError> {
+            *self.captured.lock().unwrap() = Some(body.to_string());
+            Ok((self.status, self.body.clone()))
+        }
+    }
+
+    /// design / Codex adversarial-review finding (high): the projector's
+    /// output must match the broker's native contract. Feed a projected scope
+    /// through the REAL `Broker::issue` boundary and assert the GitHub wire
+    /// body is the exact least-privilege request — bare repo name + the
+    /// permission as an object. This is the test the projector's own unit
+    /// tests structurally could not provide (they never cross the boundary).
+    #[tokio::test]
+    async fn projected_scope_flows_through_issue_to_expected_wire_body() {
+        use core_broker::project::{
+            CapabilityVerb, ConcreteTarget, GithubPermission, GithubProjector, Level,
+            NativeProjector, ResolvedNeed,
+        };
+
+        let native = GithubProjector
+            .project(&[ResolvedNeed {
+                capability: CapabilityVerb::Github {
+                    permission: GithubPermission::Contents,
+                    level: Level::Write,
+                },
+                target: ConcreteTarget::Repo("emberdotlink/emberlink-dev".to_string()),
+            }])
+            .expect("project");
+
+        let client = Arc::new(CapturingClient {
+            status: 201,
+            body: ok_token_body(),
+            captured: std::sync::Mutex::new(None),
+        });
+        let broker = GitHubBroker::with_client(fixture_creds(), client.clone());
+
+        // The projected native is consumable by the real broker (would fail
+        // deserialization if the projector emitted permissions as an object or
+        // repos with an owner prefix).
+        Broker::issue(&broker, gh_request(native, 3600))
+            .await
+            .expect("projected scope must deserialize + mint");
+
+        let sent: serde_json::Value =
+            serde_json::from_str(&client.captured.lock().unwrap().clone().unwrap())
+                .expect("captured body is JSON");
+        // Bare repo name (owner stripped) + permission as an OBJECT on the wire.
+        assert_eq!(sent["repositories"], serde_json::json!(["emberlink-dev"]));
+        assert_eq!(
+            sent["permissions"],
+            serde_json::json!({ "contents": "write" })
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,26 @@
+[package]
+name = "ember-presence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared client-side presence acquisition and daemon RPC support."
+publish = false
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "2"
+
+# Objective-C block bridge for the LocalAuthentication reply callback. Only
+# referenced under `#[cfg(target_os = "macos")]` in `biometric::macos`, so the
+# dependency remains macOS-target-scoped.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

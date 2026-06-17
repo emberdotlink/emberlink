@@ -6,8 +6,8 @@
 //!
 //! Coverage:
 //! - `EventBody::canonical_encode` -> `EventBody::decode_canonical` roundtrip
-//!   stability for a representative subset of variants. The in-tree
-//!   `lib.rs#proptest_canonical` already exhaustively covers every variant;
+//!   stability for a representative subset of variants. Full-coverage
+//!   canonical checks now live in `core-grant-types/tests/canonical.rs`;
 //!   this integration test pins the public-API contract from outside the
 //!   crate so a downstream consumer's roundtrip doesn't silently regress.
 //! - `GrantLink::to_url` / `to_web_url` -> `GrantLink::parse` roundtrip.
@@ -42,8 +42,8 @@ fn arb_key() -> impl Strategy<Value = PublicKeyMaterial> {
 }
 
 /// A small representative subset of `EventBody` variants. The full-coverage
-/// generator lives in `lib.rs#proptest_canonical`; this one is the cheap
-/// public-API smoke test that runs from `tests/`.
+/// generator lives in `core-grant-types/tests/canonical.rs`; this one is the
+/// cheap public-API smoke test that runs from `tests/`.
 fn arb_event_body() -> impl Strategy<Value = EventBody> {
     prop_oneof![
         ("[a-z0-9-]{1,32}", "[ -~]{0,32}", arb_key()).prop_map(|(root_id, display_name, key)| {
@@ -103,6 +103,7 @@ fn arb_grant_link() -> impl Strategy<Value = GrantLink> {
         "[a-f0-9]{2,64}",
         proptest::option::of("wss://[a-z.-]{1,32}"),
         "persona-[a-z0-9-]{1,32}",
+        "[a-f0-9]{2,64}",
         "[a-f0-9]{0,64}",
     )
         .prop_map(
@@ -113,6 +114,7 @@ fn arb_grant_link() -> impl Strategy<Value = GrantLink> {
                 issuer_signature,
                 relay_hint,
                 issuer_persona_id,
+                issuer_public_key_hex,
                 recipient_pubkey_hex,
             )| GrantLink {
                 offer_id,
@@ -121,6 +123,7 @@ fn arb_grant_link() -> impl Strategy<Value = GrantLink> {
                 issuer_signature,
                 relay_hint,
                 issuer_persona_id,
+                issuer_public_key_hex,
                 recipient_pubkey_hex,
             },
         )
@@ -177,6 +180,7 @@ proptest! {
             link.expires_at,
             link.relay_hint.as_deref(),
             &link.issuer_persona_id,
+            &link.issuer_public_key_hex,
             &link.recipient_pubkey_hex,
         );
         let p2 = GrantLink::signing_payload(
@@ -185,6 +189,7 @@ proptest! {
             link.expires_at,
             link.relay_hint.as_deref(),
             &link.issuer_persona_id,
+            &link.issuer_public_key_hex,
             &link.recipient_pubkey_hex,
         );
         prop_assert_eq!(p1, p2);

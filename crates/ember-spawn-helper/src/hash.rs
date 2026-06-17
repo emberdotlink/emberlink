@@ -1,3 +1,4 @@
+// CLASSIFICATION: PUBLIC
 
 //! Blake3 content-hash verification for spawn directives.
 //!
@@ -8,7 +9,7 @@
 //! that puts a malicious binary in place between hash-pin and helper-
 //! spawn must be detected here.
 //!
-//! ## MACOS-PRIMITIVES Decision 5 — shim hash pinning
+//! ## macOS shim hash pinning
 //!
 //! The macOS bin additionally hash-pins the `emberd-spawn-shim` binary
 //! it `posix_spawn`s. The helper's `EXPECTED_SHIM_HASH` env var is

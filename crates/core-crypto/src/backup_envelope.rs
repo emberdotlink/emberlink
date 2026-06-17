@@ -2,7 +2,7 @@
 //! material for cross-workstation operator portability + F-AUTHORITY-3/4
 //! recovery.
 //!
-//! Per design §Component 4 and implementation-note-32. The substrate
+//! Per design §Component 4 and implementation-note-34. The substrate
 //! is intentionally pure: `seal_backup` / `open_backup` consume only the
 //! envelope payload + a passphrase and return the sealed-blob bytes (or
 //! a recovered envelope). All operator UX (Touch ID prompts, Keychain
@@ -103,9 +103,7 @@ pub enum BackupError {
     /// Passphrase shorter than [`MIN_PASSPHRASE_LEN`] characters.
     /// Surfaced by `seal_backup` only — `open_backup` cannot detect
     /// passphrase length, only correctness.
-    #[error(
-        "passphrase must be at least {min} characters (got {got})"
-    )]
+    #[error("passphrase must be at least {min} characters (got {got})")]
     PassphraseTooWeak { min: usize, got: usize },
     /// Blob is shorter than the fixed header or its length-prefixed
     /// fields do not fit.
@@ -153,7 +151,7 @@ pub enum BackupError {
 /// `Zeroize` + `ZeroizeOnDrop` ensure the private seeds are wiped from
 /// memory when the envelope is dropped — the substrate goes to lengths
 /// to keep the seeds out of long-lived allocations.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Default, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct BackupEnvelope {
     /// 32-byte Ed25519 seed for the operator IdentityRoot. `Vec<u8>`
     /// because `serde` derives don't traverse fixed-size arrays
@@ -168,6 +166,26 @@ pub struct BackupEnvelope {
     /// created on `<hostname>` on `<date>`. Proceed?").
     #[zeroize(skip)]
     pub metadata: BackupMetadata,
+}
+
+// `Debug` is manually implemented to redact the IdentityRoot seeds — these are
+// the highest-value secrets in the system (root signing seeds). A derived
+// `Debug` would print them via any `tracing::debug!(?envelope)` /
+// `format!("{:?}")`. Seed lengths are shown for diagnostics; bytes never are.
+impl std::fmt::Debug for BackupEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupEnvelope")
+            .field(
+                "operator_ir_seed",
+                &format_args!("<redacted; {} bytes>", self.operator_ir_seed.len()),
+            )
+            .field(
+                "dev_ir_seed",
+                &format_args!("<redacted; {} bytes>", self.dev_ir_seed.len()),
+            )
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 /// Plain-text metadata attached to the envelope. Visible to anyone
@@ -209,10 +227,7 @@ pub struct BackupMetadata {
 /// [`MIN_PASSPHRASE_LEN`]. The check is on character count, not byte
 /// length, so a passphrase composed of multi-byte unicode codepoints
 /// still gets the floor's worth of entropy.
-pub fn seal_backup(
-    envelope: &BackupEnvelope,
-    passphrase: &str,
-) -> Result<Vec<u8>, BackupError> {
+pub fn seal_backup(envelope: &BackupEnvelope, passphrase: &str) -> Result<Vec<u8>, BackupError> {
     let passphrase_chars = passphrase.chars().count();
     if passphrase_chars < MIN_PASSPHRASE_LEN {
         return Err(BackupError::PassphraseTooWeak {
@@ -264,9 +279,8 @@ pub fn seal_backup(
 
     // 5. Concatenate: header || salt_len(u16 LE) || salt ||
     //    nonce_len(u16 LE) || nonce || ciphertext.
-    let mut out = Vec::with_capacity(
-        header.len() + 2 + salt.len() + 2 + nonce.len() + ciphertext.len(),
-    );
+    let mut out =
+        Vec::with_capacity(header.len() + 2 + salt.len() + 2 + nonce.len() + ciphertext.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(&(salt.len() as u16).to_le_bytes());
     out.extend_from_slice(&salt);
@@ -441,6 +455,27 @@ fn read_u16_le(blob: &[u8], offset: usize) -> Result<u16, BackupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_envelope_debug_redacts_ir_seeds() {
+        // Secret-hygiene regression: derived Debug printed the operator/dev
+        // IdentityRoot seeds (the highest-value secrets) verbatim.
+        let env = sample_envelope();
+        let dbg = format!("{env:?}");
+        assert!(
+            dbg.contains("<redacted; 32 bytes>"),
+            "IR seeds must be redacted (with length): {dbg}"
+        );
+        // 0x11 = 17, 0x22 = 34 — raw seed bytes must not appear in any form.
+        assert!(
+            !dbg.contains("17, 17") && !dbg.contains("34, 34"),
+            "no raw seed bytes may appear in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("test-host.local"),
+            "non-secret metadata stays visible for context: {dbg}"
+        );
+    }
 
     fn sample_envelope() -> BackupEnvelope {
         BackupEnvelope {

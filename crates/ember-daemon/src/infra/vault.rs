@@ -1,49 +1,42 @@
 //! Vault MEK + sealed-credentials store.
 //!
-//! implementation-note-362 — -A
-//! (`vault_macos_se::get_mek_passphrase` already returns
-//! `Zeroizing<String>`; the caller at `Vault::open_from_config` binds
-//! the result directly and passes `&passphrase`, so the buffer is
-//! zeroed on the `Drop` at function exit — verified against the
-//! current file shape, no rebind needed), -B (encrypt-then-MAC +
-//! verify-then-decrypt in `ember_broker::secure_enclave::stub_unwrap`
-//! via `subtle::ConstantTimeEq`; auth tag now computed over the
-//! ciphertext so tampered blobs are rejected before any plaintext is
-//! produced), and -C (the leakable code path —
-//! `SeError::UnwrapFailed → VaultError::Crypto` formatting in
-//! `vault_macos_se.rs:105-106` — was eliminated by the upstream
-//! Plan-2A System.keychain refactor: the daemon now reads the MEK
-//! passphrase directly from `/Library/Keychains/System.keychain` via
-//! `SecKeychain::find_generic_password` and no longer ever maps
-//! `SeError` into `VaultError`, so the SE key-label and stub-key-
-//! registry implementation details cannot reach the operator-facing
-//! error string by construction).
+//! The vault master-encryption-key (interactive_key) is a random 32-byte
+//! key whose at-rest form is a **double-envelope** (design):
 //!
-//! ## Tier 1: start-of-session unlock
+//! - **Outer envelope**: SE ECIES — peeled by the CLI in the Aqua/501
+//!   session domain where Secure Enclave operations succeed.
+//! - **Inner envelope**: DWK symmetric XChaCha20-Poly1305 — peeled by the
+//!   daemon at uid=450 via the `vault.de_unlock_complete` RPC.
 //!
-//! `Vault::open_from_config` reads the MEK passphrase via the SE-backed
-//! `vault_macos` shim on macOS — first read prompts for Touch ID. See
-//! `vault_macos.rs` for the shim contract.
+//! The former direct-SE unseal functions (`se_unseal_interactive`,
+//! `try_se_unseal`, `se_unseal_with_presence`, `AutoUnsealOutcome`,
+//! `try_auto_unseal_from_keyring`) were deleted in design S4. See
+//! `vault_macos_se.rs` for the SE wrap/unwrap primitives still used by
+//! the CLI relay's outer-envelope operations.
 //!
-//! ## Tier 2: per-op user presence + idle re-lock
+//! ## Per-op user presence + idle re-lock
 //!
-//! After Tier 1 unlocks the vault, the daemon stays "session-permissive"
-//! for read-class operations (vault_get, vault_list, status) but
-//! per-operation `require_user_presence` gates fire on high-risk write
-//! ops (vault_add, vault_remove, grant create, persona key export). The
+//! After the double-envelope unlock, the daemon stays "session-permissive"
+//! for ordinary read-class operations (vault_get, vault_list, status), while
+//! rows whose [`PresencePolicy`] is `PerAccessFresh` (formerly
+//! `requires_biometric=1` before presence-policy unification) require
+//! a fresh presence-Device proof on every read. Per-operation
+//! `require_user_presence` gates fire on high-risk
+//! write ops (vault_add, vault_remove, grant create, persona key export). The
 //! gate state machine lives in `crate::presence` (not here, because the
 //! gate is dispatch-level, not vault-level). The daemon supervisor calls
-//! `presence::mark_unlocked()` after a successful Tier 1 unlock so
-//! subsequent high-risk ops don't double-prompt within the idle window.
+//! `presence::mark_unlocked()` after a successful double-envelope unlock
+//! so subsequent high-risk ops don't double-prompt within the idle window.
 
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead, aead::Payload};
 use chrono::{DateTime, Utc};
-use core_crypto::{PublicKey, Signer};
+use core_crypto::Signer;
 use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
 use core_events::receipt::sign::{SignError, sign_receipt_v2};
 use ed25519_dalek::VerifyingKey;
 use once_cell::sync::Lazy;
 use rusqlite::{OptionalExtension, params};
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -51,7 +44,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// implementation-note-35 C5 — AAD domain-separator prefix byte. AEAD
+/// implementation-note-37 C5 — AAD domain-separator prefix byte. AEAD
 /// associated data for every C5+-sealed credential row is the byte
 /// sequence `[AAD_VERSION_BYTE] || uuid_bytes_of_row_id` (17 bytes).
 /// The literal `0x01` future-proofs the format: if we ever rotate the
@@ -76,8 +69,12 @@ fn aad_for_row_id(row_id: &str) -> Option<[u8; 17]> {
     Some(out)
 }
 
+use crate::auth::presence_gate::PresencePolicy;
 use crate::infra::config::DaemonConfig;
 use crate::infra::store::{DaemonStore, StoreError};
+
+/// Decrypted vault payload bytes. The heap allocation is scrubbed on drop.
+pub type VaultPlaintext = Zeroizing<Vec<u8>>;
 
 /// Compile-time default keyring service name.
 pub const DEFAULT_KEYRING_SERVICE: &str = "ember-daemon";
@@ -98,15 +95,21 @@ fn remember_runtime_reopen_passphrase(data_dir: &Path, passphrase: &str) {
     );
 }
 
-fn runtime_reopen_passphrase(data_dir: &Path) -> Option<String> {
+/// N6 (pre-release security review, 2026-06): returns the cached reopen
+/// passphrase wrapped in [`Zeroizing<String>`] so the heap allocation
+/// holding the secret zeroizes on drop. The cache itself stores entries as
+/// `Zeroizing<String>`; previously this getter cloned the inner `String`
+/// out of the wrapper on the return path, leaving an unzeroized heap copy
+/// in the caller's stack frame for the lifetime of the use.
+fn runtime_reopen_passphrase(data_dir: &Path) -> Option<Zeroizing<String>> {
     let cache = RUNTIME_REOPEN_PASSPHRASE_CACHE
         .lock()
         .expect("runtime reopen passphrase cache poisoned");
-    cache.get(data_dir).map(|value| (**value).clone())
+    cache
+        .get(data_dir)
+        .map(|value| Zeroizing::new((**value).clone()))
 }
 
-#[doc(hidden)]
-#[cfg(test)]
 pub(crate) fn clear_runtime_reopen_passphrase_cache() {
     let mut cache = RUNTIME_REOPEN_PASSPHRASE_CACHE
         .lock()
@@ -114,7 +117,20 @@ pub(crate) fn clear_runtime_reopen_passphrase_cache() {
     cache.clear();
 }
 
-// implementation-note-35 C4 — Argon2id KDF parameter pins. The MEK is
+/// design D6 — clear the operator-passphrase caches after a rotation that
+/// CHANGED the passphrase (`change_passphrase` mode), so the next vault reopen
+/// re-derives the MEK from the freshly-updated keychain rather than a stale
+/// cached secret. Clears the runtime-reopen cache (all hosts) and, on macOS,
+/// the Touch-ID session cache that short-circuits the keychain read. A `rekey`
+/// keeps the same passphrase, so it does NOT need this (the cached passphrase
+/// stays correct; only the DB salt changed, which reopen reads fresh).
+pub(crate) fn clear_passphrase_caches() {
+    clear_runtime_reopen_passphrase_cache();
+    #[cfg(target_os = "macos")]
+    crate::infra::vault_macos::clear_session_cache();
+}
+
+// implementation-note-37 C4 — Argon2id KDF parameter pins. The MEK is
 // derived by `Vault::from_passphrase` via Argon2id; pinning the cost
 // parameters here (and writing them to `vault.params` next to
 // `vault.salt`) lets `Vault::open_from_config` refuse to unlock a vault
@@ -148,6 +164,9 @@ pub enum VaultError {
     Store(StoreError),
     Crypto(String),
     NotFound,
+    /// The credential row is marked per-entry biometric and this read did not
+    /// arrive with a freshly verified presence-Device proof.
+    PresenceRequired,
     Keyring(String),
     Io(String),
     /// Daemon was about to open the production keyring service without an
@@ -158,43 +177,57 @@ pub enum VaultError {
     /// Only fired by `vault_add` for NEW entries; existing non-conformant
     /// entries are grandfathered (per design §5.4).
     InvalidName(VaultNameError),
-    /// Sealed-blob (implementation-note-217) parse/structural
+    /// Sealed-blob (implementation-note-186) parse/structural
     /// error: invalid argon2 parameters, malformed length fields, AEAD
     /// key-init failure, etc. `String` carries human-readable detail.
     SealedBlobInvalid(String),
     /// Sealed blob is shorter than the wire format requires. `need` is
     /// the cumulative byte offset the reader tried to advance to; `have`
     /// is the blob length.
-    SealedBlobTruncated { need: usize, have: usize },
+    SealedBlobTruncated {
+        need: usize,
+        have: usize,
+    },
     /// First 4 bytes of the sealed blob are not `b"EMVS"`. Returned as
     /// raw bytes so the caller can log the actual value without lossy
     /// UTF-8 conversion.
-    SealedBlobBadMagic { got: [u8; 4] },
+    SealedBlobBadMagic {
+        got: [u8; 4],
+    },
     /// Sealed-blob version is not the one this build knows how to read.
-    SealedBlobUnknownVersion { got: u16 },
+    SealedBlobUnknownVersion {
+        got: u16,
+    },
     /// kdf_id field is not a value this build recognises (currently
     /// only `0x01` = argon2id).
-    SealedBlobUnknownKdf { got: u8 },
+    SealedBlobUnknownKdf {
+        got: u8,
+    },
     /// aead_id field is not a value this build recognises (currently
     /// only `0x01` = XChaCha20-Poly1305).
-    SealedBlobUnknownAead { got: u8 },
+    SealedBlobUnknownAead {
+        got: u8,
+    },
     /// The fingerprint embedded in the sealed blob (or recomputed from
     /// the recovered MEK) does not match the value the caller supplied.
     /// Indicates either operator error (wrong vault) or blob tampering.
-    SealedBlobFingerprintMismatch { expected: String, actual: String },
+    SealedBlobFingerprintMismatch {
+        expected: String,
+        actual: String,
+    },
     /// AEAD authentication tag failed during sealed-blob import.
     /// Surfaces as a single variant rather than a free-form crypto
     /// message so callers can fingerprint the wrong-passphrase /
     /// tampered-ciphertext case explicitly.
     SealedBlobAeadFailure,
-    /// implementation-note-325 — emission
+    /// implementation-note-304 — emission
     /// of an `IdentityRotationWitness` Receipt failed. Surfaces signing
     /// failures from `core_events::receipt::sign::sign_receipt_v2`
     /// (canonicalize, serialize, etc.) so callers can distinguish
     /// crypto-layer faults from store-layer faults when persistence
     /// would otherwise mask the underlying signer error.
     WitnessEmit(String),
-    /// implementation-note-193 (B1) + adversarial review
+    /// implementation-note-170 (B1) + adversarial review
     /// CRIT-1 fix (2026-05-22) — a caller invoked an Interactive-lane
     /// operation (`seal`, `open`, or `add`/`get`/`replace`/`list`/
     /// `remove` with `VaultScope::Interactive`) on a Vault that was
@@ -206,11 +239,23 @@ pub enum VaultError {
     /// produce known-key ciphertext, which is exactly what `can't`
     /// forbids.
     HeadlessOnly,
+    /// design §4 / design — AuthorityBearing values may not be sealed or
+    /// opened by a production MEK-backed vault. The live authority path must
+    /// install a presence-unwrapped scope KEK (`KEK_s`) first.
+    AuthorityBearingRequiresPresence,
+    /// design §4 / design AC-4 — `rotate_mek` is a passphrase/MEK-rotation
+    /// primitive: it snapshots the live Interactive key under the passphrase
+    /// (`write_pre_rotation_snapshot`) and re-wraps every row onto a freshly
+    /// derived MEK. On a presence-backed (`KEK_s`) vault that would leak the
+    /// scope KEK into a passphrase-recoverable file AND downgrade AuthorityBearing
+    /// custody to a MEK-reachable copy. Refused fail-closed; presence/`KEK_s`
+    /// custody is re-keyed through the §4 presence lane, not this primitive.
+    AuthorityCustodyRotationUnsupported,
 }
 
 /// Reasons a credential name fails the design path grammar.
 ///
-/// Grammar (per task brief implementation-note-363):
+/// Grammar (per task brief implementation-note-321):
 ///   - Lowercase ASCII letters `a-z`
 ///   - Digits `0-9`
 ///   - Hyphens `-`
@@ -347,6 +392,10 @@ impl std::fmt::Display for VaultError {
             VaultError::Store(e) => write!(f, "store error: {e}"),
             VaultError::Crypto(s) => write!(f, "crypto error: {s}"),
             VaultError::NotFound => write!(f, "credential not found"),
+            VaultError::PresenceRequired => write!(
+                f,
+                "credential requires a fresh presence-Device signature before it can be read"
+            ),
             VaultError::Keyring(s) => write!(f, "keyring error: {s}"),
             VaultError::Io(s) => write!(f, "io error: {s}"),
             VaultError::HeadlessOnly => write!(
@@ -354,13 +403,23 @@ impl std::fmt::Display for VaultError {
                 "vault is headless-only (constructed via new_headless_only); \
                  Interactive-lane operations refused"
             ),
+            VaultError::AuthorityBearingRequiresPresence => write!(
+                f,
+                "AuthorityBearing values require a presence-unwrapped scope KEK \
+                 (design §4 / design); refusing the MEK-backed vault path"
+            ),
+            VaultError::AuthorityCustodyRotationUnsupported => write!(
+                f,
+                "MEK rotation is unsupported on a presence-backed (KEK_s) vault \
+                 (design §4 / design AC-4): it would leak the scope KEK under \
+                 the passphrase and downgrade AuthorityBearing custody to a MEK"
+            ),
             VaultError::ProductionSentinelMissing(s) => write!(f, "{s}"),
             VaultError::InvalidName(e) => write!(f, "invalid credential name: {e}"),
             VaultError::SealedBlobInvalid(s) => write!(f, "sealed blob invalid: {s}"),
-            VaultError::SealedBlobTruncated { need, have } => write!(
-                f,
-                "sealed blob truncated: need {need} bytes, have {have}"
-            ),
+            VaultError::SealedBlobTruncated { need, have } => {
+                write!(f, "sealed blob truncated: need {need} bytes, have {have}")
+            }
             VaultError::SealedBlobBadMagic { got } => write!(
                 f,
                 "sealed blob bad magic: expected EMVS, got {:02x}{:02x}{:02x}{:02x}",
@@ -380,7 +439,10 @@ impl std::fmt::Display for VaultError {
                 "sealed blob fingerprint mismatch: expected {expected}, got {actual}"
             ),
             VaultError::SealedBlobAeadFailure => {
-                write!(f, "sealed blob AEAD authentication failed (wrong passphrase or tampered ciphertext)")
+                write!(
+                    f,
+                    "sealed blob AEAD authentication failed (wrong passphrase or tampered ciphertext)"
+                )
             }
             VaultError::WitnessEmit(s) => write!(f, "identity rotation witness emit failed: {s}"),
         }
@@ -406,11 +468,34 @@ pub struct CredentialInfo {
     pub name: String,
     pub created_at: String,
     pub metadata: Option<String>,
+    /// Per-resource presence policy (design vocabulary). `PerAccessFresh`
+    /// closes the cached-unlock bypass surfaced by prior change. Replaces the
+    /// prior `requires_biometric: bool` field per
+    /// presence-policy unification.
+    pub presence_policy: PresencePolicy,
+    /// Custody-class of the row's value. Computed from the storage
+    /// namespace at read time (`__headless/` prefix → `DaemonOperational`,
+    /// no prefix → `AuthorityBearing`); exposed as a typed field on
+    /// `CredentialInfo` so callers do not re-derive the routing from the
+    /// raw name string.
+    pub value_class: ValueClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultReadGate {
+    CachedUnlockOnly,
+    FreshPresence,
+}
+
+impl VaultReadGate {
+    fn satisfies_fresh_presence(self) -> bool {
+        matches!(self, VaultReadGate::FreshPresence)
+    }
 }
 
 /// Which user-presence policy lane is calling into the vault.
 ///
-/// Phase 2A (`implementation-note-364`) makes the parameter
+/// Phase 2A (`implementation-note-322`) makes the parameter
 /// load-bearing for storage namespace selection: `Headless` now maps to a
 /// dedicated internal row-name prefix while `Interactive` preserves the
 /// historical flat names. The per-scope MEK split is still follow-up work.
@@ -429,6 +514,84 @@ pub enum VaultScope {
     /// and any path that cannot present a biometric prompt. No callers in
     /// Phase 1 — wired up in Phase 2 along with the per-scope MEK split.
     Headless,
+}
+
+impl VaultScope {
+    /// design D1 (scope+row-bound DEK-wrap AAD hardening) — the fixed
+    /// scope-enum string folded into the DEK-wrap AAD. Binds a wrapped DEK
+    /// to its scope cryptographically so an Interactive-wrapped DEK fails
+    /// AEAD authentication when unwrapped as Headless EVEN IF the two MEKs
+    /// happen to be equal (e.g. the bootstrap single-key Vault). This makes
+    /// cross-scope confused-deputy defense rest on the AEAD tag, not solely
+    /// on the MEK split. The strings are a stable wire format — never rename
+    /// them without an AAD version bump (`.v2` → `.v3`).
+    pub(crate) fn label(self) -> &'static [u8] {
+        match self {
+            VaultScope::Interactive => b"interactive",
+            VaultScope::Headless => b"headless",
+        }
+    }
+}
+
+/// Classification of a sealed value's custody, so [`Vault::seal`]/[`Vault::open`]
+/// route to the correct key **structurally** rather than by per-call-site
+/// judgment (design §4 / closure-pass finding #8).
+///
+/// This is the cross-platform home for the classification the macOS-gated §4
+/// engine (`presence_seal`) also speaks — it re-exports this type so there is
+/// exactly one vocabulary.
+///
+/// Routing (design §4 sharpened design — the interactive key is re-sourced from
+/// the presence-unwrapped scope KEK `KEK_s`):
+/// - [`AuthorityBearing`](ValueClass::AuthorityBearing) → the **interactive**
+///   key. On the §4 lane that key IS `KEK_s`, so sealing authority material is
+///   presence-as-decryption. Refused on a headless-only / idle-zeroed vault
+///   (no §4 key present) — there is NO autonomous-key fallback for authority.
+/// - [`DaemonOperational`](ValueClass::DaemonOperational) → the **headless**
+///   (autonomous) key, so daemon-operational data (the bridge-CA module key,
+///   config, …) is never dragged into the presence-gated authority window.
+///
+/// design §3 AC-3 (B1 guard rail): the attested-device / automation unlock
+/// path holds only the headless key, so it can reach `DaemonOperational` (infra)
+/// but NEVER `AuthorityBearing` (lease-key) material. Do NOT route authority into
+/// the headless lane to "make it work without presence" — that is the exact
+/// regression the `automation_unlock_decrypts_infra_only_never_lease_key` test
+/// fails closed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueClass {
+    /// Authority-bearing secret VALUE (persona/grant signing keys, …). MUST be
+    /// sealed under the interactive (§4) key; the autonomous key may never be a
+    /// recipient.
+    AuthorityBearing,
+    /// Daemon-operational data (bridge-CA module key, config, …). Sealed under
+    /// the autonomous headless key — it is not authority-bearing and must stay
+    /// available without a presence gesture. design AC-3: automation/headless
+    /// unlock may decrypt only this class, never AuthorityBearing lease-key material.
+    DaemonOperational,
+}
+
+impl ValueClass {
+    /// The [`VaultScope`] (and therefore the key) this value class routes to.
+    pub(crate) fn scope(self) -> VaultScope {
+        match self {
+            ValueClass::AuthorityBearing => VaultScope::Interactive,
+            ValueClass::DaemonOperational => VaultScope::Headless,
+        }
+    }
+
+    /// Derive the [`ValueClass`] of an existing row from its on-disk
+    /// storage name. Rows under the `__headless/` prefix are
+    /// `DaemonOperational`; everything else is `AuthorityBearing`. The
+    /// reverse of [`storage_name_for_scope`]. Used by row-shape APIs that
+    /// want to expose a typed `value_class: ValueClass` on `CredentialInfo`
+    /// rather than re-derive routing at every call site.
+    pub(crate) fn from_stored_name(stored_name: &str) -> Self {
+        if stored_name.starts_with(HEADLESS_SCOPE_STORAGE_PREFIX) {
+            ValueClass::DaemonOperational
+        } else {
+            ValueClass::AuthorityBearing
+        }
+    }
 }
 
 const HEADLESS_SCOPE_STORAGE_PREFIX: &str = "__headless/";
@@ -477,21 +640,16 @@ impl From<[u8; 16]> for Argon2Salt {
 
 /// SE-wrapped master key handle. macOS-only.
 ///
-/// **STUB.** The real implementation will (a) generate a random Vault DEK,
-/// (b) wrap it with a SE-resident Ed25519/EC key created via
-/// `SecKeyCreateRandomKey(kSecAttrTokenIDSecureEnclave)`, and (c) store the
-/// wrapped blob in the daemon's data directory. Unwrapping prompts the user
-/// for biometric/passcode and never exposes the SE-resident key material to
-/// userland. Wire-up is deferred to **.A-SE-WIRE** so the enum shape can
-/// land first and unblock .B (presence attestation) without bringing in
-/// the full SecKey API surface.
+/// Carries the SE key label and the opaque ECIES-wrapped blob of the
+/// 32-byte interactive key. The daemon SE-unwraps the blob at runtime;
+/// the raw key never persists.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 pub struct SEWrappedKey {
-    /// Stable label for the SE-resident wrapping key in the keychain. The
-    /// real implementation will use this as the `kSecAttrLabel` so the same
-    /// key is rediscoverable across daemon restarts.
+    /// Stable label for the SE-resident wrapping key in the DPK.
     pub key_label: String,
+    /// Opaque SE-ECIES-wrapped blob of the 32-byte interactive key.
+    pub blob: Vec<u8>,
 }
 
 /// Source of the vault MEK at unlock time.
@@ -509,6 +667,22 @@ pub struct SEWrappedKey {
 ///   derived from `$EMBER_VAULT_PASSPHRASE`. The salt still has to come from
 ///   somewhere — `Vault::open_with_key_store` resolves it from disk via
 ///   `vault_salt(&config)` at the call site.
+///
+/// A §4 scope KEK (design) already unwrapped by the operator-session presence
+/// gesture (the cross-uid `se_unwrap` tap; the separate-uid daemon never touches
+/// the presence-gated SE key itself). The daemon installs these raw bytes as the
+/// vault's `interactive_key`, so authority-bearing material is reachable only
+/// after a live tap. `Debug` is REDACTED so the KEK can never land in a log line
+/// or an error chain.
+#[derive(Clone)]
+pub struct PresenceUnwrappedKek(pub Zeroizing<[u8; 32]>);
+
+impl std::fmt::Debug for PresenceUnwrappedKek {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PresenceUnwrappedKek(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum VaultKeyStore {
     /// Passphrase-derived key (Argon2id over the env/configured passphrase).
@@ -516,17 +690,23 @@ pub enum VaultKeyStore {
     /// SE-wrapped master key. macOS only.
     #[cfg(target_os = "macos")]
     SecureEnclave(SEWrappedKey),
+    /// design §4 presence-as-decryption: the interactive key is the scope KEK
+    /// unwrapped by the operator-session presence tap (cross-uid `se_unwrap`),
+    /// supplied here already-unwrapped. Platform-agnostic at the vault layer (it
+    /// is just a key install); the `se_unwrap` that produces it is macOS-gated in
+    /// the operator-session CLI / unlock handoff.
+    PresenceScopeKek(PresenceUnwrappedKek),
     /// Env passphrase escape hatch (CI/headless).
     EnvPassphrase,
 }
 
 /// MEK holder for the daemon's sealed-credentials store.
 ///
-/// **implementation-note-35 C1**: `Vault` is `ZeroizeOnDrop` so the
+/// **implementation-note-37 C1**: `Vault` is `ZeroizeOnDrop` so the
 /// in-memory MEK is wiped on Drop (explicit lock, daemon shutdown, the
 /// final `Rc<Vault>` / `Arc<Vault>` reference going away).
 ///
-/// implementation-note-365 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// implementation-note-323 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
 /// REMOVED. Prior to this commit `Vault` derived `Clone` so the in-memory
 /// MEK byte-array could be by-value-copied across LocalSet spawn boundaries
 /// (runtime.rs spawned each proxy + dashboard task with a fresh
@@ -544,16 +724,169 @@ pub enum VaultKeyStore {
 /// On-disk filename (under `<data_dir>/`) carrying the AEAD-wrapped
 /// Headless MEK. The blob is `[24-byte nonce || ciphertext-with-tag]`
 /// encrypted under the Interactive MEK with AAD `b"vault.headless-mek.v1"`.
-/// Generated lazily on first vault open per implementation-note-193.
+/// Generated lazily on first vault open per implementation-note-170.
 pub(crate) const HEADLESS_MEK_WRAP_FILE: &str = "vault.headless-mek.wrapped";
 
 /// AEAD AAD for the disk-wrapped Headless MEK. Version-prefixed so a
 /// future rotation can disambiguate cleanly.
 const HEADLESS_MEK_WRAP_AAD: &[u8] = b"vault.headless-mek.v1";
 
+/// design D1 — fixed prefix for the per-row DEK-wrap AAD. The
+/// credential-row Data Encryption Key is itself AEAD-wrapped under the
+/// row's scope MEK using a scope+row-bound AAD. NOTE: this is the wrap of
+/// the DEK, not the payload — the payload keeps the existing `[0x01||uuid]`
+/// AAD (`aad_for_row_id`), now applied under the DEK rather than the MEK.
+///
+/// **v2 (scope+row-bound, 2026-05-29 security analysis).** The original
+/// v1 used a CONSTANT AAD `b"vault.dek-wrap.v1"`, so cross-scope
+/// confused-deputy defense rested entirely on the MEK split: if the two
+/// scope MEKs were ever equal (the bootstrap single-key Vault, a future
+/// misprovision), an Interactive-wrapped DEK would unwrap cleanly as
+/// Headless. v2 folds the scope label AND the identifier into the AAD so the
+/// AEAD tag itself rejects a cross-scope or cross-row unwrap. The framing is
+/// LENGTH-PREFIXED and therefore canonically injective: a fixed prefix, then a
+/// `u8` label-length + the scope label, then a `u32` id-length + the
+/// identifier. Because every variable-width field is length-delimited, no two
+/// distinct `(scope, id)` inputs can ever produce the same AAD bytes —
+/// regardless of the identifier's width or content. (A separator-only framing
+/// would be safe only by the accident that no label/id contains the separator
+/// byte; the seal-blob ids are variable-width ASCII, not fixed-width, so the
+/// length prefixes make injectivity structural rather than accidental — per
+/// the S6a.2 adversarial-review hardening.) **There is no v1-accepting
+/// fallback** (mirrors the no-no-AAD-fallback discipline on the payload seal):
+/// the dev0 host has no enveloped vault yet, so there are no v1 rows to migrate.
+const DEK_WRAP_AAD_PREFIX: &[u8] = b"vault.dek-wrap.v2:";
+
+/// design D1 — build the scope+row-bound DEK-wrap AAD, length-prefixed so it
+/// is canonically injective:
+/// `PREFIX || u8(label.len) || label || u32_le(id.len) || id_bytes`.
+///
+/// For credential rows `id_bytes` is the raw 16-byte UUID of the `cred-<uuid>`
+/// row id (`cred_row_uuid_bytes`); for the daemon-internal `seal`/`open` blobs
+/// (persona secrets, bridge-CA module key) it is a purpose-bound identifier
+/// chosen by the caller (`seal_blob_aad_id`) — variable-width, which is exactly
+/// why the length prefix (not a separator) is what guarantees no two distinct
+/// `(scope, id)` inputs collide.
+fn dek_wrap_aad(scope: VaultScope, id_bytes: &[u8]) -> Vec<u8> {
+    let label = scope.label();
+    debug_assert!(
+        label.len() <= u8::MAX as usize,
+        "scope label fits in u8 length prefix"
+    );
+    let mut aad =
+        Vec::with_capacity(DEK_WRAP_AAD_PREFIX.len() + 1 + label.len() + 4 + id_bytes.len());
+    aad.extend_from_slice(DEK_WRAP_AAD_PREFIX);
+    aad.push(label.len() as u8);
+    aad.extend_from_slice(label);
+    aad.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+    aad.extend_from_slice(id_bytes);
+    aad
+}
+
+/// design D1 — extract the raw 16-byte UUID from a `cred-<uuid>` row id
+/// for use as the fixed-width identifier in the DEK-wrap AAD. Returns
+/// `None` when the id is not a parseable `cred-<uuid>` (same shape gate as
+/// `aad_for_row_id`); callers MUST treat `None` as a hard error rather than
+/// silently dropping the row binding (an un-bound wrap would re-open the
+/// cross-row splice the v2 AAD closes).
+fn cred_row_uuid_bytes(row_id: &str) -> Option<[u8; 16]> {
+    let uuid_str = row_id.strip_prefix("cred-")?;
+    let uuid = Uuid::parse_str(uuid_str).ok()?;
+    Some(*uuid.as_bytes())
+}
+
+/// design D3 — fixed known plaintext sealed under the Interactive MEK
+/// at vault provisioning and AEAD-verified on the fail-loud startup
+/// path. A wrong MEK fails the canary's authentication tag, which is
+/// the cryptographic key-correctness authority (the `mek_fingerprint`
+/// string-compare is demoted to an advisory pre-flight). The canary is
+/// stored in `vault_meta` so it works even with zero credential rows.
+const VAULT_CANARY_PLAINTEXT: &[u8] = b"ember-vault-canary-v1";
+
+/// design D3 — AAD domain-separator for the canary seal.
+const VAULT_CANARY_AAD: &[u8] = b"vault.canary.v1";
+
+/// design D1 — wrap a freshly-generated Data Encryption Key under a
+/// scope MEK. Reuses the exact AEAD the headless-MEK wrap already uses
+/// (XChaCha20-Poly1305, 24-byte nonce). The AAD is the scope+row-bound v2
+/// AAD (`dek_wrap_aad`) so the wrap is cryptographically pinned to both the
+/// `scope` and the per-row/per-blob `id_bytes`. Returns
+/// `(dek_nonce, wrapped_dek)`. The nonce is fresh OS entropy per call —
+/// never reused across wraps.
+fn wrap_dek(
+    mek: &[u8; 32],
+    dek: &[u8; 32],
+    scope: VaultScope,
+    id_bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
+    let cipher = XChaCha20Poly1305::new_from_slice(mek)
+        .map_err(|e| VaultError::Crypto(format!("dek wrap cipher init: {e}")))?;
+    let mut nonce_bytes = [0u8; 24];
+    getrandom::fill(&mut nonce_bytes).expect("OS entropy failure on dek wrap nonce");
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let aad = dek_wrap_aad(scope, id_bytes);
+    let wrapped = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: dek,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| VaultError::Crypto(format!("dek wrap: {e}")))?;
+    Ok((nonce_bytes.to_vec(), wrapped))
+}
+
+/// design D1 — unwrap a per-row Data Encryption Key under a scope MEK.
+/// Pairs with [`wrap_dek`]. The `scope` + `id_bytes` MUST match the values
+/// used at wrap time — a mismatch (wrong scope label or wrong row id) fails
+/// the AEAD authentication tag, which is the cross-scope / cross-row
+/// confused-deputy defense (no longer resting solely on the MEK split).
+/// Returns the 32-byte DEK as `Zeroizing` so it is scrubbed on drop. A
+/// wrong MEK or tampered wrap likewise fails the AEAD tag.
+fn unwrap_dek(
+    mek: &[u8; 32],
+    dek_nonce: &[u8],
+    wrapped_dek: &[u8],
+    scope: VaultScope,
+    id_bytes: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    if dek_nonce.len() != 24 {
+        return Err(VaultError::Crypto(format!(
+            "invalid dek_nonce length: {} (expected 24)",
+            dek_nonce.len()
+        )));
+    }
+    let cipher = XChaCha20Poly1305::new_from_slice(mek)
+        .map_err(|e| VaultError::Crypto(format!("dek unwrap cipher init: {e}")))?;
+    let nonce = XNonce::from_slice(dek_nonce);
+    let aad = dek_wrap_aad(scope, id_bytes);
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: wrapped_dek,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| VaultError::Crypto(format!("dek unwrap failed: {e}")))?;
+    if plaintext.len() != 32 {
+        return Err(VaultError::Crypto(format!(
+            "dek unwrap produced {} bytes (expected 32)",
+            plaintext.len()
+        )));
+    }
+    let mut dek = Zeroizing::new([0u8; 32]);
+    dek.copy_from_slice(&plaintext);
+    let mut pt = plaintext;
+    use zeroize::Zeroize as _;
+    pt.zeroize();
+    Ok(dek)
+}
+
 /// MEK holder for the daemon's sealed-credentials store.
 ///
-/// **implementation-note-193 (B1, 2026-05-22)** — `Vault`
+/// **implementation-note-170 (B1, 2026-05-22)** — `Vault`
 /// carries TWO 32-byte master keys, one per `VaultScope` lane:
 /// - `interactive_key`: passphrase-derived (Argon2id) via the existing
 ///   keychain → vault.salt → MEK pipeline. Drives Interactive-scope
@@ -571,21 +904,130 @@ const HEADLESS_MEK_WRAP_AAD: &[u8] = b"vault.headless-mek.v1";
 /// cryptographic split. Production callers reach `Vault::new_split`
 /// through `load_or_generate_headless_key` indirectly via `finish_open`.
 ///
-/// implementation-note-35 C1: `Vault` is `ZeroizeOnDrop` so both
+/// implementation-note-37 C1: `Vault` is `ZeroizeOnDrop` so both
 /// in-memory MEK byte arrays are wiped on Drop (explicit lock, daemon
 /// shutdown, the final `Rc<Vault>` / `Arc<Vault>` reference going away).
 ///
-/// implementation-note-365 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// implementation-note-323 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
 /// REMOVED. Prior to that commit `Vault` derived `Clone`; sharing is
 /// `Rc<Vault>` ONLY, but long-lived helper lanes resolve the live vault
 /// through `DaemonStore`'s shared slot instead of owning private runtime
 /// copies. `runtime.rs` drops the startup `Rc<Vault>` after wiring the
 /// slot, so explicit lock can clear the shared slot and let the
 /// underlying MEK byte-arrays zeroize when the last live reference drops.
-#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+///
+/// design D6 (amendment 3) — INTERIOR MUTABILITY. The two MEK fields are
+/// `RefCell<[u8; 32]>` rather than bare arrays so [`Vault::zero_scope`] can
+/// actually wipe one scope's key bytes in place through the shared
+/// `&Rc<Vault>` (the design demand-pinned idle-zero, and the
+/// session-invalidation D6 relies on). NO `Clone` (a `RefCell` is not
+/// `Clone` here by design — the C1 no-MEK-copy invariant stands); the keys
+/// are never copied out, only borrowed (`Ref`) for the lifetime of one
+/// crypto op, so the interior mutability does not widen the in-memory
+/// footprint of the secret. `ZeroizeOnDrop` is hand-implemented below (the
+/// derive cannot see through `RefCell`) and wipes BOTH cells on Drop — the
+/// same guarantee the prior `#[derive(ZeroizeOnDrop)]` gave.
 pub struct Vault {
-    interactive_key: [u8; 32],
-    headless_key: [u8; 32],
+    interactive_key: RefCell<[u8; 32]>,
+    headless_key: RefCell<[u8; 32]>,
+    authority_key_source: AuthorityKeySource,
+    keys_mlocked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityKeySource {
+    /// Test-only/in-memory constructor. It does not model hardware, but keeps
+    /// legacy in-memory unit tests from depending on macOS presence plumbing.
+    TestHarness,
+    /// Legacy passphrase/keychain MEK. Production AuthorityBearing values must
+    /// not route here after design §4 / design.
+    Mek,
+    /// The interactive key is the operator-session-unwrapped `KEK_s`.
+    PresenceScopeKek,
+    /// No interactive authority key is installed.
+    None,
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        if self.keys_mlocked {
+            unsafe {
+                libc::munlock(
+                    self.interactive_key.get_mut().as_ptr() as *const libc::c_void,
+                    32,
+                );
+                libc::munlock(
+                    self.headless_key.get_mut().as_ptr() as *const libc::c_void,
+                    32,
+                );
+            }
+        }
+        use zeroize::Zeroize as _;
+        self.interactive_key.get_mut().zeroize();
+        self.headless_key.get_mut().zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Vault {}
+
+/// design D5 — the three vault MEK-rotation modes. The wire strings match
+/// [`core_events::receipt::VaultMekRotationBody`]'s `mode` field and the
+/// `vault_rotate_execute` RPC `mode` param.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationMode {
+    /// Same operator passphrase, new salt → new Interactive MEK.
+    Rekey,
+    /// New operator passphrase + new salt → new Interactive MEK.
+    ChangePassphrase,
+    /// Fresh random Headless MEK; Interactive MEK unchanged.
+    RotateHeadless,
+}
+
+impl RotationMode {
+    /// Stable wire string (matches the receipt body + RPC param).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RotationMode::Rekey => "rekey",
+            RotationMode::ChangePassphrase => "change_passphrase",
+            RotationMode::RotateHeadless => "rotate_headless",
+        }
+    }
+
+    /// Parse the wire string; `None` for an unknown mode.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rekey" => Some(RotationMode::Rekey),
+            "change_passphrase" => Some(RotationMode::ChangePassphrase),
+            "rotate_headless" => Some(RotationMode::RotateHeadless),
+            _ => None,
+        }
+    }
+}
+
+/// design D3/D7 — the result of a committed [`Vault::rotate_mek`]. Carries
+/// the freshly-keyed `Vault` (the caller swaps it into the live slot via
+/// `set_vault`), the audit facts for the `vault.mek_rotation` Receipt, and
+/// the file sidecars to retire post-commit (now shadowed by the DB copies).
+pub struct RotationOutcome {
+    /// The new live `Vault` to swap into the shared slot (D6).
+    pub new_vault: Vault,
+    /// The mode that was rotated.
+    pub mode: RotationMode,
+    /// Count of wrapped DEKs re-wrapped under the new MEK (credentials +
+    /// persona secrets in scope).
+    pub rewrap_count: u64,
+    /// `key_epoch` before / after the rotation (`new == prev + 1`).
+    pub prev_key_epoch: i64,
+    pub new_key_epoch: i64,
+    /// blake3 advisory fingerprint of the rotated scope's MEK before / after.
+    pub prev_scope_fingerprint: String,
+    pub new_scope_fingerprint: String,
+    /// Path to the pre-mutate EMVS snapshot (D4).
+    pub snapshot_path: String,
+    /// File sidecars now shadowed by the committed DB copies; the caller
+    /// best-effort deletes these post-commit (DB-first reads make a lingering
+    /// file harmless, so a delete failure is non-fatal).
+    pub retired_files: Vec<std::path::PathBuf>,
 }
 
 impl Vault {
@@ -603,15 +1045,17 @@ impl Vault {
     /// OS entropy, AEAD-wrapped to disk under the Interactive MEK).
     pub fn new(vault_key: [u8; 32]) -> Self {
         Vault {
-            interactive_key: vault_key,
-            headless_key: vault_key,
+            interactive_key: RefCell::new(vault_key),
+            headless_key: RefCell::new(vault_key),
+            authority_key_source: AuthorityKeySource::TestHarness,
+            keys_mlocked: false,
         }
     }
 
     /// Two-key constructor for production callers and tests that DO
     /// model the cryptographic Interactive/Headless split.
     ///
-    /// Per implementation-note-193 (B1): the two keys MUST
+    /// Per implementation-note-170 (B1): the two keys MUST
     /// be cryptographically independent — `interactive_key` is
     /// Argon2id-derived from the operator passphrase; `headless_key` is
     /// fresh OS entropy AEAD-wrapped under `interactive_key` and
@@ -619,13 +1063,29 @@ impl Vault {
     /// survives daemon restarts without being re-derivable from the
     /// passphrase.
     pub fn new_split(interactive_key: [u8; 32], headless_key: [u8; 32]) -> Self {
-        Vault {
+        Self::new_split_with_authority_source(
             interactive_key,
             headless_key,
-        }
+            AuthorityKeySource::Mek,
+        )
     }
 
-    /// implementation-note-193 (B1) + adversarial review
+    fn new_split_with_authority_source(
+        interactive_key: [u8; 32],
+        headless_key: [u8; 32],
+        authority_key_source: AuthorityKeySource,
+    ) -> Self {
+        let mut v = Vault {
+            interactive_key: RefCell::new(interactive_key),
+            headless_key: RefCell::new(headless_key),
+            authority_key_source,
+            keys_mlocked: false,
+        };
+        v.keys_mlocked = v.mlock_keys();
+        v
+    }
+
+    /// implementation-note-170 (B1) + adversarial review
     /// CRIT-1 fix (2026-05-22) — headless-only constructor.
     ///
     /// Sets `interactive_key` to an all-zero checkpoint and
@@ -648,25 +1108,44 @@ impl Vault {
     /// produces zero output under any non-degenerate inputs) so the
     /// false-positive risk is acceptable.
     pub fn new_headless_only(headless_key: [u8; 32]) -> Self {
-        Vault {
-            interactive_key: [0u8; 32],
-            headless_key,
-        }
+        let mut v = Vault {
+            interactive_key: RefCell::new([0u8; 32]),
+            headless_key: RefCell::new(headless_key),
+            authority_key_source: AuthorityKeySource::None,
+            keys_mlocked: false,
+        };
+        v.keys_mlocked = v.mlock_keys();
+        v
     }
 
-    /// implementation-note-193 (B1) — true iff this Vault
+    /// implementation-note-170 (B1) — true iff this Vault
     /// was constructed via [`Vault::new_headless_only`] (or any other
     /// path that left `interactive_key` as the all-zero checkpoint).
+    ///
+    /// design D6 — also true after [`Vault::zero_scope`] wipes the
+    /// Interactive key: a zeroed Interactive scope is, by construction, the
+    /// all-zero checkpoint, so every Interactive op (`add`/`get`/`replace`/
+    /// `seal`/`open`) refuses with `VaultError::HeadlessOnly` exactly as it
+    /// would for a headless-only Vault. That is the intended post-idle-zero
+    /// posture — the wipe demotes the live vault to headless-only.
     /// Internal-only.
     fn is_headless_only(&self) -> bool {
-        self.interactive_key.iter().all(|b| *b == 0)
+        self.interactive_key.borrow().iter().all(|b| *b == 0)
+    }
+
+    fn ensure_authority_bearing_source(&self) -> Result<(), VaultError> {
+        match self.authority_key_source {
+            AuthorityKeySource::PresenceScopeKek | AuthorityKeySource::TestHarness => Ok(()),
+            AuthorityKeySource::Mek => Err(VaultError::AuthorityBearingRequiresPresence),
+            AuthorityKeySource::None => Err(VaultError::HeadlessOnly),
+        }
     }
 
     /// Derive an Interactive vault key from a passphrase using Argon2id
     /// with the compile-time-pinned parameters (`VAULT_ARGON2_*`
     /// constants). Matches `Argon2::default()` in argon2 v0.5 — existing
     /// vaults sealed under the default continue to decrypt without
-    /// rotation (implementation-note-35 C4).
+    /// rotation (implementation-note-37 C4).
     ///
     /// Returns a single-key Vault (both Interactive and Headless lanes
     /// share the derived bytes). Production callers should instead
@@ -676,20 +1155,67 @@ impl Vault {
     /// here for backward compatibility with the established test suite.
     pub fn from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Self {
         let interactive = derive_interactive_key(passphrase, salt);
-        Self {
-            interactive_key: interactive,
-            headless_key: interactive,
+        let mut v = Self {
+            interactive_key: RefCell::new(interactive),
+            headless_key: RefCell::new(interactive),
+            authority_key_source: AuthorityKeySource::Mek,
+            keys_mlocked: false,
+        };
+        v.keys_mlocked = v.mlock_keys();
+        v
+    }
+
+    fn mlock_keys(&mut self) -> bool {
+        let interactive_ptr = self.interactive_key.get_mut().as_ptr();
+        let headless_ptr = self.headless_key.get_mut().as_ptr();
+        unsafe {
+            let rc1 = libc::mlock(interactive_ptr as *const libc::c_void, 32);
+            let rc2 = libc::mlock(headless_ptr as *const libc::c_void, 32);
+            if rc1 != 0 || rc2 != 0 {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!(
+                    error = %err,
+                    "mlock(vault keys) failed — key material may be paged to swap"
+                );
+                return false;
+            }
         }
+        tracing::debug!("vault key pages mlock'd (64 bytes pinned)");
+        true
     }
 
     /// AEAD key for the given scope. Internal helper used by every
     /// `add` / `get` / `replace` call path so the scope routing is
     /// concentrated in one method.
-    fn key_for_scope(&self, scope: VaultScope) -> &[u8; 32] {
+    ///
+    /// design D6 — returns a `Ref` guard into the scope's `RefCell`
+    /// rather than `&[u8; 32]` (the keys are now interior-mutable so
+    /// `zero_scope` can wipe them). The borrow is held only for the
+    /// duration of the caller's crypto op (deref to `&[u8; 32]` /
+    /// `&[u8]`); the secret is never copied out.
+    fn key_for_scope(&self, scope: VaultScope) -> Ref<'_, [u8; 32]> {
         match scope {
-            VaultScope::Interactive => &self.interactive_key,
-            VaultScope::Headless => &self.headless_key,
+            VaultScope::Interactive => self.interactive_key.borrow(),
+            VaultScope::Headless => self.headless_key.borrow(),
         }
+    }
+
+    /// Export the live Interactive MEK into the EMVS sealed-blob format.
+    ///
+    /// `vault_export_sealed_cli_landed`: the daemon keeps the raw MEK inside
+    /// the authority space; the CLI receives only the passphrase-sealed blob
+    /// and the non-secret advisory fingerprint.
+    pub fn export_interactive_mek_sealed(
+        &self,
+        passphrase: &str,
+    ) -> Result<(Vec<u8>, String), VaultError> {
+        if self.is_headless_only() {
+            return Err(VaultError::HeadlessOnly);
+        }
+        let mek = Zeroizing::new(*self.interactive_key.borrow());
+        let fingerprint = mek_fingerprint_hex(mek.as_slice());
+        let blob = export_mek_sealed(mek.as_slice(), passphrase, &fingerprint)?;
+        Ok((blob, fingerprint))
     }
 
     /// Generate a random salt for key derivation.
@@ -717,19 +1243,21 @@ impl Vault {
     ///    c. Compile-time defaults (`DEFAULT_KEYRING_SERVICE` / `DEFAULT_KEYRING_ACCOUNT`)
     /// 4. Auto-generated random passphrase stored in keyring on first run
     ///
-    /// Salt is read from `<data_dir>/vault.salt`; created on first call.
-    pub fn open_from_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
-        open_from_config_with_presence(config, PresenceAfterOpen::MarkUnlocked)
-    }
-
-    /// Open the vault for daemon bootstrap work without flipping operator
-    /// presence to Unlocked.
+    /// Open the vault via double-envelope unlock.
     ///
-    /// This keeps startup-only vault hydration distinct from the interactive
-    /// session-open posture in design: the daemon may need a temporary vault
-    /// handle during boot, but that must not look like a live operator session.
-    pub(crate) fn open_bootstrap_from_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
-        open_from_config_with_presence(config, PresenceAfterOpen::LeaveLocked)
+    /// design S4: direct SE unseal is retired. The vault opens exclusively
+    /// through the `vault.de_unlock_complete` RPC (outer SE envelope peeled
+    /// by CLI, inner DWK envelope peeled by daemon). This stub preserves
+    /// compilation for callers that have not yet migrated to the daemon RPC
+    /// path, returning a clear error.
+    pub fn open_from_config(
+        _config: &DaemonConfig,
+        _store: &DaemonStore,
+    ) -> Result<Vault, VaultError> {
+        Err(VaultError::Crypto(
+            "direct vault open retired (design); vault opens via double-envelope unlock"
+                .to_string(),
+        ))
     }
 
     /// Open the vault using a `VaultKeyStore` to select the unlock lane.
@@ -752,6 +1280,23 @@ impl Vault {
         key_store: &VaultKeyStore,
     ) -> Result<Vault, VaultError> {
         open_with_key_store_and_presence(config, key_store, PresenceAfterOpen::MarkUnlocked)
+    }
+
+    /// design §1 (AC-2) — open a key-store vault WITHOUT flipping the presence
+    /// session to Unlocked. The transient-KEK widening path
+    /// ([`crate::infra::interactive_unlock::install_presence_scope_kek_vault_leave_locked`])
+    /// installs `KEK_s` only for the lifetime of one op and evicts it on return;
+    /// it must NOT leave a standing `mark_unlocked` window behind (the widening
+    /// path holds no time-window state). The op is authorized on the verified §1
+    /// proof + the op-supplied `KEK_s`, not on a presence-unlocked flag, so this
+    /// open deliberately leaves the presence session Locked. The returned vault
+    /// IS attached to the live slot by the caller; the dispatcher's eviction
+    /// guard drops it after the op.
+    pub fn open_with_key_store_leave_locked(
+        config: &DaemonConfig,
+        key_store: &VaultKeyStore,
+    ) -> Result<Vault, VaultError> {
+        open_with_key_store_and_presence(config, key_store, PresenceAfterOpen::LeaveLocked)
     }
 }
 
@@ -782,30 +1327,181 @@ fn derive_interactive_key(passphrase: &str, salt: &[u8; 16]) -> [u8; 32] {
     key
 }
 
-/// Load the disk-wrapped Headless MEK, or generate a fresh one and
-/// persist it. Per implementation-note-193 (B1, design):
-/// the Headless MEK is cryptographically independent of the Interactive
-/// MEK — fresh OS entropy at first call, AEAD-wrapped under the
-/// Interactive MEK so the daemon can reload it across restarts without
-/// re-prompting Touch ID, but an attacker with only the Headless
-/// attested-device wrap (per `attested_device.rs`) cannot recover the
-/// Interactive subset.
+/// design D3 amendment — AEAD-wrap a 32-byte Headless MEK under the
+/// Interactive MEK with a fresh 24-byte nonce and AAD
+/// `b"vault.headless-mek.v1"`. Returns `(nonce, ciphertext-with-tag)`.
+/// Shared by the first-run file write, the `provision_envelope_meta` DB
+/// write, and the rotation re-wrap so all three produce byte-identical
+/// framing. The nonce is fresh OS entropy per call — never reused.
+fn wrap_headless_mek(
+    interactive_key: &[u8; 32],
+    headless_key: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
+    let cipher = XChaCha20Poly1305::new_from_slice(interactive_key)
+        .map_err(|e| VaultError::Crypto(format!("headless mek cipher init: {e}")))?;
+    let mut nonce_bytes = [0u8; 24];
+    getrandom::fill(&mut nonce_bytes).expect("OS entropy failure on headless mek nonce");
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: headless_key,
+                aad: HEADLESS_MEK_WRAP_AAD,
+            },
+        )
+        .map_err(|e| VaultError::Crypto(format!("headless mek wrap: {e}")))?;
+    Ok((nonce_bytes.to_vec(), ciphertext))
+}
+
+/// design D3 amendment — AEAD-unwrap a Headless MEK wrap (DB column or
+/// file sidecar) under the Interactive MEK. `source` names the origin for
+/// error messages. Returns the 32-byte Headless MEK; the recovered
+/// plaintext `Vec` is zeroized before return.
+fn unwrap_headless_mek(
+    interactive_key: &[u8; 32],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+    source: &str,
+) -> Result<[u8; 32], VaultError> {
+    if nonce_bytes.len() != 24 {
+        return Err(VaultError::Crypto(format!(
+            "headless mek nonce has invalid length: {} (expected 24, {source})",
+            nonce_bytes.len()
+        )));
+    }
+    let cipher = XChaCha20Poly1305::new_from_slice(interactive_key)
+        .map_err(|e| VaultError::Crypto(format!("headless mek cipher init: {e}")))?;
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: HEADLESS_MEK_WRAP_AAD,
+            },
+        )
+        .map_err(|e| VaultError::Crypto(format!("headless mek unwrap failed ({source}): {e}")))?;
+    if plaintext.len() != 32 {
+        return Err(VaultError::Crypto(format!(
+            "headless mek unwrap produced {} bytes (expected 32)",
+            plaintext.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&plaintext);
+    let mut pt = plaintext;
+    use zeroize::Zeroize as _;
+    pt.zeroize();
+    Ok(out)
+}
+
+/// design D3 amendment — read-only probe for the relocated Headless-MEK
+/// wrap in `<data_dir>/daemon.db`'s `vault_meta` row. Mirrors
+/// [`salt_from_vault_meta`]: opens a read-only connection so it works
+/// before the live `DaemonStore` is wired at vault-open time. Returns
+/// `None` (→ file-sidecar fallback) on any failure or NULL column.
+#[allow(clippy::type_complexity)]
+fn headless_mek_from_vault_meta(data_dir: &std::path::Path) -> Option<(Vec<u8>, Vec<u8>)> {
+    let db_path = data_dir.join("daemon.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    use rusqlite::OptionalExtension as _;
+    let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT headless_mek_nonce, headless_mek_wrapped FROM vault_meta WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()?;
+    match row {
+        Some((Some(n), Some(w))) => Some((n, w)),
+        _ => None,
+    }
+}
+
+/// design D4 — snapshot-before-mutate. Seal the OLD Interactive MEK under
+/// the current operator passphrase (the EMVS sealed-blob format) to a
+/// timestamped `vault-mek-snapshot-<UTC>.emvs` file under `data_dir`, 0600,
+/// atomic-written. Returns the snapshot path (recorded in the rotation
+/// Receipt). A below-the-DB belt-and-suspenders backstop — the atomic tx
+/// already precludes half-rotated state.
+fn write_pre_rotation_snapshot(
+    data_dir: &std::path::Path,
+    old_interactive: &[u8; 32],
+    passphrase: &str,
+) -> Result<String, VaultError> {
+    let fingerprint = mek_fingerprint_hex(old_interactive);
+    let blob = export_mek_sealed(old_interactive, passphrase, &fingerprint)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+    let filename = format!("vault-mek-snapshot-{ts}.emvs");
+    let path = data_dir.join(&filename);
+
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| VaultError::Io(format!("snapshot: create data dir failed: {e}")))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(data_dir)
+        .map_err(|e| VaultError::Io(format!("snapshot: tempfile failed: {e}")))?;
+    use std::io::Write as _;
+    tmp.write_all(&blob)
+        .map_err(|e| VaultError::Io(format!("snapshot: write failed: {e}")))?;
+    tmp.flush()
+        .map_err(|e| VaultError::Io(format!("snapshot: flush failed: {e}")))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| VaultError::Io(format!("snapshot: fsync failed: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| VaultError::Io(format!("snapshot: chmod failed: {e}")))?;
+    }
+    tmp.persist(&path)
+        .map_err(|e| VaultError::Io(format!("snapshot: persist failed: {e}")))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Load the wrapped Headless MEK, or generate a fresh one and persist it.
+/// Per implementation-note-170 (B1, design): the Headless MEK
+/// is cryptographically independent of the Interactive MEK — fresh OS
+/// entropy at first call, AEAD-wrapped under the Interactive MEK so the
+/// daemon can reload it across restarts without re-prompting Touch ID, but
+/// an attacker with only the Headless attested-device wrap (per
+/// `attested_device.rs`) cannot recover the Interactive subset.
 ///
-/// File layout: `<data_dir>/vault.headless-mek.wrapped` — a 24-byte
-/// XChaCha20 nonce followed by the ciphertext-with-tag of the 32-byte
-/// MEK. AAD is `b"vault.headless-mek.v1"` so a future version bump
-/// disambiguates cleanly.
+/// **design D3 amendment — DB-first.** The authoritative store for the
+/// wrap is now `vault_meta.headless_mek_nonce`/`headless_mek_wrapped` (so a
+/// rotation can re-wrap it atomically with the per-row DEKs in one SQLite
+/// transaction). Resolution order: DB column → `vault.headless-mek.wrapped`
+/// file sidecar (the only transitional tolerance, for a pre-relocation
+/// vault) → first-run generate. First-run still writes the file as a
+/// store-independent bootstrap; `provision_envelope_meta` then writes the
+/// authoritative DB copy and retires the file.
 ///
-/// Atomic write via `tempfile::NamedTempFile::persist` so a daemon
-/// crash mid-write leaves either the old blob or no blob — never a
-/// truncated one.
+/// First-run file layout: `<data_dir>/vault.headless-mek.wrapped` — a
+/// 24-byte XChaCha20 nonce followed by the ciphertext-with-tag of the
+/// 32-byte MEK, atomic-written via `tempfile::NamedTempFile::persist`.
 fn load_or_generate_headless_key(
     data_dir: &std::path::Path,
     interactive_key: &[u8; 32],
 ) -> Result<[u8; 32], VaultError> {
+    // DB-first (the rotation-atomic substrate).
+    if let Some((nonce, wrapped)) = headless_mek_from_vault_meta(data_dir) {
+        return unwrap_headless_mek(
+            interactive_key,
+            &nonce,
+            &wrapped,
+            "vault_meta.headless_mek_wrapped",
+        );
+    }
+
+    // File-sidecar fallback (transitional — pre-relocation vault).
     let path = data_dir.join(HEADLESS_MEK_WRAP_FILE);
-    let cipher = XChaCha20Poly1305::new_from_slice(interactive_key)
-        .map_err(|e| VaultError::Crypto(format!("headless mek cipher init: {e}")))?;
     if let Ok(blob) = std::fs::read(&path) {
         if blob.len() < 24 + 16 {
             return Err(VaultError::Crypto(format!(
@@ -815,53 +1511,20 @@ fn load_or_generate_headless_key(
             )));
         }
         let (nonce_bytes, ciphertext) = blob.split_at(24);
-        let nonce = XNonce::from_slice(nonce_bytes);
-        let plaintext = cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad: HEADLESS_MEK_WRAP_AAD,
-                },
-            )
-            .map_err(|e| {
-                VaultError::Crypto(format!(
-                    "headless mek unwrap failed (vault.headless-mek.wrapped at {}): {e}",
-                    path.display()
-                ))
-            })?;
-        if plaintext.len() != 32 {
-            return Err(VaultError::Crypto(format!(
-                "headless mek unwrap produced {} bytes (expected 32)",
-                plaintext.len()
-            )));
-        }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&plaintext);
-        // Best-effort zeroize of the plaintext Vec; the resulting buffer
-        // owned by Vec will be overwritten on Drop via the explicit
-        // zeroize call below.
-        let mut pt = plaintext;
-        use zeroize::Zeroize as _;
-        pt.zeroize();
-        return Ok(out);
+        return unwrap_headless_mek(
+            interactive_key,
+            nonce_bytes,
+            ciphertext,
+            &format!("vault.headless-mek.wrapped at {}", path.display()),
+        );
     }
 
-    // First-run path: generate fresh entropy, wrap, atomic-write.
+    // First-run path: generate fresh entropy, wrap, atomic-write the
+    // bootstrap file. `provision_envelope_meta` writes the authoritative DB
+    // copy + retires this file.
     let mut headless = [0u8; 32];
     getrandom::fill(&mut headless).expect("OS entropy failure on headless mek generation");
-    let mut nonce_bytes = [0u8; 24];
-    getrandom::fill(&mut nonce_bytes).expect("OS entropy failure on headless mek nonce");
-    let nonce = XNonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: &headless,
-                aad: HEADLESS_MEK_WRAP_AAD,
-            },
-        )
-        .map_err(|e| VaultError::Crypto(format!("headless mek wrap: {e}")))?;
+    let (nonce_bytes, ciphertext) = wrap_headless_mek(interactive_key, &headless)?;
     let mut blob = Vec::with_capacity(24 + ciphertext.len());
     blob.extend_from_slice(&nonce_bytes);
     blob.extend_from_slice(&ciphertext);
@@ -881,9 +1544,7 @@ fn load_or_generate_headless_key(
         })?;
         use std::io::Write as _;
         tmp.write_all(&blob).map_err(|e| {
-            VaultError::Crypto(format!(
-                "headless mek wrap: write to tempfile failed: {e}"
-            ))
+            VaultError::Crypto(format!("headless mek wrap: write to tempfile failed: {e}"))
         })?;
         tmp.flush().map_err(|e| {
             VaultError::Crypto(format!("headless mek wrap: flush tempfile failed: {e}"))
@@ -912,74 +1573,65 @@ fn finish_open(
     data_dir: &std::path::Path,
     presence: PresenceAfterOpen,
 ) -> Result<Vault, VaultError> {
+    let interactive_key = derive_interactive_key(passphrase, salt);
+    finish_open_with_interactive_key(interactive_key, data_dir, presence, AuthorityKeySource::Mek)
+}
+
+/// Assemble the split-key vault from an already-resolved 32-byte interactive key,
+/// loading-or-generating the headless key under it. Shared by the Argon2id
+/// passphrase lane ([`finish_open`]) and the design §4 presence-as-decryption
+/// lane ([`VaultKeyStore::PresenceScopeKek`]), where the interactive key is the
+/// scope KEK the operator-session presence tap unwrapped (cross-uid) rather than
+/// a passphrase derivation. The daemon never derives or holds a passphrase on the
+/// §4 lane — the live tap IS the unlock.
+///
+/// CLEAN-BREAK NOTE (design §4): `load_or_generate_headless_key` AEAD-unwraps an
+/// existing headless-MEK blob *under this interactive key*. A vault whose headless
+/// blob was wrapped under a PRIOR interactive key (e.g. the retired Argon2id MEK)
+/// will fail to unwrap when re-sourced from §4 — the documented clean break
+/// (operator pre-users). On a fresh data dir the headless key is generated under
+/// the §4 KEK and the lanes are coherent thereafter.
+fn finish_open_with_interactive_key(
+    interactive_key: [u8; 32],
+    data_dir: &std::path::Path,
+    presence: PresenceAfterOpen,
+    authority_key_source: AuthorityKeySource,
+) -> Result<Vault, VaultError> {
     if matches!(presence, PresenceAfterOpen::MarkUnlocked) {
         crate::trust::presence::mark_unlocked();
     }
-    let interactive_key = derive_interactive_key(passphrase, salt);
     let headless_key = load_or_generate_headless_key(data_dir, &interactive_key)?;
-    Ok(Vault::new_split(interactive_key, headless_key))
+    Ok(Vault::new_split_with_authority_source(
+        interactive_key,
+        headless_key,
+        authority_key_source,
+    ))
 }
 
-fn open_from_config_with_presence(
-    config: &DaemonConfig,
-    presence: PresenceAfterOpen,
+/// design — open vault with a raw interactive key from the double-envelope
+/// unlock flow. Marks presence as Unlocked (the CLI relay IS the presence
+/// event). Used by the `vault.de_unlock_complete` and `vault.de_provision_begin`
+/// RPC handlers.
+pub fn finish_open_with_interactive_key_for_de(
+    interactive_key: [u8; 32],
+    data_dir: &std::path::Path,
 ) -> Result<Vault, VaultError> {
-    let salt = vault_salt(config)?;
-    // implementation-note-35 C4: refuse to unlock if vault.params
-    // disagrees with the compile-time Argon2 pin. Runs BEFORE any
-    // keyring access so a param mismatch aborts before a (potentially
-    // user-presence-gated) Keychain prompt fires.
-    check_or_write_vault_params(config)?;
-    let service = resolve_keyring_service(&config.keyring);
-    let account = resolve_keyring_account(&config.keyring);
-    let env_passphrase_active = std::env::var("EMBER_VAULT_PASSPHRASE").is_ok();
-
-    // implementation-note-366 — macOS separate-uid posture (design).
-    // The system-uid LaunchDaemon install lane has no login keychain
-    // and cannot reach the operator's SE-wrapped keychain entry, so we
-    // route through the on-disk SE-wrapped MEK blob laid down at
-    // install time. The env-var override (precedence rule 1) must
-    // still win: when `EMBER_VAULT_PASSPHRASE` is set we fall through
-    // to `resolve_passphrase` below so the env value is consumed +
-    // zeroized exactly once. Skipped under cargo-test binaries
-    // (`is_cargo_test_binary`) so tests never reach the real SE.
-    #[cfg(target_os = "macos")]
-    if !is_cargo_test_binary()
-        && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
-        && is_separate_uid_posture()
-    {
-        let passphrase = crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
-        return finish_open(&passphrase, &salt, &config.data_dir, presence);
-    }
-
-    // Belt-and-suspenders: refuse to open the production keyring service
-    // unless the operator has explicitly opted in with
-    // `$HOME/.ember-production`. Dev/QA daemons that point at a custom
-    // service name (via config or env override) bypass this check. Skipped
-    // entirely under cargo-test binaries — the passphrase branch below is
-    // also gated there, so the real keychain is never touched in tests.
-    if !is_cargo_test_binary() {
-        let home = dirs_next::home_dir().ok_or_else(|| {
-            VaultError::ProductionSentinelMissing(
-                "refusing to open vault: home directory not resolvable (no $HOME)".to_string(),
-            )
-        })?;
-        check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
-    }
-
-    let passphrase = resolve_passphrase(&service, &account)?;
-    if env_passphrase_active {
-        remember_runtime_reopen_passphrase(&config.data_dir, &passphrase);
-    }
-    finish_open(&passphrase, &salt, &config.data_dir, presence)
+    finish_open_with_interactive_key(
+        interactive_key,
+        data_dir,
+        PresenceAfterOpen::LeaveLocked,
+        AuthorityKeySource::Mek,
+    )
 }
+
+// open_from_config_with_presence — retired (SE custody replaces passphrase).
 
 fn open_with_key_store_and_presence(
     config: &DaemonConfig,
     key_store: &VaultKeyStore,
     presence: PresenceAfterOpen,
 ) -> Result<Vault, VaultError> {
-    // implementation-note-35 C4: same params gate as
+    // implementation-note-37 C4: same params gate as
     // `open_from_config` — runs before any keyring access so a
     // mismatch aborts before a (potentially user-presence-gated)
     // Keychain prompt fires.
@@ -1036,69 +1688,437 @@ fn open_with_key_store_and_presence(
             let salt = vault_salt(config)?;
             finish_open(&passphrase, &salt, &config.data_dir, presence)
         }
+        VaultKeyStore::PresenceScopeKek(kek) => {
+            // design §4: the operator-session presence tap already unwrapped the
+            // scope KEK (cross-uid `se_unwrap`); install it directly as the
+            // interactive key. No passphrase, no keyring, no Argon2 — the live tap
+            // is the unlock. The daemon never derives or holds a passphrase here.
+            finish_open_with_interactive_key(
+                *kek.0,
+                &config.data_dir,
+                presence,
+                AuthorityKeySource::PresenceScopeKek,
+            )
+        }
         #[cfg(target_os = "macos")]
-        VaultKeyStore::SecureEnclave(_wrapped) => {
-            // STUB: real implementation will unwrap `_wrapped.key_label`
-            // via SecKeyCopyMatching + SecKeyCreateDecryptedData (which
-            // forces the LocalAuthentication prompt and never exposes the
-            // SE-resident key to userland). Tracked under
-            // .A-SE-WIRE; the enum shape lands first so .B can
-            // build on it without dragging in the full SecKey API.
-            Err(VaultError::Crypto(
-                "VaultKeyStore::SecureEnclave is not yet implemented; \
-                 use VaultKeyStore::Passphrase variant — see .A-SE-WIRE"
-                    .to_string(),
-            ))
+        VaultKeyStore::SecureEnclave(wrapped) => {
+            let label =
+                ember_broker::secure_enclave::EciesKeyLabel::from_provisioned(&wrapped.key_label);
+            let interactive_key =
+                crate::infra::vault_macos_se::unwrap_interactive_key(&label, &wrapped.blob)?;
+            finish_open_with_interactive_key(
+                interactive_key,
+                &config.data_dir,
+                presence,
+                AuthorityKeySource::Mek,
+            )
         }
     }
 }
 
+/// design D1 / Part B — domain-separator prefix for the PAYLOAD AAD of an
+/// enveloped daemon-internal seal (`Vault::seal`/`Vault::open`). Distinct
+/// from `DEK_WRAP_AAD_PREFIX` so the wrap AAD and the payload AAD can never
+/// alias even though both fold in the same `aad_id`. Same fixed-prefix +
+/// purpose-id framing as the wrap AAD.
+const SEAL_PAYLOAD_AAD_PREFIX: &[u8] = b"vault.seal-payload.v1:";
+
+/// design D1 / Part B — build the payload AAD for an enveloped seal:
+/// `SEAL_PAYLOAD_AAD_PREFIX || aad_id`. The `aad_id` is the same
+/// purpose-bound identifier folded into the DEK-wrap AAD, so a sealed blob
+/// is bound to its purpose+owner on BOTH the payload layer and the DEK-wrap
+/// layer.
+fn seal_payload_aad(aad_id: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(SEAL_PAYLOAD_AAD_PREFIX.len() + aad_id.len());
+    aad.extend_from_slice(SEAL_PAYLOAD_AAD_PREFIX);
+    aad.extend_from_slice(aad_id);
+    aad
+}
+
+/// design D1 / Part B — the four-component output of an enveloped seal.
+/// Carries the payload sealed under a fresh per-blob DEK plus the DEK
+/// itself AEAD-wrapped under the (Interactive) MEK. Storage sites persist
+/// all four components; the MEK directly encrypts NONE of them — it only
+/// wraps the DEK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedEnvelope {
+    /// 24-byte XChaCha20 nonce for the payload seal (under the DEK).
+    pub payload_nonce: Vec<u8>,
+    /// Payload ciphertext-with-tag, sealed under the per-blob DEK.
+    pub ciphertext: Vec<u8>,
+    /// 24-byte XChaCha20 nonce for the DEK wrap (under the MEK).
+    pub dek_nonce: Vec<u8>,
+    /// The per-blob DEK, AEAD-wrapped under the Interactive MEK with the
+    /// scope+row-bound v2 wrap AAD.
+    pub wrapped_dek: Vec<u8>,
+}
+
+/// On-disk magic + version for the [`SealedEnvelope`] concatenated blob
+/// format used by file-backed callers (bridge-CA module key). The leading
+/// byte disambiguates the enveloped v2 format from the legacy
+/// `[24-byte nonce || ciphertext]` direct-MEK blob — a legacy blob would
+/// start with a random nonce byte and is overwhelmingly unlikely to begin
+/// with this fixed magic, and the parser additionally requires a matching
+/// total length so a false match is rejected. There is no legacy-accepting
+/// read path (the dev0 host has no enveloped vault yet), but the magic
+/// makes a future format bump unambiguous.
+const SEALED_ENVELOPE_BLOB_MAGIC: u8 = 0xE2;
+
+impl SealedEnvelope {
+    /// design Part B — serialize to a single concatenated on-disk blob for
+    /// file-backed storage (bridge-CA). Layout (all integers little-endian):
+    /// `magic(1) || payload_nonce(24) || dek_nonce(24) ||
+    ///  wrapped_dek_len(u32) || wrapped_dek || ciphertext`. The two nonces
+    /// are fixed-width; only `wrapped_dek` needs an explicit length so the
+    /// trailing `ciphertext` (also variable) is unambiguous.
+    pub fn to_blob(&self) -> Vec<u8> {
+        debug_assert_eq!(self.payload_nonce.len(), 24);
+        debug_assert_eq!(self.dek_nonce.len(), 24);
+        let wrapped_len = self.wrapped_dek.len() as u32;
+        let mut out =
+            Vec::with_capacity(1 + 24 + 24 + 4 + self.wrapped_dek.len() + self.ciphertext.len());
+        out.push(SEALED_ENVELOPE_BLOB_MAGIC);
+        out.extend_from_slice(&self.payload_nonce);
+        out.extend_from_slice(&self.dek_nonce);
+        out.extend_from_slice(&wrapped_len.to_le_bytes());
+        out.extend_from_slice(&self.wrapped_dek);
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    /// design Part B — parse a blob produced by [`SealedEnvelope::to_blob`].
+    /// Returns `VaultError::Crypto` on any framing violation (bad magic,
+    /// truncation, inconsistent length) so a corrupt or legacy blob fails
+    /// loud rather than silently mis-parsing.
+    pub fn from_blob(blob: &[u8]) -> Result<Self, VaultError> {
+        // magic(1) + payload_nonce(24) + dek_nonce(24) + wrapped_len(4)
+        const HEADER_LEN: usize = 1 + 24 + 24 + 4;
+        if blob.len() < HEADER_LEN {
+            return Err(VaultError::Crypto(format!(
+                "sealed envelope blob too short: {} bytes (need >= {HEADER_LEN})",
+                blob.len()
+            )));
+        }
+        if blob[0] != SEALED_ENVELOPE_BLOB_MAGIC {
+            return Err(VaultError::Crypto(format!(
+                "sealed envelope blob has unexpected magic 0x{:02x} (expected 0x{:02x})",
+                blob[0], SEALED_ENVELOPE_BLOB_MAGIC
+            )));
+        }
+        let payload_nonce = blob[1..25].to_vec();
+        let dek_nonce = blob[25..49].to_vec();
+        let wrapped_len = u32::from_le_bytes([blob[49], blob[50], blob[51], blob[52]]) as usize;
+        let wrapped_end = HEADER_LEN.checked_add(wrapped_len).ok_or_else(|| {
+            VaultError::Crypto("sealed envelope wrapped_dek length overflow".into())
+        })?;
+        if blob.len() < wrapped_end {
+            return Err(VaultError::Crypto(format!(
+                "sealed envelope blob truncated: wrapped_dek claims {wrapped_len} bytes \
+                 but only {} remain",
+                blob.len() - HEADER_LEN
+            )));
+        }
+        let wrapped_dek = blob[HEADER_LEN..wrapped_end].to_vec();
+        let ciphertext = blob[wrapped_end..].to_vec();
+        Ok(SealedEnvelope {
+            payload_nonce,
+            ciphertext,
+            dek_nonce,
+            wrapped_dek,
+        })
+    }
+}
+
 impl Vault {
-    /// Seal raw bytes under the vault master key and return
-    /// `(nonce, ciphertext)` suitable for storing side-by-side in two
-    /// BLOB columns. Used by persona-secret at-rest encryption (F-05).
+    /// design Part B — seal raw bytes under the daemon-internal MEK→DEK
+    /// envelope and return a [`SealedEnvelope`] for storage. Used by
+    /// persona-secret and bridge-CA module-key at-rest encryption.
     ///
-    /// The nonce is a fresh 24-byte XChaCha20 nonce drawn from OS entropy
-    /// per call — never reused across seals.
-    pub fn seal(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
-        // implementation-note-193 (B1) + adversarial review
-        // CRIT-1 fix: refuse on headless-only Vault. `seal` always
-        // routes through the Interactive MEK; a headless-only Vault's
-        // `interactive_key` is the all-zero checkpoint.
-        if self.is_headless_only() {
+    /// The MEK no longer directly encrypts the payload — a fresh per-blob
+    /// 32-byte DEK encrypts the payload (XChaCha20-Poly1305, fresh nonce,
+    /// payload AAD bound to `aad_id`), and the DEK is AEAD-wrapped under the
+    /// Interactive MEK with the scope+row-bound v2 wrap AAD (scope
+    /// Interactive, identifier `aad_id`). `aad_id` is a stable purpose-bound
+    /// identifier chosen by the caller (e.g. `b"persona-secret"` + the
+    /// persona id) so a sealed blob cannot be spliced across purposes or
+    /// owners. Both nonces are fresh OS entropy per call — never reused.
+    pub fn seal(
+        &self,
+        class: ValueClass,
+        aad_id: &[u8],
+        plaintext: &[u8],
+    ) -> Result<SealedEnvelope, VaultError> {
+        // design §4 — route by value class. AuthorityBearing → the
+        // interactive key (which IS the presence-unwrapped KEK_s on the §4
+        // lane); DaemonOperational → the autonomous headless key. The scope is
+        // folded into the DEK-wrap AAD so a blob sealed in one class fails AEAD
+        // authentication when opened in the other.
+        let scope = class.scope();
+
+        // implementation-note-170 (B1) + adversarial review
+        // CRIT-1 fix: refuse AuthorityBearing on a headless-only / idle-zeroed
+        // vault — there is no §4 key to seal authority under, and the
+        // autonomous key may NEVER be a fallback recipient for authority.
+        // DaemonOperational uses the headless key, which is always present.
+        if scope == VaultScope::Interactive && self.is_headless_only() {
             return Err(VaultError::HeadlessOnly);
         }
-        // Daemon-internal F-05 path uses the Interactive MEK lane —
-        // persona-secret rows are not scope-routed by design.
-        let cipher = XChaCha20Poly1305::new_from_slice(&self.interactive_key).unwrap();
+        if class == ValueClass::AuthorityBearing {
+            self.ensure_authority_bearing_source()?;
+        }
+
+        // Fresh per-blob DEK; payload sealed under the DEK (not the MEK).
+        let mut dek = Zeroizing::new([0u8; 32]);
+        getrandom::fill(dek.as_mut_slice()).expect("OS entropy failure on seal dek generation");
+        let payload_cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).unwrap();
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+        let payload_aad = seal_payload_aad(aad_id);
+        let ciphertext = payload_cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &payload_aad,
+                },
+            )
             .map_err(|e| VaultError::Crypto(e.to_string()))?;
-        Ok((nonce_bytes.to_vec(), ciphertext))
+
+        // Wrap the DEK under the class-routed scope key with the scope+row-bound
+        // v2 AAD; the purpose binding lives in `aad_id`.
+        let (dek_nonce, wrapped_dek) = wrap_dek(&self.key_for_scope(scope), &dek, scope, aad_id)?;
+
+        Ok(SealedEnvelope {
+            payload_nonce: nonce_bytes.to_vec(),
+            ciphertext,
+            dek_nonce,
+            wrapped_dek,
+        })
     }
 
-    /// Open a `(nonce, ciphertext)` pair produced by `seal`. Returns the
-    /// plaintext bytes on success, `VaultError::Crypto` on AEAD failure.
-    pub fn open(&self, nonce_bytes: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, VaultError> {
-        // implementation-note-193 (B1) + adversarial CRIT-1
-        // fix: pair with `seal` — refuse on headless-only Vault.
+    /// design Part B — open a [`SealedEnvelope`] produced by [`Vault::seal`]
+    /// under the SAME `aad_id`. Unwraps the per-blob DEK under the
+    /// Interactive MEK (the wrap AAD must match scope+`aad_id`), then
+    /// decrypts the payload under the DEK (the payload AAD must match
+    /// `aad_id`). Any mismatch — wrong MEK, wrong purpose id, a spliced blob
+    /// — fails the AEAD authentication tag. Returns plaintext on success,
+    /// `VaultError::Crypto` on AEAD failure. There is NO direct-MEK fallback
+    /// (mirrors the credential `get` discipline).
+    pub fn open(
+        &self,
+        class: ValueClass,
+        aad_id: &[u8],
+        env: &SealedEnvelope,
+    ) -> Result<VaultPlaintext, VaultError> {
+        // design §4 — pair with `seal`: route by the SAME value class. The
+        // scope is bound into the DEK-wrap AAD, so opening a blob under the
+        // wrong class (e.g. an AuthorityBearing blob as DaemonOperational)
+        // fails the AEAD tag even if the two keys happened to be equal.
+        let scope = class.scope();
+
+        // implementation-note-170 (B1) + adversarial CRIT-1
+        // fix: refuse AuthorityBearing on a headless-only / idle-zeroed vault.
+        if scope == VaultScope::Interactive && self.is_headless_only() {
+            return Err(VaultError::HeadlessOnly);
+        }
+        if class == ValueClass::AuthorityBearing {
+            self.ensure_authority_bearing_source()?;
+        }
+        if env.payload_nonce.len() != 24 {
+            return Err(VaultError::Crypto(format!(
+                "invalid payload nonce length: {}",
+                env.payload_nonce.len()
+            )));
+        }
+
+        // Unwrap the per-blob DEK under the class-routed scope key.
+        let dek = unwrap_dek(
+            &self.key_for_scope(scope),
+            &env.dek_nonce,
+            &env.wrapped_dek,
+            scope,
+            aad_id,
+        )?;
+
+        let payload_cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).unwrap();
+        let nonce = XNonce::from_slice(&env.payload_nonce);
+        let payload_aad = seal_payload_aad(aad_id);
+        payload_cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: env.ciphertext.as_slice(),
+                    aad: &payload_aad,
+                },
+            )
+            .map(Zeroizing::new)
+            .map_err(|e| VaultError::Crypto(e.to_string()))
+    }
+
+    /// design D3 — seal the fixed key-correctness canary plaintext under
+    /// the Interactive MEK. Returns `(canary_nonce, canary_ciphertext)`
+    /// for storage in `vault_meta`. The seal is a plain XChaCha20-Poly1305
+    /// AEAD over `VAULT_CANARY_PLAINTEXT` with AAD `VAULT_CANARY_AAD` and a
+    /// fresh 24-byte nonce. Refuses on a headless-only Vault (no
+    /// Interactive MEK to seal under).
+    pub fn seal_canary(&self) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
         if self.is_headless_only() {
             return Err(VaultError::HeadlessOnly);
         }
-        if nonce_bytes.len() != 24 {
+        let cipher = XChaCha20Poly1305::new_from_slice(self.interactive_key.borrow().as_slice())
+            .map_err(|e| VaultError::Crypto(format!("canary cipher init: {e}")))?;
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes).expect("OS entropy failure on canary nonce");
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: VAULT_CANARY_PLAINTEXT,
+                    aad: VAULT_CANARY_AAD,
+                },
+            )
+            .map_err(|e| VaultError::Crypto(format!("canary seal: {e}")))?;
+        Ok((nonce_bytes.to_vec(), ciphertext))
+    }
+
+    /// design D3 — provision the vault's envelope metadata at first run:
+    /// write the KDF `salt`, the pinned Argon2 params TOML, and the
+    /// AEAD-sealed canary into `vault_meta`. Called from the open/derive
+    /// path exactly once, when the salt is freshly generated, so a wrong
+    /// MEK is caught cryptographically on every subsequent open
+    /// (`verify_canary`) regardless of credential count.
+    pub fn provision_envelope_meta(
+        &self,
+        store: &DaemonStore,
+        salt: &[u8; 16],
+    ) -> Result<(), VaultError> {
+        if self.is_headless_only() {
+            return Err(VaultError::HeadlessOnly);
+        }
+        let (canary_nonce, canary) = self.seal_canary()?;
+        let params_toml = vault_argon2_params_toml();
+        store
+            .write_vault_envelope_meta(salt, &params_toml, &canary, &canary_nonce)
+            .map_err(VaultError::Store)?;
+
+        // design D3 amendment — write the AUTHORITATIVE Headless-MEK wrap
+        // into `vault_meta` (re-wrapped under the live Interactive MEK with a
+        // fresh nonce) so a future rotation re-wraps it atomically with the
+        // per-row DEKs. `load_or_generate_headless_key` wrote a bootstrap
+        // file copy at open time; retire it best-effort now that the DB copy
+        // is authoritative (DB-first read makes a lingering file harmless, so
+        // a delete failure is non-fatal).
+        let (h_nonce, h_wrapped) =
+            wrap_headless_mek(&self.interactive_key.borrow(), &self.headless_key.borrow())?;
+        store
+            .write_headless_mek_wrap(&h_nonce, &h_wrapped)
+            .map_err(VaultError::Store)?;
+        if let Some(dir) = store.data_dir() {
+            let file = dir.join(HEADLESS_MEK_WRAP_FILE);
+            if file.exists()
+                && let Err(e) = std::fs::remove_file(&file)
+            {
+                warn!(
+                    path = %file.display(),
+                    error = %e,
+                    "vault: failed to retire bootstrap headless-mek file after DB relocation (non-fatal; DB copy is authoritative)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Provision canary + headless-MEK wrap under SE-custodied interactive
+    /// key. Like [`Self::provision_envelope_meta`] but omits the Argon2
+    /// salt/params columns (not needed when the interactive key is
+    /// SE-derived rather than passphrase-derived).
+    pub fn provision_se_canary_meta(&self, store: &DaemonStore) -> Result<(), VaultError> {
+        if self.is_headless_only() {
+            return Err(VaultError::HeadlessOnly);
+        }
+        let (canary_nonce, canary) = self.seal_canary()?;
+        store
+            .write_vault_canary(&canary, &canary_nonce)
+            .map_err(VaultError::Store)?;
+
+        let (h_nonce, h_wrapped) =
+            wrap_headless_mek(&self.interactive_key.borrow(), &self.headless_key.borrow())?;
+        store
+            .write_headless_mek_wrap(&h_nonce, &h_wrapped)
+            .map_err(VaultError::Store)?;
+        if let Some(dir) = store.data_dir() {
+            let file = dir.join(HEADLESS_MEK_WRAP_FILE);
+            if file.exists()
+                && let Err(e) = std::fs::remove_file(&file)
+            {
+                warn!(
+                    path = %file.display(),
+                    error = %e,
+                    "vault: failed to retire bootstrap headless-mek file (non-fatal)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// design D3 — the cryptographic key-correctness authority. AEAD-
+    /// unwraps the canary stored in `vault_meta` under the CURRENT
+    /// Interactive MEK and checks the recovered plaintext matches the
+    /// fixed `VAULT_CANARY_PLAINTEXT`. A wrong MEK fails the AEAD tag →
+    /// `VaultError::Crypto` (the fail-loud destination). Works with ZERO
+    /// credential rows because the canary lives in `vault_meta`, not on a
+    /// credential row.
+    ///
+    /// Returns `Ok(())` when there is no canary stored yet (pre-migration
+    /// vault or a vault provisioned before the canary landed) — the
+    /// absence is not a wrong-MEK signal, and the advisory
+    /// `mek_fingerprint` still covers that transitional case. Once the
+    /// canary is present it is authoritative.
+    pub fn verify_canary(&self, store: &DaemonStore) -> Result<(), VaultError> {
+        if self.is_headless_only() {
+            return Err(VaultError::HeadlessOnly);
+        }
+        let Some((canary, canary_nonce)) = store.read_vault_canary().map_err(VaultError::Store)?
+        else {
+            // No canary stored — nothing to verify (transitional).
+            return Ok(());
+        };
+        if canary_nonce.len() != 24 {
             return Err(VaultError::Crypto(format!(
-                "invalid nonce length: {}",
-                nonce_bytes.len()
+                "vault canary nonce has invalid length: {} (expected 24)",
+                canary_nonce.len()
             )));
         }
-        let cipher = XChaCha20Poly1305::new_from_slice(&self.interactive_key).unwrap();
-        let nonce = XNonce::from_slice(nonce_bytes);
-        cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| VaultError::Crypto(e.to_string()))
+        let cipher = XChaCha20Poly1305::new_from_slice(self.interactive_key.borrow().as_slice())
+            .map_err(|e| VaultError::Crypto(format!("canary cipher init: {e}")))?;
+        let nonce = XNonce::from_slice(&canary_nonce);
+        let plaintext = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: canary.as_slice(),
+                    aad: VAULT_CANARY_AAD,
+                },
+            )
+            .map_err(|_| {
+                VaultError::Crypto(
+                    "vault canary AEAD verification failed — the in-memory MEK does \
+                     NOT match the MEK this vault was sealed under (wrong passphrase, \
+                     wrong keychain entry, or silent key divergence); refusing to \
+                     proceed (design D3 fail-loud)"
+                        .to_string(),
+                )
+            })?;
+        if plaintext.as_slice() != VAULT_CANARY_PLAINTEXT {
+            return Err(VaultError::Crypto(
+                "vault canary unwrapped but plaintext does not match the expected \
+                 canary value; refusing to proceed (design D3 fail-loud)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn add(
@@ -1109,20 +2129,32 @@ impl Vault {
         value: &[u8],
         metadata: Option<&str>,
     ) -> Result<CredentialInfo, VaultError> {
+        self.add_with_presence_policy(scope, store, name, value, metadata, PresencePolicy::LaneDefault)
+    }
+
+    pub fn add_with_presence_policy(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+        value: &[u8],
+        metadata: Option<&str>,
+        presence_policy: PresencePolicy,
+    ) -> Result<CredentialInfo, VaultError> {
         // design path-grammar gate — applies to NEW entries only.
         // Existing rows with non-conformant names continue to function via
         // `get`/`list`/`remove`; this check fires only on insert.
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
         let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-35 C5: mint the row id BEFORE encrypting
+        // implementation-note-37 C5: mint the row id BEFORE encrypting
         // so the AEAD AAD can be bound to the row's UUID. AAD format is
         // `[0x01, row_uuid_bytes...]` (17 bytes). Decrypt-side (Vault::get)
         // tries this AAD first, falling back to no-AAD for legacy rows.
         let id = format!("cred-{}", Uuid::new_v4());
         let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
 
-        // implementation-note-193 (B1): encrypt under the
+        // implementation-note-170 (B1): encrypt under the
         // per-scope MEK so an attacker who recovers ONLY the Headless
         // attested-device wrap (per `attested_device.rs`) cannot decrypt
         // Interactive rows.
@@ -1132,11 +2164,20 @@ impl Vault {
         if scope == VaultScope::Interactive && self.is_headless_only() {
             return Err(VaultError::HeadlessOnly);
         }
-        let cipher = XChaCha20Poly1305::new_from_slice(self.key_for_scope(scope)).unwrap();
+
+        // design D1 — MEK→DEK envelope. Generate a fresh per-row Data
+        // Encryption Key, encrypt the payload under the DEK (KEEPING the
+        // existing 24-byte payload nonce + `[0x01||uuid]` AAD exactly),
+        // then wrap the DEK under the scope MEK with a FRESH dek_nonce.
+        // The scope MEK no longer directly encrypts the payload — it only
+        // wraps the DEK.
+        let mut dek = Zeroizing::new([0u8; 32]);
+        getrandom::fill(dek.as_mut_slice()).expect("OS entropy failure on dek generation");
+        let payload_cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).unwrap();
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
+        let ciphertext = payload_cipher
             .encrypt(
                 nonce,
                 Payload {
@@ -1146,20 +2187,31 @@ impl Vault {
             )
             .map_err(|e| VaultError::Crypto(e.to_string()))?;
 
+        // design D1 — scope+row-bound DEK wrap. Bind the wrap AAD to the
+        // scope AND the row UUID so the wrapped DEK cannot be unwrapped under
+        // a different scope or spliced onto a different row.
+        let aad_id =
+            cred_row_uuid_bytes(&id).expect("freshly-minted cred-<uuid> id yields a 16-byte uuid");
+        let (dek_nonce, wrapped_dek) = wrap_dek(&self.key_for_scope(scope), &dek, scope, &aad_id)?;
+
         let created_at = chrono::Utc::now().to_rfc3339();
 
         store
             .conn()
             .execute(
-                "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO credentials \
+                 (id, name, nonce, ciphertext, created_at, metadata, wrapped_dek, dek_nonce, presence_policy) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     id,
                     stored_name,
                     nonce_bytes.as_slice(),
                     ciphertext,
                     created_at,
-                    metadata
+                    metadata,
+                    wrapped_dek.as_slice(),
+                    dek_nonce.as_slice(),
+                    presence_policy.as_db_str()
                 ],
             )
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
@@ -1169,6 +2221,8 @@ impl Vault {
             name: name.to_string(),
             created_at,
             metadata: metadata.map(str::to_string),
+            presence_policy,
+            value_class: ValueClass::from_stored_name(&stored_name),
         })
     }
 
@@ -1179,16 +2233,23 @@ impl Vault {
     ) -> Result<Vec<CredentialInfo>, VaultError> {
         let mut stmt = store
             .conn()
-            .prepare("SELECT id, name, created_at, metadata FROM credentials ORDER BY created_at")
+            .prepare(
+                "SELECT id, name, created_at, metadata, presence_policy \
+                 FROM credentials ORDER BY created_at",
+            )
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
 
         let rows = stmt
             .query_map([], |row| {
+                let stored_name: String = row.get(1)?;
+                let policy_str: String = row.get(4)?;
                 Ok(CredentialInfo {
                     id: row.get(0)?,
-                    name: row.get(1)?,
+                    value_class: ValueClass::from_stored_name(&stored_name),
+                    name: stored_name,
                     created_at: row.get(2)?,
                     metadata: row.get(3)?,
+                    presence_policy: PresencePolicy::from_db_str(&policy_str),
                 })
             })
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
@@ -1210,76 +2271,157 @@ impl Vault {
         scope: VaultScope,
         store: &DaemonStore,
         name: &str,
-    ) -> Result<Vec<u8>, VaultError> {
+    ) -> Result<VaultPlaintext, VaultError> {
+        self.get_with_read_gate(scope, store, name, VaultReadGate::CachedUnlockOnly)
+    }
+
+    pub fn credential_presence_policy(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+    ) -> Result<PresencePolicy, VaultError> {
+        let stored_name = storage_name_for_scope(scope, name);
+        let result: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT presence_policy FROM credentials WHERE name = ?1",
+                params![stored_name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        result
+            .map(|s| PresencePolicy::from_db_str(&s))
+            .ok_or(VaultError::NotFound)
+    }
+
+    pub fn get_with_read_gate(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+        read_gate: VaultReadGate,
+    ) -> Result<VaultPlaintext, VaultError> {
         // Adversarial CRIT-1 fix (2026-05-22): refuse Interactive ops
         // on headless-only Vaults BEFORE the SQLite lookup so the gate
         // is visible at the API boundary, not behind a `NotFound`.
         if scope == VaultScope::Interactive && self.is_headless_only() {
             return Err(VaultError::HeadlessOnly);
         }
-        // implementation-note-35 C5: select the row id alongside
-        // nonce/ciphertext so the AAD-aware decrypt can bind to it.
-        // Legacy rows whose id parses cleanly still flow through the
-        // AAD-aware path first; the fallback path below catches any
-        // ciphertext that was sealed without AAD.
+        // design D1 — MEK→DEK envelope read. Select the wrapped DEK +
+        // dek_nonce alongside the payload nonce/ciphertext so we can
+        // unwrap the per-row DEK under the scope MEK and then decrypt the
+        // payload under the DEK. Envelope-only: a row with NULL
+        // wrapped_dek pre-dates the S6a migration and is NOT silently
+        // decrypted under the MEK — it returns a clear error.
         let stored_name = storage_name_for_scope(scope, name);
-        let result: Option<(String, Vec<u8>, Vec<u8>)> = store
+        #[allow(clippy::type_complexity)]
+        let result: Option<(
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            String,
+        )> = store
             .conn()
             .query_row(
-                "SELECT id, nonce, ciphertext FROM credentials WHERE name = ?1",
+                "SELECT id, nonce, ciphertext, wrapped_dek, dek_nonce, presence_policy \
+                 FROM credentials WHERE name = ?1",
                 params![stored_name],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
 
-        let (id, nonce_bytes, ciphertext) = result.ok_or(VaultError::NotFound)?;
+        let (id, nonce_bytes, ciphertext, wrapped_dek, dek_nonce, policy_str) =
+            result.ok_or(VaultError::NotFound)?;
+        let presence_policy = PresencePolicy::from_db_str(&policy_str);
+        // Presence-policy unification: the read-gate now consults
+        // a typed presence policy rather than the prior `requires_biometric`
+        // boolean. The semantic is unchanged — `PerAccessFresh` rows demand
+        // a fresh presence-Device signature regardless of method lane,
+        // closing the cached-unlock bypass surfaced by prior change.
+        if presence_policy.requires_fresh_presence() && !read_gate.satisfies_fresh_presence() {
+            return Err(VaultError::PresenceRequired);
+        }
 
-        // implementation-note-193 (B1): decrypt under the
-        // per-scope MEK that the row was sealed with. Pre-B1 rows from
-        // a single-MEK vault remain readable because the test/single
-        // constructor sets both lanes to the same key — but production
-        // post-B1 vaults use cryptographically independent keys per scope.
-        // The headless-only refusal gate fires at the top of this fn
-        // before the SQLite lookup; this is the cryptographic dispatch
-        // for the still-permitted scope.
-        let cipher = XChaCha20Poly1305::new_from_slice(self.key_for_scope(scope)).unwrap();
+        // design D2 — envelope-only. A row missing the wrapped-DEK
+        // columns was written by a pre-envelope daemon and must be
+        // migrated by the out-of-tree S6a one-shot before it can be read.
+        // There is no silent direct-MEK fallback (that would re-introduce
+        // the dual-path the ADR explicitly forbids).
+        let (wrapped_dek, dek_nonce) = match (wrapped_dek, dek_nonce) {
+            (Some(w), Some(n)) => (w, n),
+            _ => {
+                return Err(VaultError::Crypto(format!(
+                    "credential row '{name}' (id {id}) is not enveloped \
+                     (wrapped_dek is NULL); run the S6a migration one-shot \
+                     to wrap it under the MEK→DEK envelope before reading"
+                )));
+            }
+        };
+
+        // Unwrap the per-row DEK under the scope MEK. The headless-only
+        // refusal gate already fired at the top of this fn; this is the
+        // cryptographic dispatch for the still-permitted scope.
+        //
+        // design D1 — the unwrap AAD is rebuilt from the SAME scope + the
+        // row's OWN UUID. A whole-row cross-scope splice (moving
+        // wrapped_dek+dek_nonce+ciphertext into another scope's row) fails
+        // here on the scope-label mismatch; a cross-row splice fails on the
+        // uuid mismatch. A row id that does not parse as `cred-<uuid>` cannot
+        // produce a wrap-bound AAD, so it is a hard error rather than an
+        // unbound unwrap.
+        let Some(aad_id) = cred_row_uuid_bytes(&id) else {
+            return Err(VaultError::Crypto(
+                "credential row id is not a parseable cred-<uuid>; cannot bind AAD for dek unwrap"
+                    .into(),
+            ));
+        };
+        let dek = unwrap_dek(
+            &self.key_for_scope(scope),
+            &dek_nonce,
+            &wrapped_dek,
+            scope,
+            &aad_id,
+        )?;
+
+        // Decrypt the payload under the DEK. The payload AAD scheme is
+        // ONE payload seal format under the DEK: AAD-bound (`[0x01||uuid]`).
+        // There is no no-AAD fallback — a committed `add` always binds AAD, and
+        // the out-of-tree S6a migration one-shot re-applies AAD when it
+        // envelopes legacy rows. (Adversarial review: a surviving no-AAD path
+        // would be a second seal format living in the security core.)
+        let payload_cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).unwrap();
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        // Try the AAD-aware path first when we can compute the AAD.
-        if let Some(aad) = aad_for_row_id(&id) {
-            match cipher.decrypt(
+        let Some(aad) = aad_for_row_id(&id) else {
+            return Err(VaultError::Crypto(
+                "credential row id is not a parseable cred-<uuid>; cannot bind AAD for decrypt"
+                    .into(),
+            ));
+        };
+        payload_cipher
+            .decrypt(
                 nonce,
                 Payload {
                     msg: ciphertext.as_slice(),
                     aad: &aad,
                 },
-            ) {
-                Ok(plaintext) => return Ok(plaintext),
-                Err(_aad_err) => {
-                    // Fall through to the legacy no-AAD path.
-                }
-            }
-        }
-
-        // Legacy fallback — no-AAD decrypt. Older daemons (pre-C5)
-        // wrote ciphertext without AAD, so a successful no-AAD open is
-        // the deterministic signal that the row needs re-sealing on the
-        // next write. We log a `warn!` so the operator can see the
-        // legacy rows; the next `Vault::add` for this name will write
-        // a fresh AAD-bound row, healing the gap.
-        match cipher.decrypt(nonce, ciphertext.as_slice()) {
-            Ok(plaintext) => {
-                warn!(
-                    credential_id = %id,
-                    credential_name = %name,
-                    "vault: legacy no-AAD ciphertext decrypted via fallback path; \
-                     next write to this credential will re-seal with per-row AAD"
-                );
-                Ok(plaintext)
-            }
-            Err(e) => Err(VaultError::Crypto(e.to_string())),
-        }
+            )
+            .map(Zeroizing::new)
+            .map_err(|e| VaultError::Crypto(e.to_string()))
     }
 
     pub fn remove(
@@ -1303,27 +2445,38 @@ impl Vault {
         Ok(())
     }
 
-    /// Zero the in-memory MEK for `scope` — Phase 1 stub.
+    /// Zero the in-memory MEK for `scope`, wiping the key bytes in place.
     ///
     /// Per design ("Interactive: demand-pinned"), the idle-zero handler in
     /// `UnlockPinTracker` calls into this method when the grace window
-    /// expires with no live pins. Phase 1 logs the request but does not
-    /// actually zero the MEK reference — the real implementation lands in
-    /// **Phase 2** (`implementation-note-361`) alongside the
-    /// session-lifecycle wiring that calls it. The Phase 1 stub exists so
-    /// the substrate (the pin tracker + the API hook on Vault) can land in
-    /// isolation without the multi-file lifecycle changes.
+    /// expires with no live pins. design D6 (amendment 3) wired this from a
+    /// no-op Phase-1 stub to a real wipe: the per-scope MEK is interior-
+    /// mutable (`RefCell<[u8; 32]>`), so we `zeroize()` the scope's bytes in
+    /// place through the shared `&Rc<Vault>` — no `&mut self` and no slot
+    /// swap required.
     ///
-    /// Phase 2 will (a) take `&mut self` (or move out of an `Rc<RefCell>>`)
-    /// to actually drop the `vault_key` bytes, (b) NOT modify the keyring
-    /// or persist anything — re-unlock at the next session-open re-derives
-    /// from the keyring-stored passphrase, and (c) emit a signed
-    /// `vault_zero` Receipt per design.
+    /// Semantics after a wipe:
+    /// - **Interactive** — the key becomes the all-zero checkpoint, so
+    ///   `is_headless_only()` flips true and every Interactive op
+    ///   (`add`/`get`/`replace`/`seal`/`open`) refuses with
+    ///   `VaultError::HeadlessOnly`. The Headless lane (if independent) keeps
+    ///   serving — exactly the design demand-pinned posture. Re-unlock at
+    ///   the next session-open re-derives the Interactive MEK from the
+    ///   keyring-stored passphrase.
+    /// - **Headless** — wipes the Headless MEK; the next vault open reloads
+    ///   it from the (Interactive-MEK-wrapped) `vault_meta` / file sidecar.
+    ///
+    /// This does NOT touch the keyring, the passphrase caches, or any at-rest
+    /// material — it only scrubs the live in-memory key. (Whole-vault teardown
+    /// is `DaemonStore::drop_vault`, which drops the `Rc<Vault>` and lets the
+    /// `Drop` impl above zeroize both scopes.)
     pub fn zero_scope(&self, scope: VaultScope) -> Result<(), VaultError> {
-        info!(
-            scope = ?scope,
-            "vault: zero_scope (Phase 1 stub — no-op; Phase 2 wires lifecycle release)"
-        );
+        use zeroize::Zeroize as _;
+        match scope {
+            VaultScope::Interactive => self.interactive_key.borrow_mut().zeroize(),
+            VaultScope::Headless => self.headless_key.borrow_mut().zeroize(),
+        }
+        info!(scope = ?scope, "vault: zero_scope wiped in-memory MEK bytes (design D6)");
         Ok(())
     }
 
@@ -1343,15 +2496,27 @@ impl Vault {
         value: &[u8],
         metadata: Option<&str>,
     ) -> Result<CredentialInfo, VaultError> {
+        self.replace_with_presence_policy(scope, store, name, value, metadata, PresencePolicy::LaneDefault)
+    }
+
+    pub fn replace_with_presence_policy(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+        value: &[u8],
+        metadata: Option<&str>,
+        presence_policy: PresencePolicy,
+    ) -> Result<CredentialInfo, VaultError> {
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
         let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-35 C5: mint id first, bind AAD to the
+        // implementation-note-37 C5: mint id first, bind AAD to the
         // new row's UUID. Same pattern as `Vault::add`.
         let id = format!("cred-{}", Uuid::new_v4());
         let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
 
-        // implementation-note-193 (B1): replace also routes
+        // implementation-note-170 (B1): replace also routes
         // per-scope so the rewritten row stays sealed under the scope's
         // key, not whichever MEK happens to be in `self.interactive_key`.
         //
@@ -1360,11 +2525,17 @@ impl Vault {
         if scope == VaultScope::Interactive && self.is_headless_only() {
             return Err(VaultError::HeadlessOnly);
         }
-        let cipher = XChaCha20Poly1305::new_from_slice(self.key_for_scope(scope)).unwrap();
+
+        // design D1 — same MEK→DEK envelope as `add`: fresh per-row DEK,
+        // payload encrypted under the DEK, DEK wrapped under the scope MEK
+        // with a fresh dek_nonce.
+        let mut dek = Zeroizing::new([0u8; 32]);
+        getrandom::fill(dek.as_mut_slice()).expect("OS entropy failure on dek generation");
+        let payload_cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).unwrap();
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
+        let ciphertext = payload_cipher
             .encrypt(
                 nonce,
                 Payload {
@@ -1374,27 +2545,57 @@ impl Vault {
             )
             .map_err(|e| VaultError::Crypto(e.to_string()))?;
 
+        // design D1 — scope+row-bound DEK wrap, same as `add`.
+        let aad_id =
+            cred_row_uuid_bytes(&id).expect("freshly-minted cred-<uuid> id yields a 16-byte uuid");
+        let (dek_nonce, wrapped_dek) = wrap_dek(&self.key_for_scope(scope), &dek, scope, &aad_id)?;
+
         let created_at = chrono::Utc::now().to_rfc3339();
 
         let conn = store.conn();
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        // Sticky escalation: if the existing row was already PerAccessFresh,
+        // keep it PerAccessFresh on replace regardless of the caller's
+        // ask. Downgrading to LaneDefault requires an explicit delete +
+        // re-add, mirroring the pre-consolidation `existing||new` shape.
+        let existing_policy_str: Option<String> = tx
+            .query_row(
+                "SELECT presence_policy FROM credentials WHERE name = ?1",
+                params![stored_name.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        let existing_policy = existing_policy_str
+            .as_deref()
+            .map(PresencePolicy::from_db_str)
+            .unwrap_or(PresencePolicy::LaneDefault);
+        let presence_policy = if existing_policy.requires_fresh_presence() {
+            PresencePolicy::PerAccessFresh
+        } else {
+            presence_policy
+        };
         tx.execute(
             "DELETE FROM credentials WHERE name = ?1",
-            params![stored_name],
+            params![stored_name.as_str()],
         )
         .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
         tx.execute(
-            "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO credentials \
+             (id, name, nonce, ciphertext, created_at, metadata, wrapped_dek, dek_nonce, presence_policy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 stored_name,
                 nonce_bytes.as_slice(),
                 ciphertext,
                 created_at,
-                metadata
+                metadata,
+                wrapped_dek.as_slice(),
+                dek_nonce.as_slice(),
+                presence_policy.as_db_str()
             ],
         )
         .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
@@ -1406,20 +2607,458 @@ impl Vault {
             name: name.to_string(),
             created_at,
             metadata: metadata.map(str::to_string),
+            presence_policy,
+            value_class: ValueClass::from_stored_name(&stored_name),
         })
+    }
+
+    /// design D3/D5 — perform an atomic vault MEK rotation.
+    ///
+    /// Re-protects all at-rest material under a freshly-derived/generated MEK
+    /// in ONE SQLite transaction (the single linearization point): re-wraps
+    /// every per-row DEK whose scope MEK changes (credentials + persona
+    /// secrets), re-seals the canary, re-wraps the relocated headless-MEK and
+    /// bridge-CA wraps, and writes the new salt / `mek_fingerprint` /
+    /// `key_epoch`. Payload ciphertext + nonces are NEVER touched — only the
+    /// wrapped DEKs (and the meta) move to the new MEK.
+    ///
+    /// Modes (design D5):
+    /// - `Rekey` — same passphrase, NEW salt → new Interactive MEK. The
+    ///   Headless MEK value is unchanged but re-wrapped under the new
+    ///   Interactive MEK.
+    /// - `ChangePassphrase` — `new_passphrase` + NEW salt → new Interactive
+    ///   MEK. The caller updates the keychain entry AFTER this commits.
+    /// - `RotateHeadless` — fresh random Headless MEK; Interactive unchanged.
+    ///
+    /// Crash-safety: a crash before commit rolls back to the intact old vault;
+    /// a crash after commit leaves a fully-rotated, openable vault (new salt +
+    /// every re-wrapped DEK + both relocated wraps committed together). The
+    /// pre-mutate EMVS snapshot (D4) is a below-the-DB backstop.
+    ///
+    /// This is keychain-free and side-effect-free except the DB transaction
+    /// and the snapshot file write; the caller owns `set_vault`, cache
+    /// clears, the `change_passphrase` keychain update, the witness Receipt,
+    /// and retiring `retired_files` post-commit.
+    ///
+    /// Honest scope (D6): re-protects AT-REST material only — it does NOT
+    /// revoke minted tokens, active grants, or upstream credentials.
+    pub fn rotate_mek(
+        &self,
+        store: &DaemonStore,
+        data_dir: &std::path::Path,
+        mode: RotationMode,
+        current_passphrase: &str,
+        new_passphrase: Option<&str>,
+    ) -> Result<RotationOutcome, VaultError> {
+        if self.is_headless_only() {
+            // Rotation always re-wraps under / re-seals the Interactive MEK
+            // (the headless-MEK wrap + canary + bridge-CA all live under it),
+            // so a headless-only Vault cannot rotate.
+            return Err(VaultError::HeadlessOnly);
+        }
+        // design §4 / design AC-4 — refuse BEFORE any side effect (the
+        // pre-rotation snapshot below seals the live Interactive key under the
+        // passphrase). On a presence-backed vault the live Interactive key IS
+        // `KEK_s`; snapshotting it under the passphrase would mint a
+        // passphrase-recoverable copy of the scope KEK, and the per-row rewrap
+        // would downgrade AuthorityBearing custody to a MEK-reachable copy —
+        // both silent §4 voids. Presence/`KEK_s` custody is re-keyed through the
+        // §4 presence lane, never this MEK-rotation primitive. (`rewrap_personas_in_tx`
+        // carries the same invariant as in-tx defense-in-depth.)
+        if self.authority_key_source == AuthorityKeySource::PresenceScopeKek {
+            return Err(VaultError::AuthorityCustodyRotationUnsupported);
+        }
+
+        // Hold every transient plaintext MEK in `Zeroizing` so the stack copies
+        // are scrubbed on scope exit / early `?`-return — the
+        // implementation-note-37 C1 no-residue posture the rest of this file
+        // keeps (`unwrap_dek`, `unwrap_headless_mek`, etc.). The only un-tracked
+        // copy is the momentary by-value arg to `Vault::new_split` below, which
+        // moves straight into the new Vault's `ZeroizeOnDrop` cells — the same
+        // constructor pattern every other `new_split` call site uses.
+        let old_interactive = Zeroizing::new(*self.interactive_key.borrow());
+        let old_headless = Zeroizing::new(*self.headless_key.borrow());
+
+        let interactive_changed =
+            matches!(mode, RotationMode::Rekey | RotationMode::ChangePassphrase);
+        let headless_changed = matches!(mode, RotationMode::RotateHeadless);
+
+        // Derive/generate the new key material per mode (in-memory only; not
+        // touching disk until the tx below).
+        let new_salt: Option<[u8; 16]> = if interactive_changed {
+            Some(Vault::generate_salt())
+        } else {
+            None
+        };
+        let new_interactive: Zeroizing<[u8; 32]> = match mode {
+            RotationMode::Rekey => Zeroizing::new(derive_interactive_key(
+                current_passphrase,
+                &new_salt.expect("rekey always generates a new salt"),
+            )),
+            RotationMode::ChangePassphrase => {
+                let p = new_passphrase.ok_or_else(|| {
+                    VaultError::Crypto(
+                        "change_passphrase mode requires a new passphrase".to_string(),
+                    )
+                })?;
+                Zeroizing::new(derive_interactive_key(
+                    p,
+                    &new_salt.expect("change_passphrase always generates a new salt"),
+                ))
+            }
+            RotationMode::RotateHeadless => old_interactive.clone(),
+        };
+        let new_headless: Zeroizing<[u8; 32]> = match mode {
+            RotationMode::RotateHeadless => {
+                let mut h = Zeroizing::new([0u8; 32]);
+                getrandom::fill(h.as_mut_slice())
+                    .expect("OS entropy failure on headless mek rotation");
+                h
+            }
+            _ => old_headless.clone(),
+        };
+
+        // Fail loud if a derived Interactive MEK collapsed to the headless-only
+        // checkpoint (Argon2id never produces all-zero, but never serve it).
+        if interactive_changed && new_interactive.iter().all(|b| *b == 0) {
+            return Err(VaultError::Crypto(
+                "refusing rotation: newly-derived Interactive MEK is all-zero".to_string(),
+            ));
+        }
+
+        let new_vault = Vault::new_split(*new_interactive, *new_headless);
+
+        // design D4 — snapshot-before-mutate: seal the OLD Interactive MEK
+        // under the current passphrase to a timestamped EMVS file.
+        let snapshot_path =
+            write_pre_rotation_snapshot(data_dir, &old_interactive, current_passphrase)?;
+
+        let prev_key_epoch = store.read_key_epoch().map_err(VaultError::Store)?;
+        let new_key_epoch = prev_key_epoch + 1;
+
+        // Rotated-scope fingerprints for the witness Receipt (D7).
+        let (prev_scope_fingerprint, new_scope_fingerprint) = if interactive_changed {
+            (
+                mek_fingerprint_hex(old_interactive.as_slice()),
+                mek_fingerprint_hex(new_interactive.as_slice()),
+            )
+        } else {
+            (
+                mek_fingerprint_hex(old_headless.as_slice()),
+                mek_fingerprint_hex(new_headless.as_slice()),
+            )
+        };
+
+        let mut retired_files: Vec<std::path::PathBuf> = Vec::new();
+        let conn = store.conn();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+
+        // Guarantee the single `vault_meta` row exists so the UPDATEs below
+        // land (a pre-migration vault may have salt/canary in file sidecars
+        // and no DB row yet). `key_epoch` defaults to 0.
+        tx.execute("INSERT OR IGNORE INTO vault_meta (id) VALUES (1)", [])
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+
+        // 1. Re-wrap every per-row credential DEK whose scope MEK changed.
+        let mut rewrap_count =
+            self.rewrap_credentials_in_tx(&tx, &new_vault, interactive_changed, headless_changed)?;
+
+        // 2. Re-wrap persona-secret DEKs (Interactive MEK) — only when it changed.
+        if interactive_changed {
+            rewrap_count += self.rewrap_personas_in_tx(&tx, &new_vault)?;
+        }
+
+        // 3. Re-seal the canary under the new Interactive MEK — only when it
+        //    changed (the canary is sealed directly under the Interactive MEK,
+        //    so a rekey/change_passphrase MUST re-seal it or the next open
+        //    fails the AEAD canary fail-loud check; RotateHeadless leaves it).
+        if interactive_changed {
+            let (canary_nonce, canary) = new_vault.seal_canary()?;
+            tx.execute(
+                "UPDATE vault_meta SET canary = ?1, canary_nonce = ?2 WHERE id = 1",
+                params![canary, canary_nonce],
+            )
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        }
+
+        // 4. Re-wrap the relocated Headless-MEK wrap (ALWAYS): its wrap is
+        //    under the Interactive MEK (so a rekey re-wraps it even though the
+        //    Headless value is unchanged), and for RotateHeadless the Headless
+        //    value itself changed. Committed to vault_meta; retire the file.
+        let (h_nonce, h_wrapped) = wrap_headless_mek(&new_interactive, &new_headless)?;
+        tx.execute(
+            "UPDATE vault_meta SET headless_mek_nonce = ?1, headless_mek_wrapped = ?2 WHERE id = 1",
+            params![h_nonce, h_wrapped],
+        )
+        .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        retired_files.push(data_dir.join(HEADLESS_MEK_WRAP_FILE));
+
+        // 5. Re-wrap the bridge-CA module key — only when its wrapping key
+        //    changed and a bridge CA is provisioned. design §4: the bridge-CA
+        //    module key is DaemonOperational and now wraps under the HEADLESS
+        //    key, so a Rekey/ChangePassphrase (which leaves headless unchanged)
+        //    no longer disturbs the autonomous bridge CA; only RotateHeadless
+        //    re-wraps it.
+        if headless_changed {
+            self.rewrap_bridge_ca_in_tx(store, &tx, &new_vault, data_dir, &mut retired_files)?;
+        }
+
+        // 6. Write the new salt (Rekey/ChangePassphrase) + new advisory
+        //    fingerprint + bump key_epoch — all in the same tx as the rewraps.
+        if let Some(salt) = new_salt {
+            tx.execute(
+                "UPDATE vault_meta SET salt = ?1 WHERE id = 1",
+                params![salt.as_slice()],
+            )
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            // The file sidecar (if any) is now shadowed by the DB salt; retire it.
+            retired_files.push(data_dir.join("vault.salt"));
+        }
+        tx.execute(
+            "UPDATE vault_meta SET mek_fingerprint = ?1, key_epoch = ?2 WHERE id = 1",
+            params![
+                mek_fingerprint_hex(new_interactive.as_slice()),
+                new_key_epoch
+            ],
+        )
+        .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+
+        // COMMIT — the single linearization point. Everything above either
+        // lands together or rolls back together.
+        tx.commit()
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+
+        Ok(RotationOutcome {
+            new_vault,
+            mode,
+            rewrap_count,
+            prev_key_epoch,
+            new_key_epoch,
+            prev_scope_fingerprint,
+            new_scope_fingerprint,
+            snapshot_path,
+            retired_files,
+        })
+    }
+
+    /// design D3 — re-wrap every credential-row DEK whose scope MEK changed,
+    /// inside the rotation transaction. Reads all rows first (single-threaded
+    /// daemon → no concurrent writer), then UPDATEs `wrapped_dek`/`dek_nonce`
+    /// with a fresh nonce. Payload ciphertext/nonce untouched. Returns the
+    /// number of rows re-wrapped.
+    fn rewrap_credentials_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        new_vault: &Vault,
+        interactive_changed: bool,
+        headless_changed: bool,
+    ) -> Result<u64, VaultError> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, Option<Vec<u8>>, Option<Vec<u8>>)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, name, wrapped_dek, dek_nonce FROM credentials")
+                .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r.map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?);
+            }
+            v
+        };
+
+        let mut count = 0u64;
+        for (id, name, wrapped_dek, dek_nonce) in rows {
+            let scope = if name.starts_with(HEADLESS_SCOPE_STORAGE_PREFIX) {
+                VaultScope::Headless
+            } else {
+                VaultScope::Interactive
+            };
+            let scope_changed = match scope {
+                VaultScope::Interactive => interactive_changed,
+                VaultScope::Headless => headless_changed,
+            };
+            if !scope_changed {
+                continue;
+            }
+            // Envelope-only: a NULL-wrapped row predates the envelope and
+            // cannot be rotated — fail loud rather than silently skip (a
+            // skipped row would be unrotatable and unreadable post-rotation).
+            let (wrapped_dek, dek_nonce) = match (wrapped_dek, dek_nonce) {
+                (Some(w), Some(n)) => (w, n),
+                _ => {
+                    return Err(VaultError::Crypto(format!(
+                        "cannot rotate: credential row '{name}' (id {id}) is not enveloped \
+                         (wrapped_dek is NULL); run the migration one-shot first"
+                    )));
+                }
+            };
+            let Some(aad_id) = cred_row_uuid_bytes(&id) else {
+                return Err(VaultError::Crypto(format!(
+                    "cannot rotate: credential row id '{id}' is not a parseable cred-<uuid>"
+                )));
+            };
+            // Unwrap the DEK under the OLD scope MEK, re-wrap under the NEW
+            // scope MEK with the SAME scope+row-bound AAD and a fresh nonce.
+            let dek = unwrap_dek(
+                &self.key_for_scope(scope),
+                &dek_nonce,
+                &wrapped_dek,
+                scope,
+                &aad_id,
+            )?;
+            let (new_nonce, new_wrapped) =
+                wrap_dek(&new_vault.key_for_scope(scope), &dek, scope, &aad_id)?;
+            tx.execute(
+                "UPDATE credentials SET wrapped_dek = ?1, dek_nonce = ?2 WHERE id = ?3",
+                params![new_wrapped.as_slice(), new_nonce.as_slice(), id],
+            )
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// design Part B / D5 — re-wrap every enveloped persona-secret DEK under
+    /// the new Interactive MEK (only called when the Interactive MEK changed).
+    /// A persona row with NULL wrap columns has no at-rest secret under the
+    /// MEK and is skipped. Returns the number of persona secrets re-wrapped.
+    fn rewrap_personas_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        new_vault: &Vault,
+    ) -> Result<u64, VaultError> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, private_key_dek_nonce, private_key_wrapped_dek FROM personas \
+                     WHERE private_key_dek_nonce IS NOT NULL \
+                       AND private_key_wrapped_dek IS NOT NULL",
+                )
+                .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r.map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?);
+            }
+            v
+        };
+
+        // design §4 / design AC-4 — persona-secret rows are AuthorityBearing.
+        // This rewrap is a SECOND writer of the persona secret columns, one layer
+        // below the `seal`/`open` ValueClass gate, so it must carry the same
+        // no-MEK-recipient invariant. `rotate_mek` always derives a passphrase
+        // MEK destination (`new_vault` is `AuthorityKeySource::Mek`); re-wrapping
+        // a presence-custodied (KEK_s) persona DEK onto it would mint a
+        // MEK-reachable copy of the persona root and SILENTLY void the §4 flip.
+        // Refuse fail-closed when persona rows exist — the whole rotation tx rolls
+        // back. AuthorityBearing custody is rotated through the presence/KEK_s
+        // lane, never this MEK primitive. (RotateHeadless leaves the Interactive
+        // key unchanged and never reaches here.)
+        if !rows.is_empty() {
+            new_vault.ensure_authority_bearing_source()?;
+        }
+
+        let mut count = 0u64;
+        for (persona_id, dek_nonce, wrapped_dek) in rows {
+            let aad_id = crate::infra::persona::persona_secret_aad_id(&persona_id);
+            let dek = unwrap_dek(
+                &self.interactive_key.borrow(),
+                &dek_nonce,
+                &wrapped_dek,
+                VaultScope::Interactive,
+                &aad_id,
+            )?;
+            let (new_nonce, new_wrapped) = wrap_dek(
+                &new_vault.interactive_key.borrow(),
+                &dek,
+                VaultScope::Interactive,
+                &aad_id,
+            )?;
+            tx.execute(
+                "UPDATE personas SET private_key_dek_nonce = ?1, private_key_wrapped_dek = ?2 \
+                 WHERE id = ?3",
+                params![new_nonce.as_slice(), new_wrapped.as_slice(), persona_id],
+            )
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// design D1/D3 — re-wrap the bridge-CA module wrapping key under the new
+    /// Interactive MEK inside the rotation tx (only when the Interactive MEK
+    /// changed). Reads the current wrap DB-first then file-fallback, unwraps
+    /// the module key under the OLD MEK, re-seals it under the NEW MEK, and
+    /// commits the new `SealedEnvelope` blob to `vault_meta.bridge_ca_wrapped`.
+    /// The module-key VALUE is unchanged, so `bridge_ca.sealed` (sealed under
+    /// the module key, not the MEK) still opens. No-op when no bridge CA is
+    /// provisioned on this host.
+    fn rewrap_bridge_ca_in_tx(
+        &self,
+        store: &DaemonStore,
+        tx: &rusqlite::Transaction<'_>,
+        new_vault: &Vault,
+        data_dir: &std::path::Path,
+        retired_files: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), VaultError> {
+        let current_blob: Option<Vec<u8>> =
+            match store.read_bridge_ca_wrap().map_err(VaultError::Store)? {
+                Some(b) => Some(b),
+                None => {
+                    let file = data_dir.join("bridge_ca.wrap");
+                    std::fs::read(&file).ok()
+                }
+            };
+        let Some(blob) = current_blob else {
+            // No bridge CA on this host — nothing to re-wrap.
+            return Ok(());
+        };
+        let env = SealedEnvelope::from_blob(&blob).map_err(|e| {
+            VaultError::Crypto(format!("bridge-ca wrap blob parse during rotation: {e}"))
+        })?;
+        // Unwrap under the OLD key (`self`), re-seal under the NEW (`new_vault`).
+        // bridge-CA is DaemonOperational (autonomous headless key, design §4),
+        // so both legs route through that class. Module key held in `Zeroizing`
+        // so it is scrubbed.
+        let module_key = self.open(
+            ValueClass::DaemonOperational,
+            crate::trust::bridge_ca::BRIDGE_CA_MODULE_KEY_AAD_ID,
+            &env,
+        )?;
+        let new_env = new_vault.seal(
+            ValueClass::DaemonOperational,
+            crate::trust::bridge_ca::BRIDGE_CA_MODULE_KEY_AAD_ID,
+            &module_key,
+        )?;
+        tx.execute(
+            "UPDATE vault_meta SET bridge_ca_wrapped = ?1 WHERE id = 1",
+            params![new_env.to_blob()],
+        )
+        .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        retired_files.push(data_dir.join("bridge_ca.wrap"));
+        Ok(())
     }
 }
 
 // sealed_mek_blob_format_landed
 //
-// implementation-note-367 — sealed-blob
+// implementation-note-319 — sealed-blob
 // wire format + argon2id-KEK-wrapped MEK. Daemon-side substrate for
 // vault export/import (the CLI surface lands in a later slice).
 //
-// Wire format v1 (little-endian):
+// Wire format v2 (little-endian) — design (bumped from v1; the at-rest
+// vault this MEK unlocks is now an MEK→DEK envelope, so the version
+// records the enveloped shape and import is v2-only):
 //
 //   magic:       4B  = b"EMVS"           ("Ember MEK Vault Sealed")
-//   version:     2B  = 0x0001 (LE u16)
+//   version:     2B  = 0x0002 (LE u16)
 //   kdf_id:      1B  = 0x01 (argon2id)
 //   aead_id:     1B  = 0x01 (xchacha20-poly1305)
 //   salt_len:    1B  = 32
@@ -1444,7 +3083,16 @@ impl Vault {
 /// logic.
 pub(crate) const SEALED_BLOB_MAGIC: [u8; 4] = *b"EMVS";
 /// Sealed-blob format version (LE u16). Future format breaks bump this.
-pub(crate) const SEALED_BLOB_VERSION: u16 = 0x0001;
+///
+/// design — bumped to v2 (`0x0002`) when the at-rest shape became the
+/// MEK→DEK envelope. The sealed blob still carries the MEK bytes (the
+/// MEK is what unwraps every per-row DEK); the version bump records that
+/// the vault this MEK unlocks is an enveloped vault, so a v2 backup of
+/// (sealed-MEK blob + enveloped daemon.db) round-trips coherently. The
+/// committed import path is v2-only — the operator re-exports the one
+/// dev0 vault as a v2 backup after the out-of-tree S6a migration (D2),
+/// so no v1 import path is committed.
+pub(crate) const SEALED_BLOB_VERSION: u16 = 0x0002;
 /// KDF identifier for argon2id.
 pub(crate) const SEALED_BLOB_KDF_ARGON2ID: u8 = 0x01;
 /// AEAD identifier for XChaCha20-Poly1305.
@@ -1476,11 +3124,9 @@ fn derive_sealed_kek(
     mem_kib: u32,
     par: u8,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, VaultError> {
-    let params = argon2::Params::new(mem_kib, ops, par as u32, Some(32)).map_err(|e| {
-        VaultError::SealedBlobInvalid(format!("argon2 params invalid: {e}"))
-    })?;
-    let argon2 =
-        argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let params = argon2::Params::new(mem_kib, ops, par as u32, Some(32))
+        .map_err(|e| VaultError::SealedBlobInvalid(format!("argon2 params invalid: {e}")))?;
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut kek = zeroize::Zeroizing::new([0u8; 32]);
     argon2
         .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut_slice())
@@ -1558,12 +3204,20 @@ pub fn export_mek_sealed(
     // field length is known up front.
     let fp_bytes = plaintext_fingerprint.as_bytes();
     let mut out = Vec::with_capacity(
-        4 + 2 + 1 + 1 + 1
+        4 + 2
+            + 1
+            + 1
+            + 1
             + SEALED_BLOB_SALT_LEN as usize
-            + 4 + 4 + 1 + 1
+            + 4
+            + 4
+            + 1
+            + 1
             + SEALED_BLOB_NONCE_LEN as usize
-            + 1 + fp_bytes.len()
-            + 4 + ciphertext.len(),
+            + 1
+            + fp_bytes.len()
+            + 4
+            + ciphertext.len(),
     );
     out.extend_from_slice(&SEALED_BLOB_MAGIC);
     out.extend_from_slice(&SEALED_BLOB_VERSION.to_le_bytes());
@@ -1724,9 +3378,7 @@ pub fn import_mek_sealed(
     let fp_len = r.take_u8()? as usize;
     let fp_bytes = r.take(fp_len)?;
     let fingerprint = std::str::from_utf8(fp_bytes)
-        .map_err(|e| {
-            VaultError::SealedBlobInvalid(format!("fingerprint is not valid UTF-8: {e}"))
-        })?
+        .map_err(|e| VaultError::SealedBlobInvalid(format!("fingerprint is not valid UTF-8: {e}")))?
         .to_string();
     if fingerprint != expected_fingerprint {
         return Err(VaultError::SealedBlobFingerprintMismatch {
@@ -1769,7 +3421,7 @@ pub fn import_mek_sealed(
     Ok(zeroize::Zeroizing::new(plaintext))
 }
 
-// implementation-note-325 —
+// implementation-note-304 —
 // rotation_witness_emitted_at_mek_rotation
 //
 // At every identity-key rotation point (today: alongside the MEK
@@ -1902,13 +3554,12 @@ pub fn emit_identity_rotation_witness(
     // `core-events/src/receipt/sign.rs::witness_envelope`.
     let signature_by_next_root = "ed25519sig:pending-next-root-cosign".to_string();
 
-    let rotated_at_epoch_secs: u64 = rotation_at
-        .timestamp()
-        .try_into()
-        .map_err(|_| VaultError::WitnessEmit(format!(
+    let rotated_at_epoch_secs: u64 = rotation_at.timestamp().try_into().map_err(|_| {
+        VaultError::WitnessEmit(format!(
             "rotation_at timestamp {} is negative — cannot encode as u64 epoch seconds",
             rotation_at.timestamp(),
-        )))?;
+        ))
+    })?;
 
     let body = serde_json::json!({
         "prev_epoch_root_id": prior_epoch_root_id,
@@ -1969,172 +3620,13 @@ fn strip_ed25519_prefix(handle: &str) -> Option<String> {
     handle.strip_prefix("ed25519:").map(|s| s.to_string())
 }
 
-/// Outcome of `try_auto_unseal_from_keyring` — the daemon/CLI startup helper
-/// that opens the vault from a keyring-stored passphrase. Designed as an enum
-/// (rather than `Result<Option<Vault>, _>`) so callers can branch on the
-/// "no keyring entry yet" case without flattening it into the error path.
-pub enum AutoUnsealOutcome {
-    /// Keyring lookup succeeded and the vault is unsealed. Attach to the store.
-    Unsealed(Vault),
-    /// Keyring had no entry for the configured service/account. Treat as
-    /// non-fatal: the daemon should still start so the operator can run
-    /// `ember init` (or equivalent) to provision one.
-    NoKeyringEntry,
-    /// Keyring lookup itself failed (platform error, checkpoint missing, etc.).
-    /// Caller may surface as a startup warning but should keep running.
-    Error(VaultError),
-}
-
-/// Best-effort vault auto-unseal from the system keyring.
-///
-/// This is the documented startup path for both the daemon (`runtime.rs`)
-/// and the in-process CLI subcommands (`bin/ember.rs::open_store`) that
-/// touch personas without going through the socket. Wraps
-/// `Vault::open_from_config` and reshapes its return so a missing keyring
-/// entry is `NoKeyringEntry` rather than an opaque error.
-///
-/// Why a separate helper:
-/// - `Vault::open_from_config` auto-generates a passphrase on first call
-///   when none exists, which is correct for `ember init` but wrong for
-///   "auto-unseal on every daemon start" — we don't want a daemon restart
-///   to silently mint a fresh vault key after the keyring was wiped.
-///   `try_auto_unseal_from_keyring` only succeeds if the keyring already
-///   has an entry (or `EMBER_VAULT_PASSPHRASE` is set, or we're in a test
-///   harness with the mock gate enabled).
-/// - Centralising the auto-unseal contract here means the daemon and the
-///   CLI direct-store paths have one shared trust boundary instead of
-///   each re-implementing keyring lookup.
-///
-/// Always-attempted: there is no relay/hosted/first-party mode flag in
-/// `DaemonConfig` today (implementation-note-335 task instructions explicitly note this).
-/// If one is added later, gate auto-unseal on first-party mode here.
-pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
-    try_auto_unseal_from_keyring_with_presence(config, PresenceAfterOpen::MarkUnlocked)
-}
-
-/// Best-effort auto-unseal variant used only during daemon bootstrap.
-///
-/// This preserves the startup contract of "open a temporary bootstrap vault if
-/// a key source already exists" without silently treating boot as an
-/// interactive operator unlock or publishing that handle into the daemon's
-/// shared live-vault slot.
-pub(crate) fn try_bootstrap_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
-    try_auto_unseal_from_keyring_with_presence(config, PresenceAfterOpen::LeaveLocked)
-}
-
-fn try_auto_unseal_from_keyring_with_presence(
-    config: &DaemonConfig,
-    presence: PresenceAfterOpen,
-) -> AutoUnsealOutcome {
-    let service = resolve_keyring_service(&config.keyring);
-    let account = resolve_keyring_account(&config.keyring);
-    let env_passphrase_active = std::env::var("EMBER_VAULT_PASSPHRASE").is_ok();
-
-    // Production checkpoint — same belt-and-suspenders as `open_from_config`.
-    // Skip in cargo-test binaries (the passphrase branch below is also gated
-    // there, so the real keychain is never touched in tests).
-    if !is_cargo_test_binary() {
-        let home = match dirs_next::home_dir() {
-            Some(h) => h,
-            None => {
-                return AutoUnsealOutcome::Error(VaultError::ProductionSentinelMissing(
-                    "refusing to open vault: home directory not resolvable (no $HOME)".to_string(),
-                ));
-            }
-        };
-        if let Err(e) = check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home) {
-            return AutoUnsealOutcome::Error(e);
-        }
-    }
-
-    // Salt resolution can fail on IO. Treat as a hard error — we cannot
-    // derive the vault key without the salt.
-    let salt = match vault_salt(config) {
-        Ok(s) => s,
-        Err(e) => return AutoUnsealOutcome::Error(e),
-    };
-
-    // implementation-note-35 C4: refuse to auto-unseal if the
-    // vault.params sidecar disagrees with the compile-time Argon2 pin.
-    // Same enforcement as `open_from_config`.
-    if let Err(e) = check_or_write_vault_params(config) {
-        return AutoUnsealOutcome::Error(e);
-    }
-
-    // Resolve the passphrase WITHOUT auto-generating one. Distinguishes
-    // "keyring miss" (NoKeyringEntry) from "platform error" (Error).
-    match resolve_passphrase_no_provision(&service, &account) {
-        Ok(Some(passphrase)) => {
-            if env_passphrase_active {
-                remember_runtime_reopen_passphrase(&config.data_dir, &passphrase);
-            }
-            match finish_open(&passphrase, &salt, &config.data_dir, presence) {
-                Ok(vault) => AutoUnsealOutcome::Unsealed(vault),
-                Err(e) => AutoUnsealOutcome::Error(e),
-            }
-        }
-        Ok(None) => AutoUnsealOutcome::NoKeyringEntry,
-        Err(e) => AutoUnsealOutcome::Error(e),
-    }
-}
-
-/// Reopen the runtime vault without provisioning a fresh passphrase source.
-///
-/// Used by the same-daemon interactive reopen path after an explicit
-/// `vault_lock`. Unlike [`Vault::open_from_config`], this helper MUST NOT
-/// silently mint a new key source when the original passphrase entry has
-/// disappeared — a reopened daemon must either recover the existing MEK or
-/// fail closed.
-pub(crate) fn reopen_from_runtime_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
-    let service = resolve_keyring_service(&config.keyring);
-    let account = resolve_keyring_account(&config.keyring);
-    let salt = vault_salt(config)?;
-    check_or_write_vault_params(config)?;
-
-    #[cfg(target_os = "macos")]
-    if !is_cargo_test_binary()
-        && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
-        && is_separate_uid_posture()
-    {
-        let passphrase = crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
-        return finish_open(
-            &passphrase,
-            &salt,
-            &config.data_dir,
-            PresenceAfterOpen::MarkUnlocked,
-        );
-    }
-
-    if let Some(passphrase) = runtime_reopen_passphrase(&config.data_dir) {
-        return finish_open(
-            &passphrase,
-            &salt,
-            &config.data_dir,
-            PresenceAfterOpen::MarkUnlocked,
-        );
-    }
-
-    if !is_cargo_test_binary() {
-        let home = dirs_next::home_dir().ok_or_else(|| {
-            VaultError::ProductionSentinelMissing(
-                "refusing to open vault: home directory not resolvable (no $HOME)".to_string(),
-            )
-        })?;
-        check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
-    }
-
-    let passphrase = resolve_passphrase_no_provision(&service, &account)?.ok_or_else(|| {
-        VaultError::Keyring(
-            "runtime vault reopen requires an existing passphrase entry; none found".to_string(),
-        )
-    })?;
-    finish_open(
-        &passphrase,
-        &salt,
-        &config.data_dir,
-        PresenceAfterOpen::MarkUnlocked,
-    )
-}
+// design S4 dead-code deletion: the direct-SE unseal functions
+// (`try_se_unseal`, `se_unseal_interactive`, `se_unseal_with_presence`,
+// `AutoUnsealOutcome`, `try_auto_unseal_from_keyring`) have been removed.
+// The daemon's vault MEK and lease-KEK are now unlocked exclusively via
+// the double-envelope path (`vault.de_unlock_complete` RPC). The outer SE
+// envelope is peeled by the CLI in the Aqua/501 domain; the inner DWK
+// envelope is peeled by the daemon at uid=450. See design S1/S3.
 
 /// Like `resolve_passphrase` but never provisions a new keyring entry.
 /// Returns `Ok(None)` when the keyring has no entry — the signal callers
@@ -2146,7 +3638,15 @@ pub(crate) fn reopen_from_runtime_config(config: &DaemonConfig) -> Result<Vault,
 pub(crate) fn resolve_passphrase_no_provision(
     service: &str,
     account: &str,
-) -> Result<Option<String>, VaultError> {
+) -> Result<Option<Zeroizing<String>>, VaultError> {
+    // N6: returns Zeroizing<String> so the operator passphrase zeroizes
+    // on drop. The keychain/vault_macos sub-helpers still hand back bare
+    // String — we wrap at receipt so the new heap allocation in this
+    // frame zeroizes. (Threading Zeroizing through `keyring_core::Entry`
+    // and `vault_macos::get_password_user_presence` is a separate
+    // follow-up; the leftover residue is inside those helpers' return
+    // paths, not in callers of THIS function.)
+
     // 1. Environment variable — capture then immediately zeroize from the
     // process environment so it cannot be read from /proc/<pid>/environ
     // by a second party after this point. Done before any background threads
@@ -2155,7 +3655,7 @@ pub(crate) fn resolve_passphrase_no_provision(
     // Safety: single-threaded startup path; no other threads are reading env.
     if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-        return Ok(Some(p));
+        return Ok(Some(Zeroizing::new(p)));
     }
 
     // 2. Test gate — same three-axis check as `resolve_passphrase`.
@@ -2164,7 +3664,9 @@ pub(crate) fn resolve_passphrase_no_provision(
         // signaled "keyring entry exists" via `EMBER_VAULT_TEST_KEYRING_PRESENT=1`.
         // Otherwise return None so tests can exercise the NoKeyringEntry path.
         if std::env::var("EMBER_VAULT_TEST_KEYRING_PRESENT").is_ok() {
-            return Ok(Some(format!("test-passphrase-{service}-{account}")));
+            return Ok(Some(Zeroizing::new(format!(
+                "test-passphrase-{service}-{account}"
+            ))));
         }
         return Ok(None);
     }
@@ -2178,17 +3680,84 @@ pub(crate) fn resolve_passphrase_no_provision(
     //    demo flows don't fire a biometric prompt.
     #[cfg(target_os = "macos")]
     if crate::infra::vault_macos::apply_user_presence(service, DEFAULT_KEYRING_SERVICE) {
+        // `vault_macos::get_password_user_presence` already returns
+        // `Zeroizing<String>` (N6-deeper item 3) — no extra wrap needed.
         return crate::infra::vault_macos::get_password_user_presence(service, account)
             .map_err(VaultError::Keyring);
     }
 
-    // 4. System keyring lookup — read-only, no provisioning.
+    // 4. System keyring lookup — read-only, no provisioning. Wrap at the
+    // `keyring_core::Entry::get_password()` boundary so the bare `String`
+    // returned by the third-party crate never escapes into a longer-lived
+    // local (N6-deeper item 3).
     let entry = keyring_core::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("init: {e}")))?;
-    match entry.get_password() {
+    match entry.get_password().map(Zeroizing::new) {
         Ok(p) => Ok(Some(p)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(e) => Err(VaultError::Keyring(format!("read: {e}"))),
+    }
+}
+
+/// design D5 — resolve the CURRENT operator vault passphrase for a rotation,
+/// using the SAME posture order `open_from_config` uses so the rotation
+/// resolves the passphrase the daemon actually opened the vault with.
+///
+/// **CRITICAL (separate-uid posture):** in the design separate-uid production
+/// posture the passphrase comes from the SE-wrapped `vault-mek.bin` blob, NOT a
+/// Touch-ID keychain entry. A keychain-only resolver
+/// (`resolve_passphrase_no_provision`) returns `None` there and would break
+/// rotation on the real production daemon with "no operator passphrase entry".
+/// Order: `EMBER_VAULT_PASSPHRASE` → separate-uid SE blob → runtime-reopen cache
+/// → keychain/keyring. Returns `None` only when no source has it (genuine
+/// needs-init).
+pub(crate) fn resolve_current_vault_passphrase(
+    config: &DaemonConfig,
+) -> Result<Option<Zeroizing<String>>, VaultError> {
+    // N6: returns Zeroizing<String> so the operator passphrase zeroizes
+    // on drop. Callers pass &pass (Deref -> &str) into rotate_mek and the
+    // keychain helpers, which themselves take &str.
+    if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
+        return Ok(Some(Zeroizing::new(p)));
+    }
+    // SE custody: no passphrase concept — the interactive key is SE-wrapped.
+    // Rotation under SE custody is a separate flow (not passphrase-based).
+    #[cfg(target_os = "macos")]
+    if vault_passphrase_is_se_wrapped() {
+        return Ok(None);
+    }
+    if let Some(p) = runtime_reopen_passphrase(&config.data_dir) {
+        return Ok(Some(p));
+    }
+    let service = resolve_keyring_service(&config.keyring);
+    let account = resolve_keyring_account(&config.keyring);
+    resolve_passphrase_no_provision(&service, &account)
+}
+
+/// design D5 — true when the daemon opens its vault via the design
+/// separate-uid SE-wrapped MEK blob (`vault-mek.bin`) rather than a keychain
+/// passphrase. `change_passphrase` rotation is NOT supported in this posture
+/// (the new passphrase would have to be re-wrapped under the Secure Enclave,
+/// not written to the keychain via `set_vault_passphrase`), so the rotation
+/// handler refuses `change_passphrase` here rather than silently desyncing the
+/// SE blob from the rotated MEK. `rekey` and `rotate_headless` are unaffected —
+/// they keep the same operator secret and only change the salt / headless key.
+pub(crate) fn vault_passphrase_is_se_wrapped() -> bool {
+    // Test-only override so the rotation handler's separate-uid
+    // change_passphrase refusal is exercisable (the real detection reads the
+    // effective uid's home dir, which is never /var/empty under cargo test).
+    if cfg!(test) && std::env::var("EMBER_VAULT_TEST_FORCE_SE_POSTURE").is_ok() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        !is_cargo_test_binary()
+            && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
+            && is_separate_uid_posture()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
@@ -2303,7 +3872,7 @@ pub struct MigrateMekAclResult {
 /// (biometric on macOS via `kSecAttrAccessControl`).
 ///
 /// This migrates a pre-existing MEK entry created before
-/// implementation-note-117 shipped so subsequent vault operations
+/// implementation-note-115 shipped so subsequent vault operations
 /// use Touch ID instead of the plain keychain password.
 ///
 /// Safety contract:
@@ -2331,8 +3900,9 @@ pub fn migrate_mek_acl(service: &str, account: &str) -> Result<MigrateMekAclResu
             // Try the biometric path first. If it succeeds the entry already
             // has the right ACL — idempotent exit.
             match crate::infra::vault_macos::get_password_user_presence(service, account) {
-                Ok(Some(passphrase)) => {
-                    let _p = Zeroizing::new(passphrase);
+                Ok(Some(_passphrase)) => {
+                    // _passphrase is `Zeroizing<String>` (N6-deeper item 3);
+                    // it zeroizes on drop at the end of this arm.
                     return Ok(MigrateMekAclResult {
                         service: service.to_string(),
                         account: account.to_string(),
@@ -2353,12 +3923,15 @@ pub fn migrate_mek_acl(service: &str, account: &str) -> Result<MigrateMekAclResu
                 }
             }
 
-            // Read via the plain system keyring (pre-migration ACL).
+            // Read via the plain system keyring (pre-migration ACL). Wrap
+            // at the `keyring_core` boundary so the bare `String` returned
+            // by the third-party crate never escapes the call expression
+            // (N6-deeper item 3).
             let passphrase = {
                 let entry = keyring_core::Entry::new(service, account)
                     .map_err(|e| VaultError::Keyring(format!("migrate: init: {e}")))?;
-                match entry.get_password() {
-                    Ok(p) => Zeroizing::new(p),
+                match entry.get_password().map(Zeroizing::new) {
+                    Ok(p) => p,
                     Err(keyring_core::Error::NoEntry) => {
                         return Err(VaultError::Keyring(
                             "migrate_mek_acl: no MEK entry found in keychain; \
@@ -2487,16 +4060,16 @@ pub(crate) fn is_separate_uid_posture() -> bool {
     // (see install.rs::render_launchd_plist_body), so any env-var-based
     // home resolution would see the operator's home and miss the
     // /var/empty checkpoint that signals the design separate-uid posture.
-    // Per adversarial review implementation-note-75-(-B).
+    // Per adversarial review implementation-note-85-(-B).
     //
     // The Ok(None) and Err(e) arms both return false but log distinctly
     // so an operator debugging "why did the daemon land on the keychain
     // branch instead of SE?" can tell apart a provisioning race (uid
     // exists in kernel but passwd entry not yet written) from a real
     // passwd-database I/O failure. Per self-review 
-    // (implementation-note-368).
+    // (implementation-note-324).
     //
-    // implementation-note-369: all three 
+    // implementation-note-325: all three 
     // findings from the 2026-05-13 self-review are now closed.
     // (this site): Ok(None) / Err distinguished above.
     // : TOCTOU on file-based MEK blob — obviated by the
@@ -2548,10 +4121,14 @@ pub fn verify_keyring_roundtrip(
     }
     let verify_entry = keyring_core::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("verify: {e}")))?;
-    let read_back = verify_entry
-        .get_password()
-        .map_err(|e| VaultError::Keyring(format!("verify read: {e}")))?;
-    if read_back != expected {
+    // Wrap at the `keyring_core::Entry::get_password()` boundary so the
+    // round-trip read never lives as a bare `String` (N6-deeper item 3).
+    let read_back = Zeroizing::new(
+        verify_entry
+            .get_password()
+            .map_err(|e| VaultError::Keyring(format!("verify read: {e}")))?,
+    );
+    if *read_back != *expected {
         return Err(VaultError::Keyring(
             "roundtrip mismatch — keyring backend may be mock (missing platform features)"
                 .to_string(),
@@ -2560,7 +4137,7 @@ pub fn verify_keyring_roundtrip(
     Ok(())
 }
 
-fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError> {
+fn resolve_passphrase(service: &str, account: &str) -> Result<Zeroizing<String>, VaultError> {
     // 1. Environment variable — capture then immediately zeroize from the
     // process environment so it cannot be read from /proc/<pid>/environ
     // by a second party after this point. Done before any background threads
@@ -2569,7 +4146,7 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
     // Safety: single-threaded startup path; no other threads are reading env.
     if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-        return Ok(p);
+        return Ok(Zeroizing::new(p));
     }
 
     // 1b. Test gate — suppress real keychain access. Without this, `cargo test`
@@ -2586,7 +4163,9 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
             account = account,
             "vault: returning deterministic test passphrase (cfg!(test) or EMBER_VAULT_MOCK or cargo test binary detected)"
         );
-        return Ok(format!("test-passphrase-{service}-{account}"));
+        return Ok(Zeroizing::new(format!(
+            "test-passphrase-{service}-{account}"
+        )));
     }
 
     // 2. macOS user-presence gate. For the production keychain service
@@ -2604,7 +4183,7 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
         {
             Some(p) => return Ok(p),
             None => {
-                let p = generate_passphrase();
+                let p = Zeroizing::new(generate_passphrase());
                 crate::infra::vault_macos::set_password_user_presence(service, account, &p)
                     .map_err(VaultError::Keyring)?;
                 info!(
@@ -2615,15 +4194,17 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
         }
     }
 
-    // 3. System keyring (non-macOS, or macOS dev/QA service name).
+    // 3. System keyring (non-macOS, or macOS dev/QA service name). Wrap at
+    // the `keyring_core::Entry::get_password()` boundary so the bare `String`
+    // returned by the third-party crate never escapes the call expression.
     let entry = keyring_core::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("init: {e}")))?;
 
-    match entry.get_password() {
+    match entry.get_password().map(Zeroizing::new) {
         Ok(p) => Ok(p),
         Err(keyring_core::Error::NoEntry) => {
             // 4. Generate and store a random passphrase, then verify cross-handle read-back
-            let p = generate_passphrase();
+            let p = Zeroizing::new(generate_passphrase());
             entry
                 .set_password(&p)
                 .map_err(|e| VaultError::Keyring(format!("store: {e}")))?;
@@ -2635,7 +4216,87 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
     }
 }
 
+/// design D5 — overwrite the operator vault passphrase in the platform
+/// secret store. This is the `change_passphrase` rotation mode's post-commit
+/// step (the caller invokes it AFTER `rotate_mek` commits the new
+/// MEK-at-rest, so a rollback can never desync the keychain from the vault).
+/// Mirrors the WRITE side of `resolve_passphrase`: macOS user-presence ACL on
+/// the production service, system keyring otherwise. Honors the test gate and
+/// `keyring_writes_suppressed()` so no real keychain is touched under
+/// `cfg!(test)` / `EMBER_VAULT_MOCK` / cargo-test / suppressed-writes.
+pub(crate) fn set_vault_passphrase(
+    config: &DaemonConfig,
+    passphrase: &str,
+) -> Result<(), VaultError> {
+    if cfg!(test)
+        || std::env::var("EMBER_VAULT_MOCK").is_ok()
+        || is_cargo_test_binary()
+        || keyring_writes_suppressed()
+    {
+        // Test-only fault injection so the rotation handler's keychain-desync
+        // failure path (adversarial review O/HIGH) is exercisable — the real
+        // keychain is never touched under the test gate, so without this hook
+        // the failure branch would have zero coverage.
+        if cfg!(test) && std::env::var("EMBER_VAULT_TEST_KEYCHAIN_FAIL").is_ok() {
+            return Err(VaultError::Keyring(
+                "injected keychain failure (EMBER_VAULT_TEST_KEYCHAIN_FAIL)".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    let service = resolve_keyring_service(&config.keyring);
+    let account = resolve_keyring_account(&config.keyring);
+
+    #[cfg(target_os = "macos")]
+    if crate::infra::vault_macos::apply_user_presence(&service, DEFAULT_KEYRING_SERVICE) {
+        crate::infra::vault_macos::set_password_user_presence(&service, &account, passphrase)
+            .map_err(VaultError::Keyring)?;
+        return Ok(());
+    }
+
+    let entry = keyring_core::Entry::new(&service, &account)
+        .map_err(|e| VaultError::Keyring(format!("change_passphrase init: {e}")))?;
+    entry
+        .set_password(passphrase)
+        .map_err(|e| VaultError::Keyring(format!("change_passphrase store: {e}")))?;
+    verify_keyring_roundtrip(&service, &account, passphrase)?;
+    Ok(())
+}
+
+/// design D3 — best-effort read of the KDF salt from
+/// `<data_dir>/daemon.db`'s `vault_meta.salt` column via a read-only
+/// probe connection. New vaults write the salt here (committed
+/// atomically with the wrapped DEKs in a future rotation tx); a present
+/// non-NULL salt is authoritative. Any failure (no DB, no column, NULL,
+/// wrong length, lock contention) returns `None` so the caller falls
+/// back to the `vault.salt` file sidecar — the only transitional
+/// tolerance the committed code carries.
+fn salt_from_vault_meta(data_dir: &std::path::Path) -> Option<[u8; 16]> {
+    let db_path = data_dir.join("daemon.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    use rusqlite::OptionalExtension as _;
+    let row: Option<Option<Vec<u8>>> = conn
+        .query_row("SELECT salt FROM vault_meta WHERE id = 1", [], |r| {
+            r.get::<_, Option<Vec<u8>>>(0)
+        })
+        .optional()
+        .ok()?;
+    let bytes = row.flatten()?;
+    bytes.try_into().ok()
+}
+
 fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
+    // design D3 — prefer the DB-resident salt (atomic-rotation
+    // substrate). Falls through to the file sidecar only when the DB
+    // column is NULL / absent (pre-migration vault).
+    if let Some(salt) = salt_from_vault_meta(&config.data_dir) {
+        return Ok(salt);
+    }
     let salt_path = config.data_dir.join("vault.salt");
     if salt_path.exists() {
         let bytes =
@@ -2669,7 +4330,7 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
     }
 }
 
-/// implementation-note-35 C4: enforce Argon2 parameter pinning via a
+/// implementation-note-37 C4: enforce Argon2 parameter pinning via a
 /// `<data_dir>/vault.params` sidecar file.
 ///
 /// - If the file exists, parse it and refuse to proceed if any value
@@ -2684,6 +4345,21 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
 /// `try_auto_unseal_from_keyring` invocation, BEFORE any Argon2
 /// derivation runs. A mismatch aborts the unlock before the MEK is
 /// computed.
+/// design D3 — the pinned Argon2 params as the same TOML body
+/// `check_or_write_vault_params` writes to the `vault.params` sidecar.
+/// Stored in `vault_meta.argon2_params` for new vaults so the params
+/// travel in the rotation tx alongside the salt + canary.
+fn vault_argon2_params_toml() -> String {
+    format!(
+        "[argon2]\nm = {m}\nt = {t}\np = {p}\nalg = \"{alg}\"\nver = \"{ver}\"\n",
+        m = VAULT_ARGON2_M_KIB,
+        t = VAULT_ARGON2_T_COST,
+        p = VAULT_ARGON2_P_COST,
+        alg = VAULT_ARGON2_ALG,
+        ver = VAULT_ARGON2_VER,
+    )
+}
+
 fn check_or_write_vault_params(config: &DaemonConfig) -> Result<(), VaultError> {
     let params_path = config.data_dir.join("vault.params");
     if params_path.exists() {
@@ -2835,1664 +4511,16 @@ fn generate_passphrase() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::infra::config::{DaemonConfig, KeyringConfig};
-    use crate::infra::store::DaemonStore;
-
-    fn test_key() -> [u8; 32] {
-        [42u8; 32]
-    }
-
-    fn other_key() -> [u8; 32] {
-        [99u8; 32]
-    }
-
-    /// implementation-note-35 C5: a roundtrip through `add` → `get`
-    /// succeeds when the row carries per-row AAD bound to the row's
-    /// UUID. The shape of the test is intentionally minimal — the
-    /// existing `add_list_get_roundtrip` test exercises the happy path
-    /// for any AAD scheme; this one names the property explicitly so
-    /// the wire format is locked.
-    #[test]
-    fn aad_roundtrip() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        let info = vault
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "aad-test/key",
-                b"some-secret-value",
-                None,
-            )
-            .unwrap();
-        assert!(info.id.starts_with("cred-"));
-
-        // Same Vault decrypts cleanly via the AAD-aware get path.
-        let value = vault
-            .get(VaultScope::Interactive, &store, "aad-test/key")
-            .unwrap();
-        assert_eq!(value, b"some-secret-value");
-    }
-
-    /// implementation-note-35 C5: a credentials row whose ciphertext
-    /// was written WITHOUT AAD (legacy daemon before C5 shipped) must
-    /// still decrypt through `Vault::get` via the no-AAD fallback path.
-    /// The test synthesises a legacy row directly via SQL so the
-    /// fallback branch is exercised deterministically.
-    #[test]
-    fn legacy_no_aad_decrypts() {
-        use chacha20poly1305::aead::Aead;
-
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        // Hand-roll a no-AAD ciphertext for the row, then INSERT it
-        // directly. Mirrors what an old daemon's `add` would have done.
-        let cipher =
-            chacha20poly1305::XChaCha20Poly1305::new_from_slice(&vault.interactive_key).unwrap();
-        let mut nonce_bytes = [0u8; 24];
-        getrandom::fill(&mut nonce_bytes).unwrap();
-        let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, b"legacy-plaintext".as_ref()).unwrap();
-
-        let id = format!("cred-{}", uuid::Uuid::new_v4());
-        let created_at = chrono::Utc::now().to_rfc3339();
-        store
-            .conn()
-            .execute(
-                "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                rusqlite::params![
-                    id,
-                    "legacy-row",
-                    nonce_bytes.as_slice(),
-                    ciphertext.as_slice(),
-                    created_at,
-                ],
-            )
-            .unwrap();
-
-        // Reading via the AAD-aware get must fall back to no-AAD and
-        // recover the plaintext (rather than failing with a crypto
-        // error).
-        let value = vault
-            .get(VaultScope::Interactive, &store, "legacy-row")
-            .unwrap();
-        assert_eq!(value, b"legacy-plaintext");
-    }
-
-    /// implementation-note-35 C4: when `vault.params` contains values
-    /// that do not match the compile-time-pinned Argon2 parameters,
-    /// `Vault::open_from_config` refuses to proceed with
-    /// `VaultError::Crypto("argon2 params mismatch...")`. The file is
-    /// the trust anchor for "this vault was sealed under the pinned
-    /// KDF" — a mismatch means either a future param-rotation campaign
-    /// is needed or the file was tampered with.
-    #[test]
-    fn vault_refuses_open_on_argon2_params_mismatch() {
-        // Hold the process-wide test lock — env::set_var on a process-
-        // global env var races with peer tests under cargo's parallel
-        // runner. The lock serializes them.
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "c4-mismatch-test") };
-
-        let mut config = DaemonConfig::for_test(tmp.path());
-
-        // Write a vault.params with the wrong t-cost (1 instead of 2).
-        let bad_params = r#"[argon2]
-m = 19456
-t = 1
-p = 1
-alg = "Argon2id"
-ver = "V0x13"
-"#;
-        std::fs::write(tmp.path().join("vault.params"), bad_params).unwrap();
-
-        let result = Vault::open_from_config(&config);
-        // SAFETY: test-only.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-
-        match result {
-            Err(VaultError::Crypto(msg)) => {
-                assert!(
-                    msg.contains("argon2 params mismatch"),
-                    "expected 'argon2 params mismatch' in error, got: {msg}"
-                );
-            }
-            other => panic!(
-                "expected VaultError::Crypto with 'argon2 params mismatch', got: {other:?}",
-                other = other.map(|_| "Ok(Vault)").map_err(|e| e.to_string())
-            ),
-        }
-    }
-
-    /// implementation-note-35 C4 partner: a fresh vault (no
-    /// `vault.params` on disk) lays one down on first open with the
-    /// pinned params, and a subsequent open against the same data_dir
-    /// succeeds (the params file now exists and matches).
-    #[test]
-    fn vault_writes_params_file_on_first_open() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "c4-first-open") };
-
-        let mut config = DaemonConfig::for_test(tmp.path());
-
-        // No vault.params exists yet.
-        let params_path = tmp.path().join("vault.params");
-        assert!(!params_path.exists(), "precondition: vault.params absent");
-
-        // First open: provisions both salt and params.
-        let _v = Vault::open_from_config(&config).expect("first open should succeed");
-        assert!(
-            params_path.exists(),
-            "first open must write vault.params alongside vault.salt"
-        );
-
-        // SAFETY: test-only.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-
-        // The file content must parse and match the pinned params.
-        let contents = std::fs::read_to_string(&params_path).unwrap();
-        assert!(contents.contains("m = 19456"));
-        assert!(contents.contains("t = 2"));
-        assert!(contents.contains("p = 1"));
-        assert!(contents.contains("Argon2id"));
-        assert!(contents.contains("V0x13"));
-    }
-
-    /// implementation-note-35 C1: `Vault` must implement
-    /// `ZeroizeOnDrop` so the MEK is wiped from memory when the Vault is
-    /// dropped (explicit lock, daemon shutdown, or any Rc going to zero
-    /// references). Compile-time trait assertion: the function body
-    /// compiles iff `Vault: ZeroizeOnDrop`.
-    #[test]
-    fn vault_is_zeroize() {
-        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-        assert_zeroize_on_drop::<Vault>();
-    }
-
-    /// Vault::replace per KEYCHAIN-CONSOLIDATE-CLI adversarial-review
-    /// HIGH-3: atomic swap via a single SQLite transaction; no
-    /// observable "no key" window between DELETE and INSERT.
-    #[test]
-    fn replace_overwrites_existing_atomically() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-        vault
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "rotation-target",
-                b"old",
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            vault
-                .get(VaultScope::Interactive, &store, "rotation-target")
-                .unwrap(),
-            b"old"
-        );
-        assert!(
-            vault
-                .replace(
-                    VaultScope::Interactive,
-                    &store,
-                    "rotation-target",
-                    b"new",
-                    None
-                )
-                .is_ok()
-        );
-        assert_eq!(
-            vault
-                .get(VaultScope::Interactive, &store, "rotation-target")
-                .unwrap(),
-            b"new"
-        );
-        // List should still show exactly one row (replace, not append).
-        let names: Vec<String> = vault
-            .list(VaultScope::Interactive, &store)
-            .unwrap()
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        assert_eq!(names, vec!["rotation-target".to_string()]);
-    }
-
-    #[test]
-    fn replace_succeeds_on_absent_name() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-        assert!(
-            vault
-                .replace(
-                    VaultScope::Interactive,
-                    &store,
-                    "fresh-name",
-                    b"value",
-                    None
-                )
-                .is_ok()
-        );
-        assert_eq!(
-            vault
-                .get(VaultScope::Interactive, &store, "fresh-name")
-                .unwrap(),
-            b"value"
-        );
-    }
-
-    #[test]
-    fn replace_validates_name_grammar() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-        let outcome = vault.replace(VaultScope::Interactive, &store, "Invalid-Name", b"x", None);
-        match outcome {
-            Err(VaultError::InvalidName(_)) => (),
-            other => panic!(
-                "expected VaultError::InvalidName for uppercase name, got {other:?}",
-                other = other.err()
-            ),
-        }
-    }
-
-    #[test]
-    fn add_list_get_roundtrip() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        let info = vault
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "my-api-key",
-                b"supersecret",
-                None,
-            )
-            .unwrap();
-        assert_eq!(info.name, "my-api-key");
-        assert!(info.id.starts_with("cred-"));
-
-        let list = vault.list(VaultScope::Interactive, &store).unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "my-api-key");
-
-        let value = vault
-            .get(VaultScope::Interactive, &store, "my-api-key")
-            .unwrap();
-        assert_eq!(value, b"supersecret");
-    }
-
-    #[test]
-    fn headless_scope_isolated_from_interactive_namespace() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let interactive_vault = Vault::new(test_key());
-        let headless_vault = Vault::new(other_key());
-
-        interactive_vault
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "provider/token",
-                b"interactive-secret",
-                None,
-            )
-            .unwrap();
-        headless_vault
-            .add(
-                VaultScope::Headless,
-                &store,
-                "provider/token",
-                b"headless-secret",
-                None,
-            )
-            .unwrap();
-
-        let interactive = interactive_vault
-            .get(VaultScope::Interactive, &store, "provider/token")
-            .unwrap();
-        let headless = headless_vault
-            .get(VaultScope::Headless, &store, "provider/token")
-            .unwrap();
-        assert_eq!(interactive, b"interactive-secret");
-        assert_eq!(headless, b"headless-secret");
-
-        let interactive_names = interactive_vault
-            .list(VaultScope::Interactive, &store)
-            .unwrap()
-            .into_iter()
-            .map(|info| info.name)
-            .collect::<Vec<_>>();
-        let headless_names = headless_vault
-            .list(VaultScope::Headless, &store)
-            .unwrap()
-            .into_iter()
-            .map(|info| info.name)
-            .collect::<Vec<_>>();
-        assert_eq!(interactive_names, vec!["provider/token".to_string()]);
-        assert_eq!(headless_names, vec!["provider/token".to_string()]);
-    }
-
-    #[test]
-    fn duplicate_name_returns_error() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        vault
-            .add(VaultScope::Interactive, &store, "token", b"value1", None)
-            .unwrap();
-        let result = vault.add(VaultScope::Interactive, &store, "token", b"value2", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn get_nonexistent_returns_not_found() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        let result = vault.get(VaultScope::Interactive, &store, "does-not-exist");
-        assert!(matches!(result, Err(VaultError::NotFound)));
-    }
-
-    #[test]
-    fn remove_then_get_returns_not_found() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        vault
-            .add(VaultScope::Interactive, &store, "ephemeral", b"data", None)
-            .unwrap();
-        vault
-            .remove(VaultScope::Interactive, &store, "ephemeral")
-            .unwrap();
-
-        let result = vault.get(VaultScope::Interactive, &store, "ephemeral");
-        assert!(matches!(result, Err(VaultError::NotFound)));
-    }
-
-    #[test]
-    fn wrong_key_cannot_decrypt() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        vault
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "secret",
-                b"confidential",
-                None,
-            )
-            .unwrap();
-
-        let wrong_vault = Vault::new(other_key());
-        let result = wrong_vault.get(VaultScope::Interactive, &store, "secret");
-        assert!(matches!(result, Err(VaultError::Crypto(_))));
-    }
-
-    #[test]
-    fn list_does_not_include_values() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = Vault::new(test_key());
-
-        vault
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "key1",
-                b"secret1",
-                Some("tag=prod"),
-            )
-            .unwrap();
-        vault
-            .add(VaultScope::Interactive, &store, "key2", b"secret2", None)
-            .unwrap();
-
-        let list = vault.list(VaultScope::Interactive, &store).unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].metadata.as_deref(), Some("tag=prod"));
-        assert_eq!(list[1].metadata, None);
-    }
-
-    #[test]
-    fn open_from_config_roundtrip() {
-        // Hold the process-wide test lock — env::set_var on a process-global
-        // env var races with peer tests (`env_var_removed_after_*`) under
-        // cargo's parallel runner. The lock serializes them.
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Use a tempdir so salt is isolated; use env-var passphrase to avoid touching keyring.
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only — process-global env mutation gated by PROCESS_TEST_LOCK above.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-roundtrip-passphrase") };
-
-        let mut config = DaemonConfig::for_test(tmp.path());
-
-        let store = DaemonStore::open_in_memory().unwrap();
-
-        // First vault: write a credential.
-        let vault1 = Vault::open_from_config(&config).expect("open vault 1");
-        vault1
-            .add(
-                VaultScope::Interactive,
-                &store,
-                "round-trip-key",
-                b"secret-value",
-                None,
-            )
-            .unwrap();
-
-        // Re-set the env var: open_from_config removes it after first read.
-        // The second vault must be derived from the same passphrase to
-        // decrypt what vault1 wrote.
-        // SAFETY: test-only, single-threaded, no other threads reading env vars.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-roundtrip-passphrase") };
-
-        // Second vault from same config: must decrypt successfully.
-        let vault2 = Vault::open_from_config(&config).expect("open vault 2");
-        let value = vault2
-            .get(VaultScope::Interactive, &store, "round-trip-key")
-            .unwrap();
-        assert_eq!(value, b"secret-value");
-
-        let list = vault2.list(VaultScope::Interactive, &store).unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "round-trip-key");
-
-        // SAFETY: test-only, single-threaded, no other threads reading env vars.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-    }
-
-    // implementation-note-193 (B1) anchor: the production
-    // `open_from_config` path now generates an independent Headless MEK,
-    // AEAD-wraps it under the Interactive MEK, and persists it to
-    // `<data_dir>/vault.headless-mek.wrapped`. The two lanes hold
-    // cryptographically distinct keys after open.
-    #[test]
-    fn vault_open_generates_independent_headless_mek_with_wrap_file() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only env, gated by PROCESS_TEST_LOCK.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "split-mek-test-passphrase") };
-
-        let config = DaemonConfig::for_test(tmp.path());
-        let vault = Vault::open_from_config(&config).expect("open vault");
-
-        // Checkpoint #1: the wrap file exists post-open.
-        let wrap_path = tmp.path().join(HEADLESS_MEK_WRAP_FILE);
-        assert!(
-            wrap_path.exists(),
-            "headless MEK wrap file must be created on first vault open at {}",
-            wrap_path.display()
-        );
-
-        // Checkpoint #2: the two keys differ. The Interactive MEK is
-        // Argon2id-derived; the Headless MEK is fresh OS entropy. Their
-        // collision probability is 2^-256.
-        assert_ne!(
-            vault.interactive_key, vault.headless_key,
-            "Interactive and Headless MEKs must be cryptographically independent"
-        );
-
-        // Checkpoint #3: a Headless-scope row can be sealed and opened
-        // round-trip with the same vault (smoke). The cross-scope
-        // tamper case is the next test.
-        let store = DaemonStore::open_in_memory().unwrap();
-        vault
-            .add(
-                VaultScope::Headless,
-                &store,
-                "headless-only-key",
-                b"headless-only-value",
-                None,
-            )
-            .expect("seal headless row");
-        let got = vault
-            .get(VaultScope::Headless, &store, "headless-only-key")
-            .expect("open headless row");
-        assert_eq!(got, b"headless-only-value");
-
-        // SAFETY: test-only env cleanup.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-    }
-
-    // implementation-note-193 (B1) + adversarial CRIT-1 fix
-    // checkpoint — `Vault::new_headless_only` refuses Interactive-lane
-    // operations at the API boundary. Pre-fix, `current_headless_vault`
-    // built `Vault::new(mek)` (single-key, both lanes equal to the
-    // headless MEK); calling `seal()` / `add(Interactive, ...)` on it
-    // would silently route headless-MEK through the Interactive lane.
-    // Now structurally impossible: every Interactive op gates on
-    // `is_headless_only()`.
-    #[test]
-    fn headless_only_vault_refuses_interactive_lane_operations() {
-        let headless = Vault::new_headless_only([0x77u8; 32]);
-        let store = DaemonStore::open_in_memory().unwrap();
-
-        // seal/open refuse — daemon-internal F-05 path.
-        match headless.seal(b"payload") {
-            Err(VaultError::HeadlessOnly) => {}
-            other => panic!("expected HeadlessOnly on seal, got {other:?}"),
-        }
-        match headless.open(&[0u8; 24], &[0u8; 32]) {
-            Err(VaultError::HeadlessOnly) => {}
-            other => panic!("expected HeadlessOnly on open, got {other:?}"),
-        }
-
-        // add(Interactive, …) refuses; add(Headless, …) proceeds.
-        let interactive_add =
-            headless.add(VaultScope::Interactive, &store, "foo", b"v", None);
-        assert!(
-            matches!(interactive_add, Err(VaultError::HeadlessOnly)),
-            "expected HeadlessOnly on add(Interactive)"
-        );
-        assert!(
-            headless
-                .add(VaultScope::Headless, &store, "headless-row", b"v", None)
-                .is_ok(),
-            "headless add must proceed"
-        );
-
-        // get(Interactive, …) refuses; get(Headless, …) proceeds.
-        let interactive_get = headless.get(VaultScope::Interactive, &store, "foo");
-        assert!(
-            matches!(interactive_get, Err(VaultError::HeadlessOnly)),
-            "expected HeadlessOnly on get(Interactive)"
-        );
-        assert!(
-            headless
-                .get(VaultScope::Headless, &store, "headless-row")
-                .is_ok(),
-            "headless get must proceed"
-        );
-
-        // replace(Interactive, …) refuses.
-        let interactive_replace =
-            headless.replace(VaultScope::Interactive, &store, "foo", b"v", None);
-        assert!(
-            matches!(interactive_replace, Err(VaultError::HeadlessOnly)),
-            "expected HeadlessOnly on replace(Interactive)"
-        );
-    }
-
-    // B1 anchor: a row sealed under the Headless MEK CANNOT be
-    // decrypted by an attacker holding only the Interactive MEK. This
-    // is the load-bearing threat model design §"Split MEK topology"
-    // locks in — pre-B1 the test would have decrypted successfully
-    // because both lanes shared one key.
-    #[test]
-    fn headless_row_undecryptable_with_interactive_key_only() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: gated by PROCESS_TEST_LOCK.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "cross-scope-tamper-test") };
-
-        let config = DaemonConfig::for_test(tmp.path());
-        let vault = Vault::open_from_config(&config).expect("open vault");
-
-        let store = DaemonStore::open_in_memory().unwrap();
-        vault
-            .add(
-                VaultScope::Headless,
-                &store,
-                "isolation-target",
-                b"sensitive-headless-bytes",
-                None,
-            )
-            .expect("seal headless row");
-
-        // Construct an attacker-controlled Vault that holds ONLY the
-        // Interactive MEK in both lanes (the pre-B1 shape). It must
-        // NOT be able to decrypt the headless row.
-        let interactive_only = Vault::new(vault.interactive_key);
-        let result = interactive_only.get(VaultScope::Headless, &store, "isolation-target");
-        match result {
-            Err(VaultError::Crypto(_)) => {
-                // expected: AEAD verification fails because the
-                // ciphertext was sealed under the Headless MEK.
-            }
-            Ok(plaintext) => panic!(
-                "cryptographic split breached: Interactive-only attacker recovered {} bytes from \
-                 a Headless-scope row",
-                plaintext.len()
-            ),
-            Err(other) => panic!(
-                "expected Crypto error from cross-scope decrypt attempt, got {other:?}"
-            ),
-        }
-
-        // SAFETY: test-only env cleanup.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-    }
-
-    // --- 69G.1 keyring resolution tests ---
-
-    #[test]
-    fn vault_config_field_takes_precedence_over_env() {
-        // SAFETY: test-only env var manipulation.
-        unsafe {
-            std::env::set_var("EMBER_KEYRING_SERVICE", "env-service");
-            std::env::set_var("EMBER_KEYRING_ACCOUNT", "env-account");
-        }
-
-        let config = KeyringConfig {
-            service: Some("config-service".to_string()),
-            account: Some("config-account".to_string()),
-        };
-
-        assert_eq!(resolve_keyring_service(&config), "config-service");
-        assert_eq!(resolve_keyring_account(&config), "config-account");
-
-        unsafe {
-            std::env::remove_var("EMBER_KEYRING_SERVICE");
-            std::env::remove_var("EMBER_KEYRING_ACCOUNT");
-        }
-    }
-
-    #[test]
-    fn vault_env_var_override_when_config_field_none() {
-        // SAFETY: test-only env var manipulation.
-        unsafe {
-            std::env::set_var("EMBER_KEYRING_SERVICE", "env-service");
-            std::env::set_var("EMBER_KEYRING_ACCOUNT", "env-account");
-        }
-
-        let config = KeyringConfig {
-            service: None,
-            account: None,
-        };
-
-        assert_eq!(resolve_keyring_service(&config), "env-service");
-        assert_eq!(resolve_keyring_account(&config), "env-account");
-
-        unsafe {
-            std::env::remove_var("EMBER_KEYRING_SERVICE");
-            std::env::remove_var("EMBER_KEYRING_ACCOUNT");
-        }
-    }
-
-    #[test]
-    fn vault_falls_back_to_compile_time_default_when_both_unset() {
-        // SAFETY: test-only env var manipulation. Remove any interference from environment.
-        unsafe {
-            std::env::remove_var("EMBER_KEYRING_SERVICE");
-            std::env::remove_var("EMBER_KEYRING_ACCOUNT");
-        }
-
-        let config = KeyringConfig {
-            service: None,
-            account: None,
-        };
-
-        assert_eq!(resolve_keyring_service(&config), DEFAULT_KEYRING_SERVICE);
-        assert_eq!(resolve_keyring_account(&config), DEFAULT_KEYRING_ACCOUNT);
-    }
-
-    // --- 69G.2 startup banner tests ---
-
-    #[test]
-    fn startup_banner_logs_keyring_identity() {
-        // Smoke test: log_vault_identity must not panic with a typical config.
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = DaemonConfig::for_test(tmp.path());
-        config.keyring = KeyringConfig {
-            service: Some("test-service".to_string()),
-            account: Some("test-account".to_string()),
-        };
-        // No panic = pass.
-        log_vault_identity(&config, None);
-    }
-
-    #[test]
-    fn startup_banner_warns_on_default_service_with_custom_config() {
-        // When config.keyring.service is None and EMBER_KEYRING_SERVICE is not set,
-        // the fallback is the production default. If a non-default config path was
-        // given, log_vault_identity should emit a WARN (we test no-panic here; the
-        // tracing_test subscriber is not set up in this unit test, so we just verify
-        // the code path executes without error).
-        let tmp = tempfile::tempdir().unwrap();
-        let custom_config = tmp.path().join("custom.toml");
-        std::fs::write(&custom_config, "").unwrap();
-
-        let mut config = DaemonConfig::for_test(tmp.path());
-        config.keyring = KeyringConfig::default(); // no service override
-
-        unsafe {
-            std::env::remove_var("EMBER_KEYRING_SERVICE");
-        }
-
-        // Should not panic; warn path exercised.
-        log_vault_identity(&config, Some(&custom_config));
-    }
-
-    #[test]
-    fn startup_banner_does_not_warn_on_default_config() {
-        // When the config path IS the default path, no WARN should fire.
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = DaemonConfig::for_test(tmp.path());
-        config.keyring = KeyringConfig::default();
-
-        unsafe {
-            std::env::remove_var("EMBER_KEYRING_SERVICE");
-        }
-
-        let default_path = DaemonConfig::default_config_path();
-        // No panic regardless of whether the file exists.
-        log_vault_identity(&config, Some(&default_path));
-    }
-
-    // --- production-checkpoint tests ---
-    //
-    // The helper is parameterized on home_dir so tests can point at a tempdir
-    // and never touch the real `$HOME`. The real production service string is
-    // also passed in as a parameter so the test doesn't depend on the global
-    // `DEFAULT_KEYRING_SERVICE` constant value.
-
-    #[test]
-    fn sentinel_absent_production_service_refuses() {
-        let tmp = tempfile::tempdir().unwrap();
-        // No checkpoint file created.
-        let result = check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
-        match result {
-            Err(VaultError::ProductionSentinelMissing(msg)) => {
-                assert!(msg.contains(".ember-production"));
-                assert!(msg.contains("ember-daemon"));
-                assert!(msg.contains("touch ~/.ember-production"));
-            }
-            other => panic!("expected ProductionSentinelMissing, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn sentinel_absent_custom_service_allowed() {
-        let tmp = tempfile::tempdir().unwrap();
-        // No checkpoint; operator has opted out via custom service name.
-        check_production_sentinel("ember-daemon-test", "ember-daemon", tmp.path())
-            .expect("custom service should bypass checkpoint");
-        check_production_sentinel("ember-daemon-qa", "ember-daemon", tmp.path())
-            .expect("qa service should bypass checkpoint");
-    }
-
-    #[test]
-    fn sentinel_present_production_service_allowed() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(".ember-production"), b"").unwrap();
-        check_production_sentinel("ember-daemon", "ember-daemon", tmp.path())
-            .expect("checkpoint present should allow production service");
-    }
-
-    #[test]
-    fn sentinel_check_uses_correct_filename() {
-        // A near-miss filename must not satisfy the check.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("ember-production"), b"").unwrap();
-        std::fs::write(tmp.path().join(".ember_production"), b"").unwrap();
-        let result = check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
-        assert!(
-            matches!(result, Err(VaultError::ProductionSentinelMissing(_))),
-            "near-miss filenames must not satisfy checkpoint"
-        );
-    }
-
-    // --- EMBER_VAULT_PASSPHRASE cleared after first read ---
-
-    #[test]
-    fn env_var_removed_after_open_from_config() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-test-passphrase") };
-
-        let mut config = DaemonConfig::for_test(tmp.path());
-
-        let _vault = Vault::open_from_config(&config).expect("open vault");
-
-        assert!(
-            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
-            "EMBER_VAULT_PASSPHRASE must be absent from the environment after open_from_config"
-        );
-    }
-
-    #[test]
-    fn bootstrap_open_from_config_leaves_presence_locked() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let config = DaemonConfig::for_test(tmp.path());
-        crate::trust::presence::lock();
-        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "bootstrap-open-passphrase") };
-
-        let _vault = Vault::open_bootstrap_from_config(&config).expect("bootstrap vault open");
-
-        let (is_unlocked, idle_secs) = crate::trust::presence::snapshot();
-        assert!(
-            !is_unlocked,
-            "bootstrap vault open must not look like an interactive operator unlock"
-        );
-        assert!(
-            idle_secs.is_none(),
-            "bootstrap vault open must leave presence in Locked state"
-        );
-        // SAFETY: the happy path removes the env var itself; remove again so a
-        // failure above cannot leak process-global state into later tests.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-    }
-
-    #[test]
-    fn env_var_removed_after_resolve_passphrase_no_provision() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-no-provision") };
-
-        let result = resolve_passphrase_no_provision("svc", "acct");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some("sec14-no-provision".to_string()));
-
-        assert!(
-            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
-            "EMBER_VAULT_PASSPHRASE must be absent after resolve_passphrase_no_provision"
-        );
-    }
-
-    #[test]
-    fn bootstrap_auto_unseal_leaves_presence_locked() {
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let config = DaemonConfig::for_test(tmp.path());
-        crate::trust::presence::lock();
-        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "bootstrap-auto-passphrase") };
-
-        match try_bootstrap_auto_unseal_from_keyring(&config) {
-            AutoUnsealOutcome::Unsealed(_) => {}
-            AutoUnsealOutcome::NoKeyringEntry => {
-                panic!("env passphrase should satisfy bootstrap auto-unseal")
-            }
-            AutoUnsealOutcome::Error(err) => {
-                panic!("bootstrap auto-unseal should succeed: {err}")
-            }
-        }
-
-        let (is_unlocked, idle_secs) = crate::trust::presence::snapshot();
-        assert!(
-            !is_unlocked,
-            "bootstrap auto-unseal must not look like an interactive operator unlock"
-        );
-        assert!(
-            idle_secs.is_none(),
-            "bootstrap auto-unseal must leave presence in Locked state"
-        );
-        // SAFETY: the happy path removes the env var itself; remove again so a
-        // failure above cannot leak process-global state into later tests.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-    }
-
-    // --- macOS user-presence gate routing ---
-    //
-    // The shim itself (`vault_macos`) carries unit tests for the
-    // `apply_user_presence` predicate and the SE-safety guard. These tests
-    // assert the routing INSIDE `resolve_passphrase` selects the right
-    // backend per service name, without touching the real Keychain.
-    //
-    // The "first call prompts, subsequent calls cached" property requires a
-    // live Keychain and is exercised by the gated integration test in
-    // `tests/sec7_user_presence.rs` (env-flag opt-in).
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sec7_macos_apply_user_presence_only_for_production_default() {
-        // Production default: gate ON. Anything else: gate OFF (qember demo
-        // flow uses `ember-daemon-qa` and MUST NOT prompt).
-        assert!(crate::infra::vault_macos::apply_user_presence(
-            DEFAULT_KEYRING_SERVICE,
-            DEFAULT_KEYRING_SERVICE
-        ));
-        assert!(!crate::infra::vault_macos::apply_user_presence(
-            "ember-daemon-qa",
-            DEFAULT_KEYRING_SERVICE
-        ));
-        assert!(!crate::infra::vault_macos::apply_user_presence(
-            "ember-daemon-test",
-            DEFAULT_KEYRING_SERVICE
-        ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sec7_qa_service_name_skips_user_presence() {
-        // Pure predicate check — proves the QA service name documented in
-        // qember.sh ("ember-daemon-qa") routes around the SE-backed shim,
-        // so qember demo flows don't fire a biometric prompt every iteration.
-        // Avoids env-var manipulation (which races with parallel tests) by
-        // exercising the routing decision directly.
-        assert!(
-            !crate::infra::vault_macos::apply_user_presence(
-                "ember-daemon-qa",
-                DEFAULT_KEYRING_SERVICE
-            ),
-            "qember.sh QA service must NOT trigger the user-presence gate \
-             (would break demo flows)"
-        );
-    }
-
-    // --- salt file permissions ---
-
-    #[cfg(unix)]
-    #[test]
-    fn salt_file_created_with_0o600_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _guard = crate::PROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec17-perms-test") };
-
-        let mut config = DaemonConfig::for_test(tmp.path());
-
-        // vault_salt is called internally by open_from_config; this triggers the
-        // salt-file creation path.
-        let _vault = Vault::open_from_config(&config).expect("open vault for sec17");
-
-        let salt_path = tmp.path().join("vault.salt");
-        let mode = std::fs::metadata(&salt_path)
-            .expect("salt file must exist")
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "vault.salt must be 0o600, got {:#o}",
-            mode & 0o777
-        );
-
-        // SAFETY: test-only.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-    }
-
-    // --- implementation-note-370: migrate_mek_acl ---
-
-    // Serial lock: tests that mutate EMBER_VAULT_TEST_KEYRING_PRESENT must not
-    // run concurrently — cargo test threads share the process environment.
-    static MIGRATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn test_migrate_mek_acl_no_entry_returns_error() {
-        // When no MEK entry exists (cfg!(test) gate returns Ok(None)),
-        // migrate_mek_acl should return an error rather than silently succeeding.
-        //
-        // Hold the lock for the whole test so the idempotent test's
-        // set_var("EMBER_VAULT_TEST_KEYRING_PRESENT") does not race with our
-        // remove_var below.
-        let _guard = MIGRATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT") };
-        // Use a non-production service so the biometric path is NOT taken on macOS —
-        // we want the system_keyring code path to exercise the Ok(None) branch.
-        let result = migrate_mek_acl("ember-daemon-test", "vault");
-        assert!(
-            result.is_err(),
-            "migrate_mek_acl must fail when no MEK entry exists; got: {result:?}"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no MEK entry"),
-            "error should mention missing entry; got: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn test_migrate_mek_acl_idempotent_non_mac_service() {
-        // For a non-production / QA service on any platform, or for non-macOS,
-        // migrate_mek_acl returns system_keyring → system_keyring (idempotent).
-        // Simulate a keyring entry being present.
-        let _guard = MIGRATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1") };
-        let result = migrate_mek_acl("ember-daemon-qa", "vault");
-        unsafe { std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT") };
-
-        let result =
-            result.expect("migrate_mek_acl must succeed for qa service with entry present");
-        assert_eq!(
-            result.before_acl_kind, "system_keyring",
-            "qa service: before_acl_kind must be system_keyring"
-        );
-        assert_eq!(
-            result.after_acl_kind, "system_keyring",
-            "qa service: after_acl_kind must be system_keyring"
-        );
-        assert_eq!(result.service, "ember-daemon-qa");
-        assert_eq!(result.account, "vault");
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod name_validation_tests {
-    use super::*;
+mod name_validation_tests;
 
-    #[test]
-    fn accepts_canonical_names() {
-        for name in [
-            "gh-token",
-            "cloudflare/zone/abc",
-            "cloudflare/account-c5/api-token",
-            "x",
-            "long-name-here",
-        ] {
-            assert!(
-                validate_credential_name(name).is_ok(),
-                "rejected canonical: {name}"
-            );
-        }
-    }
+#[cfg(test)]
+mod key_store_tests;
 
-    #[test]
-    fn rejects_uppercase() {
-        assert!(validate_credential_name("GH-Token").is_err());
-        assert!(validate_credential_name("github/Foo").is_err());
-    }
+#[cfg(test)]
+mod sealed_blob_tests;
 
-    #[test]
-    fn rejects_underscores_dots_spaces() {
-        for bad in ["foo_bar", "foo.bar", "foo bar", "foo@bar"] {
-            assert!(
-                validate_credential_name(bad).is_err(),
-                "accepted bad: {bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_leading_hyphen_or_slash() {
-        assert!(validate_credential_name("-foo").is_err());
-        assert!(validate_credential_name("/foo").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_segments() {
-        assert!(validate_credential_name("foo//bar").is_err());
-        assert!(validate_credential_name("foo/").is_err());
-    }
-
-    #[test]
-    fn rejects_too_deep() {
-        // 8 segments — exceeds the design §5.1 hard cap of 7.
-        assert!(validate_credential_name("a/b/c/d/e/f/g/h").is_err());
-    }
-
-    #[test]
-    fn accepts_max_depth() {
-        // 7 segments — at the design §5.1 hard cap.
-        assert!(validate_credential_name("a/b/c/d/e/f/g").is_ok());
-    }
-
-    /// implementation-note-371 Phase 1 — the v2 path grammar
-    /// (design §5.3) introduces credential-type intermediate segments like
-    /// `github/apps/<slug>/install-<id>/private-key` which are 5 segments
-    /// deep. The previous `> 4` cap rejected these; the lifted `> 7` cap
-    /// admits the v2 shapes used by `ember broker register github`.
-    #[test]
-    fn validate_credential_name_accepts_five_segment_v2_path() {
-        assert!(
-            validate_credential_name("github/apps/test-slug/install-12345/private-key").is_ok(),
-            "5-segment v2 path should be accepted under design §5.3"
-        );
-    }
-
-    /// Partner test — 8 segments must still be rejected at the new hard cap.
-    #[test]
-    fn validate_credential_name_rejects_eight_segment_path() {
-        let outcome = validate_credential_name("a/b/c/d/e/f/g/h");
-        match outcome {
-            Err(VaultNameError::TooManySegments { count }) => assert_eq!(count, 8),
-            other => panic!("expected TooManySegments {{ count: 8 }}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_too_long() {
-        assert!(validate_credential_name(&"a".repeat(129)).is_err());
-    }
-
-    // --- .A VaultKeyStore tests ---
-
-    #[test]
-    fn vault_key_store_passphrase_variant_constructs() {
-        // Shape-only test: confirms `VaultKeyStore::Passphrase(Argon2Salt)`
-        // constructs and the salt round-trips through the variant. We
-        // deliberately don't run `open_with_key_store` here because the
-        // Passphrase lane reads/clears `EMBER_VAULT_PASSPHRASE`, which
-        // races with the existing `open_from_config_roundtrip` test
-        // under cargo's default parallel test runner. The actual unlock
-        // path is exercised end-to-end by `open_from_config_roundtrip`
-        // since both share `Vault::from_passphrase`.
-        let salt_bytes: [u8; 16] = [3u8; 16];
-        let key_store = VaultKeyStore::Passphrase(Argon2Salt::from(salt_bytes));
-        match key_store {
-            VaultKeyStore::Passphrase(s) => assert_eq!(s.as_bytes(), &salt_bytes),
-            _ => panic!("expected Passphrase variant"),
-        }
-    }
-
-    #[test]
-    fn vault_key_store_env_passphrase_variant_constructs() {
-        // Shape-only test: `EnvPassphrase` is a unit variant so the test is
-        // trivial, but locking the variant into the test surface guards
-        // against accidental rename/removal during .A-SE-WIRE follow-up.
-        let key_store = VaultKeyStore::EnvPassphrase;
-        match key_store {
-            VaultKeyStore::EnvPassphrase => {}
-            _ => panic!("expected EnvPassphrase variant"),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn vault_key_store_secure_enclave_returns_not_implemented() {
-        // The SecureEnclave variant is a stub for .A-SE-WIRE; it must
-        // return a clear "not yet implemented" error pointing at the
-        // follow-up task so callers know which lane to use today.
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = DaemonConfig::for_test(tmp.path());
-
-        let key_store = VaultKeyStore::SecureEnclave(SEWrappedKey {
-            key_label: "ember-vault-mek-stub".to_string(),
-        });
-
-        let result = Vault::open_with_key_store(&config, &key_store);
-        match result {
-            Err(VaultError::Crypto(msg)) => {
-                assert!(
-                    msg.contains("not yet implemented"),
-                    "expected 'not yet implemented' message, got: {msg}"
-                );
-                assert!(
-                    msg.contains(".A-SE-WIRE"),
-                    "expected pointer to follow-up task .A-SE-WIRE, got: {msg}"
-                );
-            }
-            Err(other) => panic!("expected Crypto error from SE stub, got: {other}"),
-            Ok(_) => panic!("expected Err from SE stub, got Ok(_)"),
-        }
-    }
-
-    #[test]
-    fn argon2_salt_round_trips_bytes() {
-        let bytes: [u8; 16] = [7u8; 16];
-        let salt = Argon2Salt::from(bytes);
-        assert_eq!(salt.as_bytes(), &bytes);
-    }
-
-    // sealed_mek_blob_format_landed tests.
-    // implementation-note-367 — T1 round-trip
-    // and the five negative cases (wrong passphrase, tampered magic,
-    // tampered ciphertext, tampered fingerprint, version mismatch).
-
-    /// Random MEK + passphrase → export → import yields the same MEK.
-    #[test]
-    fn test_sealed_blob_round_trip() {
-        let mut mek = [0u8; 32];
-        getrandom::fill(&mut mek).unwrap();
-        let passphrase = "correct horse battery staple";
-        let fp = mek_fingerprint_hex(&mek);
-
-        let blob = export_mek_sealed(&mek, passphrase, &fp).expect("export");
-        let recovered = import_mek_sealed(&blob, passphrase, &fp).expect("import");
-        assert_eq!(recovered.as_slice(), &mek);
-    }
-
-    /// Successive exports of the same (MEK, passphrase) produce
-    /// distinct blobs (fresh salt + fresh nonce).
-    #[test]
-    fn test_sealed_blob_export_is_randomised() {
-        let mek = [3u8; 32];
-        let passphrase = "rotate-test";
-        let fp = mek_fingerprint_hex(&mek);
-
-        let a = export_mek_sealed(&mek, passphrase, &fp).unwrap();
-        let b = export_mek_sealed(&mek, passphrase, &fp).unwrap();
-        assert_ne!(a, b, "two exports of same MEK must produce distinct blobs");
-
-        // Both still import to the same MEK.
-        let ra = import_mek_sealed(&a, passphrase, &fp).unwrap();
-        let rb = import_mek_sealed(&b, passphrase, &fp).unwrap();
-        assert_eq!(ra.as_slice(), &mek);
-        assert_eq!(rb.as_slice(), &mek);
-    }
-
-    /// Export with a fingerprint that does not match the MEK bytes is
-    /// refused — keeps inconsistent blobs from ever being produced.
-    #[test]
-    fn test_sealed_blob_export_refuses_wrong_fingerprint() {
-        let mek = [5u8; 32];
-        let fp = mek_fingerprint_hex(&[6u8; 32]); // intentionally wrong
-        let err = export_mek_sealed(&mek, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobFingerprintMismatch { .. }),
-            "expected fingerprint mismatch, got: {err}"
-        );
-    }
-
-    /// Wrong passphrase on import → AEAD failure (NOT a fingerprint
-    /// mismatch, because the embedded fingerprint still matches the
-    /// caller-supplied one — only the AEAD tag tells the truth).
-    #[test]
-    fn test_sealed_blob_wrong_passphrase_aead_fail() {
-        let mek = [7u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-
-        let blob = export_mek_sealed(&mek, "correct", &fp).unwrap();
-        let err = import_mek_sealed(&blob, "wrong", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobAeadFailure),
-            "expected AEAD failure, got: {err}"
-        );
-    }
-
-    /// Magic field tampered → bad-magic refusal before any crypto runs.
-    #[test]
-    fn test_sealed_blob_tampered_magic() {
-        let mek = [8u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-
-        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
-        blob[0] ^= 0xFF;
-        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobBadMagic { .. }),
-            "expected bad-magic refusal, got: {err}"
-        );
-    }
-
-    /// Ciphertext byte flipped → AEAD failure.
-    #[test]
-    fn test_sealed_blob_tampered_ciphertext() {
-        let mek = [9u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-
-        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
-        // The last ciphertext byte is at the very end of the blob.
-        let last = blob.len() - 1;
-        blob[last] ^= 0x01;
-        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobAeadFailure),
-            "expected AEAD failure on tampered ciphertext, got: {err}"
-        );
-    }
-
-    /// Fingerprint field tampered → import refuses with fingerprint
-    /// mismatch (the embedded fp no longer equals the caller-supplied
-    /// expected fp). Also confirms the embedded-fp check happens before
-    /// the (expensive) argon2 derive.
-    #[test]
-    fn test_sealed_blob_tampered_fingerprint() {
-        let mek = [10u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-        let blob = export_mek_sealed(&mek, "p", &fp).unwrap();
-
-        // Locate the fp_len byte (everything before it is fixed-size).
-        // Offset = 4 (magic) + 2 (version) + 1 (kdf) + 1 (aead) + 1
-        //  (salt_len) + 32 (salt) + 4 (ops) + 4 (mem) + 1 (par) + 1
-        //  (nonce_len) + 24 (nonce) = 75.
-        let fp_len_offset = 4 + 2 + 1 + 1 + 1 + 32 + 4 + 4 + 1 + 1 + 24;
-        let fp_offset = fp_len_offset + 1;
-        let fp_len = blob[fp_len_offset] as usize;
-        assert_eq!(fp_len, fp.len(), "fp_len byte matches fingerprint length");
-
-        let mut tampered = blob.clone();
-        // Flip a byte inside the fingerprint string.
-        tampered[fp_offset] ^= 0x20; // ASCII case-flip of a hex digit
-        let err = import_mek_sealed(&tampered, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobFingerprintMismatch { .. }),
-            "expected fingerprint mismatch on tampered fp, got: {err}"
-        );
-    }
-
-    /// Version byte forced to a value this build does not know → refusal.
-    #[test]
-    fn test_sealed_blob_version_mismatch() {
-        let mek = [11u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
-
-        // Version field is at offset 4 (LE u16). Bump to 0xFFFF.
-        blob[4] = 0xFF;
-        blob[5] = 0xFF;
-        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
-        match err {
-            VaultError::SealedBlobUnknownVersion { got } => assert_eq!(got, 0xFFFF),
-            other => panic!("expected unknown-version, got: {other}"),
-        }
-    }
-
-    /// kdf_id and aead_id values outside the recognised set are refused.
-    #[test]
-    fn test_sealed_blob_unknown_kdf_or_aead() {
-        let mek = [12u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-        let original = export_mek_sealed(&mek, "p", &fp).unwrap();
-
-        // kdf_id is at offset 4 (magic) + 2 (version) = 6.
-        let mut bad_kdf = original.clone();
-        bad_kdf[6] = 0xEE;
-        let err = import_mek_sealed(&bad_kdf, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobUnknownKdf { got: 0xEE }),
-            "expected unknown-kdf, got: {err}"
-        );
-
-        // aead_id is at offset 7.
-        let mut bad_aead = original.clone();
-        bad_aead[7] = 0xDD;
-        let err = import_mek_sealed(&bad_aead, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobUnknownAead { got: 0xDD }),
-            "expected unknown-aead, got: {err}"
-        );
-    }
-
-    /// Truncated blob (any cut point past the magic) is refused with a
-    /// truncation error rather than a panic.
-    #[test]
-    fn test_sealed_blob_truncated() {
-        let mek = [13u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-        let blob = export_mek_sealed(&mek, "p", &fp).unwrap();
-        // Cut just past the magic — every subsequent field is missing.
-        let cut = &blob[..6];
-        let err = import_mek_sealed(cut, "p", &fp).unwrap_err();
-        assert!(
-            matches!(err, VaultError::SealedBlobTruncated { .. }),
-            "expected truncation error, got: {err}"
-        );
-    }
-
-    /// argon2 ops field forced below the documented minimum (3) is
-    /// refused. Forging the field requires editing the blob in place,
-    /// which is the same threat model as "attacker presents a sealed
-    /// blob with weak KDF cost".
-    #[test]
-    fn test_sealed_blob_refuses_weak_argon2_ops() {
-        let mek = [14u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
-
-        // argon2_ops is a LE u32 at offset 4 (magic) + 2 (version) + 1
-        // (kdf) + 1 (aead) + 1 (salt_len) + 32 (salt) = 41.
-        let ops_offset = 41;
-        blob[ops_offset] = 1;
-        blob[ops_offset + 1] = 0;
-        blob[ops_offset + 2] = 0;
-        blob[ops_offset + 3] = 0;
-        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
-        assert!(
-            matches!(&err, VaultError::SealedBlobInvalid(s) if s.contains("ops below minimum")),
-            "expected ops-below-minimum invalid, got: {err}"
-        );
-    }
-
-    /// MEK fingerprint format matches `blake3(MEK).hex()` exactly (the
-    /// Slice B encoding). Locks cross-slice compatibility.
-    #[test]
-    fn test_mek_fingerprint_hex_matches_blake3() {
-        let mek = [0u8; 32];
-        let fp = mek_fingerprint_hex(&mek);
-        let expected = hex::encode(blake3::hash(&mek).as_bytes());
-        assert_eq!(fp, expected);
-        // BLAKE3 output is 32 bytes → 64 hex chars.
-        assert_eq!(fp.len(), 64);
-    }
-
-    // ============================================================
-    // implementation-note-325 — T2
-    // round-trip: emit witness → chain-verify via Slice E3's
-    // `verify_receipt_v2_with_rotation_chain`.
-    //
-    // Anchor: rotation_witness_emitted_at_mek_rotation
-    // ============================================================
-
-    /// T2 round-trip — the witness envelope emitted by
-    /// `emit_identity_rotation_witness` bridges a pre-rotation trust
-    /// anchor (the prior signer's pub) forward to a post-rotation
-    /// signer, so a Receipt signed by the new signer verifies against
-    /// the prior anchor via Slice E3's
-    /// `verify_receipt_v2_with_rotation_chain`.
-    #[test]
-    fn rotation_witness_emit_chain_verifies_against_prior_anchor() {
-        use core_crypto::{FixtureSigner, FixtureVerifier, Signer};
-        use core_events::receipt::sign::{
-            RotationWitnessEntry, sign_receipt_v2, verify_receipt_v2_with_rotation_chain,
-        };
-        use ed25519_dalek::SigningKey;
-
-        let store = DaemonStore::open_in_memory().unwrap();
-
-        // Prior identity — about to be retired.
-        let prior_signer = FixtureSigner::new("e2-prior-epoch");
-        let prior_pub = prior_signer.public_key();
-
-        // New identity — generate a fresh dalek key. `SigningKey::from_bytes`
-        // is deterministic so the test is reproducible.
-        let new_seed: [u8; 32] = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-            0xff, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
-            0xd0, 0xe0, 0xf0, 0x01,
-        ];
-        let new_signing_key = SigningKey::from_bytes(&new_seed);
-        let new_verifying_key = new_signing_key.verifying_key();
-
-        // Emit witness from prior signer over new identity pub.
-        let rotation_at = chrono::Utc::now();
-        let witness_env = emit_identity_rotation_witness(
-            &store,
-            &prior_signer,
-            &new_verifying_key,
-            rotation_at,
-        )
-        .expect("witness emission must succeed");
-
-        assert_eq!(
-            witness_env.kind,
-            core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
-            "witness envelope must carry the rotation-witness kind discriminator"
-        );
-        assert!(
-            !witness_env.receipt_id.is_empty(),
-            "sign_receipt_v2 must have populated receipt_id"
-        );
-        assert!(
-            witness_env.signature.is_some(),
-            "sign_receipt_v2 must have populated signature"
-        );
-
-        // Synthesise a fresh `core_crypto::Signer` that produces wire-form
-        // signatures under the new key — needed so the chain-walk
-        // verifier can verify a target receipt signed by the new
-        // identity.
-        struct DalekFixtureSigner {
-            verifying_key: ed25519_dalek::VerifyingKey,
-            signing_key: ed25519_dalek::SigningKey,
-        }
-        impl core_crypto::Signer for DalekFixtureSigner {
-            fn sign(&self, payload: &[u8]) -> core_crypto::Signature {
-                use ed25519_dalek::Signer as _;
-                let sig = self.signing_key.sign(payload);
-                core_crypto::Signature(format!(
-                    "ed25519sig:{}",
-                    hex::encode(sig.to_bytes())
-                ))
-            }
-            fn public_key(&self) -> core_crypto::PublicKey {
-                core_crypto::PublicKey(format!(
-                    "ed25519:{}",
-                    hex::encode(self.verifying_key.to_bytes())
-                ))
-            }
-        }
-        let new_signer = DalekFixtureSigner {
-            verifying_key: new_verifying_key,
-            signing_key: new_signing_key,
-        };
-        let new_pub = new_signer.public_key();
-
-        // Build a target Receipt signed by the new identity.
-        let mut target = ReceiptEnvelope {
-            version: ReceiptVersion::default(),
-            kind: "atomic.tool_call".into(),
-            receipt_id: String::new(),
-            daemon_root_id: hex::encode(new_verifying_key.to_bytes()),
-            traceparent: None,
-            termination_authority: TerminationAuthority::UserSession,
-            presence_kind: None,
-            body: serde_json::json!({ "tool": "post-rotation-target" }),
-            signature: None,
-            calling_principal: None,
-            presence_reason: None,
-            handle_id: None,
-            challenge_hash: None,
-            verifier_aaguid: None,
-        };
-        sign_receipt_v2(&mut target, &new_signer).expect("target sign");
-
-        // Build the chain entry that threads the trust set forward.
-        let rotation_at_secs: u64 = rotation_at
-            .timestamp()
-            .try_into()
-            .expect("test clock must be non-negative");
-        let chain = vec![RotationWitnessEntry {
-            envelope: witness_env.clone(),
-            prior_identity_pub: prior_pub.clone(),
-            new_identity_pub: new_pub.clone(),
-            rotation_at: rotation_at_secs,
-        }];
-
-        // Pre-rotation trust anchor reaches post-rotation signer via
-        // the single-hop chain.
-        verify_receipt_v2_with_rotation_chain(&target, &[prior_pub.clone()], &chain, &FixtureVerifier)
-            .expect("emitted witness must let chain-walk reach the post-rotation signer");
-
-        // Negative: without the chain, the verifier MUST reject the
-        // target (the prior anchor cannot directly verify a Receipt
-        // signed by a different key).
-        let err = verify_receipt_v2_with_rotation_chain(&target, &[prior_pub.clone()], &[], &FixtureVerifier)
-            .expect_err("without the witness chain the target must not verify");
-        assert!(
-            matches!(err, core_events::receipt::sign::SignError::UntrustedSigner),
-            "expected UntrustedSigner without the rotation chain, got: {err:?}"
-        );
-    }
-
-    /// The emitted witness is persisted to the local Receipt store and
-    /// retrievable through `get_receipt_v2_envelope_json`'s sibling
-    /// scan — confirmed by re-parsing the row JSON and checking the
-    /// kind discriminator matches.
-    #[test]
-    fn rotation_witness_emit_persists_to_local_receipt_store() {
-        use core_crypto::FixtureSigner;
-        use ed25519_dalek::SigningKey;
-
-        let store = DaemonStore::open_in_memory().unwrap();
-        let prior_signer = FixtureSigner::new("e2-persist-prior");
-        let new_seed: [u8; 32] = [7u8; 32];
-        let new_verifying_key = SigningKey::from_bytes(&new_seed).verifying_key();
-
-        let env = emit_identity_rotation_witness(
-            &store,
-            &prior_signer,
-            &new_verifying_key,
-            chrono::Utc::now(),
-        )
-        .expect("emit");
-
-        // Scan the receipts table directly — the unified table carries
-        // the row under `kind = 'identity.rotation_witness'`.
-        let row_json: String = store
-            .conn()
-            .query_row(
-                "SELECT receipt_json FROM receipts WHERE id = ?1 AND kind = ?2",
-                rusqlite::params![
-                    env.receipt_id,
-                    core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
-                ],
-                |row| row.get(0),
-            )
-            .expect("witness row must be retrievable by receipt_id+kind");
-
-        let parsed: ReceiptEnvelope =
-            serde_json::from_str(&row_json).expect("row JSON must parse back to ReceiptEnvelope");
-        assert_eq!(parsed.receipt_id, env.receipt_id);
-        assert_eq!(
-            parsed.kind,
-            core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
-        );
-    }
-
-    /// Defence in depth: emitting a witness with prior == new
-    /// (identical keys) is rejected so the body never violates Slice
-    /// E1's `IdentityRotationWitnessBody::validate()` (which requires
-    /// distinct prev/next epoch ids).
-    #[test]
-    fn rotation_witness_emit_refuses_equal_prior_and_new_pub() {
-        use core_crypto::{FixtureSigner, Signer};
-        use ed25519_dalek::VerifyingKey;
-
-        let store = DaemonStore::open_in_memory().unwrap();
-        let prior_signer = FixtureSigner::new("e2-equal-keys");
-        let prior_pub_handle = prior_signer.public_key();
-
-        // Reconstruct the dalek VerifyingKey from the prior signer's
-        // wire-form pub so prior_pub == new_pub by construction.
-        let hex_part = prior_pub_handle
-            .0
-            .strip_prefix("ed25519:")
-            .expect("prior pub handle has ed25519: prefix");
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(hex_part, &mut bytes).expect("decode prior pub hex");
-        let equal_pub = VerifyingKey::from_bytes(&bytes).expect("valid pub bytes");
-
-        let err = emit_identity_rotation_witness(
-            &store,
-            &prior_signer,
-            &equal_pub,
-            chrono::Utc::now(),
-        )
-        .expect_err("emission with identical prior/new pub must be refused");
-        match err {
-            VaultError::WitnessEmit(msg) => {
-                assert!(
-                    msg.contains("identical"),
-                    "expected 'identical' in error, got: {msg}"
-                );
-            }
-            other => panic!("expected WitnessEmit error, got: {other}"),
-        }
-    }
-}
+#[cfg(test)]
+mod rotation_witness_tests;

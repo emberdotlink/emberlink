@@ -1,4 +1,4 @@
-//! implementation-note-272 (design §"In-container
+//! implementation-note-236 (design §"In-container
 //! extension") — T2 integration tests for per-socket Persona
 //! enrollment.
 //!
@@ -72,7 +72,7 @@ fn ensure_test_identity() -> tempfile::TempDir {
 /// Build a `RequestContext` from a per-agent socket path so the
 /// dispatch layer takes the enrolled-principal branch.
 // container_persona_enrollment_tests_green_sentinel
-// (implementation-note-268):
+// (implementation-note-231):
 // Use `RequestContext::socket_for_test(peer)` to get a ctx with a
 // synthetic presence_token bound to `peer.uid`. The cfg(test)
 // synthesis in `RequestContext::socket` is unreachable from
@@ -410,7 +410,7 @@ async fn test_revoked_enrollment_refuses_rpcs() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. T3 — implementation-note-118 —
+// 5. T3 — implementation-note-116 —
 //    test_broker_resolve_refuses_namespace_inode_mismatch_refused_receipt
 // ---------------------------------------------------------------------------
 
@@ -420,7 +420,7 @@ async fn test_revoked_enrollment_refuses_rpcs() {
 /// pipeline. The live `/proc/<pid>/ns/{user,mnt}` capture for the test
 /// process pid produces real inodes which cannot match the synthetic
 /// `0xdead`-shaped recorded values, so the namespace-inode gate
-/// (implementation-note-160/D) fires:
+/// (implementation-note-140/D) fires:
 ///
 ///   1. dispatch returns `Err((-32401, _))`
 ///   2. the audit_log carries one row with action
@@ -488,11 +488,7 @@ async fn test_broker_resolve_refuses_namespace_inode_mismatch_refused_receipt() 
     // socket path matches the enrollment row, and the live ns-inode
     // capture for this pid will return REAL inodes which cannot
     // equal the synthetic 0xdead values recorded above.
-    let principal = PeerCredPrincipal::new(
-        1001,
-        std::process::id() as i32,
-        socket_path.clone(),
-    );
+    let principal = PeerCredPrincipal::new(1001, std::process::id() as i32, socket_path.clone());
     let peer = ember_daemon::infra::handler::PeerCred {
         uid: 1001,
         pid: Some(std::process::id() as i32),

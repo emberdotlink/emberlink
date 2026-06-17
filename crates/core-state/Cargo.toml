@@ -19,12 +19,16 @@ chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"
 csv = "1"
 ed25519-dalek = "2.1.1"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2.workspace = true
+subtle = "2.6"
 urlencoding = "2"
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

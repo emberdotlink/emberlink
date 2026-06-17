@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //! Session-persistent preferences for the `ember claude` launcher.
 //!
 //! Stores `~/.ember/session-prefs.json` with a `host_mode_disclaimer_suppressed`

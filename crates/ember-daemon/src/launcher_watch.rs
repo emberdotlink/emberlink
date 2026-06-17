@@ -1,7 +1,8 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Launcher pidfd watch — fast-path detector for launcher-process exit.
 //!
-//! implementation-note-344 (Phase 1).
+//! implementation-note-337 (Phase 1).
 //!
 //! Per design note §D3: when a launcher process
 //! (e.g. `ember up` or the bridge launcher) exits, all in-flight workflow
@@ -27,8 +28,8 @@
 //! ## Revocation cascade (Phase 2)
 //!
 //! On detected exit Phase 1 logs a structured `launcher.exit_detected` event
-//! and leaves a `TODO` placeholder where
-//! the cascade should invoke `infra::workflow_grant::revoke` (and any sibling
+//! and leaves a TODO placeholder where
+//! the cascade should invoke `infra::authority_delegation::revoke` (and any sibling
 //! cascade required by the parent-walk task). Wiring the cascade in this slice
 //! would tangle two tasks; Phase 2 lands once the parent-walk shape is
 //! finalised.
@@ -175,9 +176,11 @@ impl WatcherState {
 /// sessions and TTL-expired grants. Phase 2 wires the revocation cascade
 /// (currently a structured-log + TODO).
 ///
-/// `_daemon_store` is held for the eventual Phase 2 revocation cascade and to
-/// keep the lifetime parity with the sibling `session_watcher::run` signature.
-pub async fn run(_daemon_store: Rc<DaemonStore>, sessions_dir: PathBuf) {
+/// `daemon_store` drives the revocation cascade: on launcher exit the session's
+/// runtime standing grant is revoked (BKR-4c — the per-session authority now
+/// lives in that grant, not in the legacy delegation sidecar that design §6
+/// retired).
+pub async fn run(daemon_store: Rc<DaemonStore>, sessions_dir: PathBuf) {
     let session_store = SessionStore::new(sessions_dir.clone());
     let mut state = WatcherState::new();
     let mut interval = tokio::time::interval(TICK);
@@ -191,12 +194,12 @@ pub async fn run(_daemon_store: Rc<DaemonStore>, sessions_dir: PathBuf) {
 
     info!(
         tick_secs = TICK.as_secs(),
-        "launcher_watch: starting (implementation-note-344 Phase 1)"
+        "launcher_watch: starting (implementation-note-337 Phase 1)"
     );
 
     loop {
         interval.tick().await;
-        tick_once(&session_store, &sessions_dir, &mut state);
+        tick_once(&daemon_store, &session_store, &sessions_dir, &mut state);
     }
 }
 
@@ -204,6 +207,7 @@ pub async fn run(_daemon_store: Rc<DaemonStore>, sessions_dir: PathBuf) {
 /// the reconciliation step deterministically without spinning the async
 /// runtime.
 fn tick_once(
+    daemon_store: &DaemonStore,
     session_store: &SessionStore,
     sessions_dir: &std::path::Path,
     state: &mut WatcherState,
@@ -237,7 +241,7 @@ fn tick_once(
         }
     }
     for (sid, launcher_pid) in exited {
-        on_launcher_exit(sessions_dir, &sid, launcher_pid);
+        on_launcher_exit(daemon_store, sessions_dir, &sid, launcher_pid);
         state.tracked.remove(&sid);
     }
 }
@@ -330,45 +334,80 @@ fn launcher_is_dead(tracked: &TrackedLauncher) -> bool {
     }
 }
 
-/// Structured event + workflow-grant cascade revoke.
+/// Structured event + delegation-grant cascade revoke.
 ///
 /// Phase 1 emits a structured `info` event. Phase 2 (this slice — design
-/// §Component 3 + design F-AUTHORITY-1) wires the workflow-grant revoke
+/// §Component 3 + design F-AUTHORITY-1) wires the delegation-grant revoke
 /// cascade so the operator's authority does not survive a crashed launcher.
-/// The atomic rename in `workflow_grant::revoke` is the durable revocation
+/// The atomic rename in `authority_delegation::revoke` is the durable revocation
 /// signal — subsequent `broker.resolve` calls return DENIED until a fresh
-/// session opens.
+/// delegation is attached. Runtime-attachment lanes share delegated authority
+/// by caller binding, so the revoke fires only when the exited launcher owned
+/// the last live attachment on that binding.
 ///
 /// Child-grant cascade (parent-walk) is still deferred to
-/// implementation-note-305.
-fn on_launcher_exit(sessions_dir: &std::path::Path, session_id: &str, launcher_pid: u32) {
+/// implementation-note-284.
+fn on_launcher_exit(
+    store: &DaemonStore,
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    launcher_pid: u32,
+) {
     info!(
         event = "launcher.exit_detected",
         session_id = %session_id,
         launcher_pid,
-        "launcher_watch: launcher process exit detected — revoking workflow grant cascade"
+        "launcher_watch: launcher process exit detected — revoking runtime standing grant"
     );
 
-    match crate::infra::workflow_grant::revoke(sessions_dir, session_id) {
-        Ok(true) => {
-            info!(
-                event = "workflow.revoked",
-                session_id = %session_id,
-                reason = "launcher_exited",
-                "launcher_watch: workflow grant cascade-revoked on launcher exit"
-            );
-        }
-        Ok(false) => {
-            // No workflow grant on file for this session — either the
-            // session never had one (legacy path) or close_session already
-            // revoked it. Both are healthy.
-        }
+    let session_store = SessionStore::new(sessions_dir.to_path_buf());
+    let Some(meta) = session_store.read(session_id).ok().flatten() else {
+        return;
+    };
+    let remaining_attachments = match session_store.count_other_open_attachments(&meta) {
+        Ok(count) => count,
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
-                "launcher_watch: workflow-grant cascade revoke failed; \
-                 grant may leak beyond launcher exit"
+                "launcher_watch: failed to count sibling attachments; treating launcher exit as last attachment"
+            );
+            0
+        }
+    };
+    if remaining_attachments > 0 {
+        info!(
+            event = "workflow.revoke_skipped",
+            session_id = %session_id,
+            launcher_pid,
+            remaining_attachments,
+            "launcher_watch: launcher exit detected but delegated authority stays live for sibling attachments on the same caller binding"
+        );
+        return;
+    }
+
+    // BKR-4c (design §6): revoke the session's runtime standing grant — the
+    // per-session authority now lives in that signed grant chain, not in the
+    // legacy delegation sidecar design §6 retired. Revoking it fail-closes
+    // every subsequent `need ⊆ grant` use-time check for the dead launcher's
+    // session.
+    match store.revoke_grant(&meta.grant_id) {
+        Ok(()) => {
+            info!(
+                event = "grant.revoked",
+                session_id = %session_id,
+                grant_id = %meta.grant_id,
+                reason = "launcher_exited",
+                "launcher_watch: runtime standing grant revoked on launcher exit"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                grant_id = %meta.grant_id,
+                error = %e,
+                "launcher_watch: runtime standing grant revoke failed; \
+                 authority may leak beyond launcher exit"
             );
         }
     }
@@ -381,19 +420,69 @@ mod tests {
     use core_state::sessions::SessionMeta;
     use tempfile::TempDir;
 
+    fn daemon_store() -> DaemonStore {
+        let store = DaemonStore::open_in_memory().expect("in-memory daemon store");
+        store.set_vault(std::rc::Rc::new(crate::infra::vault::Vault::new(
+            [0xEF; 32],
+        )));
+        store
+    }
+
+    /// Create a runtime persona + an active standing grant; returns its grant id
+    /// (the BKR-4c per-session authority the launcher-exit cascade revokes).
+    fn persist_runtime_grant(store: &DaemonStore) -> String {
+        let persona = store
+            .create_persona("runtime-dev0")
+            .expect("create runtime persona");
+        store
+            .create_grant(&persona.id, "gh-token", "github:read:owner/repo", None)
+            .expect("create standing grant")
+            .id
+    }
+
+    fn grant_is_active(store: &DaemonStore, grant_id: &str) -> bool {
+        store
+            .get_grant(grant_id)
+            .map(|g| g.status == "active")
+            .unwrap_or(false)
+    }
+
     fn meta(session_id: &str, launcher_pid: u32) -> SessionMeta {
         SessionMeta {
             session_id: session_id.to_string(),
             persona: "persona_dev0".to_string(),
+            durable_persona: None,
             grant_id: "grant_test".to_string(),
+            caller_binding_id: None,
             started_at: Utc::now(),
             launcher_pid,
-            workflow_id: None,
-            workflow_template: None,
+            authority_strict: false,
+            delegation_id: None,
+            delegation_template: None,
         }
     }
 
-    /// Checkpoint anchor — implementation-note-344 Phase 1.
+    fn runtime_meta_with_binding(
+        session_id: &str,
+        launcher_pid: u32,
+        grant_id: &str,
+        binding: &str,
+    ) -> SessionMeta {
+        SessionMeta {
+            session_id: session_id.to_string(),
+            persona: "persona_runtime".to_string(),
+            durable_persona: Some("persona_durable".to_string()),
+            grant_id: grant_id.to_string(),
+            caller_binding_id: Some(binding.to_string()),
+            started_at: Utc::now(),
+            launcher_pid,
+            authority_strict: false,
+            delegation_id: Some("wfg_runtime".to_string()),
+            delegation_template: Some("emberd-development".to_string()),
+        }
+    }
+
+    /// Checkpoint anchor — implementation-note-337 Phase 1.
     /// Presence of this test proves the launcher_watch module ships with the
     /// load-bearing surface: tick_once reconciles against SessionStore, and
     /// the platform-specific pidfd/kqueue path lives behind cfg gates.
@@ -416,11 +505,12 @@ mod tests {
     #[test]
     fn tick_once_registers_open_session_and_drops_closed_session() {
         let dir = TempDir::new().unwrap();
+        let ds = daemon_store();
         let store = SessionStore::new(dir.path().to_path_buf());
 
         // No sessions yet — tick is a no-op, state stays empty.
         let mut state = WatcherState::new();
-        tick_once(&store, dir.path(), &mut state);
+        tick_once(&ds, &store, dir.path(), &mut state);
         assert!(state.tracked.is_empty());
 
         // Open a session whose launcher_pid is the test process itself, so
@@ -428,7 +518,7 @@ mod tests {
         let our_pid = std::process::id();
         store.create(&meta("sess-alive", our_pid)).unwrap();
 
-        tick_once(&store, dir.path(), &mut state);
+        tick_once(&ds, &store, dir.path(), &mut state);
         // On Linux we expect the pidfd to be open; on macOS the bare-pid stub
         // tracks it; on other targets the register call is a no-op.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -439,7 +529,7 @@ mod tests {
         // Close the session — list_open no longer surfaces it; the reconciler
         // drops the tracked entry on the next tick.
         store.close("sess-alive").unwrap();
-        tick_once(&store, dir.path(), &mut state);
+        tick_once(&ds, &store, dir.path(), &mut state);
         assert!(!state.tracked.contains_key("sess-alive"));
     }
 
@@ -449,6 +539,7 @@ mod tests {
     #[test]
     fn tick_once_detects_exited_launcher_on_linux() {
         let dir = TempDir::new().unwrap();
+        let ds = daemon_store();
         let store = SessionStore::new(dir.path().to_path_buf());
 
         // Spawn `/bin/sleep 30` and capture its pid. The long sleep keeps the
@@ -466,7 +557,7 @@ mod tests {
         store.create(&meta("sess-exited", child_pid)).unwrap();
 
         let mut state = WatcherState::new();
-        tick_once(&store, dir.path(), &mut state);
+        tick_once(&ds, &store, dir.path(), &mut state);
         assert!(
             state.tracked.contains_key("sess-exited"),
             "watcher should have opened a pidfd against the live child"
@@ -480,10 +571,54 @@ mod tests {
         // Give the kernel a moment to flip the pidfd's readiness state.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        tick_once(&store, dir.path(), &mut state);
+        tick_once(&ds, &store, dir.path(), &mut state);
         assert!(
             !state.tracked.contains_key("sess-exited"),
             "watcher should have detected exit and removed the entry"
+        );
+    }
+
+    #[test]
+    fn launcher_exit_revokes_runtime_grant_when_last_attachment() {
+        let dir = TempDir::new().unwrap();
+        let ds = daemon_store();
+        let grant_id = persist_runtime_grant(&ds);
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let solo =
+            runtime_meta_with_binding("sess-solo", std::process::id(), &grant_id, "binding-solo");
+        store.create(&solo).unwrap();
+        assert!(grant_is_active(&ds, &grant_id));
+
+        on_launcher_exit(&ds, dir.path(), &solo.session_id, solo.launcher_pid);
+
+        assert!(
+            !grant_is_active(&ds, &grant_id),
+            "runtime standing grant must be revoked on the last attachment's launcher exit"
+        );
+    }
+
+    #[test]
+    fn launcher_exit_keeps_runtime_grant_live_for_sibling_attachment() {
+        let dir = TempDir::new().unwrap();
+        let ds = daemon_store();
+        let grant_id = persist_runtime_grant(&ds);
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let primary =
+            runtime_meta_with_binding("sess-primary", std::process::id(), &grant_id, "binding-1");
+        let sibling = runtime_meta_with_binding(
+            "sess-sibling",
+            std::process::id() + 1,
+            &grant_id,
+            "binding-1",
+        );
+        store.create(&primary).unwrap();
+        store.create(&sibling).unwrap();
+
+        on_launcher_exit(&ds, dir.path(), &primary.session_id, primary.launcher_pid);
+
+        assert!(
+            grant_is_active(&ds, &grant_id),
+            "binding-scoped standing grant must stay active while a sibling attachment remains live"
         );
     }
 }

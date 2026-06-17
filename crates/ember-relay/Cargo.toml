@@ -33,3 +33,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "process"] }
+
+[lints]
+workspace = true

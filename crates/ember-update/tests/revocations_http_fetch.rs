@@ -1,15 +1,20 @@
-//! T2 integration test for implementation-note-342.
+//! Integration test for the revocations HTTP fetch client.
 //!
 //! Spawns a single-shot HTTP server on `127.0.0.1:0`, returns a canned
-//! `revocations/current.json` body, and asserts the
+//! signed `revocations/current.json` body, and asserts the
 //! [`RevocationsFetcher`] → [`RevocationsPoller`] chain produces the
 //! expected [`RevocationAction`]. Mirrors the
 //! `core-broker::cloudflare` mock-server pattern (TcpListener +
 //! thread) to avoid pulling a new test-dep (`wiremock`/`httpmock`)
 //! into the workspace for one test file.
+// CLASSIFICATION: PUBLIC
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use ember_update::in_toto;
 use ember_update::revocations::{
-    RevocationAction, RevocationFetchError, RevocationsFetcher, RevocationsPoller,
+    RevocationAction, RevocationDocument, RevocationEntry, RevocationFetchError,
+    RevocationPollError, RevocationSeverity, RevocationsFetcher, RevocationsPoller,
+    revocation_statement,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -21,6 +26,17 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn fixture_keys() -> (SigningKey, VerifyingKey) {
+    let sk = SigningKey::from_bytes(&[77u8; 32]);
+    let vk = sk.verifying_key();
+    (sk, vk)
+}
+
+fn signed_doc(sk: &SigningKey, doc: RevocationDocument) -> String {
+    let signed = in_toto::sign(revocation_statement(doc), sk).expect("sign doc");
+    serde_json::to_string(&signed).expect("serialize signed doc")
 }
 
 /// Bind on 127.0.0.1:0, accept ONE connection, drain the request
@@ -54,21 +70,24 @@ fn spawn_one_shot(canned_body: String) -> (String, thread::JoinHandle<()>) {
 #[tokio::test]
 async fn t2_fetch_and_poll_critical_revocation_round_trip() {
     let now = now_unix();
-    let canned = serde_json::json!({
-        "revocations": [{
-            "digest": "sha256:fakecritical",
-            "severity": "critical",
-            "reason": "implementation-note-342 T2 fixture"
-        }],
-        "issued_at_unix_secs": now
-    })
-    .to_string();
+    let (sk, vk) = fixture_keys();
+    let canned = signed_doc(
+        &sk,
+        RevocationDocument {
+            revocations: vec![RevocationEntry {
+                digest: "sha256:fakecritical".to_string(),
+                severity: RevocationSeverity::Critical,
+                reason: "revocations HTTP fetch client fixture".to_string(),
+            }],
+            issued_at_unix_secs: now,
+        },
+    );
     let (base_url, handle) = spawn_one_shot(canned);
 
     let fetcher = RevocationsFetcher::with_timeout(base_url, 5).expect("build fetcher");
     let bytes = fetcher.fetch().await.expect("fetch ok");
 
-    let poller = RevocationsPoller::new();
+    let poller = RevocationsPoller::with_trusted_signer(vk);
     let decisions = poller.poll(&bytes).expect("poll ok");
 
     assert_eq!(decisions.len(), 1, "one decision for one revocation entry");
@@ -88,28 +107,31 @@ async fn t1_fetch_and_poll_stale_doc_fails_closed() {
     // Acceptance: stale-doc detector fails closed via the HTTP fetch path,
     // not only via the in-process `evaluate()` API.
     let stale_issued_at = now_unix().saturating_sub(35 * 60);
-    let canned = serde_json::json!({
-        "revocations": [{
-            "digest": "sha256:stale",
-            "severity": "critical",
-            "reason": "stale-doc fail-closed test"
-        }],
-        "issued_at_unix_secs": stale_issued_at
-    })
-    .to_string();
+    let (sk, vk) = fixture_keys();
+    let canned = signed_doc(
+        &sk,
+        RevocationDocument {
+            revocations: vec![RevocationEntry {
+                digest: "sha256:stale".to_string(),
+                severity: RevocationSeverity::Critical,
+                reason: "stale-doc fail-closed test".to_string(),
+            }],
+            issued_at_unix_secs: stale_issued_at,
+        },
+    );
     let (base_url, handle) = spawn_one_shot(canned);
 
     let fetcher = RevocationsFetcher::with_timeout(base_url, 5).expect("build fetcher");
     let bytes = fetcher.fetch().await.expect("fetch ok");
 
-    let poller = RevocationsPoller::new();
-    let decisions = poller.poll(&bytes).expect("poll ok");
+    let poller = RevocationsPoller::with_trusted_signer(vk);
+    let err = poller
+        .poll(&bytes)
+        .expect_err("stale signed document must fail closed");
 
-    assert_eq!(decisions.len(), 1);
     assert!(
-        matches!(decisions[0].action, RevocationAction::FailClosed { .. }),
-        "stale document via HTTP fetch must produce FailClosed, got {:?}",
-        decisions[0].action
+        matches!(err, RevocationPollError::StaleDocument { .. }),
+        "stale document via HTTP fetch must fail closed, got {err:?}"
     );
 
     handle.join().expect("server thread");

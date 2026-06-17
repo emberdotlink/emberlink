@@ -7,3 +7,6 @@ description = "Prometheus-instrumentation primitives for Emberlink (per design).
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

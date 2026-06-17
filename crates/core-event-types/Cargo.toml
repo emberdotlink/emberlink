@@ -19,3 +19,6 @@ ciborium = { version = "0.2", default-features = false }
 [dev-dependencies]
 proptest = "1"
 sha2.workspace = true
+
+[lints]
+workspace = true

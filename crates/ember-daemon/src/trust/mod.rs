@@ -1,8 +1,13 @@
+pub mod affinity;
 pub mod approval;
 pub mod attenuation;
 pub mod bridge_ca;
 pub mod grant;
 pub mod introspect;
+pub mod lease;
+pub mod piv_attestation;
 pub mod policy;
 pub mod presence;
+pub mod rotation;
 pub mod standing_grant;
+pub mod use_time_verify;

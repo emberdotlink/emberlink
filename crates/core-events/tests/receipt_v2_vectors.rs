@@ -27,6 +27,14 @@ fn deterministic_envelope_broker_mint() -> ReceiptEnvelope {
         ttl_seconds: 1800,
         expires_at: "2026-05-02T20:00:00Z".to_string(),
         revoke_token_hash: "blake3:fixture-revoke".to_string(),
+        // BKR-5 scope-projection fields unset: skip-when-empty keeps this golden
+        // vector byte-identical (receipt_id + signature unchanged).
+        granted_scope: vec![],
+        requested_scope: vec![],
+        minted_scope: vec![],
+        mint_stamp: vec![],
+        mint_stamp_kind: None,
+        chain_ref: String::new(),
     };
     let mut env = ReceiptEnvelope {
         version: ReceiptVersion::default(),
@@ -86,6 +94,7 @@ fn deterministic_envelope_session_claude_code() -> ReceiptEnvelope {
                 ts: "2026-05-02T19:30:00Z".to_string(),
                 kind: ClaimKind::Approval,
                 tool: "Bash".to_string(),
+                action_ref: None,
                 input_hash: "blake3:fixture-input-hash".to_string(),
                 input_redacted: serde_json::json!({"command": "echo hi"}),
                 resolved: serde_json::json!({"allowed": true}),

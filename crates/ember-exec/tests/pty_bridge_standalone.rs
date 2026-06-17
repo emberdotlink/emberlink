@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Integration tests for the ember-exec pty bridge.
 //!

@@ -147,13 +147,23 @@ pub fn install_signal_handlers() {
 /// signal that the RPC response has arrived (child exited), prompting a
 /// clean teardown if the poll loop hasn't already detected EOF.
 pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
-    listener.set_nonblocking(false).ok();
+    listener.set_nonblocking(true).ok();
 
-    let stream = match listener.accept() {
-        Ok((s, _)) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "pty bridge: accept failed");
+    let stream = loop {
+        if let Ok(d) = done.lock()
+            && *d
+        {
             return;
+        }
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "pty bridge: accept failed");
+                return;
+            }
         }
     };
 
@@ -183,7 +193,7 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
     // teardown caused `BridgeExit::ShimDisappeared` → SIGTERM cascade
     // on every non-interactive shim invocation (headless scripts run
     // shims with stdin=/dev/null), killing the credential-injected
-    // child mid-flight. See implementation-note-24.
+    // child mid-flight. See implementation-note-27.
     let mut stdin_eof = false;
 
     loop {
@@ -369,7 +379,7 @@ mod tests {
     use std::io::Cursor;
     use std::{collections::VecDeque, io};
 
-    /// Regression for implementation-note-24.
+    /// Regression for implementation-note-27.
     ///
     /// When stdin returns `Ok(0)` (EOF — the steady state for headless
     /// shim invocations whose stdin is `/dev/null`), the previous

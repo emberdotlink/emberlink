@@ -1,6 +1,0 @@
-# Minimal Compose V2 fixture — image only.
-# Used by tests/compose_fixtures.rs T2 round-trip property test.
-version: "3.8"
-services:
-  app:
-    image: alpine:3.20

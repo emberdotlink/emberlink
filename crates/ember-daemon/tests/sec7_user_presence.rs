@@ -53,8 +53,15 @@ fn sec7_set_then_get_round_trips_under_user_presence() {
         .expect("set_password_user_presence");
 
     // First read — session cache pre-populated by the writer; should NOT prompt.
+    // `get_password_user_presence` returns `Option<Zeroizing<String>>`
+    // (N6-deeper item 3); use `.as_deref().map(String::as_str)` to compare to
+    // the bare `&str` expected value.
     let got1 = vault_macos::get_password_user_presence(PROD_SERVICE, &account).expect("first get");
-    assert_eq!(got1.as_deref(), Some(passphrase), "first read must match");
+    assert_eq!(
+        got1.as_deref().map(String::as_str),
+        Some(passphrase),
+        "first read must match"
+    );
 
     // Clear the in-process cache to simulate a fresh daemon process. The next
     // read will fall through to the real Keychain and (per SAC) prompt the
@@ -63,14 +70,18 @@ fn sec7_set_then_get_round_trips_under_user_presence() {
     let got2 = vault_macos::get_password_user_presence(PROD_SERVICE, &account)
         .expect("second get (post-cache-clear)");
     assert_eq!(
-        got2.as_deref(),
+        got2.as_deref().map(String::as_str),
         Some(passphrase),
         "post-cache-clear read must still match"
     );
 
     // Subsequent read — session cache hit, no prompt.
     let got3 = vault_macos::get_password_user_presence(PROD_SERVICE, &account).expect("third get");
-    assert_eq!(got3.as_deref(), Some(passphrase), "cached read must match");
+    assert_eq!(
+        got3.as_deref().map(String::as_str),
+        Some(passphrase),
+        "cached read must match"
+    );
 
     // Cleanup.
     vault_macos::delete_password(PROD_SERVICE, &account).expect("delete");

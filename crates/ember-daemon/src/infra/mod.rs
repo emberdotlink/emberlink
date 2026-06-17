@@ -1,42 +1,60 @@
 pub mod anomaly;
+pub(crate) mod attachment;
 pub mod attested_device;
 pub mod audit;
 pub mod audit_explain;
 pub mod binary_pin;
+pub mod bridge_frame;
 pub mod claim_journal;
+pub mod codex_oauth;
+pub mod codex_proxy;
 pub mod config;
 pub mod credential_store;
+pub mod daemon_wrap_key;
 pub mod dashboard;
+pub mod delegation_template;
+// `endpoint_gate_framework` — design slice 3 (per-session endpoint gate +
+// admission policy enum). Pure decision logic; lane integrations call into it
+// instead of running bespoke gates.
+pub mod endpoint_gate;
 pub mod events;
 pub mod handler;
 pub mod handlers;
 pub(crate) mod headless_scope;
+pub mod identity_substrate;
 pub mod image_registry;
 pub mod init_first_grant;
 pub mod interactive_unlock;
 pub mod kms;
 pub mod kms_edge;
-pub mod native_biometric_unlock;
 pub mod notification;
 pub mod notify;
-pub mod outbound_leak;
+pub mod operator_identity;
 pub mod persona;
 pub mod pid;
+pub mod pidfd;
+pub mod presence_seal;
+pub mod process_hardening;
+pub mod prompt_intent;
 pub mod proxy;
 pub mod rate_limit;
 pub mod receipt;
 pub mod receipt_tree;
+pub mod rpc_error;
+pub mod rpc_listener;
 pub mod runtime;
 pub mod sandbox;
+pub mod session_proxy;
 pub mod socket;
 pub mod status;
 pub mod store;
 pub mod tailnet;
+// ADR212-TELEMETRY-EXPORTER — per-process Prometheus telemetry surface.
+pub mod telemetry;
 pub mod template_snapshot;
 pub mod unlock_pin;
 pub mod vault;
-pub mod workflow_grant;
-pub mod workflow_template;
+pub mod vault_rotate;
 
 #[cfg(target_os = "macos")]
 pub mod vault_macos;

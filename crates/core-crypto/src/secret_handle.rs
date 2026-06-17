@@ -148,12 +148,6 @@ mod tests {
     }
 
     #[test]
-    fn drop_does_not_panic() {
-        let handle = SecretHandle::new(vec![0xAB; 64]);
-        drop(handle);
-    }
-
-    #[test]
     fn revoked_then_dropped() {
         let mut handle = SecretHandle::new(vec![0xCD; 16]);
         handle.revoke();

@@ -64,7 +64,6 @@ pub enum InstallError {
 /// row to the table above, widen the substring set below, and extend the
 /// unit tests.
 ///
-/// Anchor: `implementation-note-374`
 fn already_exists(stderr: &str) -> bool {
     let s = stderr.to_lowercase();
     s.contains("already exists")
@@ -161,9 +160,6 @@ pub fn is_separate_uid_posture() -> bool {
 ///    confirmed, surface a clear `InstallError::Subprocess` rather than
 ///    returning `Ok(())` silently.
 ///
-/// ## Checkpoint
-///
-/// implementation-note-375
 #[cfg(target_os = "macos")]
 fn dseditgroup_tolerant_inner<R, C>(
     cmd_string: &str,
@@ -304,7 +300,6 @@ enum EmberUserInspectAction {
 /// Closure injection means unit tests can simulate any shape (canonical,
 /// missing-shell, wrong-uid, absent) without touching real Open Directory.
 ///
-/// Anchor: `implementation-note-376`
 #[cfg(target_os = "macos")]
 fn read_ember_user_shape_inner<R>(mut reader: R) -> Result<Option<EmberUserShape>, InstallError>
 where
@@ -356,7 +351,6 @@ where
 /// real dscl mutation. `changer(prop, current, desired)` is invoked
 /// once per divergent property.
 ///
-/// Anchor: `implementation-note-376`
 #[cfg(target_os = "macos")]
 fn inspect_and_heal_ember_user_inner<R, C>(
     reader: R,
@@ -432,7 +426,6 @@ where
 /// the explicit `dscl` create path (user absent) or skip the create step
 /// (user present + canonical, possibly after healing).
 ///
-/// Anchor: `implementation-note-376`
 #[cfg(target_os = "macos")]
 fn inspect_and_heal_ember_user() -> Result<EmberUserInspectAction, InstallError> {
     inspect_and_heal_ember_user_inner(
@@ -661,8 +654,7 @@ fn dseditgroup_add_operator_to_group(user: &str, group: &str) -> Result<(), Inst
 ///   heal via `dscl . -change`; if present with wide divergence (uid
 ///   outside the system range) surface a hard `InstallError` with the
 ///   manual remediation command. Replaces the naive `if !id ember` check
-///   that silently kept divergent records around — see
-///   `implementation-note-376`.
+///   that silently kept divergent records around.
 /// - `dseditgroup -o create ember-clients` — connect-group create.
 /// - `dseditgroup -o edit -a "$USER" -t user ember-clients` — add the
 ///   invoking operator to the connect group.
@@ -685,7 +677,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 2) ember user — inspect-and-heal before any create.
     //
-    // implementation-note-376: a previous
+    // A previous
     // partial install (or a different package that also created an `ember`
     // record) can leave the user present with wrong shape (e.g. shell !=
     // /usr/bin/false). The naive `if !user_exists` check skipped user creation
@@ -710,7 +702,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 4) add the ember user to ember-clients
     //
-    // implementation-note-377: the
+    // The
     // launchd plist's `GroupName=ember-clients` (formerly `ember` — a group
     // that was never created on macOS, falling back silently to `staff`)
     // requires the ember user to be a member of `ember-clients` so launchd's
@@ -786,7 +778,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     })
 }
 
-// implementation-note-166 — per-spawn uid pool provisioning.
+// Per-spawn uid pool provisioning.
 // The installer creates N `ember-spawn-<i>` system users with
 // pre-assigned uids in the 10010-10099 range. The daemon's
 // `[spawn_pool]` config references this set. See design (amendment
@@ -889,9 +881,6 @@ pub enum SpawnPoolProvisioning {
 /// pre-assigned `UniqueID` (uid). Falls back to surfacing the
 /// dscl commands as `manual_commands` when the installer is not
 /// running as root.
-///
-/// implementation-note-166 — checkpoint for callers that grep
-/// for the install integration point.
 pub fn provision_spawn_pool(pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
     if pool_size == 0 {
         return Err(InstallError::Subprocess {
@@ -1093,7 +1082,7 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
             range_start,
             slot_count,
         } => format!(
-            "\n[spawn_pool]\n# implementation-note-190 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
+            "\n[spawn_pool]\n# implementation-note-167 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
         ),
         SpawnPoolProvisioning::SystemUsers { uids, gid }
         | SpawnPoolProvisioning::ManualCommands { uids, gid, .. } => {
@@ -1103,17 +1092,237 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "\n[spawn_pool]\n# implementation-note-166 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
+                "\n[spawn_pool]\n# implementation-note-139 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
             )
         }
     }
 }
 
-// implementation-note-190 — checkpoint for callers that grep
-// for the modern-Linux subuid install integration point. design
-// Component 2.
-//
-// implementation-note-378
+
+/// Remove an existing top-level `[spawn_pool]` table (header + its body up to
+/// the next top-level table header or EOF) from `config.toml` text, preserving
+/// every other section verbatim. Returns the text without the section.
+///
+/// The only writer of `[spawn_pool]` is [`render_spawn_pool_toml`], which emits
+/// the canonical `\n[spawn_pool]\n# ...\n<keys>` shape, so an exact-match on the
+/// trimmed header line is sufficient and avoids a full TOML re-serialize (which
+/// would strip the operator's comments elsewhere in the file).
+fn strip_spawn_pool_section(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if in_section {
+            // Any new top-level table header ends the spawn_pool section.
+            if line.trim_start().starts_with('[') {
+                in_section = false;
+            } else {
+                continue; // still inside [spawn_pool] — drop the line
+            }
+        }
+        if line.trim() == "[spawn_pool]" {
+            in_section = true;
+            continue; // drop the header; it will be re-rendered
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Idempotently upsert the provisioned `[spawn_pool]` section into the
+/// daemon's system `config.toml` (per design — `DaemonPaths::system().
+/// config_file()`).
+///
+/// The daemon (`emberd`) reads `[spawn_pool]` from this file. Without this
+/// section `broker_exec` has no uid pool to lease and refuses to dispatch
+/// — so the spawn-helper plist alone is not enough; the daemon must also
+/// learn the pool. Any pre-existing `[spawn_pool]` block is replaced;
+/// all other sections are preserved verbatim.
+///
+/// `operator_home` is retained for call-site stability and is unused —
+/// the file now lives at the system config path, not under `$HOME`.
+pub fn write_spawn_pool_config(
+    _operator_home: &Path,
+    provisioning: &SpawnPoolProvisioning,
+) -> Result<(), InstallError> {
+    write_spawn_pool_config_inner(&crate::paths::DaemonPaths::system(), provisioning)
+}
+
+/// Inner helper: factored out so tests can pass `DaemonPaths::for_test(tmp)`
+/// and exercise the upsert + section-preservation logic without writing to
+/// real system paths.
+fn write_spawn_pool_config_inner(
+    paths: &crate::paths::DaemonPaths,
+    provisioning: &SpawnPoolProvisioning,
+) -> Result<(), InstallError> {
+    let config_path = paths.config_file();
+
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(InstallError::Subprocess {
+                cmd: format!("read {}", config_path.display()),
+                stderr: format!("read failed: {e}"),
+                exit_code: None,
+            });
+        }
+    };
+
+    let stripped = strip_spawn_pool_section(&existing);
+    let section = render_spawn_pool_toml(provisioning);
+
+    // `section` begins with a leading newline; normalize so there is exactly
+    // one blank line between the preserved body and the section.
+    let mut out = stripped.trim_end().to_string();
+    out.push('\n');
+    out.push_str(section.trim_start_matches('\n'));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| InstallError::Subprocess {
+            cmd: format!("mkdir -p {}", parent.display()),
+            stderr: format!("create_dir_all failed: {e}"),
+            exit_code: None,
+        })?;
+    }
+
+    std::fs::write(&config_path, out).map_err(|e| InstallError::Subprocess {
+        cmd: format!("write {}", config_path.display()),
+        stderr: format!("write failed: {e}"),
+        exit_code: None,
+    })?;
+
+    Ok(())
+}
+
+/// Render the default daemon `config.toml` body — `[daemon]` + `[keyring]`
+/// only. This is the single source of the template shared by the install lane
+/// ([`write_default_config_if_absent`]) and `ember init`, so the two first-run
+/// paths can never drift.
+///
+/// Per design, `config.toml` is **system configuration** (socket/data dirs,
+/// log level, keyring service/account) — not identity. It carries no Persona,
+/// no IdentityRoot, no vault secret; those belong to the first-interactive-use
+/// ceremony, not to system provisioning.
+pub fn default_config_toml(keyring_service: &str, keyring_account: &str) -> String {
+    // Example socket_dir / data_dir comments reflect the design system
+    // paths the daemon resolves via `DaemonPaths::system()` when these
+    // keys are absent. Operators may override under `[daemon]`; the
+    // commented examples document the per-OS defaults.
+    format!(
+        "\
+# Ember daemon configuration
+
+[daemon]
+# Defaults per design (commented; uncomment + edit to override):
+# macOS:
+#   socket_dir = \"/Library/Application Support/Emberlink/run\"
+#   data_dir   = \"/Library/Application Support/Emberlink\"
+# Linux:
+#   socket_dir = \"/run/ember\"
+#   data_dir   = \"/var/lib/ember\"
+log_level = \"info\"
+
+[keyring]
+service = \"{keyring_service}\"
+account = \"{keyring_account}\"
+"
+    )
+}
+
+/// Write the default daemon `config.toml` into the system config dir
+/// (`/Library/Application Support/Emberlink/config/` on macOS;
+/// `/etc/ember/` on Linux, per [`crate::paths::DaemonPaths::system`]) if
+/// it does not already exist.
+///
+/// Per design (2026-06-14) daemon config lives at the system config
+/// path, not under any operator's `$HOME`. `operator_home` is retained
+/// in the signature for call-site stability across the multi-PR
+/// sequence; the parameter is unused.
+///
+/// The daemon (`emberd`) hard-refuses to boot without this file (see
+/// `crates/ember-daemon/src/bin/emberd.rs`), and on a fresh signed-`.pkg`
+/// install nothing else creates it: the postinstall runs `ember daemon
+/// install` (system provisioning), not `ember init` (the identity ceremony
+/// that historically wrote config). That gap left every fresh `.pkg` install
+/// failing — the daemon bootstrapped at `emit-launch-spec`, crashed on the
+/// missing config, and the install aborted. Per design §Decision 2, writing
+/// system config is system-provisioning's job, so the install wizard owns it
+/// (the `ensure-config` step, sequenced *before* `emit-launch-spec`).
+///
+/// Idempotent and **non-clobbering**: if `config.toml` already exists it is
+/// left untouched — an operator's existing config (hand edits, a prior
+/// install's settings, an upgrade-over-existing host) is authoritative. The
+/// keyring service/account match the daemon-runtime defaults
+/// (`EMBER_KEYRING_SERVICE`/`_ACCOUNT` env override → built-in defaults) so the
+/// CLI and daemon vault paths agree.
+///
+/// Ownership: the wizard runs as root and writes the file root-owned;
+/// the immediately-following `chown-data-dirs` step walks the daemon's
+/// system state root and chowns to `ember:ember-clients`. The system
+/// config dir itself is also chowned via that walk (on Linux systemd's
+/// `ConfigurationDirectory=ember` covers it).
+pub fn write_default_config_if_absent(_operator_home: &Path) -> Result<(), InstallError> {
+    write_default_config_if_absent_inner(&crate::paths::DaemonPaths::system())
+}
+
+/// Inner helper: factored out so tests can pass `DaemonPaths::for_test(tmp)`
+/// and exercise the create-if-absent + non-clobber logic without writing to
+/// real system paths.
+fn write_default_config_if_absent_inner(
+    paths: &crate::paths::DaemonPaths,
+) -> Result<(), InstallError> {
+    let config_path = paths.config_file();
+    if config_path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| InstallError::Subprocess {
+            cmd: format!("mkdir -p {}", parent.display()),
+            stderr: format!("create_dir_all failed: {e}"),
+            exit_code: None,
+        })?;
+    }
+
+    let service = std::env::var("EMBER_KEYRING_SERVICE")
+        .unwrap_or_else(|_| crate::infra::vault::DEFAULT_KEYRING_SERVICE.to_string());
+    let account = std::env::var("EMBER_KEYRING_ACCOUNT")
+        .unwrap_or_else(|_| crate::infra::vault::DEFAULT_KEYRING_ACCOUNT.to_string());
+
+    std::fs::write(&config_path, default_config_toml(&service, &account)).map_err(|e| {
+        InstallError::Subprocess {
+            cmd: format!("write {}", config_path.display()),
+            stderr: format!("write failed: {e}"),
+            exit_code: None,
+        }
+    })?;
+
+    Ok(())
+}
+
+/// End-to-end macOS spawn-helper provisioning, wired into the install wizard's
+/// `provision-spawn-helper` step:
+///
+/// 1. Provision the per-spawn uid pool (creates the pool's system users).
+/// 2. Persist the pool into the daemon's `config.toml` (`[spawn_pool]`) so
+///    `broker_exec` can lease a uid.
+/// 3. Verify the helper + shim are present at `/usr/local/libexec` (placed by
+///    the install lane / `.pkg`), hash the shim, render + bootstrap the
+///    `sh.emberlink.spawn-helper` LaunchDaemon.
+///
+/// Idempotent end-to-end (each step is independently idempotent). Requires
+/// root (creates system users, writes `/Library/LaunchDaemons`).
+#[cfg(target_os = "macos")]
+pub fn provision_spawn_helper_runtime(
+    operator_home: &Path,
+    pool_size: usize,
+) -> Result<(), InstallError> {
+    let provisioning = provision_spawn_pool(pool_size)?;
+    write_spawn_pool_config(operator_home, &provisioning)?;
+    install_spawn_helper_plist(SPAWN_POOL_UID_BASE, pool_size as u32)?;
+    Ok(())
+}
 
 /// Detect whether the running kernel supports unprivileged user
 /// namespace clone (design Component 2 modern-Linux gate). Reads
@@ -1369,9 +1578,6 @@ fn ensure_subuid_entry(
 /// `(range_start, slot_count)` the installer wrote. Caller renders
 /// this into the daemon's `[spawn_pool]` config via
 /// [`render_spawn_pool_toml`].
-///
-/// implementation-note-190 — checkpoint for callers that
-/// grep for the modern-Linux subuid install integration point.
 #[cfg(target_os = "linux")]
 pub fn provision_subuid_range() -> Result<SpawnPoolProvisioning, InstallError> {
     // Install-time probe: refuse install when the setuid newuidmap /
@@ -1635,7 +1841,6 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
         })?;
 
         run("chmod", &["0440", dst_path], false)?;
-        // implementation-note-377:
         // `root:ember-clients` (formerly `root:ember`) so the daemon — running
         // with `ember-clients` as primary group per the matching plist change
         // in `render_launchd_plist_body` — can read the credential.
@@ -1650,12 +1855,33 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
 /// `/usr/local/bin/` (fresh user directories on some macOS images, minimal
 /// Linux base images).
 const EMBERD_INSTALL_DIR: &str = "/usr/local/bin";
+const MANAGED_EMBERD_PATH: &str = "/usr/local/bin/emberd";
 
 /// Env-var override naming an explicit path to the `emberd` binary that
 /// install should publish. Honored when non-empty and free of `..` segments.
 /// Set this in CI / package builds where the binary lives outside
 /// `<cwd>/target/release/`.
 const ENV_EMBERD_BIN_PATH: &str = "EMBER_EMBERD_BIN_PATH";
+
+/// Installed name of the `emberd-rpc` mTLS-frontend sibling binary
+/// (design amendment). Platform-specific because the two `[[bin]]`
+/// targets in `ember-rpc`'s `Cargo.toml` are `emberd-rpc-macos` and
+/// `emberd-rpc-linux` (they share one `main.rs`; the split exists so each
+/// platform unit references a concrete binary name). Source of truth:
+/// `crate::install_manifest::INSTALL_ARTIFACTS` (`bin: "emberd-rpc-macos"`
+/// / `"emberd-rpc-linux"`).
+#[cfg(target_os = "macos")]
+const EMBERD_RPC_BIN_NAME: &str = "emberd-rpc-macos";
+#[cfg(target_os = "linux")]
+const EMBERD_RPC_BIN_NAME: &str = "emberd-rpc-linux";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const EMBERD_RPC_BIN_NAME: &str = "emberd-rpc-linux";
+
+/// Env-var override naming an explicit path to the `emberd-rpc` sibling
+/// binary to publish. Same contract as [`ENV_EMBERD_BIN_PATH`]: non-empty,
+/// `..`-free, must exist. Set this in CI / package builds where the binary
+/// lives outside `<cwd>/target/release/`.
+const ENV_EMBERD_RPC_BIN_PATH: &str = "EMBER_EMBERD_RPC_BIN_PATH";
 
 /// Resolve the `emberd` source binary to publish.
 ///
@@ -1665,6 +1891,9 @@ const ENV_EMBERD_BIN_PATH: &str = "EMBER_EMBERD_BIN_PATH";
 /// 2. Sibling of `current_exe()` named `emberd`. `current_exe()` is
 ///    canonicalized first so a symlinked launcher (`~/.cargo/bin/ember -> target/release/ember`)
 ///    resolves to the real workspace dir where `emberd` was built alongside.
+/// 3. Installed macOS app-bundle layout: when the launcher is
+///    `/usr/local/lib/ember.app/Contents/MacOS/ember`, use the managed daemon
+///    at `/usr/local/bin/emberd` (normally a symlink into `emberd.app`).
 ///
 /// Errors with a copy-pasteable build hint when neither path resolves —
 /// operators see "build `emberd` first with `cargo build --release -p
@@ -1700,25 +1929,62 @@ pub fn resolve_emberd_source() -> Result<PathBuf, InstallError> {
         exit_code: None,
     })?;
     let canonical = current.canonicalize().unwrap_or(current.clone());
-    let parent = canonical.parent().ok_or_else(|| InstallError::Subprocess {
-        cmd: "resolve_emberd_source".to_string(),
-        stderr: format!("current_exe has no parent: {}", canonical.display()),
-        exit_code: None,
-    })?;
-    let sibling = parent.join("emberd");
-    if !sibling.exists() {
-        return Err(InstallError::Subprocess {
+    resolve_emberd_source_from_current_exe(&canonical, Path::new(MANAGED_EMBERD_PATH))
+}
+
+fn resolve_emberd_source_from_current_exe(
+    current_exe: &Path,
+    managed_emberd_path: &Path,
+) -> Result<PathBuf, InstallError> {
+    let parent = current_exe
+        .parent()
+        .ok_or_else(|| InstallError::Subprocess {
             cmd: "resolve_emberd_source".to_string(),
-            stderr: format!(
-                "could not find `emberd` next to {}. Build with \
-                 `cargo build --release -p ember-daemon --bin emberd`, \
-                 or set {ENV_EMBERD_BIN_PATH} to an absolute path.",
-                canonical.display()
-            ),
+            stderr: format!("current_exe has no parent: {}", current_exe.display()),
             exit_code: None,
-        });
+        })?;
+    let sibling = parent.join("emberd");
+    if sibling.exists() {
+        return Ok(sibling);
     }
-    Ok(sibling)
+
+    if is_macos_ember_app_launcher(current_exe) && managed_emberd_path.exists() {
+        return Ok(managed_emberd_path.to_path_buf());
+    }
+
+    Err(InstallError::Subprocess {
+        cmd: "resolve_emberd_source".to_string(),
+        stderr: format!(
+            "could not find `emberd` next to {}. Build with \
+             `cargo build --release -p ember-daemon --bin emberd`, \
+             install the managed host daemon at {MANAGED_EMBERD_PATH}, \
+             or set {ENV_EMBERD_BIN_PATH} to an absolute path.",
+            current_exe.display()
+        ),
+        exit_code: None,
+    })
+}
+
+fn is_macos_ember_app_launcher(path: &Path) -> bool {
+    if path.file_name().and_then(|s| s.to_str()) != Some("ember") {
+        return false;
+    }
+    let Some(macos_dir) = path.parent() else {
+        return false;
+    };
+    if macos_dir.file_name().and_then(|s| s.to_str()) != Some("MacOS") {
+        return false;
+    }
+    let Some(contents_dir) = macos_dir.parent() else {
+        return false;
+    };
+    if contents_dir.file_name().and_then(|s| s.to_str()) != Some("Contents") {
+        return false;
+    }
+    let Some(app_dir) = contents_dir.parent() else {
+        return false;
+    };
+    app_dir.file_name().and_then(|s| s.to_str()) == Some("ember.app")
 }
 
 /// Publish the `emberd` daemon binary to `/usr/local/bin/emberd` so the
@@ -1813,50 +2079,313 @@ fn chown_emberd_binary(dst_str: &str) -> Result<(), InstallError> {
     let owner = "root:root";
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let owner = "root:root";
+
+    // The macOS package install publishes /usr/local/bin/emberd as a symlink
+    // into emberd.app. Plain chown follows the link and may fail on the
+    // package-owned app bundle; the LaunchDaemon only needs the launcher path
+    // ownership converged, so operate on the symlink itself.
+    #[cfg(target_os = "macos")]
+    return run("chown", &["-h", owner, dst_str], false);
+
+    #[cfg(not(target_os = "macos"))]
     run("chown", &[owner, dst_str], false)
 }
 
-/// Recursively chown every entry under `home/.ember` to `ember:ember-clients`
-/// and tighten file modes.
+// ============================================================================
+// design bridge priv-sep SLICE 2b — emberd-rpc sibling bootstrap.
+//
+// ember_rpc_sibling_bootstrap_landed
+//
+// The `emberd-rpc` mTLS-frontend sibling (design amendment, listener wired
+// post-SLICE-2a #5349) is built + manifest-declared but, before this slice,
+// the install lane never staged or supervised it. This block:
+//   1. publishes the platform binary to /usr/local/bin (install_emberd_rpc_binary),
+//   2. renders the launchd/systemd unit with daemon system-path cert/socket
+//      pins (render_rpc_{launchd_plist,systemd_unit}_body),
+//   3. always stages the unit, and conditionally bootstraps it — only when the
+//      bridge lane is configured ON (rpc_sibling_should_bootstrap), matching the
+//      "inert until enabled" doctrine (the rpc server cert + bridge_ca are minted
+//      by emberd core ONLY when `bridge_bind` is set — runtime.rs:1392/4001; a
+//      bridge-OFF bootstrap would restart-loop on the absent cert).
+//
+// CRITICAL path pins (see the four env vars below): the prod daemon resolves
+// `socket_dir` + `data_dir` via `DaemonPaths::system()` (design), NOT the
+// sibling default config and NOT any operator-home `.ember` path. So the units
+// MUST pin daemon system paths, rendered in Rust.
+// ============================================================================
+
+/// Resolve the platform `emberd-rpc` sibling source binary to publish.
 ///
-/// **Why this walks the whole `.ember` tree instead of a hardcoded subdir list:**
+/// Mirrors [`resolve_emberd_source`] exactly:
+///   1. `EMBER_EMBERD_RPC_BIN_PATH` env override (non-empty, no `..`, must exist).
+///   2. Sibling of `current_exe()` named [`EMBERD_RPC_BIN_NAME`]
+///      (`emberd-rpc-{macos,linux}`).
+///   3. Installed managed path (`/usr/local/bin/emberd-rpc-{macos,linux}`) when the
+///      launcher is the macOS app-bundle layout.
+pub fn resolve_emberd_rpc_source() -> Result<PathBuf, InstallError> {
+    if let Ok(raw) = std::env::var(ENV_EMBERD_RPC_BIN_PATH)
+        && !raw.is_empty()
+    {
+        let path = PathBuf::from(&raw);
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(InstallError::Subprocess {
+                cmd: "resolve_emberd_rpc_source".to_string(),
+                stderr: format!(
+                    "{ENV_EMBERD_RPC_BIN_PATH}={raw:?} contains `..` segment — refused"
+                ),
+                exit_code: None,
+            });
+        }
+        if !path.exists() {
+            return Err(InstallError::Subprocess {
+                cmd: "resolve_emberd_rpc_source".to_string(),
+                stderr: format!("{ENV_EMBERD_RPC_BIN_PATH}={raw:?} does not exist"),
+                exit_code: None,
+            });
+        }
+        return Ok(path);
+    }
+
+    let current = std::env::current_exe().map_err(|e| InstallError::Subprocess {
+        cmd: "current_exe".to_string(),
+        stderr: format!("could not resolve current_exe: {e}"),
+        exit_code: None,
+    })?;
+    let canonical = current.canonicalize().unwrap_or(current.clone());
+    let managed = format!("/usr/local/bin/{EMBERD_RPC_BIN_NAME}");
+    resolve_emberd_rpc_source_from_current_exe(&canonical, Path::new(&managed))
+}
+
+fn resolve_emberd_rpc_source_from_current_exe(
+    current_exe: &Path,
+    managed_rpc_path: &Path,
+) -> Result<PathBuf, InstallError> {
+    let parent = current_exe
+        .parent()
+        .ok_or_else(|| InstallError::Subprocess {
+            cmd: "resolve_emberd_rpc_source".to_string(),
+            stderr: format!("current_exe has no parent: {}", current_exe.display()),
+            exit_code: None,
+        })?;
+    let sibling = parent.join(EMBERD_RPC_BIN_NAME);
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+
+    if is_macos_ember_app_launcher(current_exe) && managed_rpc_path.exists() {
+        return Ok(managed_rpc_path.to_path_buf());
+    }
+
+    Err(InstallError::Subprocess {
+        cmd: "resolve_emberd_rpc_source".to_string(),
+        stderr: format!(
+            "could not find `{EMBERD_RPC_BIN_NAME}` next to {}. Build with \
+             `cargo build --release -p ember-rpc`, install the managed sibling \
+             at {}, or set {ENV_EMBERD_RPC_BIN_PATH} to an absolute path.",
+            current_exe.display(),
+            managed_rpc_path.display()
+        ),
+        exit_code: None,
+    })
+}
+
+/// Publish the `emberd-rpc` sibling binary to
+/// `/usr/local/bin/emberd-rpc-{macos,linux}` so the launchd/systemd unit can
+/// exec it. Idempotent + safe under a running sibling (unlink-then-copy →
+/// fresh inode; the running process keeps its fd to the old inode). Mirrors
+/// [`install_emberd_binary`].
 ///
-/// A previous version enumerated `["vault", "grants", "sessions", "run",
-/// "binaries"]` explicitly. The daemon's `DaemonConfig::default()` sets
-/// `data_dir = ~/.ember/data` (where the SQLite event store lives), which was
-/// absent from that list. After `sudo ember daemon install` ran this function,
-/// `~/.ember/data/` was still owned by the operator uid, not `ember:ember`.
-/// `emberd` (running as the `ember` system user) then opened the SQLite DB
-/// read/write and hit EACCES → "attempt to write a readonly database". Fixing
-/// the list to include `"data"` would close today's gap but reopen the hole
-/// for any future directory `DaemonConfig` introduces.
+/// Requires elevated privileges (typically invoked under `sudo` from the
+/// installer entry point).
+pub fn install_emberd_rpc_binary() -> Result<(), InstallError> {
+    let src = resolve_emberd_rpc_source()?;
+    install_emberd_rpc_binary_at(&src, Path::new(EMBERD_INSTALL_DIR), EMBERD_RPC_BIN_NAME)
+}
+
+/// Testable variant of [`install_emberd_rpc_binary`] — caller supplies the
+/// destination dir + filename so tests run in a tempdir without sudo.
+/// Production callers use [`install_emberd_rpc_binary`].
+pub fn install_emberd_rpc_binary_at(
+    src: &Path,
+    dst_dir: &Path,
+    dst_name: &str,
+) -> Result<(), InstallError> {
+    std::fs::create_dir_all(dst_dir).map_err(|e| InstallError::Subprocess {
+        cmd: format!("mkdir -p {}", dst_dir.display()),
+        stderr: format!("create_dir_all failed: {e}"),
+        exit_code: None,
+    })?;
+
+    let dst = dst_dir.join(dst_name);
+    let dst_str = dst.to_string_lossy().into_owned();
+    let src_str = src.to_string_lossy().into_owned();
+
+    // No-op if src and dst already resolve to the same canonical path.
+    if let (Ok(sc), Ok(dc)) = (src.canonicalize(), dst.canonicalize())
+        && sc == dc
+    {
+        run("chmod", &["0755", &dst_str], false)?;
+        chown_emberd_binary(&dst_str)?;
+        return Ok(());
+    }
+
+    // Remove existing dst (unlinks inode; running process keeps fd to old
+    // inode). Tolerate "does not exist".
+    if dst.exists() {
+        std::fs::remove_file(&dst).map_err(|e| InstallError::Subprocess {
+            cmd: format!("remove {dst_str}"),
+            stderr: format!("remove failed: {e}"),
+            exit_code: None,
+        })?;
+    }
+
+    std::fs::copy(src, &dst).map_err(|e| InstallError::Subprocess {
+        cmd: format!("copy {src_str} -> {dst_str}"),
+        stderr: format!("copy failed: {e}"),
+        exit_code: None,
+    })?;
+
+    run("chmod", &["0755", &dst_str], false)?;
+    chown_emberd_binary(&dst_str)?;
+
+    Ok(())
+}
+
+/// Decide whether the install lane should actively bootstrap the `emberd-rpc`
+/// sibling, versus only stage it.
 ///
-/// The robust fix: walk **every** top-level entry that exists under `.ember/`
-/// and chown it recursively so the set of covered paths tracks whatever the
-/// daemon actually creates, without requiring a parallel update here.
+/// "Option A" lifecycle (design SLICE 2b): the sibling is bootstrapped ONLY
+/// when the bridge lane is configured ON at install time, because the rpc
+/// server cert + `bridge_ca.pem` are minted by emberd core exclusively inside
+/// its `if let Some(bridge_bind)` startup branch (runtime.rs:1392 →
+/// `mint_or_rotate_ember_rpc_server_cert`). A bridge-OFF host has no cert on
+/// disk; the sibling exits when its cert is absent and `KeepAlive`/`Restart`
+/// would turn that into a restart loop. Staging-without-bootstrap keeps the
+/// whole lane genuinely inert until the operator enables the bridge — the same
+/// posture the daemon's own 0700 rpc receiver uses (runtime.rs:3781, gated on
+/// `bridge_bind.is_some()`).
 ///
-/// **Idempotent.** The `.ember` root or any subdirectory may be absent; those
-/// cases are skipped silently so re-running on an already-correct tree is a
-/// no-op.
+/// Resolution: SOLELY the persisted system `config.toml`
+/// (`DaemonPaths::system().config_file()` per design) `[daemon].bridge_bind`
+/// value — the ONLY bridge signal the launchd/systemd-launched daemon
+/// actually honors at runtime.
+///
+/// `EMBER_BRIDGE_BIND` in the INSTALLER's process env is deliberately NOT
+/// consulted. The daemon's own unit (`render_launchd_plist_body_*` /
+/// `render_systemd_unit_body`) bakes only EMBER_APP_* (+ trust roots) —
+/// HOME is no longer baked per design — and the installer never persists
+/// that env into config. So an installer-env value the daemon can't see
+/// would bootstrap a sibling while the daemon boots bridge-OFF, never mints
+/// the rpc cert, and crash-loops the sibling — the exact silent failure
+/// SLICE 2b exists to prevent. Gating on config.toml keeps the install-time
+/// decision and the daemon's runtime decision reading the SAME source of
+/// truth. (Hardened after adversarial review, 2026-06-05.)
+///
+///   * `[daemon].bridge_bind` non-empty AND parses as a `SocketAddr` ⇒ ON.
+///   * empty / absent / malformed / no config file ⇒ OFF (bridge disabled).
+///
+/// A malformed value resolves to OFF: a non-parseable `bridge_bind` is a hard
+/// daemon-startup abort (config.rs validation), so we must NOT bootstrap a
+/// sibling for a daemon that will refuse to boot.
+///
+/// `operator_home` retained for call-site stability across the multi-PR
+/// sequence; the parameter is unused (config now lives at the system path).
+pub fn rpc_sibling_should_bootstrap(_operator_home: &Path) -> bool {
+    rpc_sibling_should_bootstrap_inner(&crate::paths::DaemonPaths::system())
+}
+
+/// Inner: read the config from `paths.config_file()` so tests can swap
+/// in a `for_test` tempdir.
+fn rpc_sibling_should_bootstrap_inner(paths: &crate::paths::DaemonPaths) -> bool {
+    // Read the raw config string (not the full DaemonConfig) so this helper has
+    // no dependency on the loader's side effects — it must be callable under
+    // sudo without touching the vault.
+    let config_path = paths.config_file();
+    let Ok(contents) = std::fs::read_to_string(&config_path) else {
+        return false; // no config file ⇒ bridge disabled by default
+    };
+    bridge_bind_value_is_set(&contents)
+}
+
+/// Parse the `[daemon].bridge_bind` value out of a `config.toml` body and
+/// report whether it is set to a non-empty, `SocketAddr`-parseable string.
+/// Returns false when the key is absent, the value is empty, the value does not
+/// parse as a `SocketAddr` (a malformed `bridge_bind` is a hard daemon-startup
+/// abort, so it is NOT "bridge on" for bootstrap purposes), or the TOML can't
+/// be parsed.
+///
+/// Factored out so a test can exercise the parse without writing a temp file
+/// and without depending on the full `DaemonConfig` loader. The `SocketAddr`
+/// parse matches the daemon's own `bridge_bind: Option<SocketAddr>` resolution
+/// (config.rs), so this cannot under-bootstrap a value the daemon would accept.
+fn bridge_bind_value_is_set(config_toml: &str) -> bool {
+    // Use `toml::from_str` (the proven call shape elsewhere in this module);
+    // toml 1.0's `FromStr for Value` does not always accept a full document.
+    let Ok(value) = toml::from_str::<toml::Value>(config_toml) else {
+        return false;
+    };
+    value
+        .get("daemon")
+        .and_then(|d| d.get("bridge_bind"))
+        .and_then(|b| b.as_str())
+        .map(|s| !s.is_empty() && s.parse::<std::net::SocketAddr>().is_ok())
+        .unwrap_or(false)
+}
+
+/// Recursively chown every entry under the daemon's system state root
+/// (`/Library/Application Support/Emberlink/` on macOS;
+/// `/var/lib/ember/` on Linux per [`crate::paths::DaemonPaths::system`])
+/// to `ember:ember-clients` and tighten file modes.
+///
+/// Per design (operator-locked 2026-06-14) the daemon's at-rest state
+/// lives at system paths, not under any operator's `$HOME`. The `home`
+/// parameter is retained for call-site stability across the multi-PR
+/// sequence — PR 3e/3f sweep the CLI callers that pass it. The
+/// parameter is unused; the chown walk targets [`DaemonPaths::system`]
+/// (`crate::paths::DaemonPaths::system`).
+///
+/// **Why this walks the whole state tree instead of a hardcoded subdir
+/// list:** the daemon's `DaemonConfig::load_defaults` populates
+/// `data_dir`, `socket_dir`, `pid_file`, `policy_file` from
+/// `DaemonPaths::system()`. The set of subdirectories the daemon
+/// creates (vault, grants, sessions, codex-sessions, locks, etc.) is
+/// runtime-driven, not install-driven. Walking the state root keeps
+/// chown coverage tracking whatever the daemon actually creates,
+/// without requiring a parallel update here.
+///
+/// **Idempotent.** The state root or any subdirectory may be absent on
+/// the first install; those cases are skipped silently so re-running on
+/// an already-correct tree is a no-op.
 ///
 /// For each entry walked:
 /// - `chown ember:ember-clients <path>`
 /// - directories: `chmod 0750 <path>`
-/// - files: `chmod 0640 <path>`
+/// - signing-key files (`*.key`): `chmod 0600 <path>` (owner-only)
+/// - other files: `chmod 0640 <path>`
 ///
-/// Requires elevated privileges (typically invoked under `sudo` from the
-/// installer entry point).
+/// Requires elevated privileges (typically invoked under `sudo` from
+/// the installer entry point).
 ///
-/// ## Checkpoint
-///
-/// implementation-note-379
 pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
-    chown_ember_data_dirs_inner(home, &mut |path, is_dir| {
+    // design: operator-side `~/.ember/binaries/` (the signed binary
+    // manifest the daemon reads but the operator writes after every
+    // host refresh) still needs its operator-owned repair pass. The
+    // full move to operator-cache is deferred to PR 3e/3f; until then
+    // the legacy operator-home location is the authoritative store and
+    // the CLI's `home` argument still points at it.
+    repair_binary_manifest_dir_ownership(home)?;
+
+    // Daemon-side state — the post-design system root.
+    let paths = crate::paths::DaemonPaths::system();
+    chown_ember_data_dirs_inner(&paths.state_root, &mut |path, is_dir| {
         let path_str = path.to_string_lossy().into_owned();
         run("chown", &["ember:ember-clients", &path_str], false)?;
         // Signing-key material (daemon_identity.key, daemon_persona.key)
         // must be 0600 (owner-only) per the daemon's fail-closed check
-        // in `infra::runtime` (implementation-note-262 F-S5-013).
+        // in `infra::runtime` (audit-chain startup wiring).
         // The default 0640 lets the ember-clients group read non-secret
         // state (SQLite, snapshots, vault.salt, etc.) but is too
         // permissive for private keys.
@@ -1872,45 +2401,100 @@ pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
     })
 }
 
+/// Keep `~/.ember/binaries` writable by the operator and readable by the
+/// daemon. The daemon reads the signed binary manifest from this directory,
+/// but host refresh writes it from operator space after copying bundled
+/// Construct binaries.
+///
+/// **Deferred move per design.** `~/.ember/binaries/` is operator-data
+/// (CLI binary cache) and is slated to move to the operator-cache path
+/// (`~/Library/Caches/Emberlink/binaries/` on macOS;
+/// `$XDG_CACHE_HOME/emberlink/binaries/` on Linux) in PR 3e/3f of the
+/// design follow-on sequence. PR 3d (this PR) is the daemon-system-
+/// paths move; the operator-cache move is out of scope here. This
+/// function continues to repair `<operator_home>/.ember/binaries/`
+/// in-place until the move lands; CLI callers (`ember.rs`,
+/// `wizard.rs`) still pass the operator home, so the legacy path
+/// stays correct.
+fn repair_binary_manifest_dir_ownership(home: &Path) -> Result<(), InstallError> {
+    // Short-circuit if the binaries dir does not exist before we touch the
+    // operator resolver — keeps the chown_ember_data_dirs test surface
+    // working without an env-pinned operator (tempdir tests have no
+    // `.ember/binaries/` so the resolver is irrelevant).
+    let binaries_dir = home.join(".ember").join("binaries");
+    if !binaries_dir.exists() {
+        return Ok(());
+    }
+    let operator = resolve_operator_user()?;
+    repair_binary_manifest_dir_ownership_inner(home, &operator, &mut |path, is_dir, owner| {
+        let path_str = path.to_string_lossy().into_owned();
+        run("chown", &[owner, &path_str], false)?;
+        run(
+            "chmod",
+            &[if is_dir { "0750" } else { "0640" }, &path_str],
+            false,
+        )
+    })
+}
+
+fn repair_binary_manifest_dir_ownership_inner<F>(
+    home: &Path,
+    operator: &str,
+    apply_ownership: &mut F,
+) -> Result<(), InstallError>
+where
+    F: FnMut(&Path, bool, &str) -> Result<(), InstallError>,
+{
+    let binaries_dir = home.join(".ember").join("binaries");
+    if !binaries_dir.exists() {
+        return Ok(());
+    }
+    let owner = format!("{operator}:ember-clients");
+    chown_chmod_recursive_inner(&binaries_dir, &mut |path, is_dir| {
+        apply_ownership(path, is_dir, &owner)
+    })
+}
+
 /// Inner logic for [`chown_ember_data_dirs`], factored out so tests can
 /// inject a mock chown closure without needing root privileges or a real
 /// `ember` system user.
 ///
-/// `apply_ownership` receives `(path, is_dir)` for every entry visited and
-/// is responsible for chown + chmod. Production injects the real `run("chown",
-/// ...)` / `run("chmod", ...)` shell-outs; tests inject a closure that records
-/// which paths were visited.
-fn chown_ember_data_dirs_inner<F>(home: &Path, apply_ownership: &mut F) -> Result<(), InstallError>
+/// `state_root` is the daemon's at-rest data root — production callers
+/// pass [`DaemonPaths::system().state_root`]; tests pass a tempdir.
+/// `apply_ownership` receives `(path, is_dir)` for every entry visited
+/// and is responsible for chown + chmod. Production injects the real
+/// `run("chown", ...)` / `run("chmod", ...)` shell-outs; tests inject a
+/// closure that records which paths were visited.
+///
+/// Per design the legacy operator-owned exceptions
+/// (`orchestrator.lock`, `shadow/`, `binaries/`) no longer apply — those
+/// subtrees were the operator-side bleed of the pre-split `~/.ember/`
+/// layout and now live at the operator-conventional cache/data paths.
+/// The system state root contains ONLY daemon-owned state, so the walk
+/// is unconditional.
+fn chown_ember_data_dirs_inner<F>(
+    state_root: &Path,
+    apply_ownership: &mut F,
+) -> Result<(), InstallError>
 where
     F: FnMut(&Path, bool) -> Result<(), InstallError>,
 {
-    let ember_root = home.join(".ember");
-
-    if !ember_root.exists() {
-        // Nothing to chown — installer has not created the data tree yet.
+    if !state_root.exists() {
+        // Nothing to chown — installer has not created the state tree yet.
         return Ok(());
     }
 
-    // Walk every top-level entry under .ember/ and chown each recursively.
-    // This covers daemon-owned state like data/ (SQLite + WAL + journal),
-    // vault/, grants/, sessions/, run/, and any future daemon runtime
-    // directories DaemonConfig introduces — without requiring a parallel
-    // update to this list.
-    //
-    // Exceptions:
-    // - `orchestrator.lock` is created by the CLI running as the operator uid
-    //   (not by the daemon). Chowning it would hand it to the daemon uid and
-    //   prevent the CLI from acquiring it on subsequent runs.
-    // - `shadow/` is the launcher-managed PATH-shim tree under
-    //   `~/.ember/shadow/bin/`. The host launcher and `ember init --for claude`
-    //   mutate it as the operator uid before every session open. Chowning it
-    //   to `ember:ember-clients` makes those launcher writes fail with EPERM.
-    for entry in std::fs::read_dir(&ember_root)? {
-        let entry = entry?;
-        if entry.file_name() == "orchestrator.lock" || entry.file_name() == "shadow" {
-            continue;
+    // Walk every entry under the state root and chown each recursively.
+    // The state root itself is also chowned so the root dir is
+    // `ember:ember-clients` mode 0750 (the kernel uses dir traverse-only
+    // rights for the `ember-clients` group to reach the socket).
+    let root_meta = std::fs::symlink_metadata(state_root)?;
+    if root_meta.file_type().is_dir() {
+        apply_ownership(state_root, true)?;
+        for entry in std::fs::read_dir(state_root)? {
+            let entry = entry?;
+            chown_chmod_recursive_inner(&entry.path(), apply_ownership)?;
         }
-        chown_chmod_recursive_inner(&entry.path(), apply_ownership)?;
     }
 
     Ok(())
@@ -1947,6 +2531,8 @@ where
 }
 
 /// Filename for the SE-wrapped vault MEK blob under the daemon's data dir.
+// security/vault constant retained for callers; allow over delete in lint-clear.
+#[allow(dead_code)]
 const VAULT_MEK_FILENAME: &str = "vault-mek.bin";
 
 /// Provision the vault MEK passphrase in `/Library/Keychains/System.keychain`
@@ -2009,26 +2595,36 @@ const VAULT_MEK_FILENAME: &str = "vault-mek.bin";
 ///
 /// ## Known follow-up
 ///
-/// `implementation-note-380`: the shell-out to
+/// The shell-out to
 /// `/usr/bin/security` passes the passphrase in `argv` for the duration
 /// of the subprocess (~50ms on a single-user dev box). Long-term fix is
 /// raw FFI to `SecKeychainAddGenericPassword` + `SecAccessCreate` with
 /// an explicit permissive ACL, which avoids the argv leak entirely.
 ///
-/// Anchor: `implementation-note-381`
-pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
-    let data_dir = home.join(".ember").join("data");
+/// The daemon now self-provisions its SE key at startup — install only
+/// needs to ensure the data directory exists with correct ownership.
+/// System.keychain passphrase provisioning is retired (SE custody).
+pub fn provision_se_mek(_home: &Path) -> Result<(), InstallError> {
+    // design: daemon at-rest state (including `vault-mek.bin` and the
+    // sealed-blob directory) lives at the system data dir, NOT under
+    // any operator's `$HOME`. Resolve via `DaemonPaths::system()`. The
+    // `_home` parameter is retained for call-site stability across
+    // the multi-PR sequence; it is unused.
+    provision_se_mek_inner(&crate::paths::DaemonPaths::system())
+}
 
-    // 1) Ensure data dir exists. mkdir -p is idempotent.
-    std::fs::create_dir_all(&data_dir).map_err(|e| InstallError::Subprocess {
+/// Inner provisioning helper: factored out so unit tests can pass a
+/// `DaemonPaths::for_test(tmp)` instance and exercise the create/clean-up
+/// logic without writing to real system paths.
+fn provision_se_mek_inner(paths: &crate::paths::DaemonPaths) -> Result<(), InstallError> {
+    let data_dir = &paths.data_dir;
+
+    std::fs::create_dir_all(data_dir).map_err(|e| InstallError::Subprocess {
         cmd: format!("mkdir -p {}", data_dir.display()),
         stderr: format!("create_dir_all failed: {e}"),
         exit_code: None,
     })?;
 
-    // 2) On macOS + root, chown the dir to the daemon's uid/group so the
-    //    daemon (running as ember via launchd) can read/write its own
-    //    state files (SQLite event store, snapshots, etc.).
     #[cfg(target_os = "macos")]
     if nix::unistd::geteuid().is_root() {
         let s = data_dir.to_string_lossy().into_owned();
@@ -2036,170 +2632,65 @@ pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
         run("chmod", &["0750", &s], false)?;
     }
 
-    // 3) Delete legacy SE-wrapped blobs from previous install attempts
-    //    so they don't sit around as operator-confusing dead files. The
-    //    daemon doesn't read them anymore. We don't error if they're
-    //    absent (idempotent cleanup).
-    let legacy_blob = data_dir.join(VAULT_MEK_FILENAME);
-    if legacy_blob.exists() {
-        if let Err(e) = std::fs::remove_file(&legacy_blob) {
-            tracing::warn!(
-                path = %legacy_blob.display(),
-                error = %e,
-                "could not delete legacy vault-mek.bin; install proceeding"
-            );
-        } else {
-            tracing::info!(path = %legacy_blob.display(), "removed legacy SE-wrapped blob");
+    // Delete legacy artifacts from previous install approaches.
+    for name in ["vault-mek.bin", ".vault-mek-provision-failed"] {
+        let path = data_dir.join(name);
+        if path.exists()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(path = %path.display(), error = %e, "could not delete legacy file; proceeding");
         }
     }
-    let legacy_poison = data_dir.join(".vault-mek-provision-failed");
-    if legacy_poison.exists() {
-        let _ = std::fs::remove_file(&legacy_poison);
-    }
 
-    // 4) Write the MEK passphrase to System.keychain (macOS + root only).
-    //    The `security add-generic-password` step against System.keychain
-    //    requires root; non-root invocations (e.g., `sudo -u ember ...`
-    //    test path) skip this and return Ok so the install can be
-    //    partially exercised in unit tests without touching the real
-    //    system keychain.
+    // Delete legacy System.keychain passphrase if present (clean break).
     #[cfg(target_os = "macos")]
     if nix::unistd::geteuid().is_root() {
-        provision_vault_mek_in_system_keychain()?;
-    } else {
-        tracing::info!(
-            "non-root install — skipping System.keychain write (the canonical install runs as root via sudo)"
-        );
+        delete_legacy_system_keychain_passphrase();
     }
 
     Ok(())
 }
 
-/// Write the vault MEK passphrase to `/Library/Keychains/System.keychain`
-/// as a `kSecClassGenericPassword` item with a permissive partition list,
-/// idempotent on item presence.
-///
-/// **Idempotent.** If a vault-MEK item already exists in System.keychain
-/// (a previous install ran successfully), the function returns `Ok(())`
-/// without overwriting — overwriting would destroy access to any vault
-/// data encrypted under the existing MEK.
-///
-/// Requires root (`SecKeychainAddGenericPassword` against System.keychain
-/// requires write authority that non-root processes don't have).
-///
-/// ## Implementation
-///
-/// We shell out to `/usr/bin/security add-generic-password -A` because
-/// `security-framework`'s `SecKeychain::add_generic_password` doesn't
-/// expose a way to set the `-A` permissive partition list — the
-/// underlying `SecKeychainAddGenericPassword` FFI passes `NULL` for the
-/// `SecAccess` parameter, which gives the item a default ACL of
-/// "this app only," which would deny the daemon (different binary)
-/// access.
-///
-/// The trade-off: the `security` CLI puts the passphrase in `argv` for
-/// the duration of the subprocess. On a single-user dev box running as
-/// root, the audience is "processes I'm already trusting." Acceptable
-/// for the dev0 wedge. Long-term: raw FFI to
-/// `SecKeychainAddGenericPassword` + `SecAccessCreate` with an explicit
-/// permissive ACL. Filed as `implementation-note-380`.
+/// Best-effort delete the legacy System.keychain MEK passphrase item
+/// left by previous installs. Non-fatal — the daemon no longer reads it.
 #[cfg(target_os = "macos")]
-fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
-    use crate::infra::vault_macos_se::{
-        SYSTEM_KEYCHAIN_PATH, VAULT_MEK_ACCOUNT, VAULT_MEK_SERVICE,
-    };
+fn delete_legacy_system_keychain_passphrase() {
     use security_framework::os::macos::keychain::SecKeychain;
 
-    // Idempotency check — if the item is already present, do NOT
-    // overwrite (would orphan any vault data encrypted under the
-    // existing MEK).
-    let keychain =
-        SecKeychain::open(SYSTEM_KEYCHAIN_PATH).map_err(|e| InstallError::Subprocess {
-            cmd: format!("SecKeychain::open({SYSTEM_KEYCHAIN_PATH})"),
-            stderr: format!("{e}"),
-            exit_code: None,
-        })?;
-    if keychain
-        .find_generic_password(VAULT_MEK_SERVICE, VAULT_MEK_ACCOUNT)
-        .is_ok()
-    {
-        tracing::info!(
-            service = VAULT_MEK_SERVICE,
-            account = VAULT_MEK_ACCOUNT,
-            "vault MEK already present in System.keychain — skipping (idempotent)"
-        );
-        return Ok(());
+    const SERVICE: &str = "sh.emberlink.daemon";
+    const ACCOUNT: &str = "vault-mek";
+    const PATH: &str = "/Library/Keychains/System.keychain";
+
+    let Ok(keychain) = SecKeychain::open(PATH) else {
+        return;
+    };
+    if let Ok((_pw, item)) = keychain.find_generic_password(SERVICE, ACCOUNT) {
+        item.delete();
+        tracing::info!("deleted legacy vault-mek passphrase from System.keychain (SE custody)");
     }
-
-    // Generate 32 cryptographically-random bytes and hex-encode to a
-    // 64-char ASCII passphrase. Matches the format the daemon's read
-    // path expects (`plaintext.len() == 64`).
-    let mut mek_bytes = [0u8; 32];
-    getrandom::fill(&mut mek_bytes).map_err(|e| InstallError::Subprocess {
-        cmd: "getrandom::fill".to_string(),
-        stderr: format!("OS entropy failure: {e}"),
-        exit_code: None,
-    })?;
-    let hex_passphrase = hex::encode(mek_bytes);
-
-    // Shell out to `security add-generic-password -A`. `-A` is the
-    // permissive partition list (any signing identity can access the
-    // item without prompt). This is what Apple's own setup tools use
-    // for System.keychain items intended to be shared between system
-    // daemons (apsd's APN tokens, eapolclient's WiFi PSKs, etc.).
-    let output = std::process::Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-A",
-            "-s",
-            VAULT_MEK_SERVICE,
-            "-a",
-            VAULT_MEK_ACCOUNT,
-            "-w",
-            &hex_passphrase,
-            SYSTEM_KEYCHAIN_PATH,
-        ])
-        .output()
-        .map_err(|e| InstallError::Subprocess {
-            cmd: format!(
-                "/usr/bin/security add-generic-password -A -s {VAULT_MEK_SERVICE} -a {VAULT_MEK_ACCOUNT} {SYSTEM_KEYCHAIN_PATH}"
-            ),
-            stderr: format!("spawn failed: {e}"),
-            exit_code: None,
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(InstallError::Subprocess {
-            cmd: format!(
-                "/usr/bin/security add-generic-password -A -s {VAULT_MEK_SERVICE} -a {VAULT_MEK_ACCOUNT} {SYSTEM_KEYCHAIN_PATH}"
-            ),
-            stderr,
-            exit_code: output.status.code(),
-        });
-    }
-
-    tracing::info!(
-        service = VAULT_MEK_SERVICE,
-        account = VAULT_MEK_ACCOUNT,
-        path = SYSTEM_KEYCHAIN_PATH,
-        "vault MEK provisioned in System.keychain"
-    );
-    Ok(())
 }
 
-// Plist + systemd unit bodies are rendered with the operator's home dir
-// baked in as the daemon's HOME env var. The daemon resolves
-// `~/.ember/{vault,grants,sessions,run,binaries}` at startup via
-// `dirs_next::home_dir()`, which under launchd/systemd `User=ember` would
-// resolve to `/var/empty` (the ember system user's home) — pointing the
-// daemon at an empty tree instead of the operator's chowned-to-ember
-// data. Baking HOME=<operator_home> at install time aligns the daemon's
-// runtime view with the chown step's target. See design §macOS install.
+// Plist + systemd unit bodies historically baked the operator's HOME into
+// the launcher's `EnvironmentVariables` / `Environment=` block so the
+// daemon (running as the `ember` system uid) could resolve `~/.ember/...`
+// to the operator's chowned-to-ember data tree. Per design (operator-
+// locked 2026-06-14) the daemon's at-rest state + runtime socket + pid +
+// config now live at OS system paths (`/Library/Application Support/
+// Emberlink/` on macOS; `/var/lib/ember/` + `/run/ember/` + `/etc/ember/`
+// on Linux), resolved via `crate::paths::DaemonPaths::system()`. The
+// daemon never needs HOME any more — it never reads from `$HOME` — so
+// the renderers below DROP the HOME bake entirely. See the design
+// 2026-06-14 amendment paragraph + design §"Daemon-owned (AUTHORITY
+// space) — OS system paths".
 
 /// Path on disk for the macOS LaunchDaemon plist.
 #[cfg(target_os = "macos")]
 const LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/sh.emberlink.daemon.plist";
+/// Path on disk for the `emberd-rpc` sibling LaunchDaemon plist (design
+/// SLICE 2b). Always staged; conditionally bootstrapped (see
+/// [`rpc_sibling_should_bootstrap`]).
+#[cfg(target_os = "macos")]
+const LAUNCHD_RPC_PLIST_PATH: &str = "/Library/LaunchDaemons/sh.emberlink.rpc.plist";
 #[cfg(target_os = "macos")]
 const LAUNCHD_SANDBOX_DIR: &str = "/usr/local/lib/ember/sandbox";
 #[cfg(target_os = "macos")]
@@ -2209,13 +2700,23 @@ const EMBERD_SANDBOX_PROFILE_TEMPLATE: &str = include_str!("../templates/sandbox
 #[cfg(target_os = "macos")]
 const EMBERD_SANDBOX_WRITE_ALLOWLIST_TOKEN: &str = "__EMBERD_WRITE_ALLOWLIST__";
 
+/// Render the macOS sandbox-exec profile body.
+///
+/// Per design (operator-locked 2026-06-14): the daemon writes to system
+/// paths under [`crate::paths::DaemonPaths::system().state_root`], NOT
+/// to any user's `$HOME`. The pre-design allowlist anchored on
+/// `<operator_home>/.ember` is superseded; allowlist now anchors on the
+/// system state-root (`/Library/Application Support/Emberlink/`).
+///
+/// `operator_home` is retained in the signature for call-site stability
+/// across the multi-PR design sequence; the parameter is unused.
 #[cfg(target_os = "macos")]
-fn render_launchd_sandbox_profile_body(operator_home: &Path) -> String {
-    let ember_root = operator_home.join(".ember");
-    let ember_root_regex = regex::escape(&ember_root.to_string_lossy());
+fn render_launchd_sandbox_profile_body(_operator_home: &Path) -> String {
+    let state_root = crate::paths::DaemonPaths::system().state_root;
+    let state_root_regex = regex::escape(&state_root.to_string_lossy());
     let allowlist = format!(
         "(allow file-write*\n  \
-         (regex #\"^{ember_root_regex}(/|$)\")\n  \
+         (regex #\"^{state_root_regex}(/|$)\")\n  \
          (regex #\"^/var/log/emberd(/|$)\")\n  \
          (regex #\"^/tmp/emberd-\")\n  \
          (regex #\"^/private/tmp/emberd-\")\n  \
@@ -2227,17 +2728,59 @@ fn render_launchd_sandbox_profile_body(operator_home: &Path) -> String {
 /// Path on disk for the Linux systemd unit.
 #[cfg(target_os = "linux")]
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/emberd.service";
+/// Path on disk for the `emberd-rpc` sibling systemd unit (design SLICE 2b).
+/// Always staged; conditionally enabled (see [`rpc_sibling_should_bootstrap`]).
+#[cfg(target_os = "linux")]
+const SYSTEMD_RPC_UNIT_PATH: &str = "/etc/systemd/system/emberd-rpc.service";
 
-/// Returns the rendered launchd plist body with the operator's HOME
-/// baked into `EnvironmentVariables`. Tests assert against this helper
-/// so the writer and the assertion read from the same source.
+/// Returns the rendered launchd plist body. Tests assert against this
+/// helper so the writer and the assertion read from the same source.
+///
+/// Per design (2026-06-14) this plist no longer bakes
+/// `HOME=<operator_home>` into `EnvironmentVariables` — the daemon resolves
+/// its at-rest state, runtime socket, pid file, and config exclusively via
+/// [`crate::paths::DaemonPaths::system()`] (system paths under
+/// `/Library/Application Support/Emberlink/`). `operator_home` is retained
+/// in the signature for call-site stability across the multi-PR sequence;
+/// the parameter is unused.
 ///
 /// `dead_code` allowed because on a Linux non-test build there is no
 /// caller (the macOS impl is excluded and tests don't compile).
 #[allow(dead_code)]
 pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
-    let home = operator_home.display();
-    // emberd_launchd_sandbox_wired (implementation-note-382).
+    render_launchd_plist_body_with_trust_roots(operator_home, "")
+}
+
+/// Render the prod LaunchDaemon plist with an optional `EMBER_TRUST_ROOTS`
+/// environment entry. When `trust_roots` is non-empty it is emitted into the
+/// EnvironmentVariables dict as the canonical comma-separated 64-hex pubkey
+/// list that `crate::binary_manifest::parse_trust_roots` expects.
+///
+/// Empty `trust_roots` produces no entry so daemons that don't need to verify
+/// a manifest keep a minimal env block; the daemon's startup gate
+/// `runtime.rs::PATH-PINNING-STARTUP-VERIFY` already skips verification when
+/// no manifest is on disk.
+///
+/// Per design (2026-06-14) the rendered plist DROPS the historical
+/// `<key>HOME</key>` entry: the daemon resolves its paths via
+/// [`crate::paths::DaemonPaths::system()`] and no longer reads from `$HOME`.
+/// `operator_home` is retained in the signature for call-site stability and
+/// is unused. `EMBER_APP_PEM_PATH` / `EMBER_APP_ENV_PATH` remain — they point
+/// at `/etc/emberlink/`, a system path that design does not move.
+pub(crate) fn render_launchd_plist_body_with_trust_roots(
+    _operator_home: &Path,
+    trust_roots: &str,
+) -> String {
+    // Optional EMBER_TRUST_ROOTS env entry — adds a line inside the
+    // EnvironmentVariables <dict>. Empty trust_roots produces no line at
+    // all, keeping the plist minimal on hosts that don't pin a binary
+    // manifest.
+    let trust_roots_env_line = if trust_roots.is_empty() {
+        String::new()
+    } else {
+        format!("    <key>EMBER_TRUST_ROOTS</key><string>{trust_roots}</string>\n")
+    };
+    // emberd_launchd_sandbox_wired.
     //
     // ProgramArguments wrap `emberd` invocation in `sandbox-exec -f
     // <profile>` so the daemon process runs under the macOS TrustedBSD
@@ -2264,11 +2807,11 @@ pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
            <key>GroupName</key>       <string>ember-clients</string>\n  \
            <key>EnvironmentVariables</key>\n  \
            <dict>\n    \
-             <key>HOME</key><string>{home}</string>\n    \
              <key>EMBER_APP_PEM_PATH</key><string>/etc/emberlink/ember-engine-app.pem</string>\n    \
-             <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>\n  \
+             <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>\n\
+{trust_roots_env_line}  \
            </dict>\n  \
-           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-329. -->\n  \
+           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-309. -->\n  \
            <key>ProgramArguments</key>\n  \
            <array>\n    \
              <string>/usr/bin/sandbox-exec</string>\n    \
@@ -2286,16 +2829,27 @@ pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
     )
 }
 
-/// Returns the rendered systemd unit body with the operator's HOME baked
-/// into `Environment=HOME=...`. Tests assert against this helper so the
-/// writer and the assertion read from the same source.
+/// Returns the rendered systemd unit body. Tests assert against this
+/// helper so the writer and the assertion read from the same source.
+///
+/// Per design (2026-06-14) this unit no longer bakes
+/// `Environment=HOME=<operator_home>`: the daemon resolves its at-rest
+/// state, runtime socket, pid file, and config exclusively via
+/// [`crate::paths::DaemonPaths::system()`] (system paths: `/var/lib/ember/`,
+/// `/run/ember/`, `/etc/ember/`). The unit declares those paths to systemd
+/// via `StateDirectory=ember`, `RuntimeDirectory=ember`, and
+/// `ConfigurationDirectory=ember` so the kernel manages creation,
+/// teardown, and ownership (`ember:ember-clients`) for the daemon. The
+/// group switches from `ember` to `ember-clients` so the group ACL on the
+/// runtime dir / socket matches design §"Auth model" + design §"Socket
+/// placement rationale". `operator_home` is retained in the signature for
+/// call-site stability and is unused.
 ///
 /// `dead_code` allowed because on a macOS non-test build there is no
 /// caller (the Linux impl is excluded and tests don't compile).
 #[allow(dead_code)]
-pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
-    let home = operator_home.display();
-    // emberd_systemd_seccomp_wired (implementation-note-383).
+pub(crate) fn render_systemd_unit_body(_operator_home: &Path) -> String {
+    // emberd_systemd_seccomp_wired.
     //
     // `SystemCallFilter=` directives below apply systemd's seccomp wrapper
     // around the daemon process. The allowlist mirrors the JSON profile
@@ -2316,44 +2870,261 @@ pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
     // Seccomp: field at boot to verify this directive took effect. On
     // mismatch the daemon emits a loud WARN (or refuses to start when
     // EMBER_REQUIRE_SANDBOX=1 is in the Environment= block).
+    //
+    // design directories: StateDirectory=ember resolves to
+    // /var/lib/ember/, RuntimeDirectory=ember resolves to /run/ember/
+    // (cleared on stop, recreated by systemd on start with the unit's
+    // User/Group), ConfigurationDirectory=ember resolves to /etc/ember/.
+    // Mode 0750 + Group=ember-clients gives the operator's session
+    // (added to `ember-clients` at install time per design) traverse +
+    // socket-connect rights without granting daemon-data read.
+    //
+    // ProtectHome=yes (stronger than the previous ProtectHome=read-only):
+    // the daemon has no business in any user's $HOME under design — it
+    // never reads from there.
+    "[Unit]\n\
+     Description=Emberlink Grant Warden daemon\n\
+     After=network.target\n\
+     \n\
+     [Service]\n\
+     Type=simple\n\
+     User=ember\n\
+     Group=ember-clients\n\
+     Environment=EMBER_APP_PEM_PATH=/etc/emberlink/ember-engine-app.pem\n\
+     Environment=EMBER_APP_ENV_PATH=/etc/emberlink/ember-engine.env\n\
+     ExecStart=/usr/local/bin/emberd --foreground\n\
+     Restart=on-failure\n\
+     RestartSec=5\n\
+     \n\
+     # design system-paths — systemd manages /run/ember, /var/lib/ember,\n\
+     # /etc/ember with the unit's User/Group at the modes below.\n\
+     RuntimeDirectory=ember\n\
+     RuntimeDirectoryMode=0750\n\
+     StateDirectory=ember\n\
+     StateDirectoryMode=0750\n\
+     ConfigurationDirectory=ember\n\
+     \n\
+     # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-309.\n\
+     # Allowlist: systemd-curated baseline + explicit fork/exec/mlock.\n\
+     SystemCallFilter=@system-service @ipc @memlock\n\
+     SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources\n\
+     SystemCallErrorNumber=EPERM\n\
+     SystemCallArchitectures=native\n\
+     \n\
+     # Defense-in-depth hardening — systemd primitives complement seccomp.\n\
+     NoNewPrivileges=true\n\
+     ProtectSystem=strict\n\
+     ProtectHome=yes\n\
+     PrivateTmp=true\n\
+     PrivateDevices=true\n\
+     ProtectKernelTunables=true\n\
+     ProtectKernelModules=true\n\
+     ProtectKernelLogs=true\n\
+     ProtectControlGroups=true\n\
+     RestrictNamespaces=true\n\
+     RestrictRealtime=true\n\
+     RestrictSUIDSGID=true\n\
+     LockPersonality=true\n\
+     MemoryDenyWriteExecute=true\n\
+     \n\
+     [Install]\n\
+     WantedBy=multi-user.target\n"
+        .to_string()
+}
+
+// ── design SLICE 2b — emberd-rpc sibling unit bodies ──────────────────────
+//
+// Path-pin derivation (see the SLICE 2b block comment near
+// `install_emberd_rpc_binary` for the full rationale). The prod daemon resolves
+// its path-bearing state via `DaemonPaths::system()` per design. emberd core
+// writes the sibling's TLS material to:
+//   <data_dir>/ember-rpc/server.crt     (runtime.rs:4007)
+//   <data_dir>/ember-rpc/server.key     (runtime.rs:4008)
+//   <data_dir>/bridge_ca.pem            (runtime.rs:3877/3902)
+// and the rpc forward UDS the sibling connects to is:
+//   <run_dir>/rpc.sock                  (runtime.rs:50, socket_dir/rpc.sock)
+// The sibling reads these from EMBER_RPC_{FORWARD_UDS,SERVER_CERT,SERVER_KEY,
+// CA_CERT} (ember-rpc/src/main.rs:43-59). We pin all four here because the
+// sibling's own Config::default() points at the FHS /var/{run,lib}/emberd
+// layout the prod daemon does NOT use on macOS, and because launchd/systemd
+// services must not infer authority-space state from an operator HOME.
+
+/// Render each `EMBER_RPC_*` pin from the daemon's system path layout.
+///
+/// `operator_home` is retained in the signature for call-site stability, but
+/// design moved daemon-owned state and runtime sockets out of user homes.
+/// The RPC sibling is part of authority space and must read the same system
+/// path material the daemon writes.
+///
+/// Returns `(forward_uds, server_cert, server_key, ca_cert)`.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    allow(dead_code)
+)]
+fn rpc_env_pins(_operator_home: &Path) -> (String, String, String, String) {
+    let paths = crate::paths::DaemonPaths::system();
+    let forward_uds = paths.run_dir.join("rpc.sock");
+    let data = paths.data_dir;
+    let server_cert = data.join("ember-rpc").join("server.crt");
+    let server_key = data.join("ember-rpc").join("server.key");
+    let ca_cert = data.join("bridge_ca.pem");
+    (
+        forward_uds.to_string_lossy().into_owned(),
+        server_cert.to_string_lossy().into_owned(),
+        server_key.to_string_lossy().into_owned(),
+        ca_cert.to_string_lossy().into_owned(),
+    )
+}
+
+/// Render the `sh.emberlink.rpc` LaunchDaemon plist body with the four
+/// system-path `EMBER_RPC_*` pins baked into `EnvironmentVariables`.
+/// Modeled on [`render_launchd_plist_body_with_trust_roots`]. Tests assert
+/// against this helper so the writer and the assertion share one source.
+///
+/// `dead_code`/`unused` allowed on non-macOS non-test builds where there is no
+/// caller (the writer is macOS-only).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn render_rpc_launchd_plist_body(operator_home: &Path) -> String {
+    let (forward_uds, server_cert, server_key, ca_cert) = rpc_env_pins(operator_home);
+    // ember_rpc_sibling_bootstrap_landed (rendered authoritative unit).
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n  \
+           <key>Label</key>           <string>sh.emberlink.rpc</string>\n  \
+           <key>UserName</key>        <string>ember</string>\n  \
+           <key>EnvironmentVariables</key>\n  \
+           <dict>\n    \
+             <key>EMBER_RPC_FORWARD_UDS</key><string>{forward_uds}</string>\n    \
+             <key>EMBER_RPC_SERVER_CERT</key><string>{server_cert}</string>\n    \
+             <key>EMBER_RPC_SERVER_KEY</key><string>{server_key}</string>\n    \
+             <key>EMBER_RPC_CA_CERT</key><string>{ca_cert}</string>\n  \
+           </dict>\n  \
+           <key>ProgramArguments</key>\n  \
+           <array>\n    \
+             <string>/usr/local/bin/emberd-rpc-macos</string>\n  \
+           </array>\n  \
+           <key>RunAtLoad</key>       <true/>\n  \
+           <key>KeepAlive</key>       <true/>\n  \
+           <key>ThrottleInterval</key><integer>10</integer>\n  \
+           <key>StandardErrorPath</key><string>/var/log/emberd-rpc.err</string>\n  \
+           <key>StandardOutPath</key> <string>/var/log/emberd-rpc.out</string>\n\
+         </dict>\n\
+         </plist>\n"
+    )
+}
+
+/// Render the `emberd-rpc.service` systemd unit body with the four
+/// system-path `EMBER_RPC_*` pins as `Environment=` lines, carrying
+/// forward ALL the hardening from the `infra/systemd/emberd-rpc.service`
+/// reference scaffold. Modeled on [`render_systemd_unit_body`].
+///
+/// ## ProtectHome / ProtectSystem vs cert readability (load-bearing)
+///
+/// `ProtectSystem=strict` makes the whole filesystem read-only **except** the
+/// paths systemd is told to expose. The sibling MUST be able to (a) READ its
+/// TLS material under the daemon data dir and (b) CONNECT to the forward UDS
+/// under the daemon run dir. If those paths are hidden the sibling fails
+/// closed (cert-not-found → restart loop) — a silent lane failure.
+///
+/// Resolution (the systemd.exec(5)-documented combination): `ProtectHome=tmpfs`
+/// overlays the operator home with an empty tmpfs, then `BindReadOnlyPaths=` /
+/// `BindPaths=` bind-mount the two real `.ember` subtrees back into the
+/// namespace (the systemd bind family is `BindPaths=` [read-write] /
+/// `BindReadOnlyPaths=` [read-only] — there is no `BindReadWritePaths=`). We do
+/// NOT use `ProtectHome=true` + `ReadOnlyPaths=`: an adversarial review
+/// (2026-06-05) raised — from the systemd.exec(5) wording on `InaccessiblePaths=`
+/// nesting — that `ReadOnlyPaths=` might not re-expose through the overlay
+/// `ProtectHome=true` installs over `/home`. Empirical validation on systemd 257
+/// found BOTH combos DO re-expose the cert (so it was not the universal failure
+/// the review claimed), but `BindReadOnlyPaths=`/`BindPaths=` under
+/// `ProtectHome=tmpfs` is the man page's explicit "hide home but expose
+/// necessary dirs" pattern — kept for clarity and cross-version robustness
+/// (older systemd may differ from 257). Validated on systemd 257: cert readable
+/// + forward-UDS connectable through this namespace.
+///
+/// `data/` is bound read-only (the sibling only READS
+/// its cert/key/ca — integrity-protected against a compromised mTLS parser);
+/// `run/` is bound read-write so `connect(2)` to the forward UDS is unimpeded
+/// (same `ember` uid that already owns the dir — no new privilege). The `-`
+/// prefix tolerates a path not yet existing at namespace setup (async cert
+/// mint), so a racing sibling soft-fails on the missing cert and self-heals.
+///
+/// NOTE: the string-match test for this fn cannot prove the namespace actually
+/// re-exposes the cert at runtime — that requires booting the unit on real
+/// systemd (a Linux-VM validation step), NOT the macOS worktree.
+///
+/// `dead_code` allowed on non-Linux non-test builds (writer is Linux-only).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn render_rpc_systemd_unit_body(operator_home: &Path) -> String {
+    let (forward_uds, server_cert, server_key, ca_cert) = rpc_env_pins(operator_home);
+    let paths = crate::paths::DaemonPaths::system();
+    let data_dir = paths.data_dir;
+    let run_dir = paths.run_dir;
+    let data_dir = data_dir.display();
+    let run_dir = run_dir.display();
+    // ember_rpc_sibling_bootstrap_landed (rendered authoritative unit).
     format!(
         "[Unit]\n\
-         Description=Emberlink Grant Warden daemon\n\
-         After=network.target\n\
+         Description=Ember RPC frontend (mTLS lane) — design amendment\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
          \n\
          [Service]\n\
          Type=simple\n\
          User=ember\n\
          Group=ember\n\
-         Environment=HOME={home}\n\
-         Environment=EMBER_APP_PEM_PATH=/etc/emberlink/ember-engine-app.pem\n\
-         Environment=EMBER_APP_ENV_PATH=/etc/emberlink/ember-engine.env\n\
-         ExecStart=/usr/local/bin/emberd --foreground\n\
-         Restart=on-failure\n\
+         ExecStart=/usr/local/bin/emberd-rpc-linux\n\
+         # 2c cert hot-reload entry point — SIGHUP re-reads the rotated server cert.\n\
+         ExecReload=/bin/kill -HUP $MAINPID\n\
+         Restart=always\n\
          RestartSec=5\n\
+         StartLimitBurst=10\n\
+         StartLimitIntervalSec=120\n\
+         Environment=EMBER_RPC_FORWARD_UDS={forward_uds}\n\
+         Environment=EMBER_RPC_SERVER_CERT={server_cert}\n\
+         Environment=EMBER_RPC_SERVER_KEY={server_key}\n\
+         Environment=EMBER_RPC_CA_CERT={ca_cert}\n\
          \n\
-         # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-329.\n\
-         # Allowlist: systemd-curated baseline + explicit fork/exec/mlock.\n\
-         SystemCallFilter=@system-service @ipc @memlock\n\
-         SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources\n\
-         SystemCallErrorNumber=EPERM\n\
-         SystemCallArchitectures=native\n\
-         \n\
-         # Defense-in-depth hardening — systemd primitives complement seccomp.\n\
+         # Cap-drop=ALL — ember-rpc binds an unprivileged loopback port, reads\n\
+         # TLS bytes, forwards bincode over a UDS it owns by uid. No privileged op.\n\
+         CapabilityBoundingSet=\n\
+         AmbientCapabilities=\n\
          NoNewPrivileges=true\n\
+         \n\
+         # Filesystem hardening (see the fn doc-comment for the ProtectHome/Bind\n\
+         # interaction rationale).\n\
          ProtectSystem=strict\n\
-         ProtectHome=read-only\n\
+         # ProtectHome=tmpfs (NOT =true) overlays the operator home with an empty\n\
+         # tmpfs; the Bind*Paths= below bind-mount the two real .ember subtrees\n\
+         # back into the namespace — the systemd.exec(5)-documented 'hide home but\n\
+         # expose necessary dirs' pattern (validated on systemd 257: cert readable\n\
+         # + forward-UDS connectable). See the fn doc-comment for why this is\n\
+         # preferred over ProtectHome=true + ReadOnlyPaths=.\n\
+         ProtectHome=tmpfs\n\
+         # `-` prefix tolerates the dir not existing yet at namespace setup (the\n\
+         # cert is minted async on a fresh bridge-on host; a sibling that races\n\
+         # ahead soft-fails on the missing cert and self-heals on the next\n\
+         # restart). data/ is BindReadOnlyPaths (read-only — the sibling only\n\
+         # READS its cert/key/ca, integrity-protected); run/ is BindPaths\n\
+         # (read-write — the systemd bind family is BindPaths=/BindReadOnlyPaths=,\n\
+         # there is NO BindReadWritePaths=) so connect(2) to the forward UDS is\n\
+         # unimpeded (same ember uid that already owns the dir).\n\
+         BindReadOnlyPaths=-{data_dir}\n\
+         BindPaths=-{run_dir}\n\
          PrivateTmp=true\n\
          PrivateDevices=true\n\
          ProtectKernelTunables=true\n\
          ProtectKernelModules=true\n\
-         ProtectKernelLogs=true\n\
          ProtectControlGroups=true\n\
          RestrictNamespaces=true\n\
          RestrictRealtime=true\n\
-         RestrictSUIDSGID=true\n\
          LockPersonality=true\n\
          MemoryDenyWriteExecute=true\n\
+         \n\
+         KillSignal=SIGTERM\n\
+         TimeoutStopSec=10\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -2366,14 +3137,34 @@ pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
 /// `dirs_next::home_dir()` returns `/var/root` — not the home of the
 /// human operator who actually ran the install. `sudo` does, however,
 /// preserve `$SUDO_USER`, which gives the invoking user's name. This
-/// helper reads `$SUDO_USER` (falling back to `$USER` for the run-as-root-
-/// directly case) and resolves that user's home via `getpwnam_r`.
+/// helper resolves the operator via `resolve_operator_user`
+/// (`$EMBER_OPERATOR` > `$SUDO_USER` > `$USER`) and looks up that user's
+/// home via `getpwnam_r`. `$EMBER_OPERATOR` is the macOS `.pkg` lane's
+/// channel: its postinstall runs as a pure-root login with no `$SUDO_USER`,
+/// so it pins the console user explicitly.
 ///
 /// Returns `InstallError::Subprocess` with a clear hint when the install
-/// is being run as root with no `$SUDO_USER` to anchor to — that's the
+/// is being run as root with no operator signal to anchor to — that's the
 /// "logged in as root directly" case the install isn't designed for.
 pub fn resolve_operator_home() -> Result<PathBuf, InstallError> {
-    let user = std::env::var("SUDO_USER")
+    let user = resolve_operator_user()?;
+    home_for_user(&user).ok_or_else(|| InstallError::Subprocess {
+        cmd: "resolve_operator_home".to_string(),
+        stderr: format!("getpwnam_r for {user:?} returned no home directory"),
+        exit_code: None,
+    })
+}
+
+fn resolve_operator_user() -> Result<String, InstallError> {
+    // `EMBER_OPERATOR` takes precedence over `$SUDO_USER`/`$USER`. The macOS
+    // `.pkg` postinstall runs as a pure-root login (spawned by
+    // `package_script_service`, which does not inherit `$SUDO_USER` even when
+    // the operator launched `sudo installer`), so there is no environment
+    // signal for the human operator. The postinstall resolves the console user
+    // (`stat -f%Su /dev/console`) and pins it here. Outside the pkg lane the
+    // var is unset, so `sudo ember daemon install` keeps its prior behavior.
+    let user = std::env::var("EMBER_OPERATOR")
+        .or_else(|_| std::env::var("SUDO_USER"))
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default();
 
@@ -2381,9 +3172,11 @@ pub fn resolve_operator_home() -> Result<PathBuf, InstallError> {
         return Err(InstallError::Subprocess {
             cmd: "resolve_operator_home".to_string(),
             stderr: format!(
-                "could not resolve invoking-operator home: SUDO_USER={:?} USER={:?}. \
-                 Run via `sudo ember daemon install` from a regular user shell — \
-                 not from a root login.",
+                "could not resolve invoking-operator home: EMBER_OPERATOR={:?} \
+                 SUDO_USER={:?} USER={:?}. Run via `sudo ember daemon install` \
+                 from a regular user shell, or set EMBER_OPERATOR to the target \
+                 operator (the macOS .pkg postinstall does this from the console user).",
+                std::env::var("EMBER_OPERATOR").ok(),
                 std::env::var("SUDO_USER").ok(),
                 std::env::var("USER").ok()
             ),
@@ -2391,11 +3184,7 @@ pub fn resolve_operator_home() -> Result<PathBuf, InstallError> {
         });
     }
 
-    home_for_user(&user).ok_or_else(|| InstallError::Subprocess {
-        cmd: "resolve_operator_home".to_string(),
-        stderr: format!("getpwnam_r for {user:?} returned no home directory"),
-        exit_code: None,
-    })
+    Ok(user)
 }
 
 /// Look up a username's home directory via `getpwnam_r(3)`. Returns
@@ -2449,14 +3238,30 @@ fn home_for_user(user: &str) -> Option<PathBuf> {
 /// system` both reject non-root callers.
 #[cfg(target_os = "macos")]
 pub fn install_launchd_plist(operator_home: &Path) -> Result<(), InstallError> {
+    install_launchd_plist_with_trust_roots(operator_home, "")
+}
+
+/// Install the LaunchDaemon plist with an `EMBER_TRUST_ROOTS` environment
+/// entry baked into the EnvironmentVariables dict. The value must be a
+/// comma-separated list of 64-char lower-hex Ed25519 public keys (the shape
+/// [`crate::binary_manifest::parse_trust_roots`] consumes). An empty string
+/// falls through to the legacy plist with no trust-roots entry — the daemon
+/// then refuses to load any binary manifest, which is the historical posture
+/// for hosts that don't pin Construct binaries.
+#[cfg(target_os = "macos")]
+pub fn install_launchd_plist_with_trust_roots(
+    operator_home: &Path,
+    trust_roots: &str,
+) -> Result<(), InstallError> {
     // Publish the emberd binary first — the plist's ProgramArguments
     // references /usr/local/bin/emberd; bootstrap silently exec-fails
     // with ENOENT if the binary is missing.
     install_emberd_binary()?;
     install_launchd_sandbox_profile(operator_home)?;
+    park_incompatible_launchd_binary_manifest(operator_home, trust_roots)?;
 
     let path = Path::new(LAUNCHD_PLIST_PATH);
-    let body = render_launchd_plist_body(operator_home);
+    let body = render_launchd_plist_body_with_trust_roots(operator_home, trust_roots);
 
     // Idempotency check — skip the bootout/bootstrap cycle only when
     // BOTH (a) the on-disk plist content already matches AND (b) the
@@ -2502,12 +3307,222 @@ pub fn install_launchd_plist(operator_home: &Path) -> Result<(), InstallError> {
         wait_for_launchd_runtime_artifacts(operator_home)?;
     }
 
+    // design SLICE 2b — stage (+ conditionally bootstrap) the emberd-rpc
+    // sibling alongside the core daemon. Errors propagate so a failed sibling
+    // stage fails the install loudly rather than leaving a half-wired host.
+    install_rpc_plist(operator_home)?;
+
     Ok(())
 }
 
+/// Stage (and conditionally bootstrap) the `emberd-rpc` sibling LaunchDaemon
+/// (design SLICE 2b, "Option A" lifecycle).
+///
+/// `ember_rpc_sibling_bootstrap_landed` — install-lane entry point for the
+/// `emberd-rpc` mTLS-frontend sibling.
+///
+/// Steps:
+/// 1. Publish the platform binary to `/usr/local/bin/emberd-rpc-macos`.
+/// 2. Render the plist with daemon system-path `EMBER_RPC_*` pins and
+///    write it to `/Library/LaunchDaemons/sh.emberlink.rpc.plist` (mode 0644)
+///    — ALWAYS, so the unit is ready the moment the bridge is enabled.
+/// 3. If the bridge is configured ON ([`rpc_sibling_should_bootstrap`]):
+///    `launchctl bootstrap` it (bootout-tolerant first), then verify it loaded.
+///    Else: ensure it is NOT loaded (bootout-tolerant) so toggling the bridge
+///    off actually stops a previously-bootstrapped sibling (hard-right symmetry).
+///
+/// ## Idempotency (Plan-J lesson)
+///
+/// The content-only skip is a known bug: a re-install after the plist was
+/// parked or a failed bootstrap sees matching content but no loaded service and
+/// silently skips bootstrap. We mirror `install_launchd_plist_with_trust_roots`:
+/// skip the write/bootstrap cycle ONLY when the on-disk content matches AND the
+/// desired loaded-state already holds.
+///
+/// Requires root (LaunchDaemons dir + `launchctl ... system` reject non-root).
 #[cfg(target_os = "macos")]
-fn clear_stale_launchd_runtime_artifacts(operator_home: &Path) -> Result<bool, InstallError> {
-    let run_dir = operator_home.join(".ember").join("run");
+pub fn install_rpc_plist(operator_home: &Path) -> Result<(), InstallError> {
+    // Publish the sibling binary first — the plist's ProgramArguments
+    // references /usr/local/bin/emberd-rpc-macos; bootstrap silently
+    // exec-fails with ENOENT if the binary is missing.
+    install_emberd_rpc_binary()?;
+
+    let path = Path::new(LAUNCHD_RPC_PLIST_PATH);
+    let body = render_rpc_launchd_plist_body(operator_home);
+    let should_bootstrap = rpc_sibling_should_bootstrap(operator_home);
+
+    // Pre-create the rpc log paths the same way emberd's are pre-created:
+    // launchd opens StandardError/OutPath as root then hands the fds to the
+    // ember-uid process, but /var/log is root:wheel so the ember user can't
+    // create them. Only needed when we actually bootstrap.
+    let log_paths_repaired = if should_bootstrap {
+        ensure_emberd_rpc_log_paths()?
+    } else {
+        false
+    };
+
+    let content_matches = std::fs::read_to_string(path)
+        .map(|existing| existing == body)
+        .unwrap_or(false);
+    let loaded = is_launchd_rpc_service_loaded();
+    // Desired loaded-state already holds?
+    let state_converged = loaded == should_bootstrap;
+
+    if content_matches && state_converged && !log_paths_repaired {
+        return Ok(());
+    }
+
+    std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
+        cmd: format!("write {LAUNCHD_RPC_PLIST_PATH}"),
+        stderr: format!("write failed: {e}"),
+        exit_code: None,
+    })?;
+    run("chmod", &["0644", LAUNCHD_RPC_PLIST_PATH], false)?;
+
+    if should_bootstrap {
+        // Clear any sticky `launchctl disable` override left by a prior
+        // bridge-OFF install — a disabled service refuses to `bootstrap`, and
+        // enable/disable overrides persist in launchd's db across reboots.
+        run("launchctl", &["enable", "system/sh.emberlink.rpc"], false)?;
+        // bootout-tolerant first so a stale/old-content unit is replaced.
+        bootout_rpc_tolerant()?;
+        run(
+            "launchctl",
+            &["bootstrap", "system", LAUNCHD_RPC_PLIST_PATH],
+            false,
+        )?;
+        // Verify it actually REGISTERED — don't silent-no-op. NOTE: this
+        // confirms bootstrap-domain membership, NOT a running process — a
+        // sibling that registers then crash-loops on a missing/rotating cert
+        // still reports loaded (the async cert mint can race this verify on a
+        // fresh bridge-ON install; Restart/KeepAlive self-heals). A bridge-ON
+        // host that fails to register AT ALL is a real install failure.
+        if !is_launchd_rpc_service_loaded() {
+            return Err(InstallError::Subprocess {
+                cmd: format!("launchctl bootstrap system {LAUNCHD_RPC_PLIST_PATH}"),
+                stderr: "emberd-rpc sibling did not load after bootstrap \
+                         (bridge is configured ON; check /var/log/emberd-rpc.err)"
+                    .to_string(),
+                exit_code: None,
+            });
+        }
+    } else {
+        // Bridge OFF: stop the current session AND write a persistent disabled
+        // override. The rendered plist has RunAtLoad/KeepAlive=true, so a plist
+        // merely RESIDENT in /Library/LaunchDaemons auto-loads at the NEXT BOOT
+        // — `bootout` only unloads the current session. Without the `disable`
+        // override a staged-OFF sibling would auto-start after a reboot, find no
+        // cert (minted only in the daemon's bridge-ON branch), and crash-loop,
+        // defeating "inert until enabled". (Added after adversarial review,
+        // 2026-06-05.)
+        bootout_rpc_tolerant()?;
+        run("launchctl", &["disable", "system/sh.emberlink.rpc"], false)?;
+    }
+
+    Ok(())
+}
+
+/// Non-macOS fallback for [`install_rpc_plist`].
+#[cfg(not(target_os = "macos"))]
+pub fn install_rpc_plist(_operator_home: &Path) -> Result<(), InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "install_rpc_plist".to_string(),
+        stderr: "unsupported platform: emberd-rpc plist install is macOS-only".to_string(),
+        exit_code: None,
+    })
+}
+
+/// True if the `sh.emberlink.rpc` LaunchDaemon is currently loaded by launchd.
+/// We use the looser "service exists in the print output" check (exit 0) rather
+/// than the strict active-process check used for emberd core: on a bridge-ON
+/// host with no cert yet the sibling may be flapping, but it is still
+/// *bootstrapped* (loaded), which is what we gate the install convergence on.
+#[cfg(target_os = "macos")]
+fn is_launchd_rpc_service_loaded() -> bool {
+    Command::new("launchctl")
+        .args(["print", "system/sh.emberlink.rpc"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// `launchctl bootout system <rpc-plist>` tolerating "not currently
+/// bootstrapped" across macOS versions. Reuses [`bootout_tolerant_inner`] so
+/// the version-specific tolerance table is shared with the emberd-core path.
+#[cfg(target_os = "macos")]
+fn bootout_rpc_tolerant() -> Result<(), InstallError> {
+    let cmd_string = format!("launchctl bootout system {LAUNCHD_RPC_PLIST_PATH}");
+    bootout_tolerant_inner(&cmd_string, || {
+        let output = Command::new("launchctl")
+            .args(["bootout", "system", LAUNCHD_RPC_PLIST_PATH])
+            .output()
+            .map_err(|e| InstallError::Subprocess {
+                cmd: cmd_string.clone(),
+                stderr: format!("spawn failed: {e}"),
+                exit_code: None,
+            })?;
+        let exit_code = output.status.code();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Ok((exit_code, stderr, output.status.success()))
+    })
+}
+
+/// Standard error/out log paths written into the rpc sibling's plist. Same
+/// EX_CONFIG-on-missing-file requirement as the emberd-core log paths.
+#[cfg(target_os = "macos")]
+const EMBERD_RPC_LOG_ERR: &str = "/var/log/emberd-rpc.err";
+#[cfg(target_os = "macos")]
+const EMBERD_RPC_LOG_OUT: &str = "/var/log/emberd-rpc.out";
+
+/// Pre-create `/var/log/emberd-rpc.{err,out}` owned by the `ember` user so
+/// launchd can hand the fds to the ember-uid sibling. Delegates to the shared
+/// [`ensure_emberd_log_paths_inner`] (same EX_CONFIG-on-missing-file failure
+/// mode and chown-via-`libc::chown` mechanics as the emberd-core path).
+/// Returns true if either file was created/repaired.
+#[cfg(target_os = "macos")]
+fn ensure_emberd_rpc_log_paths() -> Result<bool, InstallError> {
+    ensure_emberd_log_paths_inner(
+        Path::new(EMBERD_RPC_LOG_ERR),
+        Path::new(EMBERD_RPC_LOG_OUT),
+        ember_user_uid_gid,
+        |path, uid, gid| {
+            use std::ffi::CString;
+            let path_c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| {
+                InstallError::Subprocess {
+                    cmd: format!("chown {}", path.display()),
+                    stderr: format!("path contains NUL: {e}"),
+                    exit_code: None,
+                }
+            })?;
+            // SAFETY: path_c is a valid NUL-terminated C string; uid/gid come
+            // from getpwnam_r for the provisioned `ember` user.
+            let rc = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(InstallError::Subprocess {
+                    cmd: format!("chown {}:{} {}", uid, gid, path.display()),
+                    stderr: format!("chown failed: {err}"),
+                    exit_code: Some(rc),
+                });
+            }
+            Ok(())
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn clear_stale_launchd_runtime_artifacts(_operator_home: &Path) -> Result<bool, InstallError> {
+    // design: runtime artifacts (socket + pid) live at the system run dir
+    // (`/Library/Application Support/Emberlink/run/`). The `_operator_home`
+    // argument is retained for call-site stability and is unused.
+    clear_stale_launchd_runtime_artifacts_inner(&crate::paths::DaemonPaths::system())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_stale_launchd_runtime_artifacts_inner(
+    paths: &crate::paths::DaemonPaths,
+) -> Result<bool, InstallError> {
+    let run_dir = &paths.run_dir;
     let mut changed = false;
     for path in [run_dir.join("emberd.pid"), run_dir.join("daemon.sock")] {
         match std::fs::remove_file(&path) {
@@ -2526,11 +3541,14 @@ fn clear_stale_launchd_runtime_artifacts(operator_home: &Path) -> Result<bool, I
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_launchd_runtime_artifacts(operator_home: &Path) -> Result<(), InstallError> {
+fn wait_for_launchd_runtime_artifacts(_operator_home: &Path) -> Result<(), InstallError> {
     const MAX_ATTEMPTS: usize = 50;
     const SLEEP_MS: u64 = 100;
 
-    let run_dir = operator_home.join(".ember").join("run");
+    // design: runtime artifacts under the system run dir; `_operator_home`
+    // retained for call-site stability and unused.
+    let paths = crate::paths::DaemonPaths::system();
+    let run_dir = paths.run_dir;
     let pid_path = run_dir.join("emberd.pid");
     let socket_path = run_dir.join("daemon.sock");
 
@@ -2538,18 +3556,21 @@ fn wait_for_launchd_runtime_artifacts(operator_home: &Path) -> Result<(), Instal
         MAX_ATTEMPTS,
         || pid_path.exists() && socket_path.exists(),
         || std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS)),
+        || launchd_runtime_timeout_diagnostics(&pid_path, &socket_path),
     )
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_launchd_runtime_artifacts_inner<P, S>(
+fn wait_for_launchd_runtime_artifacts_inner<P, S, D>(
     max_attempts: usize,
     probe: P,
     sleep: S,
+    diagnostics: D,
 ) -> Result<(), InstallError>
 where
     P: Fn() -> bool,
     S: Fn(),
+    D: Fn() -> String,
 {
     for attempt in 0..max_attempts {
         if probe() {
@@ -2562,10 +3583,219 @@ where
 
     Err(InstallError::Subprocess {
         cmd: "launchctl bootstrap system sh.emberlink.daemon".to_string(),
-        stderr: "daemon install completed but the managed runtime artifacts never reappeared"
-            .to_string(),
+        stderr: format!(
+            "daemon install completed but the managed runtime artifacts never reappeared\n{}",
+            diagnostics()
+        ),
         exit_code: None,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_runtime_timeout_diagnostics(pid_path: &Path, socket_path: &Path) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "runtime artifact state: pid_file={} present={}, socket={} present={}",
+        pid_path.display(),
+        pid_path.exists(),
+        socket_path.display(),
+        socket_path.exists()
+    ));
+
+    match Command::new("launchctl")
+        .args(["print", "system/sh.emberlink.daemon"])
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            out.push_str("\nlaunchctl print system/sh.emberlink.daemon:\n");
+            out.push_str(&last_lines(stdout.trim(), 80));
+            if !stderr.trim().is_empty() {
+                out.push_str("\nlaunchctl stderr:\n");
+                out.push_str(&last_lines(stderr.trim(), 20));
+            }
+        }
+        Err(e) => {
+            out.push_str(&format!("\nlaunchctl print failed: {e}"));
+        }
+    }
+
+    for log_path in ["/var/log/emberd.err", "/var/log/emberd.out"] {
+        match std::fs::read_to_string(log_path) {
+            Ok(text) if !text.trim().is_empty() => {
+                out.push_str(&format!("\nlast lines from {log_path}:\n"));
+                out.push_str(&last_lines(text.trim(), 40));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                out.push_str(&format!("\nread {log_path} failed: {e}"));
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn last_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+#[cfg(target_os = "macos")]
+fn park_incompatible_launchd_binary_manifest(
+    operator_home: &Path,
+    install_trust_roots: &str,
+) -> Result<bool, InstallError> {
+    let manifest_path = operator_home
+        .join(".ember")
+        .join("binaries")
+        .join("manifest.toml");
+    let trust_roots = launchd_binary_manifest_trust_roots(operator_home, install_trust_roots)?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown-time".to_string());
+    park_incompatible_launchd_binary_manifest_inner(&manifest_path, &trust_roots, &suffix)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_binary_manifest_trust_roots(
+    operator_home: &Path,
+    install_trust_roots: &str,
+) -> Result<Vec<ed25519_dalek::VerifyingKey>, InstallError> {
+    let mut roots = Vec::new();
+    if let Ok(release_pk) =
+        ed25519_dalek::VerifyingKey::from_bytes(&crate::trust_graph::EMBER_SYSTEMS_PUBKEY_BYTES)
+    {
+        roots.push(release_pk);
+    }
+
+    let trust_root_text = read_launchd_config_trust_roots(operator_home)?;
+    let user_roots = crate::binary_manifest::parse_trust_roots(&trust_root_text).map_err(|e| {
+        InstallError::Subprocess {
+            cmd: "parse launchd binary manifest trust roots".to_string(),
+            stderr: format!(
+                "could not parse [daemon].trust_roots from {}: {e}",
+                crate::paths::DaemonPaths::system().config_file().display()
+            ),
+            exit_code: None,
+        }
+    })?;
+    roots.extend(user_roots);
+
+    let install_roots =
+        crate::binary_manifest::parse_trust_roots(install_trust_roots).map_err(|e| {
+            InstallError::Subprocess {
+                cmd: "parse launchd binary manifest install trust roots".to_string(),
+                stderr: format!("could not parse installer-supplied EMBER_TRUST_ROOTS: {e}"),
+                exit_code: None,
+            }
+        })?;
+    roots.extend(install_roots);
+    Ok(roots)
+}
+
+#[cfg(target_os = "macos")]
+fn read_launchd_config_trust_roots(_operator_home: &Path) -> Result<String, InstallError> {
+    // design: daemon config at the system path; `_operator_home` retained
+    // for call-site stability and unused.
+    let config_path = crate::paths::DaemonPaths::system().config_file();
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => {
+            return Err(InstallError::Subprocess {
+                cmd: format!("read {}", config_path.display()),
+                stderr: format!("read failed: {e}"),
+                exit_code: None,
+            });
+        }
+    };
+
+    let value: toml::Value = toml::from_str(&text).map_err(|e| InstallError::Subprocess {
+        cmd: format!("parse {}", config_path.display()),
+        stderr: format!("toml parse failed: {e}"),
+        exit_code: None,
+    })?;
+    Ok(value
+        .get("daemon")
+        .and_then(|daemon| daemon.get("trust_roots"))
+        .and_then(|roots| roots.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn park_incompatible_launchd_binary_manifest_inner(
+    manifest_path: &Path,
+    trust_roots: &[ed25519_dalek::VerifyingKey],
+    suffix: &str,
+) -> Result<bool, InstallError> {
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+
+    match crate::binary_manifest::verify_manifest_signature_with_trust_roots(
+        manifest_path,
+        trust_roots,
+    ) {
+        Ok(()) => Ok(false),
+        Err(e) => {
+            let parked_manifest = rejected_manifest_path(manifest_path, suffix);
+            std::fs::rename(manifest_path, &parked_manifest).map_err(|rename_err| {
+                InstallError::Subprocess {
+                    cmd: format!(
+                        "mv {} {}",
+                        manifest_path.display(),
+                        parked_manifest.display()
+                    ),
+                    stderr: format!(
+                        "manifest failed launchd trust-root verification ({e}); rename failed: {rename_err}"
+                    ),
+                    exit_code: None,
+                }
+            })?;
+
+            let sidecar_path = manifest_path.with_extension("toml.sig");
+            if sidecar_path.exists() {
+                let parked_sidecar = rejected_manifest_path(&sidecar_path, suffix);
+                std::fs::rename(&sidecar_path, &parked_sidecar).map_err(|rename_err| {
+                    InstallError::Subprocess {
+                        cmd: format!(
+                            "mv {} {}",
+                            sidecar_path.display(),
+                            parked_sidecar.display()
+                        ),
+                        stderr: format!(
+                            "manifest failed launchd trust-root verification ({e}); sidecar rename failed: {rename_err}"
+                        ),
+                        exit_code: None,
+                    }
+                })?;
+            }
+
+            tracing::warn!(
+                manifest = %manifest_path.display(),
+                parked = %parked_manifest.display(),
+                error = %e,
+                "parked binary manifest that is incompatible with the launchd trust roots"
+            );
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rejected_manifest_path(path: &Path, suffix: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("manifest.toml");
+    path.with_file_name(format!("{name}.rejected-{suffix}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -2699,9 +3929,6 @@ fn launchd_service_has_active_process(print_output: &str) -> bool {
 /// runner closure so unit tests can inject canned `(exit_code, stderr)`
 /// tuples without spawning a real `launchctl` subprocess.
 ///
-/// ## Checkpoint
-///
-/// implementation-note-384
 #[cfg(target_os = "macos")]
 fn bootout_tolerant() -> Result<(), InstallError> {
     let cmd_string = format!("launchctl bootout system {LAUNCHD_PLIST_PATH}");
@@ -2793,9 +4020,6 @@ const EMBERD_LOG_OUT: &str = "/var/log/emberd.out";
 /// then chown them to `ember:ember-clients` so the daemon can append to them
 /// at runtime.
 ///
-/// ## Checkpoint
-///
-/// implementation-note-385
 #[cfg(target_os = "macos")]
 pub fn ensure_emberd_log_paths() -> Result<bool, InstallError> {
     ensure_emberd_log_paths_inner(
@@ -2939,6 +4163,18 @@ pub fn install_launchd_plist(_operator_home: &Path) -> Result<(), InstallError> 
     })
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn install_launchd_plist_with_trust_roots(
+    _operator_home: &Path,
+    _trust_roots: &str,
+) -> Result<(), InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "install_launchd_plist_with_trust_roots".to_string(),
+        stderr: "unsupported platform: launchd plist install is macOS-only".to_string(),
+        exit_code: None,
+    })
+}
+
 /// Install the `emberd.service` systemd unit at
 /// `/etc/systemd/system/emberd.service` and enable it (per design
 /// §Linux install).
@@ -2986,6 +4222,11 @@ pub fn install_systemd_unit(operator_home: &Path) -> Result<(), InstallError> {
     run("systemctl", &["daemon-reload"], false)?;
     run("systemctl", &["enable", "--now", "emberd.service"], false)?;
 
+    // design SLICE 2b — stage (+ conditionally enable) the emberd-rpc sibling
+    // alongside the core daemon. Errors propagate so a failed sibling stage
+    // fails the install loudly rather than leaving a half-wired host.
+    install_rpc_systemd_unit(operator_home)?;
+
     Ok(())
 }
 
@@ -3001,14 +4242,105 @@ pub fn install_systemd_unit(_operator_home: &Path) -> Result<(), InstallError> {
     })
 }
 
+/// Stage (and conditionally enable) the `emberd-rpc` sibling systemd unit
+/// (design SLICE 2b, "Option A" lifecycle).
+///
+/// `ember_rpc_sibling_bootstrap_landed` — install-lane entry point for the
+/// `emberd-rpc` mTLS-frontend sibling (Linux).
+///
+/// Steps:
+/// 1. Publish the platform binary to `/usr/local/bin/emberd-rpc-linux`.
+/// 2. Render the unit with daemon system-path `EMBER_RPC_*` pins + carried
+///    hardening and write it to `/etc/systemd/system/emberd-rpc.service`
+///    (mode 0644) — ALWAYS, so the unit is ready the moment the bridge is on.
+/// 3. `systemctl daemon-reload`.
+/// 4. If the bridge is configured ON ([`rpc_sibling_should_bootstrap`]):
+///    `systemctl enable --now emberd-rpc.service`. Else:
+///    `systemctl disable --now emberd-rpc.service` (tolerant when the unit is
+///    not loaded) so toggling the bridge off actually stops a previously-
+///    enabled sibling (hard-right symmetry).
+///
+/// Requires root (typically invoked under `sudo` from the installer entry
+/// point).
+#[cfg(target_os = "linux")]
+pub fn install_rpc_systemd_unit(operator_home: &Path) -> Result<(), InstallError> {
+    // Publish the sibling binary first — the unit's ExecStart references
+    // /usr/local/bin/emberd-rpc-linux; without it `systemctl start` fails
+    // with "Failed to locate executable" and the unit goes to failed.
+    install_emberd_rpc_binary()?;
+
+    let path = Path::new(SYSTEMD_RPC_UNIT_PATH);
+    let body = render_rpc_systemd_unit_body(operator_home);
+
+    let already_matches = std::fs::read_to_string(path)
+        .map(|existing| existing == body)
+        .unwrap_or(false);
+
+    if !already_matches {
+        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
+            cmd: format!("write {SYSTEMD_RPC_UNIT_PATH}"),
+            stderr: format!("write failed: {e}"),
+            exit_code: None,
+        })?;
+        run("chmod", &["0644", SYSTEMD_RPC_UNIT_PATH], false)?;
+    }
+
+    run("systemctl", &["daemon-reload"], false)?;
+
+    if rpc_sibling_should_bootstrap(operator_home) {
+        run(
+            "systemctl",
+            &["enable", "--now", "emberd-rpc.service"],
+            false,
+        )?;
+        // `enable --now` on a Type=simple/Restart=always unit returns 0 as soon
+        // as ExecStart is exec'd — BEFORE a cert-missing crash. Surface a
+        // sibling that did not come up, but do NOT hard-fail: on a fresh
+        // bridge-ON host emberd-core mints the rpc cert asynchronously, so the
+        // sibling may legitimately be mid-restart and a strict check would
+        // false-fail the install. WARN with a journal hint instead. (Added
+        // after adversarial review, 2026-06-05.)
+        let active = Command::new("systemctl")
+            .args(["is-active", "--quiet", "emberd-rpc.service"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !active {
+            tracing::warn!(
+                "emberd-rpc sibling enabled but not yet active — if it does not \
+                 settle shortly, check `journalctl -u emberd-rpc.service` (a \
+                 missing rpc cert means emberd-core has not minted it yet)"
+            );
+        }
+    } else {
+        // Bridge OFF: stop + disable any previously-enabled sibling. We always
+        // wrote the unit file above, so `disable --now` sees an existing unit;
+        // on a unit that was never enabled it is a harmless exit-0 no-op. A
+        // real failure (e.g. permission) still propagates.
+        run(
+            "systemctl",
+            &["disable", "--now", "emberd-rpc.service"],
+            false,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Non-Linux fallback for [`install_rpc_systemd_unit`].
+#[cfg(not(target_os = "linux"))]
+pub fn install_rpc_systemd_unit(_operator_home: &Path) -> Result<(), InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "install_rpc_systemd_unit".to_string(),
+        stderr: "unsupported platform: emberd-rpc systemd unit install is Linux-only".to_string(),
+        exit_code: None,
+    })
+}
+
 // ============================================================================
 // design Components 2 + 3 + MACOS-PRIMITIVES Decision 5 —
 // spawn-helper + spawn-shim install integration.
 // ============================================================================
-//
-// implementation-note-187
-// implementation-note-186
-// implementation-note-188
 //
 // The spawn-helper is a root-privileged sibling daemon (LaunchDaemon
 // on macOS, systemd unit on hardened Linux) that accepts
@@ -3094,8 +4426,6 @@ pub fn detect_hardened_linux() -> Result<bool, InstallError> {
 /// 5 brief: the helper bin REQUIRES `--pool-uid-base` and `--pool-
 /// size` with no defaults; this renderer is the single producer of
 /// those values for production systemd.
-///
-/// implementation-note-187
 #[allow(dead_code)]
 pub(crate) fn render_spawn_helper_unit_body(
     ember_uid: u32,
@@ -3104,8 +4434,8 @@ pub(crate) fn render_spawn_helper_unit_body(
 ) -> String {
     format!(
         "[Unit]\n\
-         Description=Emberlink spawn-helper (design Component 2 hardened-Linux)\n\
-         Documentation=https://github.com/emberlink/emberlink/blob/main/project design notes\n\
+         Description=Emberlink spawn-helper (hardened-Linux)\n\
+         Documentation=https://docs.ember.link\n\
          After=network.target\n\
          \n\
          [Service]\n\
@@ -3152,8 +4482,6 @@ pub(crate) fn render_spawn_helper_unit_body(
 /// **Idempotent.** Re-running on a host with the unit already
 /// installed rewrites only when the body differs; `daemon-reload` +
 /// `enable --now` are always issued so the active state converges.
-///
-/// implementation-note-187
 #[cfg(target_os = "linux")]
 pub fn install_spawn_helper_unit(
     ember_uid: u32,
@@ -3238,8 +4566,6 @@ fn ember_clients_group_exists() -> bool {
 /// - `{{POOL_UID_BASE}}` → first uid in the spawn-helper pool
 /// - `{{POOL_SIZE}}` → number of slots in the pool
 /// - `{{EXPECTED_SHIM_HASH}}` → blake3 hex of the shipped shim
-///
-/// implementation-note-186
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn render_spawn_helper_plist_body(
@@ -3297,17 +4623,15 @@ pub(crate) fn render_spawn_helper_plist_body(
 ///    sets `GroupName=ember-clients`; an absent group would block
 ///    daemon connectivity).
 /// 2. Resolve the `ember` system uid.
-/// 3. Publish both the helper binary and the shim binary to
-///    `/usr/local/libexec/`.
+/// 3. Verify both the helper binary and the shim binary are present at
+///    `/usr/local/libexec/` (placed by the install lane / `.pkg` payload)
+///    and normalize their mode to 0755.
 /// 4. Compute blake3 of the on-disk shim; render it into the plist's
 ///    `EXPECTED_SHIM_HASH` env var.
 /// 5. Pre-create `/var/log/emberd-spawn-helper.{err,out}` for
 ///    launchd's fd handoff.
 /// 6. Write the plist (mode 0644), `launchctl bootout`-tolerant,
 ///    `launchctl bootstrap system`.
-///
-/// implementation-note-186
-/// implementation-note-188
 #[cfg(target_os = "macos")]
 pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<(), InstallError> {
     // 1) Probe ember-clients group. Refuse install if missing — the
@@ -3333,7 +4657,8 @@ pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<
         exit_code: None,
     })?;
 
-    // 3) Publish helper binary + shim binary.
+    // 3) Verify helper binary + shim binary are present at /usr/local/libexec
+    //    (placed by the install lane / .pkg payload) and normalize perms.
     install_spawn_helper_binary()?;
     let shim_dest = install_spawn_shim_binary()?;
 
@@ -3423,8 +4748,9 @@ fn spawn_helper_bootout_tolerant() -> Result<(), InstallError> {
     })
 }
 
-/// Publish the `emberd-spawn-helper-macos` binary into
-/// `/usr/local/libexec/`. Idempotent.
+/// Verify the `emberd-spawn-helper-macos` binary is present at
+/// `/usr/local/libexec/` (placed by the install lane / `.pkg` payload) and
+/// normalize its mode to `0755`. Idempotent.
 ///
 /// The helper is mode `0755 root:wheel`. It's NOT setuid (per ADR
 /// 155 Component 4) — launchd starts it as root via
@@ -3435,71 +4761,49 @@ fn install_spawn_helper_binary() -> Result<(), InstallError> {
     Ok(())
 }
 
-/// Publish the `emberd-spawn-shim` binary into `/usr/local/libexec/`.
-/// Mode `0755 root:wheel`. NOT setuid — the shim receives its root
+/// Verify the `emberd-spawn-shim` binary is present at `/usr/local/libexec/`
+/// (placed by the install lane / `.pkg` payload) and normalize its mode to
+/// `0755 root:wheel`. NOT setuid — the shim receives its root
 /// identity through the helper's `posix_spawn` (which runs the shim
 /// in a clean post-execve image inheriting the helper's effective
 /// uid), not via a kernel-evaluated suid bit.
 ///
 /// Returns the install destination so the caller can hash it for
 /// `EXPECTED_SHIM_HASH`.
-///
-/// implementation-note-188
 #[cfg(target_os = "macos")]
 fn install_spawn_shim_binary() -> Result<PathBuf, InstallError> {
     install_libexec_binary(SPAWN_SHIM_BINARY_NAME)
 }
 
-/// Shared helper-binary install routine. Copies the named binary
-/// from the current_exe's directory to `/usr/local/libexec/` with
-/// mode `0755`. Idempotent — skips the copy when the destination's
-/// bytes already match.
+/// Verify a privilege-separation binary is present at
+/// `/usr/local/libexec/<name>` and normalize its mode to `0755`; return its
+/// path.
+///
+/// The helper + shim are placed at `/usr/local/libexec/` by the install lane
+/// (`scripts/dev-refresh-macos-host-install.sh`) or the signed `.pkg` payload —
+/// NOT copied from the running CLI's directory. The `ember` CLI lives inside a
+/// sealed, codesigned `.app` bundle (`/usr/local/lib/ember.app/Contents/MacOS`),
+/// so the old `current_exe().parent()` source could neither hold these binaries
+/// (adding files breaks the bundle seal) nor be a stable source. The
+/// authoritative home is the libexec dir the plist already references.
+///
+/// Returns a clear error if the lane has not placed the binary yet — that is a
+/// loud guard rail, not a copy fallback.
 #[cfg(target_os = "macos")]
 fn install_libexec_binary(name: &str) -> Result<PathBuf, InstallError> {
-    let cur_exe = std::env::current_exe().map_err(|e| InstallError::Subprocess {
-        cmd: "current_exe".to_string(),
-        stderr: format!("current_exe failed: {e}"),
-        exit_code: None,
-    })?;
-    let src = cur_exe
-        .parent()
-        .ok_or_else(|| InstallError::Subprocess {
-            cmd: "current_exe.parent".to_string(),
-            stderr: "current_exe has no parent dir".to_string(),
-            exit_code: None,
-        })?
-        .join(name);
+    let dest = Path::new(SPAWN_HELPER_BINARY_DIR).join(name);
 
-    if !src.exists() {
+    if !dest.exists() {
         return Err(InstallError::Subprocess {
             cmd: format!("locate {name}"),
             stderr: format!(
-                "{name} not found next to current_exe ({}); \
-                 build with `cargo build -p ember-spawn-helper --release` and re-run install",
-                src.display()
+                "{name} not found at {} — the install lane (`./x insiders` or the \
+                 signed .pkg) must place it there before `ember daemon install` \
+                 renders the spawn-helper plist",
+                dest.display()
             ),
             exit_code: None,
         });
-    }
-
-    let dest_dir = Path::new(SPAWN_HELPER_BINARY_DIR);
-    let dest = dest_dir.join(name);
-    std::fs::create_dir_all(dest_dir).map_err(|e| InstallError::Subprocess {
-        cmd: format!("mkdir -p {}", dest_dir.display()),
-        stderr: format!("create_dir_all failed: {e}"),
-        exit_code: None,
-    })?;
-
-    let need_copy = match (std::fs::read(&src), std::fs::read(&dest)) {
-        (Ok(a), Ok(b)) => a != b,
-        _ => true,
-    };
-    if need_copy {
-        std::fs::copy(&src, &dest).map_err(|e| InstallError::Subprocess {
-            cmd: format!("cp {} {}", src.display(), dest.display()),
-            stderr: format!("copy failed: {e}"),
-            exit_code: None,
-        })?;
     }
 
     use std::os::unix::fs::PermissionsExt;
@@ -3567,234 +4871,173 @@ mod tests {
         assert!(!already_exists(""));
     }
 
-    /// T1 unit — the chown traversal is a no-op on an empty dir tree.
-    /// We point `chown_ember_data_dirs` at a tmpdir that has no `.ember`
-    /// subdir at all; every known subdir is missing so the function
-    /// short-circuits per the idempotent-skip branch and returns Ok.
+    /// T1 unit — the chown traversal is a no-op when the system state
+    /// root does not exist yet (fresh host pre-install). The public
+    /// `chown_ember_data_dirs` short-circuits on a missing root so
+    /// re-running before the installer has populated the system tree is
+    /// safe. We don't assert on `repair_binary_manifest_dir_ownership`
+    /// here — tmpdir has no `.ember/binaries/` so the resolver is never
+    /// called.
     #[test]
-    fn chown_ember_data_dirs_on_empty_dir_is_ok() {
+    fn chown_ember_data_dirs_on_empty_system_root_is_ok() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Production resolver targets a real `/Library/Application Support/
+        // Emberlink/`; under a non-root test runner that path either
+        // doesn't exist (no-op) or is unreadable. The function is
+        // expected to return Ok in both cases.
         let result = chown_ember_data_dirs(tmp.path());
-        assert!(
-            result.is_ok(),
-            "empty home (no .ember tree) should be a no-op, got {:?}",
-            result
-        );
+        // The only error we tolerate is a chown/chmod shell-out failure
+        // (we're not root and the `ember:ember-clients` identity doesn't
+        // exist in CI); fs reads of a missing system tree return Ok via
+        // the early-return in `chown_ember_data_dirs_inner`.
+        match result {
+            Ok(()) => {}
+            Err(InstallError::Subprocess { cmd, .. })
+                if cmd.starts_with("chown ") || cmd.starts_with("chmod ") => {}
+            Err(other) => panic!("unexpected error from chown_ember_data_dirs: {other:?}"),
+        }
     }
 
-    /// T1 unit — calling on a home that has `.ember/` but none of the
-    /// expected subdirs is also a no-op (all five are missing → all five
-    /// hit the idempotent-skip branch).
+    /// T1 — chown_ember_data_dirs_inner walks the daemon's system state
+    /// root and visits every entry recursively (per design). The walk
+    /// is unconditional — there are no operator-data exceptions inside
+    /// the system tree because design moved orchestrator.lock /
+    /// shadow/ / binaries/ out of the daemon tree entirely.
+    ///
+    /// Uses closure injection + tempdir-as-state-root so no root
+    /// privileges or real system paths are required.
     #[test]
-    fn chown_ember_data_dirs_on_missing_subdirs_is_ok() {
+    fn chown_ember_data_dirs_inner_visits_daemon_state_recursively() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(tmp.path().join(".ember")).expect("mkdir .ember");
-        let result = chown_ember_data_dirs(tmp.path());
-        assert!(
-            result.is_ok(),
-            "home with empty .ember/ should be a no-op, got {:?}",
-            result
-        );
-    }
+        let state_root = tmp.path();
 
-    /// T1 — chown_ember_data_dirs_inner visits `data/` and the file inside it.
-    ///
-    /// Regression: the previous hardcoded-subdir implementation did not include
-    /// `"data"` in its list, so `~/.ember/data/` (where the SQLite event store
-    /// lives per `DaemonConfig::default().data_dir`) was never chowned. emberd
-    /// running as the `ember` system user hit EACCES on the DB → "attempt to
-    /// write a readonly database". This test pins the fix: a tree that contains
-    /// `data/` with a file inside it MUST be visited by the chown walk.
-    ///
-    /// Uses closure injection so no root privileges are required.
-    #[test]
-    fn chown_ember_data_dirs_includes_daemon_data_dir() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ember_root = tmp.path().join(".ember");
-        let data_dir = ember_root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("mkdir .ember/data");
-        // Simulate the SQLite DB file and WAL file that the daemon creates
-        // inside data/.
+        // Populate the system state root with the directories the daemon
+        // creates at runtime: data/, run/, sessions/, codex-sessions/,
+        // locks/, scratch/. plus a SQLite event-store file.
+        let data_dir = state_root.join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
         std::fs::write(data_dir.join("ember.db"), b"fake-sqlite-header").expect("write ember.db");
         std::fs::write(data_dir.join("ember.db-wal"), b"fake-wal").expect("write ember.db-wal");
-
-        let mut visited: Vec<std::path::PathBuf> = Vec::new();
-        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
-            visited.push(path.to_path_buf());
-            Ok(())
-        });
-        assert!(
-            result.is_ok(),
-            "chown_ember_data_dirs_inner failed: {:?}",
-            result
-        );
-
-        // data/ itself must be visited.
-        assert!(
-            visited.contains(&data_dir),
-            "data/ dir was not visited; visited={:?}",
-            visited
-        );
-
-        // Files inside data/ must also be visited (recursive walk).
-        let db_path = data_dir.join("ember.db");
-        let wal_path = data_dir.join("ember.db-wal");
-        assert!(
-            visited.contains(&db_path),
-            "ember.db was not visited; visited={:?}",
-            visited
-        );
-        assert!(
-            visited.contains(&wal_path),
-            "ember.db-wal was not visited; visited={:?}",
-            visited
-        );
-    }
-
-    /// T1 — chown_ember_data_dirs_inner visits the legacy dirs (vault, grants,
-    /// sessions, run, binaries) so the fix for the missing `data/` entry does
-    /// not regress ownership of the pre-existing subdirectory set.
-    #[test]
-    fn chown_ember_data_dirs_regression_legacy_dirs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ember_root = tmp.path().join(".ember");
-
-        // Create the legacy subdirs with a checkpoint file in each.
-        let legacy = ["vault", "grants", "sessions", "run", "binaries"];
-        for name in legacy.iter() {
-            let dir = ember_root.join(name);
-            std::fs::create_dir_all(&dir).expect("mkdir legacy subdir");
-            std::fs::write(dir.join("checkpoint"), b"x").expect("write checkpoint");
+        for name in ["run", "sessions", "codex-sessions", "locks", "scratch"] {
+            std::fs::create_dir_all(state_root.join(name)).expect("mkdir runtime subdir");
         }
 
         let mut visited: Vec<std::path::PathBuf> = Vec::new();
-        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
+        chown_ember_data_dirs_inner(state_root, &mut |path, _is_dir| {
             visited.push(path.to_path_buf());
             Ok(())
-        });
-        assert!(
-            result.is_ok(),
-            "chown_ember_data_dirs_inner failed: {:?}",
-            result
-        );
+        })
+        .expect("walk must succeed");
 
-        for name in legacy.iter() {
-            let dir = ember_root.join(name);
+        // The state root itself MUST be visited (chowned to
+        // ember:ember-clients).
+        assert!(
+            visited.contains(&state_root.to_path_buf()),
+            "state_root must be visited; visited={visited:?}"
+        );
+        // data/ + its files must be visited.
+        for path in [
+            data_dir.clone(),
+            data_dir.join("ember.db"),
+            data_dir.join("ember.db-wal"),
+        ] {
             assert!(
-                visited.contains(&dir),
-                "{name}/ dir was not visited; visited={:?}",
-                visited
+                visited.contains(&path),
+                "{} not visited; visited={visited:?}",
+                path.display()
             );
-            let checkpoint = dir.join("checkpoint");
+        }
+        // Every runtime subdir must be visited.
+        for name in ["run", "sessions", "codex-sessions", "locks", "scratch"] {
+            let path = state_root.join(name);
             assert!(
-                visited.contains(&checkpoint),
-                "{name}/checkpoint was not visited; visited={:?}",
-                visited
+                visited.contains(&path),
+                "{}/ not visited; visited={visited:?}",
+                path.display()
             );
         }
     }
 
-    /// T1 — chown_ember_data_dirs_inner does NOT visit `orchestrator.lock`.
-    ///
-    /// The orchestrator lock is created by the CLI running as the operator uid.
-    /// Under design, `~/.ember/` is chowned to `ember:ember-clients` so the
-    /// operator uid cannot write there after install. To avoid double-locking
-    /// the problem, the chown walk explicitly skips `orchestrator.lock` so a
-    /// stale copy (from before the lock path moved to `/tmp`) would be left in
-    /// operator-owned state rather than reassigned to the daemon uid.
+    /// T1 — `chown_ember_data_dirs_inner` is a no-op when the state root
+    /// does not exist. This is the fresh-host posture before the
+    /// installer has populated `/Library/Application Support/Emberlink/`.
     #[test]
-    fn chown_ember_data_dirs_skips_orchestrator_lock() {
+    fn chown_ember_data_dirs_inner_missing_state_root_is_noop() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ember_root = tmp.path().join(".ember");
-        std::fs::create_dir_all(&ember_root).expect("mkdir .ember");
-
-        // Populate the lock file alongside a normal data directory.
-        let lock_path = ember_root.join("orchestrator.lock");
-        std::fs::write(&lock_path, b"").expect("write orchestrator.lock");
-        let data_dir = ember_root.join("data");
-        std::fs::create_dir_all(&data_dir).expect("mkdir .ember/data");
-        std::fs::write(data_dir.join("ember.db"), b"x").expect("write ember.db");
+        let absent_root = tmp.path().join("does-not-exist");
 
         let mut visited: Vec<std::path::PathBuf> = Vec::new();
-        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
+        chown_ember_data_dirs_inner(&absent_root, &mut |path, _is_dir| {
             visited.push(path.to_path_buf());
             Ok(())
-        });
-        assert!(
-            result.is_ok(),
-            "chown_ember_data_dirs_inner failed: {result:?}"
-        );
+        })
+        .expect("missing root must be a no-op");
 
-        // The normal data dir must be visited.
         assert!(
-            visited.contains(&data_dir),
-            "data/ was not visited; visited={visited:?}"
-        );
-
-        // orchestrator.lock must NOT be visited (it is operator-uid owned).
-        assert!(
-            !visited.contains(&lock_path),
-            "orchestrator.lock was visited but should be skipped; visited={visited:?}"
+            visited.is_empty(),
+            "missing state root must NOT invoke the closure; visited={visited:?}"
         );
     }
 
-    /// T1 — `shadow/` is launcher-managed operator state and must be skipped.
-    ///
-    /// Regression: chowning `~/.ember/shadow` to `ember:ember-clients`
-    /// prevents `ember init --for claude` / `ember claude --host` from
-    /// repairing the PATH-shadow shims as the operator uid, surfacing
-    /// `Operation not permitted` after `sudo ember daemon install`.
+    /// The skipped `binaries/` tree still needs an explicit ownership repair:
+    /// operator-owned for manifest refresh writes, `ember-clients` group-readable
+    /// for daemon startup and broker resolution.
     #[test]
-    fn chown_ember_data_dirs_skips_shadow_tree() {
+    fn repair_binary_manifest_dir_ownership_inner_visits_binaries_as_operator() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ember_root = tmp.path().join(".ember");
-        let shadow_dir = ember_root.join("shadow");
-        let shadow_bin = shadow_dir.join("bin");
-        std::fs::create_dir_all(&shadow_bin).expect("mkdir .ember/shadow/bin");
-        std::fs::write(shadow_bin.join("gh"), b"shim").expect("write shadow shim");
+        let binaries_dir = tmp.path().join(".ember").join("binaries");
+        std::fs::create_dir_all(&binaries_dir).expect("mkdir .ember/binaries");
+        let manifest_path = binaries_dir.join("manifest.toml");
+        std::fs::write(&manifest_path, b"# manifest").expect("write manifest");
 
-        let mut visited: Vec<std::path::PathBuf> = Vec::new();
-        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
-            visited.push(path.to_path_buf());
-            Ok(())
-        });
-        assert!(
-            result.is_ok(),
-            "chown_ember_data_dirs_inner failed: {result:?}"
-        );
+        let mut visited: Vec<(std::path::PathBuf, bool, String)> = Vec::new();
+        repair_binary_manifest_dir_ownership_inner(
+            tmp.path(),
+            "alice",
+            &mut |path, is_dir, owner| {
+                visited.push((path.to_path_buf(), is_dir, owner.to_string()));
+                Ok(())
+            },
+        )
+        .expect("repair should visit binaries tree");
 
         assert!(
-            !visited.contains(&shadow_dir),
-            "shadow dir must be skipped so launcher-managed shims stay operator-owned; visited={visited:?}"
+            visited
+                .iter()
+                .any(|(path, is_dir, owner)| path == &binaries_dir
+                    && *is_dir
+                    && owner == "alice:ember-clients"),
+            "binaries dir must be repaired as operator-owned; visited={visited:?}"
         );
         assert!(
-            !visited.contains(&shadow_bin),
-            "shadow/bin must be skipped so launcher-managed shims stay operator-owned; visited={visited:?}"
+            visited
+                .iter()
+                .any(|(path, is_dir, owner)| path == &manifest_path
+                    && !*is_dir
+                    && owner == "alice:ember-clients"),
+            "manifest file must be repaired as operator-owned; visited={visited:?}"
         );
     }
 
-    /// T1 — chown_ember_data_dirs_inner skips symlink entries entirely.
-    ///
-    /// Regression: before `shadow/` was excluded entirely, the chown walk had
-    /// to avoid following dangling shadow shims like
-    /// `~/.ember/shadow/docker -> ~/.cargo/bin/ember-docker`. The stronger
-    /// launcher fix is to skip the whole `shadow/` subtree, which also implies
-    /// dangling symlink entries under it are never visited.
+    /// T1 — `chown_chmod_recursive_inner` skips symlink entries entirely
+    /// so a dangling symlink under the daemon's system state root does
+    /// not surface as a chown-of-nothing error. The walk follows
+    /// non-symlink directory entries normally.
     #[test]
     fn chown_ember_data_dirs_skips_dangling_symlink_entries() {
         #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let ember_root = tmp.path().join(".ember");
-        let shadow_dir = ember_root.join("shadow");
-        std::fs::create_dir_all(&shadow_dir).expect("mkdir .ember/shadow");
-        let symlink_path = shadow_dir.join("docker");
+        let state_root = tmp.path();
+        let sub_dir = state_root.join("scratch");
+        std::fs::create_dir_all(&sub_dir).expect("mkdir scratch");
+        let symlink_path = sub_dir.join("orphan");
         #[cfg(unix)]
-        symlink("/nonexistent/ember-docker", &symlink_path).expect("create dangling symlink");
+        symlink("/nonexistent/ember-target", &symlink_path).expect("create dangling symlink");
 
         let mut visited: Vec<std::path::PathBuf> = Vec::new();
-        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
+        let result = chown_ember_data_dirs_inner(state_root, &mut |path, _is_dir| {
             visited.push(path.to_path_buf());
             Ok(())
         });
@@ -3802,13 +5045,14 @@ mod tests {
             result.is_ok(),
             "chown_ember_data_dirs_inner must ignore dangling symlinks, got: {result:?}"
         );
+        // Containing dir + state root are visited; the dangling symlink itself is NOT.
         assert!(
-            !visited.contains(&shadow_dir),
-            "shadow dir must be skipped entirely; visited={visited:?}"
+            visited.contains(&sub_dir),
+            "containing dir must be visited; visited={visited:?}"
         );
         assert!(
             !visited.contains(&symlink_path),
-            "dangling shadow symlink entry must be skipped; visited={visited:?}"
+            "dangling symlink entry must be skipped; visited={visited:?}"
         );
     }
 
@@ -3831,17 +5075,19 @@ mod tests {
         use std::os::unix::net::UnixListener;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let run_dir = tmp.path().join(".ember").join("run");
-        std::fs::create_dir_all(&run_dir).expect("mkdir .ember/run");
+        // Drive the inner helper with a `for_test` DaemonPaths so the
+        // walk targets `<tmp>/run/...` instead of the real system path.
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
 
-        let pid_path = run_dir.join("emberd.pid");
+        let pid_path = paths.run_dir.join("emberd.pid");
         std::fs::write(&pid_path, b"12345\n").expect("write pid file");
 
-        let sock_path = run_dir.join("daemon.sock");
+        let sock_path = paths.run_dir.join("daemon.sock");
         let _listener = UnixListener::bind(&sock_path).expect("bind daemon.sock");
 
         let changed =
-            clear_stale_launchd_runtime_artifacts(tmp.path()).expect("cleanup must succeed");
+            clear_stale_launchd_runtime_artifacts_inner(&paths).expect("cleanup must succeed");
 
         assert!(
             !pid_path.exists(),
@@ -3861,11 +5107,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn clear_stale_launchd_runtime_artifacts_false_when_nothing_to_remove() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let run_dir = tmp.path().join(".ember").join("run");
-        std::fs::create_dir_all(&run_dir).expect("mkdir .ember/run");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
 
         let changed =
-            clear_stale_launchd_runtime_artifacts(tmp.path()).expect("cleanup must succeed");
+            clear_stale_launchd_runtime_artifacts_inner(&paths).expect("cleanup must succeed");
 
         assert!(
             !changed,
@@ -3887,6 +5133,7 @@ mod tests {
                 next >= 3
             },
             || sleeps.set(sleeps.get() + 1),
+            || "unused diagnostics".to_string(),
         )
         .expect("probe should eventually succeed");
 
@@ -3911,6 +5158,7 @@ mod tests {
                 false
             },
             || sleeps.set(sleeps.get() + 1),
+            || "launchctl diagnostic payload".to_string(),
         )
         .expect_err("probe should time out");
 
@@ -3919,6 +5167,10 @@ mod tests {
                 assert!(
                     stderr.contains("runtime artifacts never reappeared"),
                     "unexpected timeout stderr: {stderr}"
+                );
+                assert!(
+                    stderr.contains("launchctl diagnostic payload"),
+                    "timeout stderr must include diagnostics: {stderr}"
                 );
             }
             other => panic!("expected subprocess timeout error, got {other:?}"),
@@ -3931,29 +5183,122 @@ mod tests {
         );
     }
 
-    /// T1 — under Plan 2A, `provision_se_mek` creates the data dir,
-    /// chowns it to `ember:ember-clients` (when root), and DELETES any
-    /// orphaned legacy `vault-mek.bin` from earlier SE-attempt installs.
-    /// The MEK now lives in `/Library/Keychains/System.keychain`, not
-    /// on disk. Under non-root test runners the System.keychain write
-    /// is skipped (only the canonical `sudo ember daemon install` does
-    /// the write).
     #[test]
-    fn provision_se_mek_creates_data_dir() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let result = provision_se_mek(tmp.path());
+    #[cfg(target_os = "macos")]
+    fn park_incompatible_launchd_binary_manifest_inner_moves_manifest_and_sidecar() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
 
-        let data_dir = tmp.path().join(".ember").join("data");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("manifest.toml");
+        let sidecar_path = manifest_path.with_extension("toml.sig");
+        let manifest_bytes = b"[[entries]]\ntool_name = \"ember-gh\"\n";
+        std::fs::write(&manifest_path, manifest_bytes).expect("write manifest");
+
+        let dev_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let release_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let sig = dev_key.sign(manifest_bytes);
+        let sidecar = serde_json::json!({
+            "schema_version": 1,
+            "signature": format!(
+                "ed25519:{}",
+                base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+            ),
+            "signature_alg": "ed25519",
+        });
+        std::fs::write(&sidecar_path, sidecar.to_string()).expect("write sidecar");
+
+        let changed = park_incompatible_launchd_binary_manifest_inner(
+            &manifest_path,
+            &[release_key.verifying_key()],
+            "test",
+        )
+        .expect("incompatible manifest should be parked");
+
+        assert!(changed, "parking should report a changed manifest");
         assert!(
-            data_dir.is_dir(),
-            "~/.ember/data/ must be created; provision_se_mek returned {result:?}"
+            !manifest_path.exists(),
+            "original manifest should move out of launchd's startup path"
+        );
+        assert!(
+            !sidecar_path.exists(),
+            "original sidecar should move with the manifest"
+        );
+        assert!(
+            tmp.path().join("manifest.toml.rejected-test").exists(),
+            "parked manifest must preserve the original bytes"
+        );
+        assert!(
+            tmp.path().join("manifest.toml.sig.rejected-test").exists(),
+            "parked sidecar must preserve the original signature"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn park_incompatible_launchd_binary_manifest_inner_keeps_valid_manifest() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("manifest.toml");
+        let sidecar_path = manifest_path.with_extension("toml.sig");
+        let manifest_bytes = b"[[entries]]\ntool_name = \"ember-gh\"\n";
+        std::fs::write(&manifest_path, manifest_bytes).expect("write manifest");
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let sig = signing_key.sign(manifest_bytes);
+        let sidecar = serde_json::json!({
+            "schema_version": 1,
+            "signature": format!(
+                "ed25519:{}",
+                base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+            ),
+            "signature_alg": "ed25519",
+        });
+        std::fs::write(&sidecar_path, sidecar.to_string()).expect("write sidecar");
+
+        let changed = park_incompatible_launchd_binary_manifest_inner(
+            &manifest_path,
+            &[signing_key.verifying_key()],
+            "test",
+        )
+        .expect("valid manifest should be kept");
+
+        assert!(!changed, "valid manifest should not be parked");
+        assert!(manifest_path.exists(), "original manifest must remain");
+        assert!(sidecar_path.exists(), "original sidecar must remain");
+        assert!(
+            !tmp.path().join("manifest.toml.rejected-test").exists(),
+            "no rejected copy should be created"
+        );
+    }
+
+    /// T1 — under Plan 2A, `provision_se_mek_inner` creates the data
+    /// dir, chowns it to `ember:ember-clients` (when root), and DELETES
+    /// any orphaned legacy `vault-mek.bin` from earlier SE-attempt
+    /// installs. The MEK now lives in `/Library/Keychains/System.
+    /// keychain`, not on disk. Under non-root test runners the
+    /// System.keychain write is skipped.
+    ///
+    /// Post-design the data dir lives at the system path; the test
+    /// uses `DaemonPaths::for_test(tmp)` so the inner helper writes
+    /// under a tempdir instead of `/Library/Application Support/
+    /// Emberlink/`.
+    #[test]
+    fn provision_se_mek_inner_creates_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        let result = provision_se_mek_inner(&paths);
+
+        assert!(
+            paths.data_dir.is_dir(),
+            "data dir must be created; provision_se_mek_inner returned {result:?}"
         );
 
         // `vault-mek.bin` MUST NOT exist after install — Plan 2A stores
-        // the MEK in System.keychain instead. (This test starts with no
-        // legacy blob; the orphan-cleanup path is exercised in
-        // `provision_se_mek_idempotent_no_root` below.)
-        let mek_path = data_dir.join("vault-mek.bin");
+        // the MEK in System.keychain instead.
+        let mek_path = paths.data_dir.join("vault-mek.bin");
         assert!(
             !mek_path.exists(),
             "vault-mek.bin must NOT exist after install (Plan 2A — MEK is in System.keychain)"
@@ -3966,28 +5311,27 @@ mod tests {
             Err(InstallError::Subprocess { cmd, .. })
                 if cmd.starts_with("chown ") || cmd.starts_with("chmod ") => {}
             Err(other) => panic!(
-                "unexpected error from provision_se_mek (only chown/chmod failures expected under non-root): {other:?}"
+                "unexpected error from provision_se_mek_inner (only chown/chmod failures expected under non-root): {other:?}"
             ),
         }
     }
 
-    /// T1 — `provision_se_mek` cleans up legacy `vault-mek.bin` blobs
-    /// from earlier SE-attempt installs. The pre-existing blob is the
-    /// product of a previous failed install lineage (SE-in-DPK or
-    /// Plan-J) and is no longer read by the daemon under Plan 2A.
-    /// Leaving it on disk would just confuse operators.
+    /// T1 — `provision_se_mek_inner` cleans up legacy `vault-mek.bin`
+    /// blobs from earlier SE-attempt installs. The pre-existing blob is
+    /// the product of a previous failed install lineage and is no
+    /// longer read by the daemon under Plan 2A.
     #[test]
-    fn provision_se_mek_idempotent_no_root() {
+    fn provision_se_mek_inner_idempotent_no_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
 
         // Pre-create the data dir + a stale legacy blob.
-        let data_dir = tmp.path().join(".ember").join("data");
-        std::fs::create_dir_all(&data_dir).expect("mkdir data");
-        let mek_path = data_dir.join("vault-mek.bin");
+        std::fs::create_dir_all(&paths.data_dir).expect("mkdir data");
+        let mek_path = paths.data_dir.join("vault-mek.bin");
         let checkpoint = [0xABu8; 32];
         std::fs::write(&mek_path, checkpoint).expect("write checkpoint");
 
-        let result = provision_se_mek(tmp.path());
+        let result = provision_se_mek_inner(&paths);
         match result {
             Ok(()) => {}
             Err(InstallError::Subprocess { cmd, .. })
@@ -3995,28 +5339,27 @@ mod tests {
             Err(other) => panic!("unexpected error on idempotent path: {other:?}"),
         }
 
-        // Plan 2A cleans up the legacy blob. The MEK now lives in
-        // System.keychain instead.
+        // Plan 2A cleans up the legacy blob.
         assert!(
             !mek_path.exists(),
             "Plan 2A install must remove the legacy vault-mek.bin orphan"
         );
     }
 
-    /// The launchd plist body the writer emits must include the
-    /// EnvironmentVariables.HOME block so the daemon (running as the
-    /// `ember` system uid) resolves `~/.ember/...` to the operator's
-    /// chowned data dir instead of `/var/empty`. It must also include
-    /// EMBER_APP_PEM_PATH and EMBER_APP_ENV_PATH so the daemon can read
-    /// the GH App credentials from `/etc/emberlink/` at boot without
-    /// falling back to the ember uid's (empty) $HOME. Guards against
-    /// silent drift between the rendered text and design.
+    /// Per design (2026-06-14) the launchd plist body MUST NOT bake
+    /// `HOME=<operator_home>` into `EnvironmentVariables` — the daemon
+    /// resolves its paths exclusively via
+    /// `crate::paths::DaemonPaths::system()` and never reads from
+    /// `$HOME`. The plist still pins `EMBER_APP_PEM_PATH` /
+    /// `EMBER_APP_ENV_PATH` (those point at `/etc/emberlink/`, a
+    /// system path design does not move). Guards against silent drift
+    /// between the rendered text and design.
     ///
     /// Build the expected text by joining lines with `\n` rather than
     /// using string-continuation (`\\\n`), which would collapse the
     /// significant two-space indentation inside `<dict>...</dict>`.
     #[test]
-    fn plist_body_matches_adr_131() {
+    fn plist_body_matches_adr_218() {
         let expected = [
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
             "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
@@ -4027,12 +5370,11 @@ mod tests {
             "  <key>GroupName</key>       <string>ember-clients</string>",
             "  <key>EnvironmentVariables</key>",
             "  <dict>",
-            "    <key>HOME</key><string>/home/test-operator</string>",
             "    <key>EMBER_APP_PEM_PATH</key><string>/etc/emberlink/ember-engine-app.pem</string>",
             "    <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>",
             "  </dict>",
-            // emberd_launchd_sandbox_wired (implementation-note-382).
-            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-329. -->",
+            // emberd_launchd_sandbox_wired.
+            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-309. -->",
             "  <key>ProgramArguments</key>",
             "  <array>",
             "    <string>/usr/bin/sandbox-exec</string>",
@@ -4054,17 +5396,72 @@ mod tests {
             render_launchd_plist_body(Path::new("/home/test-operator")),
             expected
         );
+        // Regression guard: the plist must NOT bake HOME any more
+        // (the daemon no longer resolves paths through $HOME).
+        assert!(
+            !render_launchd_plist_body(Path::new("/home/test-operator"))
+                .contains("<key>HOME</key>"),
+            "plist must NOT bake HOME per design"
+        );
     }
 
-    /// The systemd unit body the writer emits must include
-    /// `Environment=HOME=<operator_home>` so the daemon (running as the
-    /// `ember` system uid via `User=ember`) resolves `~/.ember/...` to
-    /// the operator's chowned data dir. It must also include
-    /// EMBER_APP_PEM_PATH and EMBER_APP_ENV_PATH so the daemon can read
-    /// GH App credentials from `/etc/emberlink/` at boot. Guards against
-    /// silent drift between the rendered text and design.
+    /// When trust roots are passed in, the rendered plist must include an
+    /// `EMBER_TRUST_ROOTS` env entry in the EnvironmentVariables dict — the
+    /// daemon reads this at startup to assemble the manifest trust set
+    /// (design §Component 1). The non-trust-roots path is exercised by
+    /// `plist_body_matches_adr_131`; this test is the load-bearing positive
+    /// case.
     #[test]
-    fn systemd_unit_body_matches_adr_131() {
+    fn plist_body_with_trust_roots_emits_env_entry() {
+        let pubkey_hex = "a".repeat(64);
+        let body = render_launchd_plist_body_with_trust_roots(
+            Path::new("/home/test-operator"),
+            &pubkey_hex,
+        );
+        assert!(
+            body.contains(&format!(
+                "<key>EMBER_TRUST_ROOTS</key><string>{pubkey_hex}</string>"
+            )),
+            "trust-roots plist must embed EMBER_TRUST_ROOTS entry; got: {body}"
+        );
+        // The entry must land INSIDE the EnvironmentVariables <dict>, not
+        // outside — ahead of </dict> + ProgramArguments.
+        let env_close = body.find("</dict>").expect("env dict close must exist");
+        let trust_pos = body
+            .find("EMBER_TRUST_ROOTS")
+            .expect("trust entry must exist");
+        assert!(
+            trust_pos < env_close,
+            "EMBER_TRUST_ROOTS must precede the env </dict>"
+        );
+    }
+
+    /// Empty trust_roots is the legacy posture — the rendered body must
+    /// match `render_launchd_plist_body(...)` exactly so existing hosts
+    /// installed without trust roots see no churn.
+    #[test]
+    fn plist_body_empty_trust_roots_matches_legacy_body() {
+        let home = Path::new("/home/test-operator");
+        assert_eq!(
+            render_launchd_plist_body_with_trust_roots(home, ""),
+            render_launchd_plist_body(home),
+        );
+    }
+
+    /// Per design (2026-06-14) the systemd unit body MUST NOT bake
+    /// `Environment=HOME=<operator_home>` — the daemon resolves its
+    /// paths exclusively via `crate::paths::DaemonPaths::system()` and
+    /// never reads from `$HOME`. The unit MUST declare
+    /// `RuntimeDirectory=ember` (resolves to `/run/ember/`),
+    /// `StateDirectory=ember` (`/var/lib/ember/`), and
+    /// `ConfigurationDirectory=ember` (`/etc/ember/`) so systemd creates
+    /// and teardown the daemon's per-OS system paths with the unit's
+    /// User/Group. The group switches from `ember` to `ember-clients` so
+    /// the kernel-enforced socket ACL on `/run/ember/daemon.sock` is the
+    /// per-design group. `EMBER_APP_PEM_PATH` / `EMBER_APP_ENV_PATH`
+    /// remain (`/etc/emberlink/` is not moved by design).
+    #[test]
+    fn systemd_unit_body_matches_adr_218() {
         let expected = [
             "[Unit]",
             "Description=Emberlink Grant Warden daemon",
@@ -4073,16 +5470,23 @@ mod tests {
             "[Service]",
             "Type=simple",
             "User=ember",
-            "Group=ember",
-            "Environment=HOME=/home/test-operator",
+            "Group=ember-clients",
             "Environment=EMBER_APP_PEM_PATH=/etc/emberlink/ember-engine-app.pem",
             "Environment=EMBER_APP_ENV_PATH=/etc/emberlink/ember-engine.env",
             "ExecStart=/usr/local/bin/emberd --foreground",
             "Restart=on-failure",
             "RestartSec=5",
             "",
-            // emberd_systemd_seccomp_wired (implementation-note-383).
-            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-329.",
+            "# design system-paths — systemd manages /run/ember, /var/lib/ember,",
+            "# /etc/ember with the unit's User/Group at the modes below.",
+            "RuntimeDirectory=ember",
+            "RuntimeDirectoryMode=0750",
+            "StateDirectory=ember",
+            "StateDirectoryMode=0750",
+            "ConfigurationDirectory=ember",
+            "",
+            // emberd_systemd_seccomp_wired.
+            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-309.",
             "# Allowlist: systemd-curated baseline + explicit fork/exec/mlock.",
             "SystemCallFilter=@system-service @ipc @memlock",
             "SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources",
@@ -4092,7 +5496,7 @@ mod tests {
             "# Defense-in-depth hardening — systemd primitives complement seccomp.",
             "NoNewPrivileges=true",
             "ProtectSystem=strict",
-            "ProtectHome=read-only",
+            "ProtectHome=yes",
             "PrivateTmp=true",
             "PrivateDevices=true",
             "ProtectKernelTunables=true",
@@ -4114,6 +5518,18 @@ mod tests {
             render_systemd_unit_body(Path::new("/home/test-operator")),
             expected
         );
+        // Regression guard: the unit must NOT bake HOME and must NOT
+        // re-introduce `Group=ember` (the post-design group is
+        // `ember-clients` for socket-ACL access).
+        let body = render_systemd_unit_body(Path::new("/home/test-operator"));
+        assert!(
+            !body.contains("Environment=HOME="),
+            "systemd unit must NOT bake HOME per design"
+        );
+        assert!(
+            !body.contains("\nGroup=ember\n"),
+            "systemd unit must use Group=ember-clients (not Group=ember) per design §Auth model + design"
+        );
     }
 
     /// The HOME-resolution helper handles the empty-user case cleanly,
@@ -4123,17 +5539,20 @@ mod tests {
     /// the load-bearing safety net — confirm it fires.
     #[test]
     fn resolve_operator_home_refuses_root_only_invocation() {
-        // Drop SUDO_USER + force USER=root for this thread; restore on exit.
-        // T1 unit — std::env mutation requires a process-wide lock for safety
-        // against parallel test threads; gate behind the existing test lock.
+        // Drop EMBER_OPERATOR + SUDO_USER + force USER=root for this thread;
+        // restore on exit. T1 unit — std::env mutation requires a process-wide
+        // lock for safety against parallel test threads; gate behind the
+        // existing test lock.
         let _guard = crate::PROCESS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let prior_op = std::env::var("EMBER_OPERATOR").ok();
         let prior_sudo = std::env::var("SUDO_USER").ok();
         let prior_user = std::env::var("USER").ok();
         // SAFETY: std::env::* are unsafe in Rust 2024; we hold PROCESS_TEST_LOCK
         // for the duration so no other thread mutates env concurrently.
         unsafe {
+            std::env::remove_var("EMBER_OPERATOR");
             std::env::remove_var("SUDO_USER");
             std::env::set_var("USER", "root");
         }
@@ -4142,6 +5561,10 @@ mod tests {
 
         // Restore environment.
         unsafe {
+            match prior_op {
+                Some(v) => std::env::set_var("EMBER_OPERATOR", v),
+                None => std::env::remove_var("EMBER_OPERATOR"),
+            }
             match prior_sudo {
                 Some(v) => std::env::set_var("SUDO_USER", v),
                 None => std::env::remove_var("SUDO_USER"),
@@ -4154,8 +5577,51 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "resolve_operator_home must refuse when only USER=root is set, got {:?}",
+            "resolve_operator_home must refuse when no operator signal is set, got {:?}",
             result
+        );
+    }
+
+    /// `EMBER_OPERATOR` is the macOS `.pkg` postinstall's channel for pinning
+    /// the operator when the process runs as a pure-root login with no
+    /// `$SUDO_USER`. It must win over both `$SUDO_USER` and `$USER` — including
+    /// the `USER=root` case the bare-root refusal above guards.
+    #[test]
+    fn resolve_operator_user_honors_ember_operator_override() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior_op = std::env::var("EMBER_OPERATOR").ok();
+        let prior_sudo = std::env::var("SUDO_USER").ok();
+        let prior_user = std::env::var("USER").ok();
+        // SAFETY: PROCESS_TEST_LOCK held for the duration; no concurrent env mutation.
+        unsafe {
+            std::env::set_var("EMBER_OPERATOR", "console-operator");
+            std::env::set_var("SUDO_USER", "sudo-operator");
+            std::env::set_var("USER", "root");
+        }
+
+        let resolved = resolve_operator_user();
+
+        unsafe {
+            match prior_op {
+                Some(v) => std::env::set_var("EMBER_OPERATOR", v),
+                None => std::env::remove_var("EMBER_OPERATOR"),
+            }
+            match prior_sudo {
+                Some(v) => std::env::set_var("SUDO_USER", v),
+                None => std::env::remove_var("SUDO_USER"),
+            }
+            match prior_user {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+
+        assert_eq!(
+            resolved.expect("EMBER_OPERATOR should resolve the operator user"),
+            "console-operator",
+            "EMBER_OPERATOR must take precedence over SUDO_USER/USER"
         );
     }
 
@@ -4187,9 +5653,14 @@ mod tests {
 
         let body = std::fs::read_to_string(&dst).expect("read sandbox profile");
         assert_eq!(body, render_launchd_sandbox_profile_body(operator_home));
+        // design: sandbox profile must allowlist the system state root,
+        // NOT the retired `~/.ember/` tree.
+        let state_root = crate::paths::DaemonPaths::system().state_root;
+        let escaped = regex::escape(&state_root.to_string_lossy());
         assert!(
-            body.contains(r#"^/home/test\-operator/\.ember(/|$)"#),
-            "sandbox profile must allow writes to the operator chowned ~/.ember tree"
+            body.contains(&format!("^{escaped}(/|$)")),
+            "sandbox profile must allow writes to the system state root {} per design",
+            state_root.display()
         );
         assert!(
             !body.contains(EMBERD_SANDBOX_WRITE_ALLOWLIST_TOKEN),
@@ -4204,13 +5675,24 @@ mod tests {
         );
     }
 
+    /// design (operator-locked 2026-06-14): sandbox profile must allow
+    /// writes to the system state root, NOT the operator-home `~/.ember/`
+    /// tree (which is retired). Test rewritten to lock the new boundary.
     #[cfg(target_os = "macos")]
     #[test]
-    fn render_launchd_sandbox_profile_body_targets_operator_home_tree() {
+    fn render_launchd_sandbox_profile_body_targets_system_state_root_per_adr_218() {
         let body = render_launchd_sandbox_profile_body(Path::new("/home/test-operator"));
+        let state_root = crate::paths::DaemonPaths::system().state_root;
+        let state_root_str = state_root.to_string_lossy();
+        let escaped = regex::escape(&state_root_str);
+        let expected_regex = format!("^{escaped}(/|$)");
         assert!(
-            body.contains(r#"^/home/test\-operator/\.ember(/|$)"#),
-            "sandbox profile must match the operator-home runtime tree"
+            body.contains(&expected_regex),
+            "sandbox profile must allow writes under {state_root_str} per design; body:\n{body}"
+        );
+        assert!(
+            !body.contains(r#"\.ember(/|$)"#),
+            "sandbox profile must NOT allowlist the retired ~/.ember/ tree"
         );
         assert!(
             body.contains(r#"^/var/log/emberd(/|$)"#),
@@ -4494,8 +5976,7 @@ system/sh.emberlink.daemon = {\n\
         );
     }
 
-    // emberd_systemd_seccomp_wired tests
-    // (implementation-note-383).
+    // emberd_systemd_seccomp_wired tests.
 
     #[test]
     fn systemd_unit_body_contains_seccomp_filter() {
@@ -4544,7 +6025,7 @@ system/sh.emberlink.daemon = {\n\
         );
     }
 
-    // ── implementation-note-386 — resolve_emberd_source + install_emberd_binary_at ────
+    // ── resolve_emberd_source + install_emberd_binary_at ────
 
     /// Serialize tests that mutate process env. `EMBER_EMBERD_BIN_PATH`
     /// is process-global; two override tests racing under cargo's
@@ -4625,6 +6106,54 @@ system/sh.emberlink.daemon = {\n\
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    /// T1 — insiders/release macOS host installs place `ember` and `emberd`
+    /// in separate signed app bundles. `sudo ember daemon install` runs from
+    /// `/usr/local/lib/ember.app/.../ember`, so there is intentionally no
+    /// same-directory `emberd` sibling; the managed daemon path is the source
+    /// to publish/no-op against.
+    #[test]
+    fn resolve_emberd_source_installed_app_uses_managed_daemon_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let current = tmp
+            .path()
+            .join("usr/local/lib/ember.app/Contents/MacOS/ember");
+        std::fs::create_dir_all(current.parent().expect("current parent")).expect("mkdir app");
+        std::fs::write(&current, b"fake-ember").expect("write fake ember");
+
+        let managed = tmp.path().join("usr/local/bin/emberd");
+        std::fs::create_dir_all(managed.parent().expect("managed parent")).expect("mkdir bin");
+        std::fs::write(&managed, b"fake-emberd").expect("write fake emberd");
+
+        let resolved = resolve_emberd_source_from_current_exe(&current, &managed)
+            .expect("installed app layout must resolve managed emberd");
+        assert_eq!(resolved, managed);
+    }
+
+    /// T1 — the managed-daemon fallback is only for the installed app-bundle
+    /// launcher. A repo-build `target/.../ember` without an `emberd` sibling
+    /// must not silently reuse an unrelated host daemon.
+    #[test]
+    fn resolve_emberd_source_repo_build_without_sibling_rejects_managed_daemon_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let current = tmp.path().join("target/release/ember");
+        std::fs::create_dir_all(current.parent().expect("current parent")).expect("mkdir target");
+        std::fs::write(&current, b"fake-ember").expect("write fake ember");
+
+        let managed = tmp.path().join("usr/local/bin/emberd");
+        std::fs::create_dir_all(managed.parent().expect("managed parent")).expect("mkdir bin");
+        std::fs::write(&managed, b"fake-emberd").expect("write fake emberd");
+
+        let err = match resolve_emberd_source_from_current_exe(&current, &managed) {
+            Err(e) => e,
+            Ok(path) => panic!("repo build must not resolve managed daemon path: {path:?}"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not find `emberd` next to"),
+            "error should preserve sibling-build guidance: {msg}"
+        );
     }
 
     /// T1 — `..` segment in env var is refused with a named error.
@@ -4931,7 +6460,7 @@ system/sh.emberlink.daemon = {\n\
         );
     }
 
-    // ── implementation-note-190 — T2 tests ───────────────────────
+    // ── subuid install tests ───────────────────────
     //
     // design Component 2 modern-Linux subuid install path. Tests use
     // `provision_subuid_range_at` against tempdir-scoped `subuid` /
@@ -5346,6 +6875,131 @@ system/sh.emberlink.daemon = {\n\
         );
     }
 
+    /// T1 — `write_spawn_pool_config_inner` writes `[spawn_pool]` into a
+    /// fresh `config.toml` (system config path per design) and the
+    /// daemon-side TOML deserializer round-trips it. The test drives the
+    /// inner variant with `DaemonPaths::for_test(tmp)` so the write
+    /// targets `<tmp>/config/config.toml` instead of the real system
+    /// path.
+    #[test]
+    fn write_spawn_pool_config_creates_section() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        let prov = SpawnPoolProvisioning::SystemUsers {
+            uids: vec![10010, 10011, 10012],
+            gid: 10020,
+        };
+        write_spawn_pool_config_inner(&paths, &prov).expect("write config");
+
+        let text = std::fs::read_to_string(paths.config_file()).expect("config written");
+        assert!(
+            text.contains("[spawn_pool]"),
+            "section header present: {text}"
+        );
+        assert!(
+            text.contains("uids = [10010, 10011, 10012]"),
+            "uids: {text}"
+        );
+        assert!(text.contains("gid = 10020"), "gid: {text}");
+    }
+
+    /// T1 — `write_default_config_if_absent_inner` writes a bootable base
+    /// config (`[daemon]` + `[keyring]`) into the daemon's system config
+    /// path (per design — `DaemonPaths::config_file()`). This is the
+    /// fix for the fresh-`.pkg`-install daemon-won't-boot gap (design
+    /// §Decision 2), now retargeted to the system path.
+    #[test]
+    fn write_default_config_creates_bootable_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        write_default_config_if_absent_inner(&paths).expect("write config");
+
+        let text = std::fs::read_to_string(paths.config_file()).expect("config written");
+        assert!(text.contains("[daemon]"), "daemon section: {text}");
+        assert!(text.contains("log_level = \"info\""), "log level: {text}");
+        assert!(text.contains("[keyring]"), "keyring section: {text}");
+        // Round-trips through the daemon-side config deserializer.
+        let parsed: toml::Value = toml::from_str(&text).expect("config parses as TOML");
+        assert!(parsed.get("daemon").is_some(), "daemon table present");
+        assert!(parsed.get("keyring").is_some(), "keyring table present");
+    }
+
+    /// T1 — non-clobbering: an existing `config.toml` (operator edits, a
+    /// prior install's settings, an upgrade-over-existing host) is
+    /// authoritative and left byte-for-byte untouched.
+    #[test]
+    fn write_default_config_does_not_clobber_existing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).expect("mkdir config dir");
+        let existing = "[daemon]\nlog_level = \"debug\"\ntrust_roots = \"operator-pinned\"\n";
+        std::fs::write(paths.config_file(), existing).expect("seed config");
+
+        write_default_config_if_absent_inner(&paths).expect("idempotent no-op");
+
+        let text = std::fs::read_to_string(paths.config_file()).expect("config still there");
+        assert_eq!(text, existing, "existing config must be left untouched");
+    }
+
+    /// T1 — upsert is idempotent and replaces a stale `[spawn_pool]` block
+    /// without duplicating it or disturbing other sections.
+    #[test]
+    fn write_spawn_pool_config_replaces_and_preserves_other_sections() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).expect("mkdir config dir");
+        // Seed a config with an unrelated section and a STALE spawn_pool block.
+        std::fs::write(
+            paths.config_file(),
+            "[daemon]\nlog_level = \"info\"\ntrust_roots = \"abc\"\n\n\
+             [spawn_pool]\n# stale\nuids = [999]\ngid = 1\n",
+        )
+        .expect("seed config");
+
+        let prov = SpawnPoolProvisioning::SystemUsers {
+            uids: vec![10010, 10011],
+            gid: 10020,
+        };
+        // Run twice — must be idempotent.
+        write_spawn_pool_config_inner(&paths, &prov).expect("write 1");
+        write_spawn_pool_config_inner(&paths, &prov).expect("write 2");
+
+        let text = std::fs::read_to_string(paths.config_file()).expect("read");
+        // Unrelated section preserved.
+        assert!(
+            text.contains("[daemon]"),
+            "daemon section preserved: {text}"
+        );
+        assert!(
+            text.contains("trust_roots = \"abc\""),
+            "daemon keys preserved: {text}"
+        );
+        // Exactly one spawn_pool header, stale uid gone, new uids present.
+        assert_eq!(
+            text.matches("[spawn_pool]").count(),
+            1,
+            "exactly one spawn_pool section: {text}"
+        );
+        assert!(!text.contains("uids = [999]"), "stale uids removed: {text}");
+        assert!(text.contains("uids = [10010, 10011]"), "new uids: {text}");
+
+        // The daemon's own config loader must accept the result.
+        let cfg: toml::Value = toml::from_str(&text).expect("valid toml");
+        assert!(cfg.get("spawn_pool").is_some(), "spawn_pool parses");
+        assert!(cfg.get("daemon").is_some(), "daemon parses");
+    }
+
+    /// T1 — `strip_spawn_pool_section` removes the section when it is the last
+    /// block in the file (no trailing top-level header to terminate it).
+    #[test]
+    fn strip_spawn_pool_section_handles_trailing_section() {
+        let text = "[daemon]\nlog_level = \"info\"\n\n[spawn_pool]\nuids = [1]\ngid = 2\n";
+        let stripped = strip_spawn_pool_section(text);
+        assert!(stripped.contains("[daemon]"));
+        assert!(!stripped.contains("[spawn_pool]"));
+        assert!(!stripped.contains("uids = [1]"));
+    }
+
     // ─── design + MACOS-PRIMITIVES Decision 5 install renderers ──
 
     /// T1 — Linux unit body renders pool args into `ExecStart`. The
@@ -5597,8 +7251,6 @@ system/sh.emberlink.daemon = {\n\
 
     // ── T3: inspect_and_heal_ember_user_inner — partial-state collision ──────
     //
-    // implementation-note-376.
-    //
     // These tests exercise the inspect-and-heal step that gates the
     // sysadminctl -addUser call. They use injected closures (mirroring
     // the dseditgroup_tolerant_inner pattern shipped in #3470) so no
@@ -5817,5 +7469,411 @@ system/sh.emberlink.daemon = {\n\
             msg.contains("no free macOS system uid available"),
             "error must explain the exhausted system-uid range, got: {msg}"
         );
+    }
+
+    // ── design SLICE 2b — emberd-rpc sibling bootstrap (ember_rpc_sibling_bootstrap_landed) ──
+
+    /// Serialize tests that mutate `EMBER_BRIDGE_BIND` — it is process-global,
+    /// so two `rpc_sibling_should_bootstrap` tests racing under cargo's
+    /// parallel runner would flake (and could poison `config.rs` env-reading
+    /// tests run in the same process if not restored). Drop-restore guard.
+    static BRIDGE_BIND_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct BridgeBindEnvGuard {
+        previous: Option<String>,
+    }
+    impl BridgeBindEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var("EMBER_BRIDGE_BIND").ok();
+            unsafe { std::env::set_var("EMBER_BRIDGE_BIND", value) };
+            Self { previous }
+        }
+        fn unset() -> Self {
+            let previous = std::env::var("EMBER_BRIDGE_BIND").ok();
+            unsafe { std::env::remove_var("EMBER_BRIDGE_BIND") };
+            Self { previous }
+        }
+    }
+    impl Drop for BridgeBindEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var("EMBER_BRIDGE_BIND", v),
+                    None => std::env::remove_var("EMBER_BRIDGE_BIND"),
+                }
+            }
+        }
+    }
+
+    /// The launchd plist body must pin all four `EMBER_RPC_*` env vars to the
+    /// daemon system paths (NOT the operator-home paths and NOT the sibling's
+    /// own Config::default()). A wrong pin is a silent lane failure
+    /// (cert-not-found → restart loop), so this asserts the exact strings.
+    #[test]
+    fn rpc_launchd_plist_body_pins_system_env() {
+        let oh = Path::new("/home/test-operator");
+        let body = render_rpc_launchd_plist_body(oh);
+        let paths = crate::paths::DaemonPaths::system();
+
+        for expected in [
+            format!(
+                "<key>EMBER_RPC_FORWARD_UDS</key><string>{}</string>",
+                paths.run_dir.join("rpc.sock").display()
+            ),
+            format!(
+                "<key>EMBER_RPC_SERVER_CERT</key><string>{}</string>",
+                paths
+                    .data_dir
+                    .join("ember-rpc")
+                    .join("server.crt")
+                    .display()
+            ),
+            format!(
+                "<key>EMBER_RPC_SERVER_KEY</key><string>{}</string>",
+                paths
+                    .data_dir
+                    .join("ember-rpc")
+                    .join("server.key")
+                    .display()
+            ),
+            format!(
+                "<key>EMBER_RPC_CA_CERT</key><string>{}</string>",
+                paths.data_dir.join("bridge_ca.pem").display()
+            ),
+        ] {
+            assert!(
+                body.contains(&expected),
+                "rpc plist must pin `{expected}`; got:\n{body}"
+            );
+        }
+        assert!(
+            !body.contains("/home/test-operator/.ember"),
+            "rpc plist must not pin authority-space paths under operator home: {body}"
+        );
+        // Label + binary path sanity.
+        assert!(body.contains("<string>sh.emberlink.rpc</string>"));
+        assert!(body.contains("<string>/usr/local/bin/emberd-rpc-macos</string>"));
+        assert!(body.contains("<key>UserName</key>        <string>ember</string>"));
+        assert!(body.contains("<key>RunAtLoad</key>       <true/>"));
+        assert!(body.contains("<key>KeepAlive</key>       <true/>"));
+        // ThrottleInterval caps the respawn rate so a stuck sibling flaps at a
+        // visible cadence rather than launchd's tight default (fail-loud parity
+        // with the Linux StartLimit). (Added after adversarial review.)
+        assert!(body.contains("<key>ThrottleInterval</key><integer>10</integer>"));
+        assert!(body.contains("<string>/var/log/emberd-rpc.err</string>"));
+        // All four pins must sit INSIDE the EnvironmentVariables <dict>.
+        let env_close = body.find("</dict>").expect("env dict close");
+        let ca_pos = body.find("EMBER_RPC_CA_CERT").expect("ca pin present");
+        assert!(ca_pos < env_close, "pins must precede the env </dict>");
+    }
+
+    /// The systemd unit body must pin all four `EMBER_RPC_*` env vars to the
+    /// daemon system paths via `Environment=` lines.
+    #[test]
+    fn rpc_systemd_unit_body_pins_system_env() {
+        let oh = Path::new("/home/test-operator");
+        let body = render_rpc_systemd_unit_body(oh);
+        let paths = crate::paths::DaemonPaths::system();
+
+        for expected in [
+            format!(
+                "Environment=EMBER_RPC_FORWARD_UDS={}",
+                paths.run_dir.join("rpc.sock").display()
+            ),
+            format!(
+                "Environment=EMBER_RPC_SERVER_CERT={}",
+                paths
+                    .data_dir
+                    .join("ember-rpc")
+                    .join("server.crt")
+                    .display()
+            ),
+            format!(
+                "Environment=EMBER_RPC_SERVER_KEY={}",
+                paths
+                    .data_dir
+                    .join("ember-rpc")
+                    .join("server.key")
+                    .display()
+            ),
+            format!(
+                "Environment=EMBER_RPC_CA_CERT={}",
+                paths.data_dir.join("bridge_ca.pem").display()
+            ),
+        ] {
+            assert!(
+                body.contains(&expected),
+                "rpc systemd unit must pin `{expected}`; got:\n{body}"
+            );
+        }
+        assert!(
+            !body.contains("/home/test-operator/.ember"),
+            "rpc systemd unit must not pin authority-space paths under operator home: {body}"
+        );
+        assert!(body.contains("ExecStart=/usr/local/bin/emberd-rpc-linux"));
+        assert!(body.contains("User=ember"));
+        assert!(body.contains("Group=ember"));
+    }
+
+    /// The systemd unit must carry forward the full hardening set, add the 2c
+    /// cert-hot-reload `ExecReload`, and — load-bearing — re-expose the daemon
+    /// data/run dirs via `BindReadOnlyPaths`/`BindPaths` so the cert/socket
+    /// paths are not hidden (and the lane does not silently fail).
+    #[test]
+    fn rpc_systemd_unit_body_carries_hardening_and_readonly_cert_paths() {
+        let oh = Path::new("/home/test-operator");
+        let body = render_rpc_systemd_unit_body(oh);
+        let paths = crate::paths::DaemonPaths::system();
+
+        for directive in [
+            "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "ProtectHome=tmpfs",
+            "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
+            "RestrictNamespaces=true",
+            "RestrictRealtime=true",
+            "LockPersonality=true",
+            "MemoryDenyWriteExecute=true",
+        ] {
+            assert!(
+                body.contains(directive),
+                "rpc systemd unit must carry hardening `{directive}`; got:\n{body}"
+            );
+        }
+
+        // 2c cert hot-reload entry point.
+        assert!(
+            body.contains("ExecReload=/bin/kill -HUP $MAINPID"),
+            "rpc systemd unit must declare ExecReload for cert hot-reload"
+        );
+
+        // Load-bearing: the Bind*Paths= must expose exactly the data
+        // (read-only — certs) + run (read-write — forward-UDS connect)
+        // dirs. Regressing to operator-home paths would silently
+        // restart-loop every bridge-on Linux host.
+        assert!(
+            body.contains(&format!("BindReadOnlyPaths=-{}", paths.data_dir.display())),
+            "must BIND data_dir read-only so the cert/key/ca are readable; got:\n{body}"
+        );
+        assert!(
+            body.contains(&format!("BindPaths=-{}", paths.run_dir.display())),
+            "must BIND run_dir read-write (BindPaths=) so the forward UDS is connectable; got:\n{body}"
+        );
+        // The `ProtectHome=tmpfs` directive assertion above is the regression
+        // guard against a revert to `ProtectHome=true` (which can't re-expose
+        // the cert path) — a revert would fail that assertion. (We can't assert
+        // `!contains("ProtectHome=true")` here because the explanatory comment
+        // in the rendered body legitimately mentions the rejected directive.)
+    }
+
+    /// Regression guard (adversarial review 2026-06-05): the INSTALLER's
+    /// `EMBER_BRIDGE_BIND` env must be IGNORED — the launchd/systemd-launched
+    /// daemon never sees it (not baked into its unit, not persisted to config),
+    /// so honoring it would bootstrap a sibling for a daemon that boots
+    /// bridge-OFF and crash-loops on the missing cert. Env set + NO config ⇒
+    /// still disabled.
+    ///
+    /// Post-design: drives the `_inner` variant with a `for_test`
+    /// `DaemonPaths` so the config-file lookup targets `<tmp>/config/
+    /// config.toml` rather than the real system path.
+    #[test]
+    fn rpc_should_bootstrap_ignores_installer_env() {
+        let _lock = BRIDGE_BIND_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = BridgeBindEnvGuard::set("127.0.0.1:8443");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        assert!(
+            !rpc_sibling_should_bootstrap_inner(&paths),
+            "installer EMBER_BRIDGE_BIND must NOT bootstrap a sibling the daemon never backs"
+        );
+    }
+
+    /// The config file decides regardless of any installer env value: a set
+    /// `[daemon].bridge_bind` enables bootstrap even when `EMBER_BRIDGE_BIND` is
+    /// set in the installer env — the env is ignored, config is authoritative.
+    #[test]
+    fn rpc_should_bootstrap_decided_by_config_not_env() {
+        let _lock = BRIDGE_BIND_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = BridgeBindEnvGuard::set("");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[daemon]\nbridge_bind = \"127.0.0.1:8443\"\n",
+        )
+        .unwrap();
+        assert!(
+            rpc_sibling_should_bootstrap_inner(&paths),
+            "config bridge_bind must enable bootstrap; installer env is ignored"
+        );
+    }
+
+    /// True from the config file's `[daemon].bridge_bind` when env is unset.
+    #[test]
+    fn rpc_should_bootstrap_true_from_config_when_env_unset() {
+        let _lock = BRIDGE_BIND_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = BridgeBindEnvGuard::unset();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[daemon]\nlog_level = \"info\"\nbridge_bind = \"0.0.0.0:8443\"\n",
+        )
+        .unwrap();
+        assert!(rpc_sibling_should_bootstrap_inner(&paths));
+    }
+
+    /// False when env unset and config absent / empty bridge_bind.
+    #[test]
+    fn rpc_should_bootstrap_false_when_both_absent_or_empty() {
+        let _lock = BRIDGE_BIND_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = BridgeBindEnvGuard::unset();
+
+        // (a) no config file at all.
+        let tmp_none = tempfile::tempdir().expect("tempdir");
+        let paths_none = crate::paths::DaemonPaths::for_test(tmp_none.path());
+        assert!(
+            !rpc_sibling_should_bootstrap_inner(&paths_none),
+            "no config + no env ⇒ disabled"
+        );
+
+        // (b) config present but bridge_bind empty string.
+        let tmp_empty = tempfile::tempdir().expect("tempdir");
+        let paths_empty = crate::paths::DaemonPaths::for_test(tmp_empty.path());
+        std::fs::create_dir_all(&paths_empty.config_dir).unwrap();
+        std::fs::write(paths_empty.config_file(), "[daemon]\nbridge_bind = \"\"\n").unwrap();
+        assert!(
+            !rpc_sibling_should_bootstrap_inner(&paths_empty),
+            "empty config bridge_bind ⇒ disabled"
+        );
+
+        // (c) config present but no bridge_bind key.
+        let tmp_absent = tempfile::tempdir().expect("tempdir");
+        let paths_absent = crate::paths::DaemonPaths::for_test(tmp_absent.path());
+        std::fs::create_dir_all(&paths_absent.config_dir).unwrap();
+        std::fs::write(
+            paths_absent.config_file(),
+            "[daemon]\nlog_level = \"info\"\n",
+        )
+        .unwrap();
+        assert!(
+            !rpc_sibling_should_bootstrap_inner(&paths_absent),
+            "absent config bridge_bind key ⇒ disabled"
+        );
+    }
+
+    /// Unit-level coverage of the config-parse helper (no env, no temp file).
+    #[test]
+    fn bridge_bind_value_is_set_parses_correctly() {
+        assert!(bridge_bind_value_is_set(
+            "[daemon]\nbridge_bind = \"127.0.0.1:8443\"\n"
+        ));
+        assert!(!bridge_bind_value_is_set("[daemon]\nbridge_bind = \"\"\n"));
+        assert!(!bridge_bind_value_is_set(
+            "[daemon]\nlog_level = \"info\"\n"
+        ));
+        assert!(!bridge_bind_value_is_set(""));
+        // Malformed TOML ⇒ not enabling (false), never panics.
+        assert!(!bridge_bind_value_is_set("this is not = valid = toml ["));
+        // Non-empty but NOT a SocketAddr ⇒ false — a malformed bridge_bind is a
+        // hard daemon-startup abort, so we must not bootstrap a sibling for a
+        // daemon that won't boot.
+        assert!(!bridge_bind_value_is_set(
+            "[daemon]\nbridge_bind = \"not-an-addr\"\n"
+        ));
+        assert!(!bridge_bind_value_is_set(
+            "[daemon]\nbridge_bind = \"localhost:8443\"\n"
+        ));
+    }
+
+    /// The rpc env-pin derivation must agree between the launchd + systemd
+    /// renderers (they both call `rpc_env_pins`); assert the tuple directly.
+    #[test]
+    fn rpc_env_pins_derive_system_paths() {
+        let (uds, cert, key, ca) = rpc_env_pins(Path::new("/Users/alice"));
+        let paths = crate::paths::DaemonPaths::system();
+        assert_eq!(
+            uds,
+            paths
+                .run_dir
+                .join("rpc.sock")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            cert,
+            paths
+                .data_dir
+                .join("ember-rpc")
+                .join("server.crt")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            key,
+            paths
+                .data_dir
+                .join("ember-rpc")
+                .join("server.key")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            ca,
+            paths
+                .data_dir
+                .join("bridge_ca.pem")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    /// `install_emberd_rpc_binary_at` copies the sibling into the destination
+    /// dir under the platform binary name (tempdir; no sudo). Mirrors
+    /// `install_emberd_binary_at_copies_file`: the copy completes before the
+    /// chown-to-root step, which fails under a non-root test runner; we verify
+    /// the copy and tolerate only that chown/chmod failure.
+    #[test]
+    fn install_emberd_rpc_binary_at_copies_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("emberd-rpc-src");
+        std::fs::write(&src, b"#!/bin/sh\necho rpc\n").expect("write src");
+        let dst_dir = tmp.path().join("bin");
+
+        let result = install_emberd_rpc_binary_at(&src, &dst_dir, EMBERD_RPC_BIN_NAME);
+
+        let dst = dst_dir.join(EMBERD_RPC_BIN_NAME);
+        assert!(
+            dst.exists(),
+            "rpc binary must be copied to dst even if a later step fails"
+        );
+        assert_eq!(
+            std::fs::read(&dst).expect("read dst"),
+            b"#!/bin/sh\necho rpc\n"
+        );
+        match result {
+            Ok(()) => {}
+            Err(InstallError::Subprocess { cmd, .. })
+                if cmd.starts_with("chown ") || cmd.starts_with("chmod ") => {}
+            Err(other) => panic!(
+                "unexpected error variant (only chown/chmod failure expected under non-root): {other:?}"
+            ),
+        }
     }
 }

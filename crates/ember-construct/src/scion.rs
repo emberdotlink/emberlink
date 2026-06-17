@@ -1,10 +1,18 @@
-//! Argv classifier for `ember-scion` container lifecycle commands.
+//! Argv classifier and factory adapter for `ember-scion` container lifecycle commands.
 //!
+//! CLASSIFICATION: PUBLIC
 //!
 //! Maps `ember-scion <subcommand>` to a `scion.toml` action key. The daemon
 //! re-classifies server-side (design §3); this is shim-side only.
+//!
+//! Scion is the only bundled Construct with a non-identity argv translator
+//! (per design §4), making it the execution-adapter stress test for the
+//! generic factory contract.
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// Wrapper for the VENDORS classifier field — converts the `&'static str`
 /// returned by `classify_scion_argv` into the `ActionKey` type used by the
@@ -13,18 +21,19 @@ pub fn classify_scion_argv_key(argv: &[String]) -> Option<ActionKey> {
     classify_scion_argv(argv).map(|k| ActionKey(k.to_string()))
 }
 
-/// Classify `ember-scion <subcommand> [args…]` argv into an action key.
+/// Classify `ember-scion <subcommand> [args…]` argv into the authority-side
+/// action key declared in `scion.toml`.
 ///
 /// `argv` is the full argv including the binary name at position 0.
-/// Returns `Some("scion.<subcommand>")` for known subcommands, `None` otherwise.
+/// Returns `Some("<subcommand>")` for known subcommands, `None` otherwise.
 pub fn classify_scion_argv(argv: &[String]) -> Option<&'static str> {
     match argv.get(1).map(String::as_str) {
-        Some("start") => Some("scion.start"),
-        Some("stop") => Some("scion.stop"),
-        Some("delete") => Some("scion.delete"),
-        Some("attach") => Some("scion.attach"),
-        Some("logs") => Some("scion.logs"),
-        Some("list") => Some("scion.list"),
+        Some("start") => Some("start"),
+        Some("stop") => Some("stop"),
+        Some("delete") => Some("delete"),
+        Some("attach") => Some("attach"),
+        Some("logs") => Some("logs"),
+        Some("list") => Some("list"),
         _ => None,
     }
 }
@@ -35,7 +44,7 @@ pub fn classify_scion_argv(argv: &[String]) -> Option<&'static str> {
 /// consumes server-side, not flags scion understands. This translation runs
 /// after `broker.resolve` and before exec'ing the upstream scion binary.
 ///
-/// Translation rules (implementation-note-103):
+/// Translation rules (implementation-note-102):
 ///   - Strip `--persona <X>` (daemon-side context, not scion CLI)
 ///   - Strip `--max-depth <N>` (capability check, not scion CLI)
 ///   - Strip `--brief <text>` (worker brief, not scion CLI)
@@ -98,6 +107,82 @@ pub fn translate_scion_argv(argv: &[String]) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// factory adapter — ScionFactory
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone)]
+pub struct ScionFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScionTarget {
+    pub container_name: String,
+}
+
+impl InvocationGrammar for ScionFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_scion_argv_key(argv)
+    }
+}
+
+impl TargetExtractor for ScionFactory {
+    type Target = ScionTarget;
+
+    fn target_for_argv(&self, action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let k = action_key.0.as_str();
+        match k {
+            "start" | "stop" | "delete" | "attach" | "logs" => {
+                let container_name = argv.get(2)?.clone();
+                Some(ScionTarget { container_name })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl NeedTemplate for ScionFactory {
+    type Need = ();
+
+    fn need_for_target(
+        &self,
+        _action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        None
+    }
+}
+
+impl ConstructFactory for ScionFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        match key.0.as_str() {
+            "list" | "logs" | "stop" | "attach" => FactoryDisposition::Credentialless,
+
+            "start" => {
+                if argv.iter().any(|a| a == "--max-depth") {
+                    return FactoryDisposition::UnsupportedFailClosed;
+                }
+                if argv.iter().any(|a| a == "--brief") {
+                    return FactoryDisposition::PayloadAnalysisRequired;
+                }
+                FactoryDisposition::ResolverRequired
+            }
+
+            "delete" => FactoryDisposition::ResolverRequired,
+
+            _ => FactoryDisposition::Credentialless,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,7 +195,7 @@ mod tests {
     fn test_classify_scion_argv_start() {
         assert_eq!(
             classify_scion_argv(&argv(&["ember-scion", "start"])),
-            Some("scion.start")
+            Some("start")
         );
     }
 
@@ -118,7 +203,7 @@ mod tests {
     fn test_classify_scion_argv_list() {
         assert_eq!(
             classify_scion_argv(&argv(&["ember-scion", "list"])),
-            Some("scion.list")
+            Some("list")
         );
     }
 
@@ -136,7 +221,7 @@ mod tests {
     fn test_classify_scion_argv_stop() {
         assert_eq!(
             classify_scion_argv(&argv(&["ember-scion", "stop"])),
-            Some("scion.stop")
+            Some("stop")
         );
     }
 
@@ -144,7 +229,7 @@ mod tests {
     fn test_classify_scion_argv_delete() {
         assert_eq!(
             classify_scion_argv(&argv(&["ember-scion", "delete"])),
-            Some("scion.delete")
+            Some("delete")
         );
     }
 
@@ -152,7 +237,7 @@ mod tests {
     fn test_classify_scion_argv_attach() {
         assert_eq!(
             classify_scion_argv(&argv(&["ember-scion", "attach"])),
-            Some("scion.attach")
+            Some("attach")
         );
     }
 
@@ -160,11 +245,11 @@ mod tests {
     fn test_classify_scion_argv_logs() {
         assert_eq!(
             classify_scion_argv(&argv(&["ember-scion", "logs"])),
-            Some("scion.logs")
+            Some("logs")
         );
     }
 
-    // translate_scion_argv tests (implementation-note-103) ---
+    // translate_scion_argv tests (implementation-note-102) ---
 
     #[test]
     fn test_translate_strips_persona() {
@@ -304,13 +389,168 @@ mod tests {
             ])
         );
     }
+
+    // --- ScionFactory tests ---
+
+    #[test]
+    fn factory_list_is_credentialless() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "list"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn factory_logs_is_credentialless() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "logs", "worker-a"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn factory_stop_is_credentialless() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "stop", "worker-a"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn factory_attach_is_credentialless() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "attach", "worker-a"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn factory_start_is_resolver_required() {
+        let f = ScionFactory;
+        let input = argv(&[
+            "ember-scion",
+            "start",
+            "worker-a",
+            "--persona",
+            "claude-code-default",
+        ]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn factory_start_with_brief_is_payload_analysis() {
+        let f = ScionFactory;
+        let input = argv(&[
+            "ember-scion",
+            "start",
+            "worker-a",
+            "--brief",
+            "fix the deployment",
+        ]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn factory_start_with_max_depth_is_unsupported() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "start", "worker-a", "--max-depth", "3"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn factory_max_depth_takes_priority_over_brief() {
+        let f = ScionFactory;
+        let input = argv(&[
+            "ember-scion",
+            "start",
+            "worker-a",
+            "--brief",
+            "fix it",
+            "--max-depth",
+            "3",
+        ]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn factory_delete_is_resolver_required() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "delete", "worker-a"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn factory_unclassified_is_credentialless() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "bogus"]);
+        let key = f.action_key_for_argv(&input);
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &input),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn factory_target_extracts_container_name() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "start", "worker-a", "--persona", "alice"]);
+        let key = f.action_key_for_argv(&input).unwrap();
+        let target = f.target_for_argv(&key, &input);
+        assert_eq!(
+            target,
+            Some(ScionTarget {
+                container_name: "worker-a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn factory_target_none_for_list() {
+        let f = ScionFactory;
+        let input = argv(&["ember-scion", "list"]);
+        let key = f.action_key_for_argv(&input).unwrap();
+        let target = f.target_for_argv(&key, &input);
+        assert!(target.is_none());
+    }
 }
 
 // translate_scion_argv_helper_landed
 
 // ---------------------------------------------------------------------------
 // T2 integration tests — translated-argv round-trip + receipt emission
-// (implementation-note-17)
+// (implementation-note-21)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -321,12 +561,57 @@ mod t2_tests {
         ActionKey, BrokerTransactionError, BrokerTransport, ClassifyArgv, ConstructSpec,
         CredentialAuditKind, ExecOutcome, SpawnHandle,
     };
+    use core_event_types::ActionRef;
     use std::process::ExitCode;
     use std::sync::Mutex;
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
+
+    // Full v2 manifest: the carrier-load seam is fail-closed (design), so an
+    // identity-only stub no longer resolves.
+    const TEST_CONSTRUCT_TOML_BYTES: &[u8] = br#"
+schema_version = "2"
+
+[meta]
+name = "ember-scion"
+plugin_address = "registry.ember.systems/ember-systems/ember-scion"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "SCION CLI Construct"
+description = "Mediates scion invocations through ember."
+
+[defaults]
+materialization_class = "none"
+default_runner_classes = ["local_trusted"]
+
+[runtime.cli]
+wrapped_binary = "ember-scion"
+
+[[actions]]
+key = "start"
+action_version = "v1"
+summary = "Start a SCION agent"
+input_schema = { kind = "argv", classifier = "start *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "long_running_job"
+audit_fields = ["action_ref", "terminal_outcome"]
+handler_ref = "cli:start"
+
+[[actions]]
+key = "stop"
+action_version = "v1"
+summary = "Stop a SCION agent"
+input_schema = { kind = "argv", classifier = "stop *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+audit_fields = ["action_ref", "terminal_outcome"]
+handler_ref = "cli:stop"
+"#;
 
     // -----------------------------------------------------------------------
     // Mock transport that records argv received by exec phase.
@@ -339,7 +624,7 @@ mod t2_tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RecordedEvent {
-        Resolve { action_key: String },
+        Resolve { action_ref: String },
         Exec { argv: Vec<String> },
     }
 
@@ -363,18 +648,20 @@ mod t2_tests {
     impl BrokerTransport for RecordingTransport {
         fn resolve(
             &self,
-            action_key: &ActionKey,
-            _binary: &str,
+            action_ref: &ActionRef,
             _env_passthrough: &[String],
             _construct_toml_bytes: &[u8],
+            _session_id: Option<&str>,
         ) -> Result<SpawnHandle, BrokerTransactionError> {
             self.recorded_events
                 .lock()
                 .unwrap()
                 .push(RecordedEvent::Resolve {
-                    action_key: action_key.0.clone(),
+                    action_ref: action_ref.to_string(),
                 });
             Ok(SpawnHandle {
+                execution_contract: core_event_types::ExecutionContract::new(action_ref.clone())
+                    .with_contract_id("contract-scion-t2"),
                 binary: "/usr/bin/scion".to_string(),
                 env_allowlist: vec![],
                 materialization_id: "mat-scion-t2".to_string(),
@@ -386,6 +673,7 @@ mod t2_tests {
             &self,
             _handle: SpawnHandle,
             argv: &[String],
+            _session_id: Option<&str>,
         ) -> Result<ExecOutcome, BrokerTransactionError> {
             self.recorded_argv.lock().unwrap().push(argv.to_vec());
             self.recorded_events
@@ -395,9 +683,10 @@ mod t2_tests {
                     argv: argv.to_vec(),
                 });
             Ok(ExecOutcome {
+                contract_id: Some("contract-scion-t2".to_string()),
                 exit_code: 0,
-                stderr_tail: String::new(),
                 stdout_tail: String::new(),
+                stderr_tail: String::new(),
             })
         }
 
@@ -426,7 +715,7 @@ mod t2_tests {
     /// Also verifies that the transaction emits `CredentialProvisioned` (not
     /// `CredentialResolveAborted`) — the receipt is correct.
     ///
-    /// Anchor: implementation-note-105.
+    /// Anchor: implementation-note-104.
     #[test]
     fn scion_start_translated_argv_reaches_exec_and_emits_provisioned_receipt() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -504,7 +793,7 @@ mod t2_tests {
         let spec = ConstructSpec {
             argv: &translated,
             classifier: &classifier,
-            construct_toml_bytes: b"",
+            construct_toml_bytes: TEST_CONSTRUCT_TOML_BYTES,
             session_id_env: TEST_ENV,
             wrapped_binary: "/usr/bin/scion",
         };
@@ -524,13 +813,16 @@ mod t2_tests {
             "run should succeed; code={code:?}"
         );
 
-        // Verify resolve was called with scion.start action key.
+        // Verify resolve was called with the authority action ref for start.
         let events = transport.events();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, RecordedEvent::Resolve { action_key } if action_key == "scion.start")),
-            "resolve must be called with action_key=scion.start; events={events:?}"
+            events.iter().any(|e| matches!(
+                e,
+                RecordedEvent::Resolve { action_ref }
+                    if action_ref
+                        == "registry.ember.systems/ember-systems/ember-scion/start@v1"
+            )),
+            "resolve must be called with action_ref=.../start@v1; events={events:?}"
         );
 
         // Verify exec received the translated argv (scion-native flags only).
@@ -580,7 +872,7 @@ mod t2_tests {
         let spec = ConstructSpec {
             argv: &translated,
             classifier: &classifier,
-            construct_toml_bytes: b"",
+            construct_toml_bytes: TEST_CONSTRUCT_TOML_BYTES,
             session_id_env: TEST_ENV,
             wrapped_binary: "/usr/bin/scion",
         };
@@ -597,15 +889,20 @@ mod t2_tests {
 
         // Receipt kind: resolve + exec both succeeded → CredentialProvisioned.
         let events = transport.events();
-        let has_resolve = events.iter().any(
-            |e| matches!(e, RecordedEvent::Resolve { action_key } if action_key == "scion.stop"),
-        );
+        let has_resolve = events.iter().any(|e| {
+            matches!(
+                e,
+                RecordedEvent::Resolve { action_ref }
+                    if action_ref
+                        == "registry.ember.systems/ember-systems/ember-scion/stop@v1"
+            )
+        });
         let has_exec = events
             .iter()
             .any(|e| matches!(e, RecordedEvent::Exec { .. }));
         assert!(
             has_resolve,
-            "resolve must be called with scion.stop; events={events:?}"
+            "resolve must be called with action_ref=.../stop@v1; events={events:?}"
         );
         assert!(has_exec, "exec must be called; events={events:?}");
 

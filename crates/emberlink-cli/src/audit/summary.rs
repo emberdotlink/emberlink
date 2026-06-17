@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember audit summary` — direct-SQLite Receipt aggregation path.
 //!
@@ -5,8 +6,9 @@
 //!
 //! Sister module to `audit::query`: where `query` returns a flat list of
 //! per-Receipt rows, `summary` returns aggregate counts (total Receipts,
-//! distinct sessions, calls-by-kind histogram) for at-a-glance audit
-//! posture. Same direct-SQLite read-only contract as `query` — opens
+//! distinct sessions, calls-by-kind histogram, pregrant-path histogram)
+//! for at-a-glance audit posture. Same direct-SQLite read-only contract as
+//! `query` — opens
 //! `daemon.db` via `SQLITE_OPEN_READ_ONLY` so the operator's primary
 //! aggregation surface works even when the daemon is not running.
 //!
@@ -18,20 +20,22 @@
 //!
 //! - `since_iso` — lower bound on `created_at` (caller pre-parses via
 //!   `audit::query::parse_since`).
-//! - `workflow` — match `workflow_id` OR `workflow_template` extracted
+//! - `workflow` — match `delegation_id` OR `delegation_template` extracted
 //!   from `receipt_json` via SQLite JSON1.
 //! - `persona` — exact match on `persona_id`.
 //!
-//! Clap wiring (`AuditAction::Summary`), JIT/mock-broker/deny-list
-//! breakdowns, chain-integrity rollups, and the T2 perf test at
-//! 1000 Receipts are deferred to follow-up tasks (see worker brief).
+//! JIT/mock-broker/deny-list breakdowns, chain-integrity rollups, and
+//! the T2 perf test at 1000 Receipts are deferred to follow-up tasks
+//! (see worker brief).
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, params_from_iter};
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const MISSING_PREGRANT_PATH: &str = "missing";
 
 /// Direct-SQLite aggregation filter for `ember audit summary`.
 ///
@@ -44,9 +48,9 @@ pub struct SummaryFilter {
     /// parsing user input via `audit::query::parse_since` and rendering
     /// to RFC3339.
     pub since_iso: Option<String>,
-    /// Exact match on either `workflow_id` or `workflow_template`
+    /// Exact match on either `delegation_id` or `delegation_template`
     /// extracted from `receipt_json` via JSON1.
-    pub workflow: Option<String>,
+    pub delegation: Option<String>,
     /// Exact match on `persona_id`.
     pub persona: Option<String>,
 }
@@ -58,7 +62,11 @@ pub struct SummaryFilter {
 /// proxy for "agent sessions" available in the MVP receipts schema —
 /// session-level grouping is a follow-up). `calls_by_kind` is a
 /// histogram keyed by `receipts.kind` (`grant`, `kms_wrap`,
-/// `kms_unwrap`, `broker.materialization`, etc.).
+/// `kms_unwrap`, `broker.materialization`, etc.). `pregrant_path_counts`
+/// is keyed by the on-wire `pregrant_path` value carried in
+/// `receipt_json` (`standing_grant`, `per_action`, etc.), with
+/// `missing` used for rows that do not carry the field so serializer
+/// regressions remain visible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AuditSummary {
     /// Total Receipt rows matching the filter.
@@ -69,6 +77,9 @@ pub struct AuditSummary {
     pub sessions_count: usize,
     /// Histogram of Receipt counts keyed by `kind`.
     pub calls_by_kind: HashMap<String, usize>,
+    /// Histogram of Receipt counts keyed by `pregrant_path`.
+    #[serde(default)]
+    pub pregrant_path_counts: HashMap<String, usize>,
 }
 
 /// Errors returned by [`run_audit_summary`].
@@ -87,7 +98,10 @@ pub enum SummaryError {
     /// We surface this rather than silently dropping the row so a
     /// corrupted Receipt is visible to the operator (matches
     /// `query::QueryError::InvalidReceiptJson`).
-    InvalidReceiptJson { id: String, source: serde_json::Error },
+    InvalidReceiptJson {
+        id: String,
+        source: serde_json::Error,
+    },
 }
 
 impl std::fmt::Display for SummaryError {
@@ -144,17 +158,17 @@ pub fn run_audit_summary(
         clauses.push(format!("created_at >= ?{}", params.len() + 1));
         params.push(since.to_string());
     }
-    if let Some(workflow) = filter.workflow.as_deref() {
+    if let Some(delegation) = filter.delegation.as_deref() {
         let p1 = params.len() + 1;
         let p2 = params.len() + 2;
         clauses.push(format!(
-            "(json_extract(receipt_json, '$.body.workflow_id') = ?{p1} \
-              OR json_extract(receipt_json, '$.body.workflow_template') = ?{p1} \
-              OR json_extract(receipt_json, '$.workflow_id') = ?{p2} \
-              OR json_extract(receipt_json, '$.workflow_template') = ?{p2})"
+            "(json_extract(receipt_json, '$.body.delegation_id') = ?{p1} \
+              OR json_extract(receipt_json, '$.body.delegation_template') = ?{p1} \
+              OR json_extract(receipt_json, '$.delegation_id') = ?{p2} \
+              OR json_extract(receipt_json, '$.delegation_template') = ?{p2})"
         ));
-        params.push(workflow.to_string());
-        params.push(workflow.to_string());
+        params.push(delegation.to_string());
+        params.push(delegation.to_string());
     }
 
     let where_clause = if clauses.is_empty() {
@@ -163,9 +177,7 @@ pub fn run_audit_summary(
         format!("WHERE {}", clauses.join(" AND "))
     };
 
-    let sql = format!(
-        "SELECT id, kind, persona_id, receipt_json FROM receipts {where_clause}"
-    );
+    let sql = format!("SELECT id, kind, persona_id, receipt_json FROM receipts {where_clause}");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
@@ -180,26 +192,40 @@ pub fn run_audit_summary(
     let mut total_receipts: usize = 0;
     let mut personas: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut calls_by_kind: HashMap<String, usize> = HashMap::new();
+    let mut pregrant_path_counts: HashMap<String, usize> = HashMap::new();
     for r in rows {
         let (id, kind, persona_id, receipt_json) = r?;
         // Parse the receipt_json for early-detection of corruption,
-        // matching the query path. The current summary surface doesn't
-        // need fields out of it, but we still surface decode errors so
-        // operators see corrupted rows instead of silently skipping
-        // them.
-        if let Err(e) = serde_json::from_str::<Value>(&receipt_json) {
-            return Err(SummaryError::InvalidReceiptJson { id, source: e });
-        }
+        // matching the query path. Also extract pregrant_path from the
+        // Receipt body so the summary command can prove standing-grant
+        // routing without falling back to a raw query.
+        let receipt = match serde_json::from_str::<Value>(&receipt_json) {
+            Ok(v) => v,
+            Err(e) => return Err(SummaryError::InvalidReceiptJson { id, source: e }),
+        };
+        let pregrant_path =
+            extract_pregrant_path(&receipt).unwrap_or_else(|| MISSING_PREGRANT_PATH.to_string());
         total_receipts += 1;
         personas.insert(persona_id);
         *calls_by_kind.entry(kind).or_insert(0) += 1;
+        *pregrant_path_counts.entry(pregrant_path).or_insert(0) += 1;
     }
 
     Ok(AuditSummary {
         total_receipts,
         sessions_count: personas.len(),
         calls_by_kind,
+        pregrant_path_counts,
     })
+}
+
+/// Extract `pregrant_path` from a parsed Receipt JSON value. Tries the
+/// v2 `body.pregrant_path` path first, then the v1 top-level path.
+fn extract_pregrant_path(v: &Value) -> Option<String> {
+    v.pointer("/body/pregrant_path")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("pregrant_path").and_then(|x| x.as_str()))
+        .map(str::to_string)
 }
 
 /// Render a summary as a human-readable block. Mirrors the
@@ -218,6 +244,16 @@ pub fn format_summary_pretty(s: &AuditSummary) -> String {
         kinds.sort_by(|a, b| a.0.cmp(b.0));
         for (kind, count) in kinds {
             out.push_str(&format!("  {kind:<28}  {count}\n"));
+        }
+    }
+    if s.pregrant_path_counts.is_empty() {
+        out.push_str("pregrant paths: (none)\n");
+    } else {
+        out.push_str("pregrant paths:\n");
+        let mut paths: Vec<(&String, &usize)> = s.pregrant_path_counts.iter().collect();
+        paths.sort_by(|a, b| a.0.cmp(b.0));
+        for (path, count) in paths {
+            out.push_str(&format!("  {path:<28}  {count}\n"));
         }
     }
     out
@@ -283,6 +319,7 @@ mod tests {
         assert_eq!(s.total_receipts, 0);
         assert_eq!(s.sessions_count, 0);
         assert!(s.calls_by_kind.is_empty());
+        assert!(s.pregrant_path_counts.is_empty());
     }
 
     #[test]
@@ -303,6 +340,7 @@ mod tests {
         assert_eq!(s.total_receipts, 1);
         assert_eq!(s.sessions_count, 1);
         assert_eq!(s.calls_by_kind.get("grant"), Some(&1));
+        assert_eq!(s.pregrant_path_counts.get("missing"), Some(&1));
     }
 
     #[test]
@@ -348,6 +386,43 @@ mod tests {
         assert_eq!(s.sessions_count, 3);
         assert_eq!(s.calls_by_kind.get("grant"), Some(&3));
         assert_eq!(s.calls_by_kind.get("kms_wrap"), Some(&1));
+        assert_eq!(s.pregrant_path_counts.get("missing"), Some(&4));
+    }
+
+    #[test]
+    fn summary_aggregates_pregrant_path_from_body_and_top_level() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = dir.path().join("daemon.db");
+        let conn = make_db(&db);
+        insert(
+            &conn,
+            "r1",
+            "persona-a",
+            "broker.materialization",
+            "2026-05-19T12:00:00Z",
+            r#"{"body":{"pregrant_path":"standing_grant"}}"#,
+        );
+        insert(
+            &conn,
+            "r2",
+            "persona-a",
+            "broker.materialization",
+            "2026-05-19T13:00:00Z",
+            r#"{"pregrant_path":"per_action"}"#,
+        );
+        insert(
+            &conn,
+            "r3",
+            "persona-b",
+            "grant",
+            "2026-05-20T12:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        drop(conn);
+        let s = run_audit_summary(&db, &SummaryFilter::default()).expect("query");
+        assert_eq!(s.pregrant_path_counts.get("standing_grant"), Some(&1));
+        assert_eq!(s.pregrant_path_counts.get("per_action"), Some(&1));
+        assert_eq!(s.pregrant_path_counts.get("missing"), Some(&1));
     }
 
     #[test]
@@ -386,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_filters_by_workflow_template() {
+    fn summary_filters_by_delegation_template() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let db = dir.path().join("daemon.db");
         let conn = make_db(&db);
@@ -396,7 +471,7 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-19T12:00:00Z",
-            r#"{"body":{"workflow_template":"emberd-development"}}"#,
+            r#"{"body":{"delegation_template":"emberd-development"}}"#,
         );
         insert(
             &conn,
@@ -404,13 +479,13 @@ mod tests {
             "persona-a",
             "grant",
             "2026-05-20T12:00:00Z",
-            r#"{"body":{"workflow_template":"emberd-staging"}}"#,
+            r#"{"body":{"delegation_template":"emberd-staging"}}"#,
         );
         drop(conn);
         let s = run_audit_summary(
             &db,
             &SummaryFilter {
-                workflow: Some("emberd-development".to_string()),
+                delegation: Some("emberd-development".to_string()),
                 ..Default::default()
             },
         )
@@ -436,6 +511,7 @@ mod tests {
             total_receipts: 4,
             sessions_count: 2,
             calls_by_kind,
+            pregrant_path_counts: HashMap::new(),
         };
         let out = format_summary_pretty(&s);
         assert!(out.contains("total receipts: 4"));
@@ -454,6 +530,26 @@ mod tests {
     }
 
     #[test]
+    fn format_pretty_renders_pregrant_paths_sorted() {
+        let mut pregrant_path_counts = HashMap::new();
+        pregrant_path_counts.insert("standing_grant".to_string(), 3);
+        pregrant_path_counts.insert("missing".to_string(), 1);
+        let s = AuditSummary {
+            total_receipts: 4,
+            sessions_count: 2,
+            calls_by_kind: HashMap::new(),
+            pregrant_path_counts,
+        };
+        let out = format_summary_pretty(&s);
+        assert!(out.contains("pregrant paths:"));
+        assert!(out.contains("standing_grant"));
+        assert!(out.contains("missing"));
+        let m_idx = out.find("missing").expect("missing");
+        let s_idx = out.find("standing_grant").expect("standing_grant");
+        assert!(m_idx < s_idx);
+    }
+
+    #[test]
     fn format_json_round_trips() {
         let mut calls_by_kind = HashMap::new();
         calls_by_kind.insert("grant".to_string(), 2);
@@ -461,6 +557,7 @@ mod tests {
             total_receipts: 2,
             sessions_count: 1,
             calls_by_kind,
+            pregrant_path_counts: HashMap::from([("standing_grant".to_string(), 2)]),
         };
         let encoded = format_summary_json(&s, false).expect("encode");
         let decoded: AuditSummary = serde_json::from_str(&encoded).expect("decode");

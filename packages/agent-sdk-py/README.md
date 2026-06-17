@@ -1,5 +1,6 @@
 # emberlink-agent
 
+
 Experimental Python helper client for the Emberlink agent authorization protocol. It spawns the `emberlink-agent` helper subprocess, which routes daemon-backed methods through the local Ember daemon.
 
 See the [TypeScript counterpart SDK](../agent-sdk-ts/README.md) and the [Emberlink project README](../../README.md).
@@ -111,7 +112,7 @@ EmberAgent(config: AgentConfig)
 | `persona_id` | `str` | yes | Persona ID to operate as |
 | `binary_path` | `str` | no | Path to `emberlink-agent` binary (default: `"emberlink-agent"`, resolved from PATH) |
 | `label` | `str \| None` | no | Optional human-readable label for this persona session |
-| `daemon_socket` | `str \| None` | no | Override the daemon socket path instead of defaulting to `$HOME/.ember/run/daemon.sock` |
+| `daemon_socket` | `str \| None` | no | Override the platform default daemon socket path |
 
 Use as a context manager or call `connect()` / `close()` manually:
 

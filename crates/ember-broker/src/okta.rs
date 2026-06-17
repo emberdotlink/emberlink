@@ -44,7 +44,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, IdentityRef, MintStamp,
+};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -229,6 +231,7 @@ pub fn build_okta_jwt(
         exp,
         jti: jti.to_string(),
     };
+    crate::install_jwt_crypto_provider();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(key_id.to_string());
     let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
@@ -410,10 +413,15 @@ impl Broker for OktaBroker {
         };
         let expires_at = SystemTime::now() + std::time::Duration::from_secs(lifetime_secs);
 
+        // Fold the per-mint `jti` into the id: `client_id` + expiry alone
+        // collide for two mints of the same app within the same second,
+        // which would overwrite the earlier entry in `state` and leave its
+        // token untracked (revoke would target the wrong/forgotten token).
         let materialization_id = format!(
-            "okta-{}-{}",
+            "okta-{}-{}-{}",
             self.app.client_id,
-            DateTime::<Utc>::from(expires_at).timestamp()
+            DateTime::<Utc>::from(expires_at).timestamp(),
+            jti
         );
 
         let token_secret = SecretString::from(parsed.access_token);
@@ -429,6 +437,16 @@ impl Broker for OktaBroker {
             token: token_secret,
             expires_at,
             materialization_id,
+            mint_stamp: MintStamp::Identity {
+                identity: IdentityRef {
+                    provider: BrokerProvider::Okta,
+                    identity: format!(
+                        "{}:{}",
+                        self.app.org_url.trim_end_matches('/'),
+                        self.app.client_id
+                    ),
+                },
+            },
         })
     }
 
@@ -634,6 +652,13 @@ mod tests {
             provider: BrokerProvider::Okta,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -789,6 +814,37 @@ mod tests {
             call.body.contains("client_assertion="),
             "body must include client_assertion: {}",
             call.body
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_twice_same_second_keeps_distinct_materialization_ids() {
+        // Two mints of the same service-app within the same second share
+        // `client_id` and the expiry-second. If the id were only
+        // `okta-{client_id}-{expiry}` they would collide, overwriting the
+        // first entry in `state` and leaving its token untracked. The
+        // per-mint `jti` keeps the ids distinct so both stay revocable.
+        let mock = Arc::new(MockOktaClient::new().with_response(200, token_ok_body()));
+        let broker = OktaBroker::with_client(fixture_app(), mock.clone());
+        let mk = || {
+            okta_request(
+                serde_json::json!({
+                    "scopes": ["okta.users.manage"],
+                    "ttl_seconds": 3600,
+                }),
+                3600,
+            )
+        };
+        let c1 = Broker::issue(&broker, mk()).await.expect("first issue");
+        let c2 = Broker::issue(&broker, mk()).await.expect("second issue");
+        assert_ne!(
+            c1.materialization_id, c2.materialization_id,
+            "two same-second mints must produce distinct ids"
+        );
+        assert_eq!(
+            broker.active_count(),
+            2,
+            "both materializations must be tracked, not overwritten"
         );
     }
 
@@ -1047,5 +1103,28 @@ mod tests {
             a, b,
             "two random_jti calls must (essentially always) produce different values"
         );
+    }
+
+    #[tokio::test]
+    async fn issue_mint_stamp_records_okta_app_identity() {
+        let mock = Arc::new(MockOktaClient::new().with_response(200, token_ok_body()));
+        let broker = OktaBroker::with_client(fixture_app(), mock);
+        let req = okta_request(
+            serde_json::json!({ "scopes": ["api:access"], "ttl_seconds": 3600 }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        match &cred.mint_stamp {
+            MintStamp::Identity { identity } => {
+                assert_eq!(identity.provider, BrokerProvider::Okta);
+                assert_eq!(
+                    identity.identity,
+                    "https://example.okta.com:0oa-test-service-app"
+                );
+            }
+            other => panic!("expected MintStamp::Identity, got {other:?}"),
+        }
     }
 }

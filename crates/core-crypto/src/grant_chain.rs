@@ -17,6 +17,55 @@ fn chain_msg(payload: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Length-prefixed concatenation. Each component is prefixed with its
+/// big-endian u32 length so the resulting byte string is unambiguously
+/// decomposable — there is no parse path that could mistake the boundary
+/// between two adjacent components for a payload byte.
+///
+/// Used by [`chain_block_zero_msg`] and [`chain_appended_msg`] to bind
+/// `pubkey_next` (and, for block 0, the root pubkey) into the signed
+/// payload so a holder of any valid chain prefix cannot swap the tail
+/// key and append a widening block — C1 fix.
+fn len_prefixed_concat(components: &[&[u8]]) -> Vec<u8> {
+    let total: usize = components.iter().map(|c| 4 + c.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for c in components {
+        out.extend_from_slice(&(c.len() as u32).to_be_bytes());
+        out.extend_from_slice(c);
+    }
+    out
+}
+
+/// Build the canonical signed-message bytes for block 0.
+///
+/// Binds `block.canonical_encode()`, the successor's `pubkey_next` bytes,
+/// and the persona root pubkey bytes — so flipping any of the three
+/// without re-signing breaks verification. The root-pubkey binding makes
+/// "splice a forged block-0 into a chain rooted at a different persona"
+/// fail closed: the message any honest signer signed under root A cannot
+/// re-verify under root B.
+fn chain_block_zero_msg(
+    block_canonical: &[u8],
+    pubkey_next: &[u8; 32],
+    root_pubkey: &[u8; 32],
+) -> Vec<u8> {
+    chain_msg(&len_prefixed_concat(&[
+        block_canonical,
+        pubkey_next,
+        root_pubkey,
+    ]))
+}
+
+/// Build the canonical signed-message bytes for an appended block (N≥1).
+///
+/// Binds `block.canonical_encode()` and the successor's `pubkey_next`
+/// bytes. The signer is the previous block's `pubkey_next` private half,
+/// so the predecessor key is already cryptographically pinned by the
+/// chain rule; only the successor needs explicit binding here.
+fn chain_appended_msg(block_canonical: &[u8], pubkey_next: &[u8; 32]) -> Vec<u8> {
+    chain_msg(&len_prefixed_concat(&[block_canonical, pubkey_next]))
+}
+
 /// Errors from the grant-chain signing / verification layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
@@ -97,12 +146,32 @@ const PUBKEY_HEX_LEN: usize = 64; // 32 bytes * 2 hex chars
 /// further attenuation can be applied.
 ///
 /// Callers MUST persist `secret_hex` securely (the same keystore used for
-/// other signing keys). This type derives `Zeroize` so the in-memory copy
-/// is wiped on drop.
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
+/// other signing keys); it is a public field precisely so the holder can
+/// persist it.
+///
+/// # Secret hygiene
+///
+/// - `Debug` is **manually implemented** to redact `secret_hex`, so a
+///   reflexive `format!("{kp:?}")` — or a derived `Debug` on a containing
+///   type such as [`GrantChainLink`] — prints `secret_hex: <redacted>`
+///   rather than the raw key material.
+/// - `Zeroize` + `ZeroizeOnDrop` scrub both `String`s' backing bytes when the
+///   value goes out of scope (or on an explicit `zeroize()`). Deriving
+///   `Zeroize` alone does **not** wipe on drop — `ZeroizeOnDrop` is what
+///   installs the `Drop` impl. (The sibling [`RootKeyPair`] derives both.)
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct PubkeyNextKeyPair {
     pub public_hex: String,
     pub secret_hex: String,
+}
+
+impl std::fmt::Debug for PubkeyNextKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubkeyNextKeyPair")
+            .field("public_hex", &self.public_hex)
+            .field("secret_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PubkeyNextKeyPair {
@@ -219,18 +288,30 @@ pub struct SignedBlockOutput {
 
 /// Sign block 0 of a grant chain under the persona's root key.
 ///
-/// Generates a fresh `pubkey_next` keypair and signs the block's
-/// `CanonicalEncode`d bytes with the root private key. Returns both the
-/// resulting `SignedBlock` and the `pubkey_next` secret — the caller must
-/// persist the secret to later append block 1.
+/// Generates a fresh `pubkey_next` keypair and signs `chain_msg` over the
+/// length-prefixed concatenation of `block.canonical_encode()`,
+/// `pubkey_next` bytes, and the root pubkey bytes. The root-pubkey
+/// binding prevents "splice a forged block 0 into a chain rooted at a
+/// different persona"; the `pubkey_next` binding prevents tail-key swap +
+/// widening append (C1 fix — pre-fix the signature covered only the
+/// block payload and `pubkey_next` was a sibling field).
+///
+/// Returns both the resulting `SignedBlock` and the `pubkey_next` secret —
+/// the caller must persist the secret to later append block 1.
 pub fn sign_block_zero(
     root_key: &RootKeyPair,
     block: &Block,
 ) -> Result<SignedBlockOutput, ChainError> {
     let root_signing = root_key.signing_key()?;
+    let root_pubkey_bytes = root_key.public_bytes()?;
     let pubkey_next = PubkeyNextKeyPair::generate();
+    let pubkey_next_bytes = decode_pubkey(&pubkey_next.public_hex)?;
     let payload = block.canonical_encode();
-    let signature = root_signing.sign(&chain_msg(&payload));
+    let signature = root_signing.sign(&chain_block_zero_msg(
+        &payload,
+        &pubkey_next_bytes,
+        &root_pubkey_bytes,
+    ));
     Ok(SignedBlockOutput {
         signed: SignedBlock {
             block: block.clone(),
@@ -244,6 +325,14 @@ pub fn sign_block_zero(
 /// Sign a later block in the chain, using the previous block's
 /// `pubkey_next` private key as the signer.
 ///
+/// The signature covers `chain_msg` over the length-prefixed
+/// concatenation of `block.canonical_encode()` and the successor's
+/// `pubkey_next` bytes (C1 fix — previously only the block payload was
+/// signed, leaving `pubkey_next` swap-and-append-able). The predecessor
+/// key is already cryptographically pinned by the chain rule (this
+/// signature is verifiable only by the previous `pubkey_next`'s public
+/// half), so it is not duplicated in the message.
+///
 /// The caller is responsible for pairing the right `prev_pubkey_next`
 /// secret with the right predecessor block. This function does not
 /// re-verify the whole chain — use `verify_chain` for that.
@@ -253,8 +342,9 @@ pub fn sign_appended_block(
 ) -> Result<SignedBlockOutput, ChainError> {
     let prev_signing = prev_pubkey_next.signing_key()?;
     let pubkey_next = PubkeyNextKeyPair::generate();
+    let pubkey_next_bytes = decode_pubkey(&pubkey_next.public_hex)?;
     let payload = block.canonical_encode();
-    let signature = prev_signing.sign(&chain_msg(&payload));
+    let signature = prev_signing.sign(&chain_appended_msg(&payload, &pubkey_next_bytes));
     Ok(SignedBlockOutput {
         signed: SignedBlock {
             block: block.clone(),
@@ -268,12 +358,16 @@ pub fn sign_appended_block(
 /// Verify a complete grant chain.
 ///
 /// - Block 0's signature is verified against `root_pubkey` (the persona's
-///   declared root Ed25519 public key, 32 raw bytes).
+///   declared root Ed25519 public key, 32 raw bytes). The signed message
+///   covers the block payload, the successor's `pubkey_next`, and the
+///   root pubkey bytes (C1 fix — see [`chain_block_zero_msg`]).
 /// - Each subsequent block is verified against the previous `SignedBlock`'s
-///   `pubkey_next`.
+///   `pubkey_next`. The signed message covers the block payload and the
+///   successor's `pubkey_next` (see [`chain_appended_msg`]).
 ///
 /// Canonical-encodes each block with `CanonicalEncode` — any tampering of
-/// block payload or reorder of blocks breaks the chain.
+/// block payload, reorder of blocks, or swap of any block's
+/// `pubkey_next` breaks the chain.
 pub fn verify_chain(blocks: &[SignedBlock], root_pubkey: &[u8]) -> Result<(), ChainError> {
     if blocks.is_empty() {
         return Err(ChainError::EmptyChain);
@@ -291,15 +385,14 @@ pub fn verify_chain(blocks: &[SignedBlock], root_pubkey: &[u8]) -> Result<(), Ch
         }
     }
 
-    let root_verifying = VerifyingKey::from_bytes(
-        root_pubkey
-            .try_into()
-            .map_err(|_| ChainError::InvalidEncoding("root pubkey must be 32 bytes".into()))?,
-    )
-    .map_err(|err| ChainError::InvalidEncoding(format!("invalid root pubkey: {err}")))?;
+    let root_pubkey_bytes: [u8; 32] = root_pubkey
+        .try_into()
+        .map_err(|_| ChainError::InvalidEncoding("root pubkey must be 32 bytes".into()))?;
+    let root_verifying = VerifyingKey::from_bytes(&root_pubkey_bytes)
+        .map_err(|err| ChainError::InvalidEncoding(format!("invalid root pubkey: {err}")))?;
 
-    // Block 0 — signed by root.
-    verify_one(&blocks[0], &root_verifying, 0).map_err(|err| {
+    // Block 0 — signed by root; signature binds root_pubkey + pubkey_next.
+    verify_block_zero(&blocks[0], &root_verifying, &root_pubkey_bytes).map_err(|err| {
         // Remap generic signature-mismatch at block 0 to a more precise
         // root-key-mismatch error so callers can distinguish "chain forged
         // against a different persona" from "chain internally inconsistent."
@@ -310,39 +403,64 @@ pub fn verify_chain(blocks: &[SignedBlock], root_pubkey: &[u8]) -> Result<(), Ch
         }
     })?;
 
-    // Blocks 1..N — each signed by the previous block's pubkey_next.
+    // Blocks 1..N — each signed by the previous block's pubkey_next;
+    // signature binds this block's pubkey_next.
     for i in 1..blocks.len() {
         let prev_pubkey_hex = &blocks[i - 1].pubkey_next;
         let prev_pubkey_bytes = decode_pubkey(prev_pubkey_hex)?;
         let prev_verifying = VerifyingKey::from_bytes(&prev_pubkey_bytes).map_err(|err| {
             ChainError::InvalidEncoding(format!("invalid pubkey_next at block {}: {err}", i - 1))
         })?;
-        verify_one(&blocks[i], &prev_verifying, i)?;
+        verify_appended(&blocks[i], &prev_verifying, i)?;
     }
     Ok(())
 }
 
-fn verify_one(
+/// Verify block 0 under the root pubkey, binding both `pubkey_next` and
+/// the root pubkey into the signed message.
+fn verify_block_zero(
+    sb: &SignedBlock,
+    signer_pubkey: &VerifyingKey,
+    root_pubkey_bytes: &[u8; 32],
+) -> Result<(), ChainError> {
+    let signature = decode_signature(&sb.signature)?;
+    let pubkey_next_bytes = decode_pubkey(&sb.pubkey_next)?;
+    let payload = sb.block.canonical_encode();
+    signer_pubkey
+        .verify_strict(
+            &chain_block_zero_msg(&payload, &pubkey_next_bytes, root_pubkey_bytes),
+            &signature,
+        )
+        .map_err(|_| ChainError::SignatureMismatch { block_index: 0 })
+}
+
+/// Verify an appended block (N≥1) under the previous block's
+/// `pubkey_next`, binding this block's `pubkey_next` into the signed
+/// message.
+fn verify_appended(
     sb: &SignedBlock,
     signer_pubkey: &VerifyingKey,
     block_index: usize,
 ) -> Result<(), ChainError> {
-    let sig_bytes = hex::decode(&sb.signature)
+    let signature = decode_signature(&sb.signature)?;
+    let pubkey_next_bytes = decode_pubkey(&sb.pubkey_next)?;
+    let payload = sb.block.canonical_encode();
+    signer_pubkey
+        .verify_strict(
+            &chain_appended_msg(&payload, &pubkey_next_bytes),
+            &signature,
+        )
+        .map_err(|_| ChainError::SignatureMismatch { block_index })
+}
+
+fn decode_signature(hex_str: &str) -> Result<DalekSignature, ChainError> {
+    let sig_bytes = hex::decode(hex_str)
         .map_err(|err| ChainError::InvalidEncoding(format!("invalid signature hex: {err}")))?;
     let sig_array: [u8; 64] = sig_bytes
         .as_slice()
         .try_into()
         .map_err(|_| ChainError::InvalidEncoding("signature must be 64 bytes".into()))?;
-    let signature = DalekSignature::from_bytes(&sig_array);
-
-    // Also validate pubkey_next is well-formed here so a chain that was
-    // partially corrupted at a tail block fails cleanly.
-    let _ = decode_pubkey(&sb.pubkey_next)?;
-
-    let payload = sb.block.canonical_encode();
-    signer_pubkey
-        .verify_strict(&chain_msg(&payload), &signature)
-        .map_err(|_| ChainError::SignatureMismatch { block_index })
+    Ok(DalekSignature::from_bytes(&sig_array))
 }
 
 fn decode_secret(hex_str: &str) -> Result<[u8; 32], ChainError> {
@@ -441,6 +559,7 @@ mod tests {
                 budget: None,
                 usage: Usage::default(),
                 conditions: Vec::new(),
+                can_delegate: None,
             }],
             nbf: None,
             expires_at: None,
@@ -685,8 +804,64 @@ mod tests {
         );
     }
 
-    /// Torsion-point regression: `verify_chain` uses `verify_strict` in `verify_one`,
-    /// which rejects any block whose signature R component is a torsion point.
+    /// `PubkeyNextKeyPair` `Debug` must never leak `secret_hex`. It is
+    /// reachable via the derived `Debug` on [`GrantChainLink`], which holds a
+    /// `PubkeyNextKeyPair` — a reflexive `tracing::debug!(?link, ...)` would
+    /// otherwise ship the secret to logs/sinks.
+    #[test]
+    fn pubkeynextkeypair_debug_redacts_secret() {
+        let seed = [0x5au8; 32];
+        let secret_hex_true = hex::encode(seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let pub_hex_true = hex::encode(signing.verifying_key().to_bytes());
+        let kp =
+            PubkeyNextKeyPair::from_hex(pub_hex_true.clone(), secret_hex_true.clone()).unwrap();
+
+        let dbg = format!("{kp:?}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output must contain redaction marker: {dbg}"
+        );
+        assert!(
+            !dbg.contains(&secret_hex_true),
+            "Debug output MUST NOT contain the secret hex: {dbg}"
+        );
+        assert!(
+            dbg.contains(&pub_hex_true),
+            "Debug output should include the public hex for triage: {dbg}"
+        );
+    }
+
+    /// `Zeroize` on `PubkeyNextKeyPair` scrubs the secret in place;
+    /// `ZeroizeOnDrop` runs the same routine at end-of-scope. Post-drop memory
+    /// is not portably observable, so test the explicit path — the drop
+    /// behaviour is guaranteed by the derive. (Before the fix this type derived
+    /// `Zeroize` only, and the doc falsely claimed it wiped on drop.)
+    #[test]
+    fn pubkeynextkeypair_zeroize_clears_secret() {
+        let seed = [0x5au8; 32];
+        let secret_hex = hex::encode(seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let pub_hex = hex::encode(signing.verifying_key().to_bytes());
+        let mut kp = PubkeyNextKeyPair::from_hex(pub_hex, secret_hex).unwrap();
+        assert!(!kp.secret_hex.is_empty());
+        assert!(!kp.public_hex.is_empty());
+
+        kp.zeroize();
+
+        assert!(
+            kp.secret_hex.is_empty(),
+            "zeroize must empty the secret_hex string"
+        );
+        assert!(
+            kp.public_hex.is_empty(),
+            "zeroize must empty the public_hex string"
+        );
+    }
+
+    /// Torsion-point regression: `verify_chain` uses `verify_strict` in the
+    /// internal `verify_block_zero` / `verify_appended` helpers, which reject
+    /// any block whose signature R component is a torsion point.
     ///
     /// Without `verify_strict`, an attacker could substitute a valid block
     /// signature with a malleable variant (same S, R replaced by R + torsion
@@ -738,5 +913,126 @@ mod tests {
         let b1 = sample_block("Stmt1", 20);
         let out1 = sign_appended_block(&restored, &b1).unwrap();
         verify_chain(&[out0.signed, out1.signed], &root_pubkey_bytes).unwrap();
+    }
+
+    /// **C1 forgery regression** — pubkey_next is part of the signed
+    /// payload, so a holder of a valid chain prefix [B0] CANNOT swap
+    /// `B0.pubkey_next` to an attacker-controlled key and then sign a
+    /// widening appended block with that attacker key. Pre-fix the
+    /// signature covered only `block.canonical_encode()`, leaving the
+    /// pubkey_next field a sibling that anyone could overwrite — and
+    /// `verify_chain([B0', B1])` would accept the result.
+    ///
+    /// Voids design's "cryptographically enforced attenuation" claim
+    /// pre-fix; verifies it post-fix.
+    #[test]
+    fn tail_key_swap_plus_append_is_refused() {
+        // Build a valid chain [B0] under root R.
+        let (root, root_pubkey_bytes) = fresh_root_keypair();
+        let b0_block = sample_block("Stmt0", 10);
+        let b0 = sign_block_zero(&root, &b0_block).unwrap();
+
+        // Honest sanity check: the chain verifies.
+        verify_chain(std::slice::from_ref(&b0.signed), &root_pubkey_bytes).unwrap();
+
+        // Attacker mints a fresh keypair (their own pubkey_next replacement).
+        let attacker = PubkeyNextKeyPair::generate();
+
+        // Swap B0.pubkey_next to the attacker-controlled key.
+        let mut b0_forged = b0.signed.clone();
+        b0_forged.pubkey_next = attacker.public_hex.clone();
+
+        // Sign a widening B1 with the attacker's private key.
+        let b1_widened = Block {
+            statements: vec![Statement {
+                sid: "Forged".into(),
+                resource_type: ResourceType::Credential,
+                actions: vec!["*".into()],
+                resource: ResourceSelector::Any,
+                budget: None,
+                usage: Usage::default(),
+                conditions: Vec::new(),
+                can_delegate: None,
+            }],
+            nbf: None,
+            expires_at: None,
+            issued_by: "persona_work".into(),
+            issued_at: 99,
+            approval: None,
+            note: None,
+        };
+        let b1 = sign_appended_block(&attacker, &b1_widened).unwrap();
+
+        // Post-fix: verify_chain MUST refuse. Pre-fix this returned Ok.
+        let err = verify_chain(&[b0_forged, b1.signed], &root_pubkey_bytes).unwrap_err();
+        assert!(
+            matches!(err, ChainError::RootKeyMismatch)
+                || matches!(err, ChainError::SignatureMismatch { block_index: 0 }),
+            "tail-key swap + widening append MUST refuse; got {err:?}"
+        );
+    }
+
+    /// C1 sibling regression: tampering ONLY with `pubkey_next` on a
+    /// single-block chain (no appended block) still breaks verification,
+    /// because the signed payload binds the successor key.
+    #[test]
+    fn pubkey_next_swap_alone_invalidates_block_zero() {
+        let (root, root_pubkey_bytes) = fresh_root_keypair();
+        let block = sample_block("Stmt0", 10);
+        let mut out = sign_block_zero(&root, &block).unwrap();
+
+        let attacker = PubkeyNextKeyPair::generate();
+        out.signed.pubkey_next = attacker.public_hex.clone();
+
+        let err = verify_chain(&[out.signed], &root_pubkey_bytes).unwrap_err();
+        assert_eq!(
+            err,
+            ChainError::RootKeyMismatch,
+            "swapping pubkey_next on block 0 MUST invalidate the signature"
+        );
+    }
+
+    /// C1 sibling regression: on a multi-block chain, tampering with an
+    /// intermediate block's `pubkey_next` (after the chain is built)
+    /// invalidates the intermediate block's signature too, because the
+    /// signature binds its own pubkey_next.
+    #[test]
+    fn intermediate_pubkey_next_swap_invalidates_that_block() {
+        let (root, root_pubkey_bytes) = fresh_root_keypair();
+        let b0 = sample_block("Stmt0", 10);
+        let out0 = sign_block_zero(&root, &b0).unwrap();
+
+        let b1 = sample_block("Stmt1", 20);
+        let mut out1 = sign_appended_block(&out0.pubkey_next_secret, &b1).unwrap();
+
+        let attacker = PubkeyNextKeyPair::generate();
+        out1.signed.pubkey_next = attacker.public_hex.clone();
+
+        let err = verify_chain(&[out0.signed, out1.signed], &root_pubkey_bytes).unwrap_err();
+        assert_eq!(
+            err,
+            ChainError::SignatureMismatch { block_index: 1 },
+            "swapping pubkey_next on an appended block MUST invalidate that block's signature"
+        );
+    }
+
+    /// C1 cross-persona splice defence: a block-0 signature minted under
+    /// root_a MUST NOT re-verify under root_b even if all other fields
+    /// are identical (because the root pubkey is bound into the message).
+    /// This protects against "forge a block 0 against a different persona
+    /// root and splice."
+    #[test]
+    fn block_zero_signature_does_not_re_verify_under_a_different_root() {
+        let (root_a, root_a_pubkey) = make_root_keypair(7);
+        let (_root_b, root_b_pubkey) = make_root_keypair(8);
+        let block = sample_block("Stmt0", 10);
+        let out = sign_block_zero(&root_a, &block).unwrap();
+
+        // Sanity: verifies under root_a.
+        verify_chain(std::slice::from_ref(&out.signed), &root_a_pubkey).unwrap();
+
+        // Splicing into a chain rooted at root_b MUST fail.
+        let err = verify_chain(std::slice::from_ref(&out.signed), &root_b_pubkey).unwrap_err();
+        assert_eq!(err, ChainError::RootKeyMismatch);
     }
 }

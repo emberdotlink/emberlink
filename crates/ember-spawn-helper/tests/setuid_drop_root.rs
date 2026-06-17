@@ -1,9 +1,9 @@
+// CLASSIFICATION: PUBLIC
 
 //! Root-required Linux e2e test that **actually observes the
 //! `setuid` privilege drop** in the spawn-helper.
 //!
-//! implementation-note-432 anchor:
-//! `setuid_drops_to_target_uid_observed_via_id_u`
+//! Greppable marker: `setuid_drops_to_target_uid_observed_via_id_u`
 //!
 //! ## Why this file exists
 //!
@@ -40,11 +40,9 @@
 //!     --nocapture
 //! ```
 //!
-//! Per project doctrine `project_ci_disabled` (CI frozen 2026-05-09),
-//! this test is documentation-only — it is NOT wired into any
-//! GH Actions workflow. The operator runs it manually on a root-shell
-//! hardened-Linux host when the spawn-helper's privilege-drop chain
-//! changes.
+//! This root-required test is not wired into the default CI workflow. Run it
+//! manually on a root shell on a hardened-Linux host when the spawn-helper's
+//! privilege-drop chain changes.
 //!
 //! ## What the test asserts
 //!
@@ -193,8 +191,7 @@ async fn send_directive_and_read(
 /// `target_uid==current_uid` tests pass, but would fail HERE because
 /// the child's reported uid would still be 0.
 ///
-/// Checkpoint for the brief's `target_state_anchor`:
-/// `setuid_drops_to_target_uid_observed_via_id_u`.
+/// Greppable marker: `setuid_drops_to_target_uid_observed_via_id_u`.
 #[tokio::test]
 async fn setuid_drops_to_target_uid_observed_via_id_u() {
     if !root_gate_enabled() {
@@ -238,11 +235,8 @@ async fn setuid_drops_to_target_uid_observed_via_id_u() {
         .expect("scratch tempdir");
     // World-writable so the dropped target_uid can write to it.
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        scratch.path(),
-        std::fs::Permissions::from_mode(0o777),
-    )
-    .expect("chmod 777 scratch");
+    std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("chmod 777 scratch");
     let uid_out = scratch.path().join("uid.txt");
 
     let binary = PathBuf::from("/bin/sh");

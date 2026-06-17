@@ -6,8 +6,8 @@
 //! <root-id>` — drill-down lookup by full fingerprint or unique hex
 //! prefix. Phase 3 adds `trust.explain` — chain-walk a signed artifact
 //! back to the trust root that verifies it. The receipt-envelope
-//! artifact-kind branch landed in implementation-note-409; workflow
-//! grant lands in implementation-note-410.
+//! artifact-kind branch landed in implementation-note-361; workflow
+//! grant lands in implementation-note-362.
 //!
 //! Anchor: `trust_introspect_module_landed` (Phase 1) /
 //! `trust_show_landed` (Phase 2) / `trust_explain_landed` (Phase 3
@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use crate::binary_manifest::{
     ManifestSidecar, TrustRootRecord, TrustRootSource, trust_roots_snapshot,
 };
+use crate::infra::store::DaemonStore;
 
 /// Handle `trust.list` JSON-RPC. Returns the daemon's startup trust-root
 /// snapshot as a JSON object:
@@ -306,7 +307,7 @@ mod tests {
         assert!(out["trust_root"].is_null());
     }
 
-    // ── implementation-note-409 T1 tests ───────────────────────────────
+    // ── implementation-note-361 T1 tests ───────────────────────────────
 
     #[test]
     fn handle_trust_explain_receipt_rejects_non_empty_sidecar() {
@@ -459,6 +460,141 @@ mod tests {
     }
 
     #[test]
+    fn explain_authority_grant_issued_receipt_verifies_operator_device_proof() {
+        use core_crypto::{P256Signer, Signer as _};
+        use core_event_types::{
+            AttestationTier, CustodyClass, DeviceEnrolledEvent, PresenceFactor,
+        };
+        use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion};
+        use core_events::receipt::sign::sign_receipt_v2;
+        use core_events::receipt::{
+            AuthorityGrantIssuedBody, AuthorityPresenceProof, RECEIPT_KIND_AUTHORITY_GRANT_ISSUED,
+            TerminationAuthority,
+        };
+        use core_principals::KeyAlgorithm;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::infra::store::DaemonStore::open(&dir.path().join("daemon.db")).unwrap();
+        let mut identity_store =
+            crate::infra::identity_substrate::open_identity_store(store.data_dir().unwrap())
+                .unwrap();
+
+        let founding = P256Signer::from_scalar_bytes(&[0x41; 32]).unwrap();
+        let founding_material = founding.public_key_material("key-operator-founding");
+        let ids = crate::infra::operator_identity::ensure_operator_identity(
+            &mut identity_store,
+            &founding_material,
+            &founding,
+        )
+        .unwrap();
+
+        let device = P256Signer::from_scalar_bytes(&[0x42; 32]).unwrap();
+        let encryption = P256Signer::from_scalar_bytes(&[0x43; 32]).unwrap();
+        let device_id = "device-operator-authority-receipt".to_string();
+        crate::infra::operator_identity::enroll_presence_device(
+            &mut identity_store,
+            &ids.root_id,
+            DeviceEnrolledEvent {
+                root_id: ids.root_id.clone(),
+                device_id: device_id.clone(),
+                label: "Authority Receipt Device".to_string(),
+                device_key: device.public_key_material("key-authority-receipt-device"),
+                encryption_key: core_principals::PublicKeyMaterial {
+                    key_id: "key-authority-receipt-ecies".to_string(),
+                    algorithm: KeyAlgorithm::EcdsaP256,
+                    public_key: encryption.public_key().0,
+                },
+                custody_class: CustodyClass::Presence,
+                attestation_statement: None,
+                attestation_tier: AttestationTier::None,
+                presence_factor: PresenceFactor::UserPresence,
+            },
+            &founding,
+            &ids.key_id,
+            1_800_000_000,
+        )
+        .unwrap();
+        drop(identity_store);
+
+        let request_params = json!({
+            "persona_id": "persona-runtime",
+            "credential_name": "github",
+            "scope": "*",
+            "ttl_secs": 14_400,
+            "statements": []
+        });
+        let params_digest =
+            crate::auth::presence_gate::presence_params_digest(&request_params).unwrap();
+        let intent = crate::auth::presence_gate::canonical_presence_intent_bytes(
+            "create_composite_grant",
+            "op-authority-receipt",
+            "nonce-authority-receipt",
+            "daemon-fingerprint",
+            &params_digest,
+        );
+        let proof_sig = device.sign(&intent).0;
+
+        let envelope_signer = core_crypto::FixtureSigner::new("authority-grant-issued-envelope");
+        let daemon_root_id = envelope_signer
+            .public_key()
+            .0
+            .strip_prefix("ed25519:")
+            .unwrap()
+            .to_string();
+        let mut envelope = ReceiptEnvelope {
+            version: ReceiptVersion::default(),
+            kind: RECEIPT_KIND_AUTHORITY_GRANT_ISSUED.to_string(),
+            receipt_id: String::new(),
+            daemon_root_id,
+            traceparent: None,
+            termination_authority: TerminationAuthority::UserSession,
+            presence_kind: None,
+            body: serde_json::to_value(AuthorityGrantIssuedBody {
+                grant_id: "grant-authority-receipt".to_string(),
+                grantee_principal_id: "persona-runtime".to_string(),
+                credential_name: "github".to_string(),
+                request_params,
+                issued_at: "2026-06-17T00:00:00Z".to_string(),
+                expires_at: Some("2026-06-17T04:00:00Z".to_string()),
+                granted_scope: Vec::new(),
+                operator_root_id: ids.root_id.clone(),
+                operator_persona_id: ids.persona_id.clone(),
+                signing_device_id: device_id.clone(),
+                presence_proof: AuthorityPresenceProof {
+                    method: "create_composite_grant".to_string(),
+                    op_id: "op-authority-receipt".to_string(),
+                    nonce: "nonce-authority-receipt".to_string(),
+                    daemon_fingerprint: "daemon-fingerprint".to_string(),
+                    params_digest,
+                    signature: proof_sig,
+                },
+            })
+            .unwrap(),
+            signature: None,
+            calling_principal: None,
+            presence_reason: None,
+            handle_id: None,
+            challenge_hash: None,
+            verifier_aaguid: None,
+        };
+        sign_receipt_v2(&mut envelope, &envelope_signer).unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+
+        let out = explain_receipt_with_store(Some(&store), &bytes).unwrap();
+        assert_eq!(out["verdict"], "verified", "chain={}", out["chain"]);
+        assert_eq!(out["receipt_class"], "authority_decision");
+        assert_eq!(out["receipt_kind"], RECEIPT_KIND_AUTHORITY_GRANT_ISSUED);
+        assert!(out["trust_root"]["fingerprint_hex"].as_str().is_some());
+        assert_eq!(out["trust_root"]["root_id"], ids.root_id);
+        assert_eq!(out["trust_root"]["source"], "operator");
+        assert_eq!(out["outer_daemon_signature_verified"], true);
+        assert_eq!(out["params_digest_matches"], true);
+        assert_eq!(out["chain_contains_trusted_operator_principal"], true);
+        assert_eq!(out["chain_contains_signing_device"], true);
+        assert_eq!(out["chain_contains_presence_proof"], true);
+    }
+
+    #[test]
     fn handle_trust_list_returns_empty_when_snapshot_uninit() {
         // The OnceLock is per-process; in this isolated test the snapshot
         // may or may not be initialised depending on test ordering. Both
@@ -583,14 +719,21 @@ pub fn render_trust_show_human(fingerprint_hex: &str, source: &str, posture: &st
 ///   artifact bytes are the manifest body.
 /// - `"receipt"` — artifact bytes are the canonical JSON-encoded
 ///   `ReceiptEnvelope`; sidecar bytes MUST be empty (receipts carry
-///   their signature inline). See implementation-note-409.
+///   their signature inline). See implementation-note-361.
 ///
-/// Workflow grant chain walk lands in implementation-note-410.
+/// Delegation grant chain walk lands in implementation-note-362.
 ///
 /// Read-only operation; same posture as `trust.list` / `trust.show`
 /// (`AuthorityClass::ConnectOnly`). Sentinels: `trust_explain_landed`
 /// (binary-manifest) / `trust_explain_receipt_chain_walked` (receipt).
 pub fn handle_trust_explain(params: &Value) -> Result<Value, (i32, String)> {
+    handle_trust_explain_with_store(None, params)
+}
+
+pub fn handle_trust_explain_with_store(
+    store: Option<&DaemonStore>,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
     let artifact_kind = params
         .get("artifact_kind")
         .and_then(|v| v.as_str())
@@ -622,12 +765,12 @@ pub fn handle_trust_explain(params: &Value) -> Result<Value, (i32, String)> {
                     "chain": "artifact (receipt) → caller supplied sidecar bytes; Receipt envelopes carry their signature inline — pass empty sidecar bytes".to_string(),
                 }));
             }
-            explain_receipt(&artifact_bytes)
+            explain_receipt_with_store(store, &artifact_bytes)
         }
         other => Err((
             -32004,
             format!(
-                "unsupported_artifact_kind: {other:?}; supported: binary_manifest, receipt (workflow_grant lands in implementation-note-410)"
+                "unsupported_artifact_kind: {other:?}; supported: binary_manifest, receipt (authority_delegation lands in implementation-note-362)"
             ),
         )),
     }
@@ -642,8 +785,17 @@ pub fn handle_trust_explain(params: &Value) -> Result<Value, (i32, String)> {
 /// Anchor: `trust_explain_receipt_chain_walked`.
 ///
 /// Pure function — no I/O, no socket calls. Test-friendly.
+#[cfg(test)]
 fn explain_receipt(envelope_bytes: &[u8]) -> Result<Value, (i32, String)> {
+    explain_receipt_with_store(None, envelope_bytes)
+}
+
+fn explain_receipt_with_store(
+    store: Option<&DaemonStore>,
+    envelope_bytes: &[u8],
+) -> Result<Value, (i32, String)> {
     use core_crypto::{Ed25519Verifier, PublicKey};
+    use core_events::receipt::RECEIPT_KIND_AUTHORITY_GRANT_ISSUED;
     use core_events::receipt::envelope::ReceiptEnvelope;
     use core_events::receipt::sign::verify_receipt_v2;
 
@@ -667,6 +819,10 @@ fn explain_receipt(envelope_bytes: &[u8]) -> Result<Value, (i32, String)> {
                 envelope.kind
             ),
         }));
+    }
+
+    if envelope.kind == RECEIPT_KIND_AUTHORITY_GRANT_ISSUED {
+        return explain_authority_grant_issued_receipt(store, &envelope);
     }
 
     let records = trust_roots_snapshot();
@@ -710,6 +866,193 @@ fn explain_receipt(envelope_bytes: &[u8]) -> Result<Value, (i32, String)> {
         "chain": format!(
             "artifact (receipt kind={}) → envelope ed25519 signature → tried {} trust root(s) — NO VERIFICATION",
             envelope.kind, records.len()
+        ),
+    }))
+}
+
+fn verify_outer_daemon_receipt(envelope: &core_events::receipt::ReceiptEnvelope) -> bool {
+    use core_crypto::{Ed25519Verifier, PublicKey};
+    use core_events::receipt::sign::verify_receipt_v2;
+
+    if envelope.daemon_root_id.is_empty()
+        || !envelope
+            .daemon_root_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let public_key = PublicKey(format!("ed25519:{}", envelope.daemon_root_id));
+    verify_receipt_v2(envelope, &public_key, &Ed25519Verifier).is_ok()
+}
+
+fn explain_authority_grant_issued_receipt(
+    store: Option<&DaemonStore>,
+    envelope: &core_events::receipt::ReceiptEnvelope,
+) -> Result<Value, (i32, String)> {
+    use core_crypto::{DeviceSignatureVerifier, PublicKey, Signature, Verifier as _};
+    use core_event_types::CustodyClass;
+    use core_events::receipt::AuthorityGrantIssuedBody;
+    use core_state::{DeviceStatus, PersonaStatus};
+
+    let outer_daemon_signature_verified = verify_outer_daemon_receipt(envelope);
+    let body: AuthorityGrantIssuedBody = match serde_json::from_value(envelope.body.clone()) {
+        Ok(body) => body,
+        Err(error) => {
+            return Ok(json!({
+                "verdict": "authority_body_parse_error",
+                "trust_root": Value::Null,
+                "chain_contains_trusted_operator_principal": false,
+                "chain_contains_signing_device": false,
+                "chain_contains_presence_proof": false,
+                "outer_daemon_signature_verified": outer_daemon_signature_verified,
+                "chain": format!(
+                    "artifact (receipt kind={}) → authority body parse FAILED ({error})",
+                    envelope.kind
+                ),
+            }));
+        }
+    };
+
+    let recomputed_params_digest = match crate::auth::presence_gate::presence_params_digest(
+        &body.request_params,
+    ) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return Ok(json!({
+                "verdict": "authority_params_digest_error",
+                "trust_root": Value::Null,
+                "chain_contains_trusted_operator_principal": false,
+                "chain_contains_signing_device": false,
+                "chain_contains_presence_proof": false,
+                "outer_daemon_signature_verified": outer_daemon_signature_verified,
+                "chain": format!(
+                    "artifact (receipt kind={}) → request params canonicalization FAILED ({error})",
+                    envelope.kind
+                ),
+            }));
+        }
+    };
+    let params_digest_matches = recomputed_params_digest == body.presence_proof.params_digest;
+
+    let Some(store) = store else {
+        return Ok(json!({
+            "verdict": "authority_identity_store_unavailable",
+            "trust_root": Value::Null,
+            "chain_contains_trusted_operator_principal": false,
+            "chain_contains_signing_device": false,
+            "chain_contains_presence_proof": false,
+            "outer_daemon_signature_verified": outer_daemon_signature_verified,
+            "params_digest_matches": params_digest_matches,
+            "chain": format!(
+                "artifact (receipt kind={}) → authority receipt requires daemon identity store for operator root/device verification",
+                envelope.kind
+            ),
+        }));
+    };
+    let Some(data_dir) = store.data_dir() else {
+        return Ok(json!({
+            "verdict": "authority_identity_store_unavailable",
+            "trust_root": Value::Null,
+            "chain_contains_trusted_operator_principal": false,
+            "chain_contains_signing_device": false,
+            "chain_contains_presence_proof": false,
+            "outer_daemon_signature_verified": outer_daemon_signature_verified,
+            "params_digest_matches": params_digest_matches,
+            "chain": format!(
+                "artifact (receipt kind={}) → daemon store has no data_dir for operator identity verification",
+                envelope.kind
+            ),
+        }));
+    };
+    let identity_store = match crate::infra::identity_substrate::open_identity_store(data_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            return Ok(json!({
+                "verdict": "authority_identity_store_error",
+                "trust_root": Value::Null,
+                "chain_contains_trusted_operator_principal": false,
+                "chain_contains_signing_device": false,
+                "chain_contains_presence_proof": false,
+                "outer_daemon_signature_verified": outer_daemon_signature_verified,
+                "params_digest_matches": params_digest_matches,
+                "chain": format!(
+                    "artifact (receipt kind={}) → open operator identity store FAILED ({error})",
+                    envelope.kind
+                ),
+            }));
+        }
+    };
+    let state = identity_store.materialized();
+    let chain_contains_trusted_operator_principal =
+        crate::infra::operator_identity::operator_root_id(state)
+            == Some(body.operator_root_id.as_str())
+            && state
+                .persona(&body.operator_persona_id)
+                .is_some_and(|persona| {
+                    persona.root_id == body.operator_root_id
+                        && persona.status == PersonaStatus::Active
+                });
+    let signing_device = state.device(&body.signing_device_id);
+    let chain_contains_signing_device = signing_device.is_some_and(|device| {
+        device.root_id == body.operator_root_id
+            && device.status == DeviceStatus::Active
+            && device.custody_class == CustodyClass::Presence
+    });
+    let signature_valid = signing_device.is_some_and(|device| {
+        let intent = crate::auth::presence_gate::canonical_presence_intent_bytes(
+            &body.presence_proof.method,
+            &body.presence_proof.op_id,
+            &body.presence_proof.nonce,
+            &body.presence_proof.daemon_fingerprint,
+            &body.presence_proof.params_digest,
+        );
+        DeviceSignatureVerifier.verify(
+            &PublicKey(device.active_key.public_key.clone()),
+            &intent,
+            &Signature(body.presence_proof.signature.clone()),
+        )
+    });
+    let chain_contains_presence_proof = params_digest_matches && signature_valid;
+    let verified = outer_daemon_signature_verified
+        && chain_contains_trusted_operator_principal
+        && chain_contains_signing_device
+        && chain_contains_presence_proof;
+
+    Ok(json!({
+        "verdict": if verified { "verified" } else { "authority_verification_failed" },
+        "trust_root": {
+            "fingerprint_hex": blake3::hash(body.operator_root_id.as_bytes()).to_hex().to_string(),
+            "root_id": body.operator_root_id,
+            "source": "operator",
+        },
+        "receipt_class": "authority_decision",
+        "receipt_kind": envelope.kind,
+        "receipt_id": envelope.receipt_id,
+        "outer_daemon_signature_verified": outer_daemon_signature_verified,
+        "params_digest_matches": params_digest_matches,
+        "chain_contains_trusted_operator_principal": chain_contains_trusted_operator_principal,
+        "chain_contains_signing_device": chain_contains_signing_device,
+        "chain_contains_presence_proof": chain_contains_presence_proof,
+        "operator_persona_id": body.operator_persona_id,
+        "signing_device_id": body.signing_device_id,
+        "presence_proof": {
+            "method": body.presence_proof.method,
+            "op_id": body.presence_proof.op_id,
+            "nonce": body.presence_proof.nonce,
+            "daemon_fingerprint": body.presence_proof.daemon_fingerprint,
+            "params_digest": body.presence_proof.params_digest,
+        },
+        "chain": format!(
+            "artifact (receipt kind={}) → daemon envelope integrity={} → operator root {} → persona {} → presence Device {} → params digest match={} → P-256 presence proof={}{}",
+            envelope.kind,
+            if outer_daemon_signature_verified { "VERIFIED" } else { "FAILED" },
+            body.operator_root_id,
+            body.operator_persona_id,
+            body.signing_device_id,
+            params_digest_matches,
+            signature_valid,
+            if verified { " — VERIFIED" } else { " — NO VERIFICATION" },
         ),
     }))
 }

@@ -1,7 +1,6 @@
+// CLASSIFICATION: PUBLIC
 
-//! End-to-end tests for the MACOS-PRIMITIVES Decision 5 spawn chain.
-//!
-//! implementation-note-188
+//! End-to-end tests for the macOS helper → shim → construct spawn chain.
 //!
 //! ## Test surfaces
 //!
@@ -204,6 +203,64 @@ async fn t2_happy_path_construct_runs_via_shim() {
     let _ = child.kill().await;
 }
 
+/// The helper must capture the construct's stdout/stderr and carry the
+/// tails back in the `Exit` frame — this is the end-to-end proof of the
+/// posix_spawn → shim → execve → pipe → wire path that headless
+/// brokered commands (e.g. `gh pr list` with no PTY) depend on.
+#[tokio::test]
+async fn t2_captures_construct_stdout_and_stderr() {
+    let (_dir, socket) = fresh_socket();
+    let scratch = fresh_scratch();
+    let uid = current_uid();
+    let shim = shim_bin();
+    let shim_hash = blake3_of(&shim);
+    let mut child = spawn_helper(&socket, scratch.path(), &shim, uid, uid, 1, &shim_hash).await;
+
+    let binary = PathBuf::from("/bin/sh");
+    let construct_hash = blake3_of(&binary);
+    let directive = SpawnDirective {
+        protocol_version: WIRE_VERSION,
+        binary_path: binary,
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo HELLO_STDOUT; echo OOPS_STDERR 1>&2; exit 0".to_string(),
+        ],
+        env: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+        cwd: PathBuf::from("/"),
+        target_uid: uid,
+        target_gid: current_gid(),
+        content_hash_blake3: construct_hash,
+        chroot_dir: None,
+        sandbox_profile: None,
+        seccomp_filter: None,
+        invocation_id: None,
+    };
+
+    let reply = send_directive_and_read(&socket, directive).await;
+    match reply {
+        HelperFrame::Exit {
+            code,
+            stdout_tail,
+            stderr_tail,
+            ..
+        } => {
+            assert_eq!(code, 0, "unexpected exit code");
+            assert!(
+                stdout_tail.contains("HELLO_STDOUT"),
+                "stdout not captured: {stdout_tail:?}"
+            );
+            assert!(
+                stderr_tail.contains("OOPS_STDERR"),
+                "stderr not captured: {stderr_tail:?}"
+            );
+        }
+        other => panic!("expected Exit, got {other:?}"),
+    }
+
+    let _ = child.kill().await;
+}
+
 // ──────────────────────────────────────────────────────────────────
 // T2 — Sandbox enforcement
 // ──────────────────────────────────────────────────────────────────
@@ -354,11 +411,10 @@ async fn t2_shim_hash_mismatch_refuses_spawn() {
 // T2 — Regression guard: helper does NOT use Command::pre_exec
 // ──────────────────────────────────────────────────────────────────
 
-/// Static source-level check. MACOS-PRIMITIVES Decision 5 forbids
-/// `Command::pre_exec(...)` in the macOS helper bin because that
-/// re-introduces the fork-without-exec Mach IPC inheritance bug.
-/// If a future drop accidentally adds it back, this test fails the
-/// PR before review.
+/// Static source-level check. The macOS helper must not call
+/// `Command::pre_exec(...)` because that re-introduces the fork-without-exec
+/// Mach IPC inheritance bug. If a future change accidentally adds it back,
+/// this test fails before review.
 #[test]
 fn t2_regression_guard_no_pre_exec_in_macos_helper() {
     // The crate root is `crates/ember-spawn-helper/`; the test file
@@ -385,7 +441,7 @@ fn t2_regression_guard_no_pre_exec_in_macos_helper() {
     assert!(
         lines_with_call.is_empty(),
         "macOS helper must not use Command::pre_exec() — \
-         MACOS-PRIMITIVES Decision 5 forbids it. Offending lines: {:?}",
+         use the shim exec boundary instead. Offending lines: {:?}",
         lines_with_call
     );
 }

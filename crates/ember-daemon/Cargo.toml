@@ -11,36 +11,12 @@ categories = ["authentication", "command-line-utilities"]
 publish = false
 
 [features]
-# implementation-note-107: age keypair generation for SOPS+emberd integration.
-# On by default — implementation-note-107 ships persona age keys as a first-class
-# daemon capability. Build with `--no-default-features` to opt out for
-# environments that explicitly don't want the age dep linked.
-#
-# implementation-note-108: webauthn enables server-side passkey ceremony
-# (registration + authentication) so dashboard approvals are gated by
-# a verified WebAuthn assertion against a stored credential pubkey.
-# Default-on: the gate fails closed by default. Build with
-# `--no-default-features` for environments that explicitly opt out.
 default = ["age", "webauthn", "se-real"]
 age = ["dep:age"]
 webauthn = ["dep:webauthn-rs"]
 
-# implementation-note-75-: gates the real Secure-Enclave wrap/unwrap
-# path in `install::provision_se_mek` (write side) and
-# `infra::vault_macos_se::get_mek_passphrase` (read side, transitively via
-# `ember_broker::secure_enclave::se_unwrap`). On by default so the daemon
-# binary ships with the SE path live on macOS; on Linux the feature is inert
-# because `ember-broker`'s `secure_enclave.rs` is `#![cfg(target_os = "macos")]`.
 se-real = ["ember-broker/se-real"]
 
-# implementation-note-5 (Cluster D D1, design review 20260513-122447):
-# Workspace test-substrate exposure. Off by default; enabled by tests +
-# staging builds that need MockBroker, mock fixtures, etc. The build.rs
-# refuses to compile when this is enabled together with EMBER_RELEASE=1,
-# so release artifacts can never accidentally carry test scaffolding.
-# Production checkpoint approaches were rejected (runtime-deletable);
-# cfg!(debug_assertions) handles the always-test case, qa-mock handles
-# "I need test helpers in a release build for staging."
 qa-mock = []
 
 [dependencies]
@@ -48,60 +24,56 @@ age = { version = "0.11", optional = true, features = ["armor"] }
 anyhow = "1"
 async-trait = "0.1"
 argon2 = "0.5"
-# AWS SigV4 signing for Vault AWS IAM auth (implementation-note-109).
-# Used by `infra::credential_store::hashicorp_vault::vault_aws_login`
-# to sign a `sts:GetCallerIdentity` request that Vault re-plays
-# server-side as proof of the daemon's AWS IAM identity. Already
-# arrives transitively via `ember-broker`'s aws_sts module; declared
-# here to make the daemon-level usage explicit and stable.
 aws-credential-types = "1"
 aws-sigv4 = "1"
 base64 = "0.22"
 blake3 = "1"
-# implementation-note-110 — Bollard Docker engine
-# client. The daemon-side `spawn::docker::connect_docker_engine` helper
-# uses bollard's `Docker::connect_with_*_defaults` constructors to talk
-# to a Docker engine (Docker Desktop on macOS, or any compatible engine)
-# over the engine socket. Pinned to 0.18 — current stable as of
-# 2026-05-19. Default features include the Hyper-based transport that
-# `connect_with_local_defaults` / `connect_with_socket_defaults` rely on.
-bollard = "0.18"
 bytes = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 core-approval = { path = "../core-approval" }
 core-broker = { path = "../core-broker" }
-ember-broker = { path = "../ember-broker", features = ["se-stub"] }
+ember-broker = { path = "../ember-broker" }
 core-state = { path = "../core-state" }
 core-crypto = { path = "../core-crypto" }
 core-construct-runtime = { path = "../core-construct-runtime" }
 core-events = { path = "../core-events" }
-# implementation-note-52 — SCM_RIGHTS + sealed-memfd
-# cross-process fd-passing primitive. Daemon-side consumer wire-up lands
-# in a follow-up task (META-design-AMEND-EXTEND-TO-implementation-note-53 Phase D);
-# the dep is declared here so the crate is in the daemon's build graph
-# for compile-time discovery as the RPC frontend evolves.
 core-fd-pass = { path = "../core-fd-pass" }
 core-grants = { path = "../core-grants" }
 core-kms = { path = "../core-kms" }
+# ADR212-TELEMETRY-EXPORTER — process telemetry surface. `core-metrics` is the
+# WASM-clean taxonomy (bucket constants + receipt-kind/outcome labels +
+# forbidden-label gate); `ember-telemetry` is the non-WASM substrate (registry +
+# `/metrics` text-exposition handler + resource-identity labels). The daemon
+# owns its broker-materialization families (`infra::telemetry`) and mounts the
+# shared handler on its existing dashboard listener.
+core-metrics = { path = "../core-metrics" }
+ember-telemetry = { path = "../ember-telemetry" }
+# Direct use in `infra::telemetry` for the broker histogram/counter families +
+# the exemplar API (design §6). Same crate `ember-telemetry` re-exposes.
+prometheus-client = "0.25"
 core-personas = { path = "../core-personas" }
 core-proxy-forward = { path = "../core-proxy-forward" }
-# implementation-note-111 — emit `spawn.witness` Receipt v2
-# envelopes (kind constant + `SpawnWitness` body shape) at every parent→child
-# grant edge in `crate::trust::grant::delegate_grant_full_sql`. Acyclic: the
-# core-receipts crate depends only on `core-events::receipt::sign` for kind
-# constants, never back on ember-daemon.
+# -S2 — generic LLM/HTTP forwarding core extracted out of
+# `infra::proxy`. The daemon links the moved `handle_request` /
+# `ProxyBody` / `TeeBody` / response-builder primitives + the `pricing`
+# module from here; the daemon-specific `DaemonPolicyBackend` /
+# `DaemonEventSink` / git-echo lane stay in `infra::proxy`.
+proxy-forward-runtime = { path = "../proxy-forward-runtime" }
 core-receipts = { path = "../core-receipts" }
 core-types = { path = "../core-types" }
 core-principals = { path = "../core-principals" }
 core-event-types = { path = "../core-event-types" }
 core-grant-types = { path = "../core-grant-types" }
 ember-construct = { path = "../ember-construct" }
-# implementation-note-112 — emberd-side SpawnDirective
-# sender shares the `ExecFrame` / `SpawnDirective` wire types with the
-# in-container `ember-exec` receiver. The dep is acyclic: ember-exec
-# (a leaf binary + thin lib) does not depend back on ember-daemon.
 ember-exec = { path = "../ember-exec" }
+# design §Component 1 + design seam 5 — daemon-owned bridge mTLS
+# listener lifecycle. emberd links `ember_rpc::Listener` and spawns it
+# in-process on `bridge_bind` at startup (the daemon-owned frontend that
+# supersedes the external `emberd-rpc-*` binary). Acyclic: ember-rpc
+# depends only on core-crypto / core-personas / rustls, never back on
+# ember-daemon.
+ember-rpc = { path = "../ember-rpc" }
 # design Components 2 + 3 + MACOS-PRIMITIVES Decision 5 — daemon-side
 # uses the shared `SpawnDirective` wire types + `HelperFrame` reply
 # enum + canonical socket-path constants from this crate when
@@ -109,12 +81,6 @@ ember-exec = { path = "../ember-exec" }
 # daemon. The dep is acyclic: ember-spawn-helper does not depend back
 # on ember-daemon.
 ember-spawn-helper = { path = "../ember-spawn-helper" }
-# implementation-note-19 — the `headless_preflight_gaps` socket
-# method delegates to headless-runtime's `recent_gaps_for_persona` reader,
-# which owns the `.ember/runtime/permission-gaps.jsonl` log. The dep
-# is acyclic — headless-runtime does not depend on ember-daemon.
-# implementation-note-113 — 60-second revocations poller; severity-driven
-# daemon response (critical=isolate+drain+kill, high=drain, medium/low=log).
 ember-update = { path = "../ember-update" }
 dirs-next = "2"
 ed25519-dalek = "2.1.1"
@@ -127,17 +93,7 @@ sha2.workspace = true
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 libc = "0.2"
-# implementation-note-54 Phase 1 — memfd_create + F_ADD_SEALS
-# via nix for the Linux-only credential-seal path in `broker/exec_env.rs`.
-# `fs` feature enables `SealFlag` / `F_ADD_SEALS` (Linux + FreeBSD-gated).
-# Pinned to 0.29 to match the workspace's existing nix transitive (via
-# ember-exec) and avoid a duplicate compile.
-# `process` feature pulls in `fork`/`waitpid`/`ForkResult`/`WaitStatus` used
-# by `install::provision_se_mek` to drop to the `ember` system uid before
-# touching the Secure Enclave (so the SE key lands in ember's per-user
-# DataProtectionKeychain context, where the launchd-spawned daemon also
-# running as ember can read it back).
-nix = { version = "0.29", features = ["fs", "process", "user"] }
+nix = { version = "0.31", features = ["fs", "process", "user"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-tokio"] }
@@ -145,13 +101,10 @@ hyper-util = { version = "0.1", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-# implementation-note-114: `FutureExt::catch_unwind`
-# is the canonical async panic-recovery primitive (std::panic::catch_unwind
-# only handles sync closures). futures-util is already pulled in
-# transitively via tokio/hyper; this declares it as a direct dep for
-# the dispatch-site wrapper in infra/socket.rs.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-x509-parser = "0.16"
+# `verify`: ring-backed RSA/ECDSA-SHA256 certificate-signature verification for
+# the PIV attestation chain walk (design §3 / OQ-7 — never the Ed25519 path).
+x509-parser = { version = "0.18", features = ["verify"] }
 webpki-roots = "1.0"
 # Use `getrandom` directly for byte-fill ops in vault and dashboard.
 # The `rand` crate is no longer needed since its 0.9/0.10 API reorg moved
@@ -163,15 +116,11 @@ percent-encoding = "2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# implementation-note-115 — `OffsetDateTime` conversion for
-# the leaf cert's `not_before`/`not_after` window. Arrives transitively via
-# rcgen; declared here so the direct `time::OffsetDateTime::from(SystemTime)`
-# call in `trust::bridge_ca::sign_server_cert` is explicit.
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
 # tracing-subscriber is also listed in dev-dependencies for tests; we need it
@@ -186,36 +135,10 @@ aho-corasick = "1"
 once_cell = "1"
 regex = "1"
 zeroize = { version = "1", features = ["derive"] }
-# implementation-note-108: WebAuthn relying-party. Verifies passkey
-# registration + authentication ceremonies against stored credential
-# pubkeys. Sync API (no Send/async surprises in our LocalSet model).
-# `resident-key-support` feature so the dashboard can authenticate
-# against discoverable platform passkeys (TouchID on macOS).
-#
-# Features:
-# - resident-key-support: dashboard authenticates against discoverable
-#   platform passkeys (TouchID on macOS) without a stored credential ID.
-# - danger-allow-state-serialisation: serialize PasskeyRegistration /
-#   PasskeyAuthentication state to SQLite between begin/finish. The
-#   "danger" prefix flags the requirement that the storage be private
-#   to the daemon; our `webauthn_challenges` table lives in the
-#   daemon's local-only SQLite database, never replicated.
 webauthn-rs = { version = "0.5", features = ["resident-key-support", "danger-allow-state-serialisation"], optional = true }
 
-# Ephemeral per-spawn HOME tempdir for broker_exec children
-# (implementation-note-116). The TempDir guard auto-cleans on Drop;
-# `handle_broker_exec` holds the binding across the child spawn so the
-# directory exists for the lifetime of the child process.
 tempfile = "3"
 
-# implementation-note-117: macOS biometric+passcode gate. The
-# `keyring` crate (already a dep above) does not expose
-# `kSecAttrAccessControl`, so we drop down to `security-framework` directly
-# on macOS to wrap the vault MEK with
-# `kSecAccessControlBiometryAny | kSecAccessControlOr | kSecAccessControlDevicePasscode`
-# (Touch ID / Face ID, with device passcode fallback). Pinned to v3 (same
-# major already present transitively via keyring's `apple-native` feature)
-# to avoid a duplicate compile of v2.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 # Force static/vendored OpenSSL on macOS so signed host builds do not pick up
@@ -223,18 +146,27 @@ security-framework = "3.7"
 openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
+# se-stub is DEV-ONLY: the software SE stub must never compile into a
+# production daemon (resolver 2 keeps dev-dep features out of normal builds).
+# Test modules (#[cfg(test)]) get se_register_stub_key/new_stub_key via this
+# edge; production builds get se-real only, so the §4 presence-seal guard
+# (`se_backend_is_real() && !se_stub_is_active()`) passes honestly. design §4.
+ember-broker = { path = "../ember-broker", features = ["se-stub"] }
 emberlink-agent = { path = "../emberlink-agent" }
+# -S3-PR4b-2 — the operator-identity genesis tests run the independent
+# `verify_chain` over the materialized operator log (AC-1: a party holding only
+# the device pubkey re-verifies the device-rooted root/persona/device
+# chain). Dev-only: the daemon never re-verifies its own log at runtime.
+core-eventlog = { path = "../core-eventlog" }
+# -S2 — `test-support` exposes the `#[cfg(test)]`-only constructors,
+# accessors, and pure-logic helpers (TeeBody/PassthroughBody test ctors,
+# StreamingSlot::inflight, check_scope, subtarget_matches, ScopeViolation)
+# so the in-tree `infra::proxy::tests` can exercise the moved forwarding
+# types without those tests having to move out of ember-daemon (they reach
+# DaemonStore / Vault / DaemonPolicyBackend).
+proxy-forward-runtime = { path = "../proxy-forward-runtime", features = ["test-support"] }
 hex = "0.4"
-# implementation-note-118 — T1 property test on the namespace-inode
-# comparator. The brief mandates proptest for permutation coverage over the
-# (cgroup_v2_id, userns_inode, mnt_ns_inode) tuple per `.claude/rules/library-crates.md`
-# (property tests are the default for state machines / pure comparators).
 proptest = "1"
-# implementation-note-115 — T3 integration test parses
-# the minted PEM pair through the same rustls_pemfile path the ember-rpc
-# listener uses, so a format mismatch (PEM-vs-DER, BEGIN-block name,
-# wrong key encoding) surfaces here as a real load error rather than at
-# sibling-boot time.
 rustls-pemfile = "2"
 # `test-util` enables `tokio::time::{pause, advance, resume}` for deterministic
 # wall-clock control in the P69L.0b--TIMEOUTS regression tests. Dev-only;
@@ -247,3 +179,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 name = "emberd"
 path = "src/bin/emberd.rs"
 
+[lints]
+workspace = true

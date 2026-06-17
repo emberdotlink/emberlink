@@ -1,9 +1,7 @@
 //! fn resolve_caller_principal
+//! CLASSIFICATION: PUBLIC
 
-use serde_json::Value;
-
-use core_events::receipt::sign::sign_receipt_v2;
-use core_events::receipt::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
+use core_events::receipt::TerminationAuthority;
 
 use crate::infra::handler::{RequestContext, peercred_principal};
 use crate::infra::receipt::current_identity;
@@ -14,7 +12,8 @@ use crate::infra::receipt::issue::{TerminationMeta, issue_cohort_a_receipt};
 /// Resolution order:
 ///   1. `ctx.principal` — pre-resolved (tests / session-ticket binding).
 ///   2. `peercred_principal(&ctx.peer)` — kernel-attested PID registry.
-///   3. `ctx.mtls_principal.persona_id` — mTLS-attested bridge lane.
+///   3. `ctx.mtls_principal().persona_id` — mTLS-attested bridge lane
+///      (the principal carried in `DispatchSource::Bridge`).
 ///   4. `params["caller_persona_id"]` — legacy param-asserted fallback.
 ///
 /// Returns `Err` when peercred lookup fails in a way that makes the
@@ -50,7 +49,7 @@ pub async fn resolve_caller_principal(
     }
 
     // 3. mTLS-attested principal from the cross-uid bridge lane.
-    if let Some(mtls) = &ctx.mtls_principal {
+    if let Some(mtls) = ctx.mtls_principal() {
         return Ok(mtls.persona_id.clone());
     }
 
@@ -67,76 +66,10 @@ pub async fn resolve_caller_principal(
     ))
 }
 
-/// Emit a signed v2 local-state Receipt via the canonical `sign_receipt_v2`
-/// path (design + design). Best-effort: a signing failure logs and returns
-/// without aborting the caller's operation. The body is pre-serialised by the
-/// caller so this helper stays type-agnostic.
-///
-/// Call sites: `local_state_key_get`, `local_state_key_rotate_and_reencrypt`
-/// in `crate::infra::handler`.
-pub fn emit_local_state_v2_receipt(
-    kind: &'static str,
-    body_value: Result<Value, serde_json::Error>,
-    caller: &str,
-    vault_namespace: &str,
-) {
-    let Some(identity) = current_identity() else {
-        tracing::warn!(
-            caller = %caller,
-            vault_namespace = %vault_namespace,
-            kind = %kind,
-            "local_state Receipt: daemon identity not initialised — skipping v2 emission"
-        );
-        return;
-    };
-    let body = match body_value {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                caller = %caller,
-                vault_namespace = %vault_namespace,
-                kind = %kind,
-                error = %e,
-                "local_state Receipt: failed to serialize body — skipping v2 emission"
-            );
-            return;
-        }
-    };
-    let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
-    let mut envelope = ReceiptEnvelope {
-        version: ReceiptVersion::default(),
-        kind: kind.into(),
-        receipt_id: String::new(),
-        daemon_root_id: identity.pubkey_hex(),
-        traceparent: None,
-        termination_authority: TerminationAuthority::DaemonPersona,
-        presence_kind: None,
-        body,
-        signature: None,
-        calling_principal: None,
-        presence_reason: None,
-        handle_id: None,
-        challenge_hash: None,
-        verifier_aaguid: None,
-    };
-    if let Err(e) = sign_receipt_v2(&mut envelope, &signer) {
-        tracing::warn!(
-            caller = %caller,
-            vault_namespace = %vault_namespace,
-            kind = %kind,
-            error = %e,
-            "local_state Receipt: sign_receipt_v2 failed — work still committed"
-        );
-    } else {
-        tracing::info!(
-            caller = %caller,
-            vault_namespace = %vault_namespace,
-            kind = %kind,
-            receipt_id = %envelope.receipt_id,
-            "local_state Receipt: signed v2 envelope emitted"
-        );
-    }
-}
+// NB: `emit_local_state_v2_receipt` was removed here per design §76-78 —
+// local_state.key_resolve / key_rotation are withdrawn from the Receipt lane
+// and now emit immutable audit rows (see crate::infra::handlers::local_state).
+// Do NOT reintroduce a signed-receipt path for those kinds. (Sweep 3 D2.)
 
 /// Emit a signed v2 cohort-A Receipt for a grant lifecycle event (revoke,
 /// etc.) via `issue_cohort_a_receipt`. Best-effort: failures are logged but

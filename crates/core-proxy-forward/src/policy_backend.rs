@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! PolicyBackend trait — decouples proxy IO from policy/credential/Receipt RPCs.
 //!
@@ -76,12 +77,61 @@ pub enum PreflightDecision {
 /// a Unix-domain socket instead, allowing the proxy to run as a separate binary.
 #[async_trait]
 pub trait PolicyBackend: Send + Sync + 'static {
+    async fn resolve_attachment_authority(
+        &self,
+        _attachment_id: &str,
+        _endpoint_token: &str,
+    ) -> Result<Option<ResolvedAttachmentAuthority>, PolicyError> {
+        Ok(None)
+    }
+
+    /// Resolve the attachment authority bound to a per-session peercred-gated
+    /// socket, keyed by `session_id` — **without** an endpoint-token bearer.
+    ///
+    /// -S2 (design §2): on the per-session UDS lane the socket path *is*
+    /// the attachment binding and the connection was already kernel-attested by
+    /// the accept-time gate (peercred uid + liveness + launcher pid-tree +
+    /// binary attestation). The replayable bearer is therefore superseded —
+    /// `handle_request` resolves the credential identity from the socket's
+    /// session binding instead of a caller-supplied token. The default returns
+    /// `None` (no socket binding) so non-daemon backends and the transitional
+    /// TCP lane are unaffected.
+    async fn resolve_attachment_for_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<ResolvedAttachmentAuthority>, PolicyError> {
+        Ok(None)
+    }
+
+    /// Resolve the gateway authority for a session entirely server-side, keyed
+    /// by the daemon-minted `session_id` rather than by client-supplied
+    /// `X-Ember-*` headers.
+    ///
+    /// The codex loopback-TCP responses lane (-S2 / design codex) cannot
+    /// instruct codex to send `X-Ember-Credential` / `X-Ember-Target` /
+    /// `X-Ember-Persona` headers — codex only POSTs a JSON body to
+    /// `base_url/responses`. So the codex handler must synthesize the persona,
+    /// grant, and credential name from the session binding the acceptor set.
+    /// The daemon implementation reads the session metadata (persona + grant
+    /// id) and resolves the grant's `credential_name`.
+    ///
+    /// Returns `None` when the session has no resolvable gateway authority
+    /// (unknown / closed session). The codex handler treats `None` as
+    /// fail-closed (403 — no credential is synthesized, nothing forwarded).
+    async fn resolve_session_authority(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<SessionGatewayAuthority>, PolicyError> {
+        Ok(None)
+    }
+
     /// Resolve the active grant for `(persona_id, credential_name)` and find
     /// the Statement that covers the incoming request's method + URI.
     ///
-    /// When `pinned_grant_id` is `Some`, look up that specific grant rather
-    /// than searching by persona/credential; the grant must still belong to
-    /// `persona_id` and reference `credential_name`.
+    /// When `resolved_grant_id` is `Some`, use the daemon-resolved current
+    /// grant for an attachment rather than searching by persona/credential;
+    /// the grant must still belong to `persona_id` and reference
+    /// `credential_name`.
     ///
     /// `method` is the HTTP method string (e.g. `"GET"`, `"POST"`) used to
     /// resolve the applicable Statement in the grant's composite chain.
@@ -89,7 +139,7 @@ pub trait PolicyBackend: Send + Sync + 'static {
         &self,
         persona_id: &str,
         credential_name: &str,
-        pinned_grant_id: Option<&str>,
+        resolved_grant_id: Option<&str>,
         effective_uri: &http::Uri,
         method: &str,
     ) -> Result<ResolvedGrant, PolicyError>;
@@ -110,6 +160,33 @@ pub trait PolicyBackend: Send + Sync + 'static {
     async fn get_credential(&self, credential_name: &str)
     -> Result<Zeroizing<String>, PolicyError>;
 
+    /// Resolve the ChatGPT *plan/subscription* OAuth auth for the codex
+    /// responses lane (-S2 GPT-plan rework).
+    ///
+    /// Unlike [`get_credential`] (which returns a single opaque secret string),
+    /// the codex GPT-plan lane needs a *structured* credential: a short-window
+    /// `Bearer` access token PLUS the `ChatGPT-Account-ID` the upstream
+    /// (`chatgpt.com/backend-api/codex/responses`) requires. The vault stores
+    /// the codex `auth.json` token blob (`{id_token, access_token,
+    /// refresh_token, account_id}`); the daemon implementation parses it,
+    /// refreshes the access token against `auth.openai.com/oauth/token` when it
+    /// is near expiry (the daemon owns the `refresh_token` + rotation
+    /// write-back — see design), and returns ONLY the fields the proxy injects.
+    /// The `refresh_token` deliberately never crosses this boundary.
+    ///
+    /// Returns [`PolicyError::Forbidden`] with a re-auth signal when the
+    /// `refresh_token` is expired/reused/revoked (the operator must re-run
+    /// `codex login`). The default errors so non-codex backends need not
+    /// implement it.
+    async fn resolve_chatgpt_plan_auth(
+        &self,
+        _credential_name: &str,
+    ) -> Result<ChatgptPlanAuth, PolicyError> {
+        Err(PolicyError::Other(
+            "chatgpt plan auth not supported by this backend".into(),
+        ))
+    }
+
     /// Meter post-flight usage against the resolved grant/statement.
     ///
     /// `usage` is `None` when the upstream response did not include usage
@@ -126,7 +203,7 @@ pub trait PolicyBackend: Send + Sync + 'static {
     /// Distinct from `post_flight` so the daemon-side implementation can
     /// route the two through different metering paths — Slice B will land
     /// the in-process implementation, Slice C the remote one.
-    /// (implementation-note-68.)
+    /// (implementation-note-78.)
     async fn post_flight_meter(
         &self,
         resolved: &ResolvedGrant,
@@ -145,6 +222,67 @@ pub trait PolicyBackend: Send + Sync + 'static {
         outcome: &str,
         detail: Option<&str>,
     ) -> Result<(), PolicyError>;
+}
+
+/// Server-side gateway authority for a session, resolved from the
+/// daemon-minted `session_id` by [`PolicyBackend::resolve_session_authority`].
+///
+/// Used by the codex responses lane, where no `X-Ember-*` headers exist: the
+/// handler synthesizes the credential identity from this rather than trusting
+/// any caller-supplied bearer/credential header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGatewayAuthority {
+    pub session_id: String,
+    pub persona_id: String,
+    pub grant_id: String,
+    pub credential_name: String,
+}
+
+/// Structured ChatGPT plan/subscription auth resolved for the codex responses
+/// lane by [`PolicyBackend::resolve_chatgpt_plan_auth`].
+///
+/// Carries ONLY what the proxy injects on the outbound request: the current
+/// (already-refreshed-if-needed) access token, the workspace/account id, and
+/// the FedRAMP routing flag. The long-lived `refresh_token` stays daemon-side
+/// (the daemon owns refresh + rotation per design) and never appears here.
+#[derive(Clone)]
+pub struct ChatgptPlanAuth {
+    /// Short-window ChatGPT OAuth access token, injected as `Authorization:
+    /// Bearer`. `Zeroizing` so the secret is wiped on drop.
+    pub access_token: Zeroizing<String>,
+    /// ChatGPT workspace/account id, injected as the `ChatGPT-Account-ID`
+    /// header. `None` when the token blob carried neither an explicit
+    /// `account_id` nor a `chatgpt_account_id` id-token claim.
+    pub account_id: Option<String>,
+    /// Whether the account must route through the FedRAMP edge
+    /// (`X-OpenAI-Fedramp: true`).
+    pub is_fedramp: bool,
+}
+
+impl std::fmt::Debug for ChatgptPlanAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the access token.
+        f.debug_struct("ChatgptPlanAuth")
+            .field("access_token", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("is_fedramp", &self.is_fedramp)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAttachmentAuthority {
+    pub session_id: String,
+    pub attachment_id: String,
+    pub runtime_persona_id: String,
+    pub caller_binding_id: String,
+    pub grant_id: String,
+    pub state: String,
+    /// design §4 base posture for the session: `true` => strict (a lapsed
+    /// authority denies until re-delegated), `false` => jit (re-approvable).
+    /// Lets the LLM lane render a posture-aware recovery signal instead of a
+    /// flat 403 when the grant goes non-active mid-session (design §2).
+    pub authority_strict: bool,
 }
 
 /// A grant record held in `ProxyState`'s in-process store.
@@ -215,12 +353,12 @@ impl PolicyBackend for ColocatedBackend {
         &self,
         persona_id: &str,
         credential_name: &str,
-        pinned_grant_id: Option<&str>,
+        resolved_grant_id: Option<&str>,
         _effective_uri: &http::Uri,
         _method: &str,
     ) -> Result<ResolvedGrant, PolicyError> {
         let grants = self.state.grants.read().unwrap();
-        let record = if let Some(gid) = pinned_grant_id {
+        let record = if let Some(gid) = resolved_grant_id {
             grants.iter().find(|g| g.grant_id == gid)
         } else {
             grants
@@ -305,6 +443,27 @@ impl PolicyBackend for ColocatedBackend {
             })
     }
 
+    /// Minimal test impl: treats the stored plaintext credential as the raw
+    /// access token, with no account id. The structured `auth.json` blob
+    /// parsing + refresh lives in the daemon implementation (which owns the
+    /// vault); the colocated in-memory backend exists only for unit tests.
+    async fn resolve_chatgpt_plan_auth(
+        &self,
+        credential_name: &str,
+    ) -> Result<ChatgptPlanAuth, PolicyError> {
+        let creds = self.state.credentials.read().unwrap();
+        creds
+            .get(credential_name)
+            .map(|v| ChatgptPlanAuth {
+                access_token: Zeroizing::new(v.clone()),
+                account_id: None,
+                is_fedramp: false,
+            })
+            .ok_or_else(|| {
+                PolicyError::NotFound(format!("credential not found: {credential_name}"))
+            })
+    }
+
     async fn post_flight(
         &self,
         _resolved: &ResolvedGrant,
@@ -349,6 +508,7 @@ mod tests {
             budget: None,
             usage: Usage::default(),
             conditions: vec![],
+            can_delegate: None,
         }
     }
 

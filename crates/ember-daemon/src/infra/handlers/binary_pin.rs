@@ -1,5 +1,6 @@
 //! Binary-pin RPC helpers for the launcher-facing `binary_pin_generate`
 //! method.
+//! CLASSIFICATION: PUBLIC
 
 use serde_json::{Value, json};
 
@@ -12,7 +13,7 @@ use crate::trust::presence::HighRiskOp;
 
 pub(crate) fn handle_generate(
     store: &DaemonStore,
-    source: DispatchSource,
+    source: &DispatchSource,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     if source.is_internal() {

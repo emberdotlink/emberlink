@@ -14,6 +14,9 @@
 //!   - stack ls / preview / config get / about / version → None (passthrough)
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// Classify `pulumi <verb> ...` argv into an action_key.
 ///
@@ -238,5 +241,235 @@ mod tests {
             classify_pulumi_argv(&args(&["whoami"])).is_none(),
             "unknown verb should passthrough"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PulumiFactory — construct-factory contract for the pulumi construct
+// ---------------------------------------------------------------------------
+
+static PULUMI_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/pulumi.toml"))
+            .expect("bundled pulumi.toml must be valid")
+    });
+
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("pulumi.")?;
+    PULUMI_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key == format!("pulumi.{suffix}"))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+fn action_in_manifest(action_key: &str) -> bool {
+    PULUMI_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("pulumi.")
+                .is_some_and(|suffix| a.key == format!("pulumi.{suffix}"))
+    })
+}
+
+/// Extended factory classifier that supplements the legacy classifier with
+/// verbs the legacy path doesn't classify (login, stack rm/remove).
+fn classify_pulumi_factory_argv(argv: &[String]) -> Option<ActionKey> {
+    if let Some(key) = classify_pulumi_argv(argv) {
+        return Some(key);
+    }
+    let verb = argv.first()?.as_str();
+    match verb {
+        "login" => Some(ActionKey("pulumi.login".to_string())),
+        "stack" => {
+            let sub = argv.get(1).map(|s| s.as_str());
+            match sub {
+                Some("rm") | Some("remove") => Some(ActionKey("pulumi.stack.rm".to_string())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PulumiFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulumiFactoryTarget {
+    pub provider: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulumiFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for PulumiFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_pulumi_factory_argv(argv)
+    }
+}
+
+impl TargetExtractor for PulumiFactory {
+    type Target = PulumiFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, _argv: &[String]) -> Option<Self::Target> {
+        None
+    }
+}
+
+impl NeedTemplate for PulumiFactory {
+    type Need = PulumiFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(PulumiFactoryNeed)
+    }
+}
+
+impl ConstructFactory for PulumiFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            // No classified action — but check raw argv for `login` since
+            // the runtime path uses the legacy classifier which doesn't
+            // classify it.
+            let verb = argv.first().map(|s| s.as_str());
+            if verb == Some("login") {
+                return FactoryDisposition::UnsupportedFailClosed;
+            }
+            return FactoryDisposition::Credentialless;
+        };
+
+        if key.0 == "pulumi.up" || key.0 == "pulumi.destroy" {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        if key.0 == "pulumi.login" {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if action_in_manifest(&key.0) {
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        FactoryDisposition::ResolverRequired
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pulumi_factory_version_credentialless() {
+        let f = PulumiFactory;
+        let a = argv(&["version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn pulumi_factory_up_is_payload_analysis() {
+        let f = PulumiFactory;
+        let a = argv(&["up", "--yes"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn pulumi_factory_destroy_is_payload_analysis() {
+        let f = PulumiFactory;
+        let a = argv(&["destroy", "--yes"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn pulumi_factory_stack_rm_is_resolver_required() {
+        let f = PulumiFactory;
+        let a = argv(&["stack", "rm", "prod"]);
+        let key = f.action_key_for_argv(&a).expect("classified by factory");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn pulumi_factory_login_fails_closed() {
+        let f = PulumiFactory;
+        let a = argv(&["login", "s3://state-bucket"]);
+        let key = f.action_key_for_argv(&a).expect("classified by factory");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn pulumi_factory_login_fails_closed_via_legacy_path() {
+        let f = PulumiFactory;
+        let a = argv(&["login", "s3://state-bucket"]);
+        // Simulate the runtime path: legacy classifier returns None for login
+        let legacy_key = classify_pulumi_argv(&a);
+        assert!(
+            legacy_key.is_none(),
+            "legacy classifier should not classify login"
+        );
+        assert_eq!(
+            f.disposition_for_argv(legacy_key.as_ref(), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn pulumi_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/pulumi/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/pulumi.toml"),
+        )
+        .expect("pulumi manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &PulumiFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! Privilege-boundary mechanisms for `ember-exec` (implementation-note-422).
+//! Privilege-boundary mechanisms for `ember-exec` (implementation-note-382).
 //!
 //! Two responsibilities, deliberately kept side-effect-free at this layer:
 //!
@@ -20,7 +21,7 @@
 //!    pre-drop identity) and BEFORE any `execve` (so the child inherits
 //!    the dropped credentials).
 //!
-//! Subtask C ([`implementation-note-424`]) wires both
+//! Subtask C ([`implementation-note-384`]) wires both
 //! mechanisms into the `SpawnDirective` handler. This module owns the
 //! mechanisms; the orchestration lives in `main.rs` after C lands.
 
@@ -92,7 +93,7 @@ pub fn verify_content_hash(binary_path: &Path, expected_hex: &str) -> Result<(),
 /// On non-Linux targets (macOS, etc.) this returns `Err(nix::Error::ENOSYS)`.
 /// The SCION ember-exec runtime only runs as root on Linux — macOS builds
 /// compile clean but the privilege-drop path is unsupported at runtime.
-// implementation-note-426
+// implementation-note-386
 #[cfg(target_os = "linux")]
 pub fn drop_privileges(target_uid: u32, target_gid: u32) -> nix::Result<()> {
     use nix::unistd::{Gid, Uid, setresgid, setresuid};
@@ -122,7 +123,7 @@ pub enum HandleSpawnError {
     Frame(#[from] FrameError),
 }
 
-/// implementation-note-424 + implementation-note-425: glue
+/// implementation-note-384 + implementation-note-385: glue
 /// handler that runs the full gated-spawn flow for a single `SpawnDirective`.
 ///
 /// 1. Verify `binary_path` against `content_hash_expected`. On mismatch,
@@ -141,7 +142,7 @@ pub enum HandleSpawnError {
 ///    `ExecFrame::OutputBytes` frames toward the peer.
 /// 4. On child exit, write `ExecFrame::Exit { code }` and return.
 ///
-// PtyBridge wired into handle_spawn_directive per implementation-note-425:
+// PtyBridge wired into handle_spawn_directive per implementation-note-385:
 // `pump_connection` owns the fork+pty+pump body; this handler owns the
 // outer ExecFrame ↔ inner TAG_DATA/TAG_WINSIZE translation.
 pub async fn handle_spawn_directive<S>(
@@ -369,12 +370,12 @@ mod tests {
         );
     }
 
-    /// implementation-note-424: `handle_spawn_directive`
+    /// implementation-note-384: `handle_spawn_directive`
     /// runs the verify → spawn → exit flow end-to-end. We use `/bin/sh`
     /// (universally present on Linux/macOS) and hash it for a real
     /// content_hash_expected to exercise the OK branch.
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn handle_spawn_directive_runs_and_emits_exit() {
         use crate::uds::ExecFrame;
         use tokio::io::duplex;

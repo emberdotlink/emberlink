@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `ember orchestrator` — host-side entrypoint for the recursive SCION
 //! topology (design §3).
@@ -33,6 +34,39 @@ pub struct OrchestratorSpawnResult {
     pub persona_id: String,
     pub grant_id: String,
     pub container_id: String,
+    /// The daemon-minted design bridge client bundle. `None`
+    /// when the daemon could not mint it (e.g. bridge listener unconfigured) —
+    /// the worker then starts without an emberd control plane (fail-soft,
+    /// mirroring the daemon-sandbox lane).
+    pub bridge_bundle: Option<OrchestratorBridgeBundle>,
+}
+
+/// The daemon-minted bridge client bundle returned by `create_agent_persona`.
+/// The daemon owns the mint (it holds the bridge CA); the
+/// orchestrator only materializes the returned PEMs into the container's
+/// cert dir — it never mints locally.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OrchestratorBridgeBundle {
+    /// Port the daemon bridge listener is bound to; the container reaches it
+    /// at `https://host.docker.internal:<port>`.
+    pub port: u16,
+    pub client_cert_pem: String,
+    pub client_key_pem: String,
+    pub ca_cert_pem: String,
+}
+
+// Manual Debug redacts `client_key_pem` (review MED-3) so the
+// private key can never leak into a log line via a stray `{:?}` on the
+// spawn result.
+impl std::fmt::Debug for OrchestratorBridgeBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratorBridgeBundle")
+            .field("port", &self.port)
+            .field("client_cert_pem", &self.client_cert_pem)
+            .field("client_key_pem", &"<redacted>")
+            .field("ca_cert_pem", &self.ca_cert_pem)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +261,8 @@ pub async fn cmd_orchestrator_spawn(
     //     *.anthropic.com, github.com (defaults from mint_per_agent_proxy_ca).
     //     The CA key is not written to disk — only the cert is needed by
     //     the container's trust-store install step. Single-tenant fixed
-    //     path for now; implementation-note-515
-    //     tracks the per-container_id scoping work.
+    //     path for now; per-container_id scoping is tracked as follow-up
+    //     work.
     // per_agent_ca_path_scoped_by_container_id
     let certs_dir = PathBuf::from(format!("/tmp/ember-agent-certs/{container_id}"));
     if let Err(e) = std::fs::create_dir_all(&certs_dir) {
@@ -258,24 +292,54 @@ pub async fn cmd_orchestrator_spawn(
     }
     debug!(path = %ca_path.display(), "per-agent CA cert written");
 
-    // 4f-mtls. Materialize per-agent mTLS client cert files so the container
-    //     can authenticate to the bridge as a first-class principal (not just
-    //     via the shared proxy CA). Content is placeholder until
-    //     implementation-note-39 publishes the real mint helper.
-    // orchestrator_spawn_mints_bridge_client_cert: per-agent mTLS materialization (implementation-note-26)
+    // 4f-mtls. Materialize the daemon-minted bridge client bundle.
+    //     The daemon minted it as part of `create_agent_persona` — the
+    //     spawn-mint owns the cert (it holds the design bridge CA; design
+    //     §2/§5), so the orchestrator only writes the returned PEMs, never mints
+    //     locally. `EMBER_DAEMON_ENDPOINT` is wired from the bundle port so the
+    //     in-container agent reaches emberd's bridge listener over mTLS.
+    // orchestrator_spawn_materializes_daemon_minted_bridge_client_bundle
     let cert_dir = PathBuf::from("/tmp/ember-agent-certs"); // per-container subdirs created inside
-    let _materialized =
-        materialize_bridge_client_cert_for_container(&container_id, &persona_id, &cert_dir)
+    let mut daemon_endpoint: Option<String> = std::env::var("EMBER_DAEMON_ENDPOINT").ok();
+    match spawn.bridge_bundle.as_ref() {
+        Some(bundle) => {
+            materialize_bridge_client_cert_for_container(
+                &container_id,
+                &cert_dir,
+                &bundle.client_cert_pem,
+                &bundle.client_key_pem,
+                &bundle.ca_cert_pem,
+            )
             .map_err(|e| {
                 eprintln!("ember orchestrator spawn: materialize bridge client cert: {e}");
                 1i32
             })?;
-    // TODO: replace placeholder cert content with real
-    // mint_per_agent_mtls_client_cert(persona_id, container_id, ...) output once the SPIFFE-shape
-    // helper is published from core-crypto.
-
-    // TODO(design): set EMBER_DAEMON_ENDPOINT=https://host.docker.internal:<port> in inline
-    // config env (replaces EMBER_DAEMON_SOCKET path for the bridge path).
+            // The daemon bridge listens on the host; the container reaches it at
+            // host.docker.internal:<port> (design). An ambient
+            // EMBER_DAEMON_ENDPOINT override, if present, wins.
+            daemon_endpoint
+                .get_or_insert_with(|| format!("https://host.docker.internal:{}", bundle.port));
+            debug!(
+                port = bundle.port,
+                "materialized daemon-minted bridge client bundle; EMBER_DAEMON_ENDPOINT wired"
+            );
+        }
+        None => {
+            // FAIL CLOSED (review HIGH-3). The bundle is the
+            // worker's mTLS identity; unlike the daemon-sandbox lane, the SCION
+            // lane has no session-runtime authority anchor to fall back on, so
+            // a missing bundle must NOT silently downgrade the worker to a
+            // no-control-plane start. Refuse the spawn with an actionable error
+            // (the daemon bridge listener is almost certainly unconfigured).
+            eprintln!(
+                "ember orchestrator spawn: refusing to spawn — the daemon returned no bridge \
+                 client bundle, so the worker would have no mTLS identity / emberd control plane. \
+                 Ensure the daemon bridge listener is configured ([daemon].bridge_bind) and the \
+                 vault is unlocked, then retry."
+            );
+            return Err(1);
+        }
+    }
 
     // 5. Invoke `ember-scion start` via the Construct shim with emberlink-
     //    shaped argv. The shim's argv-translation layer (scion.rs::translate_
@@ -284,7 +348,6 @@ pub async fn cmd_orchestrator_spawn(
     //    scion sees only its own native vocabulary. Per design §4 the shim
     //    is also the broker.resolve gate for spawn-subagent authority
     //    (capability check, scope attenuation, template-allowlist, depth cap).
-    //    Anchor: implementation-note-516.
     // 4f. Write a per-spawn SCION inline config carrying EMBER_PERSONA_ID
     //     and EMBER_DAEMON_SOCKET into the container's env. The base image
     //     (ember-claude-code:v1) requires EMBER_PERSONA_ID at startup for
@@ -297,17 +360,15 @@ pub async fn cmd_orchestrator_spawn(
     })?;
     // In-container daemon socket path. SCION template bind-mounts the host
     // socket (socket_path_str) → this path inside the container.
-    // implementation-note-423 tracks the uid bridge work
+    // The uid bridge work is tracked as follow-up
     // (Docker Desktop on macOS does not pass through Linux UDS peer-cred
     // identically; first connect will likely surface the bridge gap).
     let in_container_socket = "/run/ember/daemon.sock";
 
-    // Probe EMBER_DAEMON_ENDPOINT once per spawn. When set, this is the
-    // HTTP endpoint that the in-container agent uses to reach emberd's HTTP
-    // listener (as opposed to the UDS socket). Injected into the container
-    // env so the agent can reach the daemon across the bridge.
-    // Anchor: scion_extra_hosts_declarative.
-    let daemon_endpoint: Option<String> = std::env::var("EMBER_DAEMON_ENDPOINT").ok();
+    // `daemon_endpoint` was resolved above (4f-mtls): the daemon-minted
+    // bundle's bridge port, or an ambient EMBER_DAEMON_ENDPOINT override.
+    // Injected into the container env below so the agent reaches emberd over
+    // the mTLS bridge. Anchor: scion_extra_hosts_declarative.
 
     // Build the env block for the inline SCION config.
     let mut env_block = format!(
@@ -518,15 +579,14 @@ pub async fn cmd_orchestrator_stop(cfg: &DaemonConfig) -> Result<(), i32> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Bridge client cert materialization (implementation-note-26)
+// Bridge client cert materialization
 // ---------------------------------------------------------------------------
 
 /// Paths to the materialized per-agent mTLS client cert files.
 ///
-/// Returned by `materialize_bridge_client_cert_for_container`. Content is
-/// placeholder until `implementation-note-39` publishes the real
-/// `mint_per_agent_mtls_client_cert` helper from `core-crypto`.
-/// Anchor: orchestrator_spawn_mints_bridge_client_cert
+/// Returned by `materialize_bridge_client_cert_for_container`. The PEMs are
+/// minted daemon-side and written verbatim by the orchestrator.
+/// Anchor: orchestrator_spawn_materializes_daemon_minted_bridge_client_bundle
 #[derive(Debug)]
 pub struct MaterializedCert {
     /// Path to the DER/PEM client certificate (`client.crt`, mode 0644).
@@ -562,68 +622,89 @@ pub enum BridgeCertError {
     },
 }
 
-/// Create `<output_dir>/<container_id>/` (mode 0700) and write three stub
-/// certificate files into it, returning their paths as a [`MaterializedCert`].
+/// Create `<output_dir>/<container_id>/` (mode 0700) and write the
+/// daemon-minted bridge client bundle into it, returning the paths as a
+/// [`MaterializedCert`].
 ///
 /// File layout:
-/// - `client.crt`    (mode 0644) — stub client certificate
-/// - `client.key`    (mode 0600) — stub private key
-/// - `client-ca.crt` (mode 0644) — stub CA certificate
+/// - `client.crt`    (mode 0644) — the daemon-minted client certificate
+/// - `client.key`    (mode 0600) — the client private key
+/// - `client-ca.crt` (mode 0644) — the bridge CA trust root
 ///
-/// All three files contain placeholder content (`b"# placeholder"`) until
-/// `implementation-note-39` ships the real SPIFFE-shape mint.
-/// The directory is scoped per container so concurrent spawns don't collide.
+/// The PEMs are minted **daemon-side** (the daemon holds the
+/// design bridge CA, mlock'd, never on disk) and returned by
+/// `create_agent_persona`; the orchestrator only writes them. The SPIFFE SAN
+/// (`spiffe://emberd/persona/<id>` + `spiffe://emberd/container/<id>`) is the
+/// container's mTLS identity per design §2. The directory is scoped per
+/// container so concurrent spawns don't collide.
 fn materialize_bridge_client_cert_for_container(
     container_id: &str,
-    _persona_id: &str,
     output_dir: &Path,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    ca_cert_pem: &str,
 ) -> Result<MaterializedCert, BridgeCertError> {
     use std::os::unix::fs::PermissionsExt;
 
     let container_dir = output_dir.join(container_id);
+    // Create the cert dirs with 0700 from the start (atomic perms, not
+    // default-then-chmod) so the private key written below is never even
+    // momentarily traversable by another uid (review MED-2). On
+    // unix the 0700 mode is applied to every dir created in the chain,
+    // including the `/tmp/ember-agent-certs` root, and a failure is fatal —
+    // we will not write a private key into a dir we couldn't lock down.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&container_dir)
+            .map_err(|e| BridgeCertError::CreateDirFailed {
+                path: container_dir.clone(),
+                source: e,
+            })?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&container_dir).map_err(|e| BridgeCertError::CreateDirFailed {
         path: container_dir.clone(),
         source: e,
     })?;
-    // Set directory permissions to 0700 so only the owning uid can traverse it.
-    #[cfg(unix)]
-    {
-        if let Err(e) =
-            std::fs::set_permissions(&container_dir, std::fs::Permissions::from_mode(0o700))
-        {
-            // Non-fatal: cert files' own permissions are the real security boundary.
-            debug!(dir = %container_dir.display(), error = %e, "chmod 0700 cert dir failed (non-fatal)");
-        }
-    }
 
     let cert_path = container_dir.join("client.crt");
     let key_path = container_dir.join("client.key");
     let ca_path = container_dir.join("client-ca.crt");
 
-    // Write stub client.crt (mode 0644).
-    std::fs::write(&cert_path, b"# placeholder").map_err(|e| BridgeCertError::WriteCertFailed {
-        path: cert_path.clone(),
-        source: e,
+    // Write the daemon-minted client.crt (mode 0644).
+    std::fs::write(&cert_path, client_cert_pem.as_bytes()).map_err(|e| {
+        BridgeCertError::WriteCertFailed {
+            path: cert_path.clone(),
+            source: e,
+        }
     })?;
     #[cfg(unix)]
     {
         let _ = std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644));
     }
 
-    // Write stub client.key (mode 0600 — private key).
-    std::fs::write(&key_path, b"# placeholder").map_err(|e| BridgeCertError::WriteKeyFailed {
-        path: key_path.clone(),
-        source: e,
+    // Write the client.key (mode 0600 — private key).
+    std::fs::write(&key_path, client_key_pem.as_bytes()).map_err(|e| {
+        BridgeCertError::WriteKeyFailed {
+            path: key_path.clone(),
+            source: e,
+        }
     })?;
     #[cfg(unix)]
     {
         let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    // Write stub client-ca.crt (mode 0644).
-    std::fs::write(&ca_path, b"# placeholder").map_err(|e| BridgeCertError::WriteCaFailed {
-        path: ca_path.clone(),
-        source: e,
+    // Write the bridge CA trust root client-ca.crt (mode 0644).
+    std::fs::write(&ca_path, ca_cert_pem.as_bytes()).map_err(|e| {
+        BridgeCertError::WriteCaFailed {
+            path: ca_path.clone(),
+            source: e,
+        }
     })?;
     #[cfg(unix)]
     {
@@ -893,6 +974,9 @@ fn call_daemon(
                 source,
             })
         }
+        Err(crate::DaemonRpcError::PermissionDenied(e)) => Err(OrchestratorRpcError::Io(
+            crate::format_daemon_socket_io_error(&e),
+        )),
         Err(crate::DaemonRpcError::Io(e)) => Err(OrchestratorRpcError::Io(format!("{e}"))),
         Err(crate::DaemonRpcError::Protocol(e)) => Err(OrchestratorRpcError::Protocol(e)),
         Err(crate::DaemonRpcError::Rpc { code, message }) => {
@@ -977,8 +1061,8 @@ fn daemon_find_operator_persona(socket_path: &Path) -> Result<String, Orchestrat
 ///
 /// The grant uses a synthetic `credential_name` (`_orchestrator_root`)
 /// because `create_grant` is credential-shaped today; the destination work
-/// (implementation-note-517) replaces this with a proper
-/// delegation primitive that doesn't piggyback on credential_name.
+/// replaces this with a proper delegation primitive that doesn't
+/// piggyback on credential_name.
 ///
 /// When `create_grant` returns `{status:"pending_approval", approval_id}`,
 /// this function blocks on the daemon's `await_approval` RPC (up to
@@ -1074,7 +1158,7 @@ fn daemon_await_grant_approval(
     _persona_id: &str,
     approval_id: &str,
 ) -> Result<(), OrchestratorRpcError> {
-    // Five minutes — matches the proxy hook's default (implementation-note-55).
+    // Five minutes — matches the proxy hook's default.
     const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
     // Open a new socket connection with an extended read deadline so the
@@ -1227,6 +1311,10 @@ fn daemon_create_agent_persona(
             "max_depth": max_depth,
             "allowed_templates": [template],
         },
+        // Request the daemon-minted design bridge client bundle
+        // as part of the same daemon-owned spawn-mint. The daemon holds the
+        // bridge CA; the orchestrator never mints the cert locally.
+        "bridge_client_bundle": true,
     });
     if let Some(cents) = budget_cents {
         // The daemon's create_agent_persona RPC accepts a `budget` field
@@ -1263,10 +1351,24 @@ fn daemon_create_agent_persona(
             )
         })?
         .to_string();
+    // Parse the daemon-minted bridge client bundle if present.
+    // Absent when the daemon minted persona+grant but could not mint the bundle
+    // (e.g. bridge listener unconfigured); fail-soft, the worker then starts
+    // without an emberd control plane.
+    let bridge_bundle = result.get("bridge_client_bundle").and_then(|b| {
+        Some(OrchestratorBridgeBundle {
+            port: u16::try_from(b.get("port")?.as_u64()?).ok()?,
+            client_cert_pem: b.get("client_cert_pem")?.as_str()?.to_string(),
+            client_key_pem: b.get("client_key_pem")?.as_str()?.to_string(),
+            ca_cert_pem: b.get("ca_cert_pem")?.as_str()?.to_string(),
+        })
+    });
+
     Ok(OrchestratorSpawnResult {
         persona_id,
         grant_id,
         container_id,
+        bridge_bundle,
     })
 }
 
@@ -1297,10 +1399,11 @@ fn daemon_revoke_persona(socket_path: &Path, persona_id: &str) -> Result<(), Orc
 // Spawn checkpoint tail
 // ---------------------------------------------------------------------------
 
-/// Read the shared engine event log without depending on an internal runtime crate.
+/// Read the shared engine event log without depending on `headless-runtime`.
 ///
-/// Missing files, unreadable files, and malformed JSON lines are ignored because
-/// this is a best-effort observability path.
+/// This is a best-effort observability helper for `ember orchestrator status`.
+/// Missing files, unreadable files, and malformed JSON lines are ignored so the
+/// status path never fails the operator's main workflow.
 fn tail_engine_events_silent(n: usize) -> Vec<Value> {
     let Ok(root) = core_construct_runtime::layout::primary_worktree_root() else {
         return Vec::new();
@@ -1683,7 +1786,7 @@ mod tests {
         socket_path
     }
 
-    /// T-APPROVAL-APPROVED — `daemon_await_grant_approval` returns `Ok(())`
+    /// `daemon_await_grant_approval` returns `Ok(())`
     /// when the daemon resolves the approval as `approved`.
     #[test]
     fn daemon_await_grant_approval_approved() {
@@ -1702,7 +1805,7 @@ mod tests {
         assert!(result.is_ok(), "expected Ok(()), got: {result:?}");
     }
 
-    /// T-APPROVAL-DENIED — `daemon_await_grant_approval` returns
+    /// `daemon_await_grant_approval` returns
     /// `Err(ApprovalDenied)` when the daemon resolves as `denied`.
     #[test]
     fn daemon_await_grant_approval_denied() {
@@ -1736,7 +1839,7 @@ mod tests {
         }
     }
 
-    /// T-APPROVAL-TIMED-OUT — `daemon_await_grant_approval` returns
+    /// `daemon_await_grant_approval` returns
     /// `Err(ApprovalTimedOut)` when the daemon resolves as `timed_out`.
     #[test]
     fn daemon_await_grant_approval_timed_out() {
@@ -1849,16 +1952,19 @@ mod tests {
         );
     }
 
-    /// T-MATERIALIZE-CERT — materialize_bridge_client_cert_for_container creates
-    /// a per-container subdirectory and writes the three expected stub files with
-    /// the correct names and placeholder content.
+    /// materialize_bridge_client_cert_for_container creates
+    /// a per-container subdirectory and writes the three daemon-minted bundle
+    /// PEMs with the correct names and exact content.
     #[test]
-    fn materialize_bridge_client_cert_creates_stub_files() {
+    fn materialize_bridge_client_cert_writes_daemon_minted_bundle() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let key_pem = format!("{}PRIVATE KEY-----\nKEY\n{}PRIVATE KEY-----\n", "-----BEGIN ", "-----END ");
         let result = materialize_bridge_client_cert_for_container(
             "test-container-id",
-            "test-persona-id",
             dir.path(),
+            "-----BEGIN CERTIFICATE-----\nCLIENT\n-----END CERTIFICATE-----\n",
+            &key_pem,
+            "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n",
         );
         let cert = result.expect("materialize should succeed");
 
@@ -1884,16 +1990,33 @@ mod tests {
         assert_eq!(cert.key_path.file_name().unwrap(), "client.key");
         assert_eq!(cert.ca_path.file_name().unwrap(), "client-ca.crt");
 
-        // Content must be the placeholder stub.
-        let crt_content = std::fs::read(&cert.cert_path).unwrap();
-        assert_eq!(crt_content, b"# placeholder");
-        let key_content = std::fs::read(&cert.key_path).unwrap();
-        assert_eq!(key_content, b"# placeholder");
-        let ca_content = std::fs::read(&cert.ca_path).unwrap();
-        assert_eq!(ca_content, b"# placeholder");
+        // Content must be the daemon-minted PEMs, written verbatim.
+        let crt_content = std::fs::read_to_string(&cert.cert_path).unwrap();
+        assert_eq!(
+            crt_content,
+            "-----BEGIN CERTIFICATE-----\nCLIENT\n-----END CERTIFICATE-----\n"
+        );
+        let key_content = std::fs::read_to_string(&cert.key_path).unwrap();
+        assert_eq!(key_content, key_pem);
+        let ca_content = std::fs::read_to_string(&cert.ca_path).unwrap();
+        assert_eq!(
+            ca_content,
+            "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n"
+        );
+
+        // Key file must be private (0600).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cert.key_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "client.key must be 0600");
+        }
     }
 
-    /// T-LOCK-PATH — orchestrator_lock_path returns a /tmp path keyed to the
+    /// orchestrator_lock_path returns a /tmp path keyed to the
     /// invoking uid, not a path inside ~/.ember/.
     ///
     /// Under design the daemon owns ~/.ember/ (chowned to ember:ember-clients).

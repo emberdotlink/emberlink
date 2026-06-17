@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct StatusSummary {
     pub personas: Vec<crate::infra::persona::PersonaInfo>,
     pub grants: Vec<crate::trust::grant::GrantInfo>,
+    #[serde(default)]
+    pub grant_live_leases: Vec<String>,
     pub sandboxes: Vec<crate::infra::sandbox::SandboxInfo>,
     pub approvals: Vec<crate::trust::approval::ApprovalRequestInfo>,
     pub recent_activity: Vec<crate::infra::audit::AuditEntry>,

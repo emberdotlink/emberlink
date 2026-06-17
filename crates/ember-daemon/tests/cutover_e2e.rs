@@ -1,4 +1,4 @@
-//! implementation-note-414 — T3 cutover end-to-end test.
+//! implementation-note-374 — T3 cutover end-to-end test.
 //!
 //! Pins the vault-first credential-discovery contract added by PR4A
 //! (`github_config_from_store` design reader) + PR4B (the
@@ -52,6 +52,7 @@ use ember_daemon::broker::github_config::github_config_from_store;
 use ember_daemon::infra::credential_store::{CredentialStore, LocalEncryptedStore};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
+use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use tracing::Subscriber;
 use tracing::subscriber::set_default;
@@ -236,9 +237,13 @@ async fn cutover_e2e_vault_first_path() {
     assert_eq!(creds.app_id, "12345");
     assert_eq!(creds.installation_id, "42");
     assert!(
-        creds.private_key_pem.contains("BEGIN PRIVATE KEY"),
+        creds
+            .private_key_pem
+            .expose_secret()
+            .contains("BEGIN PRIVATE KEY"),
         "PEM body must contain BEGIN PRIVATE KEY: {}",
-        &creds.private_key_pem[..creds.private_key_pem.len().min(80)]
+        &creds.private_key_pem.expose_secret()
+            [..creds.private_key_pem.expose_secret().len().min(80)]
     );
 
     // ── 7. Assert: bot-identity-source event with source="vault" was

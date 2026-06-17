@@ -23,7 +23,7 @@
 //! - Bind mTLS listener.
 //! - Accept connections + complete TLS handshake.
 //! - Parse newline-delimited JSON-RPC frames.
-//! - **Policy gate**: reject the 9 plaintext-bearing methods enumerated
+//! - **Policy gate**: reject the 11 plaintext-bearing methods enumerated
 //!   in [`PLAINTEXT_BEARING_METHODS`] with JSON-RPC error `-32601
 //!   policy-denied`. Those methods stay on the peercred lane and are
 //!   physically unreachable from the mTLS frontend.
@@ -34,13 +34,15 @@
 //!
 //! `ember_rpc_phase_b_mtls_lane_landed` (also stamped in `main.rs`) is
 //! the `target_state_anchor` checkpoint for
-//! implementation-note-430.
+//! implementation-note-390.
 //!
 //! `ember_rpc_phase_c_mtls_listener_wired` (stamped in `listener.rs`) is
-//! the checkpoint for implementation-note-431.
+//! the checkpoint for implementation-note-391.
 
+pub mod frame;
 pub mod listener;
 
+pub use frame::{DecodedFrame, FrameError};
 pub use listener::{Listener, ListenerConfig, ListenerError};
 
 use std::net::SocketAddr;
@@ -48,7 +50,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// The 9 plaintext-bearing JSON-RPC methods that MUST NOT be served
+/// The 11 plaintext-bearing JSON-RPC methods that MUST NOT be served
 /// over the mTLS lane. Source of truth: META-design amendment.
 ///
 /// These methods either accept plaintext key material as input or
@@ -66,6 +68,8 @@ pub const PLAINTEXT_BEARING_METHODS: &[&str] = &[
     "mint_grant",
     "export_private_key",
     "import_private_key",
+    "vault_export_sealed",
+    "vault_import_sealed",
     "decrypt_blob",
     "sign_with_unsealed_key",
     "recover_secret",
@@ -78,7 +82,7 @@ pub const POLICY_DENIED_ERROR_CODE: i64 = -32601;
 
 /// Listener-frontend configuration. Bind addr is a localhost mTLS port
 /// by default; UDS forward target is the path emberd core listens on
-/// for typed bincode frames from siblings.
+/// for the hand-rolled typed bridge frames ([`crate::frame`]) from siblings.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// mTLS listen address. Default `127.0.0.1:8443`. ember-rpc and
@@ -86,11 +90,12 @@ pub struct Config {
     /// sufficient — no privileged-port escalation needed.
     pub listen_addr: SocketAddr,
 
-    /// Path to emberd core's bincode forwarding UDS. Default
-    /// `/var/run/emberd/rpc.sock`. emberd peercred-verifies the
-    /// connecting uid is `ember` (i.e. ember-rpc's own uid) so this
-    /// is the trust boundary, not a security boundary — both sides
-    /// are the same uid.
+    /// Path to emberd core's dedicated `0700` rpc-forward UDS, over which
+    /// the sibling forwards the hand-rolled typed bridge frame (see
+    /// [`crate::frame`]). Default `/var/run/emberd/rpc.sock`. emberd attests
+    /// the peer via `SO_PEERCRED` (uid == `ember`) + a content-hash of the
+    /// peer binary against the pinned `emberd-rpc` manifest entry, so this is
+    /// a real provenance boundary, not merely a same-uid convention.
     pub forward_uds: PathBuf,
 
     /// Path to ember-rpc's server cert (PEM). Phase C: emberd's
@@ -198,7 +203,7 @@ pub fn build_policy_denied_response(req: &JsonRpcRequest) -> JsonRpcErrorRespons
     }
 }
 
-/// Synchronous entry point used by `main.rs`. Wraps the async
+/// Synchronous entry point used by the binary entrypoints. Wraps the async
 /// [`run_async`] in a tokio runtime + Ctrl-C shutdown signal so the
 /// binary stays simple.
 ///
@@ -314,11 +319,11 @@ mod tests {
     /// drive-by has to update this test and consciously acknowledge
     /// it's growing the plaintext surface.
     #[test]
-    fn plaintext_bearing_method_list_is_exactly_nine() {
+    fn plaintext_bearing_method_list_is_exactly_eleven() {
         assert_eq!(
             PLAINTEXT_BEARING_METHODS.len(),
-            9,
-            "META-design amendment enumerates 9 plaintext-bearing methods; \
+            11,
+            "META-design amendment enumerates 11 plaintext-bearing methods; \
              extending this list is a deliberate ADR-amendment decision, \
              not a casual addition"
         );

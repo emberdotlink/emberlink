@@ -1,8 +1,6 @@
+// CLASSIFICATION: PUBLIC
 
-//! `emberd-spawn-helper-linux` — design Component 2 hardened-Linux
-//! helper.
-//!
-//! implementation-note-187
+//! `emberd-spawn-helper-linux` — hardened-Linux helper.
 //!
 //! Privileged sibling daemon (systemd unit, `User=root`) that performs
 //! the `setuid → chroot → seccomp → execve` chain on behalf of the
@@ -28,10 +26,12 @@
 //!    status pipe; child performs
 //!    `chdir → chroot? → setresgid → setresuid → seccomp? → execve`.
 //! 6. Send [`HelperFrame::Exit { code, .. }`] / `HashMismatch` /
-//!    `Refused` back over the socket.
+//!    `Refused` back over the socket. The child's stdout/stderr are
+//!    captured via dup2'd pipes and returned as `stdout_tail` /
+//!    `stderr_tail` so headless callers see command output even with
+//!    no PTY bridge.
 //! 7. Close the connection. The spawned child runs detached under
-//!    its new uid; output capture is the main daemon's job over a
-//!    separate pty fd.
+//!    its new uid.
 //!
 //! ## Privilege posture
 //!
@@ -70,7 +70,7 @@ fn main() {
 mod linux_impl {
     use clap::Parser;
     use ember_spawn_helper::{
-        HelperFrame, RefuseReason, SpawnDirective,
+        HelperFrame, RefuseReason, STDERR_TAIL_CAP, STDOUT_TAIL_CAP, SpawnDirective, format_tail,
         hash::{VerifyError, verify_content_hash},
         peercred::peer_uid,
         sync_io::{read_frame as sync_read_frame, write_frame as sync_write_frame},
@@ -86,7 +86,7 @@ mod linux_impl {
     #[derive(Parser, Debug)]
     #[command(
         name = "emberd-spawn-helper-linux",
-        about = "Root-privileged spawn helper for emberd (design Component 2 hardened-Linux)",
+        about = "Root-privileged hardened-Linux spawn helper for emberd",
         long_about = None,
     )]
     struct Cli {
@@ -387,9 +387,11 @@ mod linux_impl {
 
         let invocation_id = directive.invocation_id.clone();
         let response = match spawn_child(&directive, no_privilege_drop) {
-            Ok(code) => HelperFrame::Exit {
+            Ok((code, stdout_tail, stderr_tail)) => HelperFrame::Exit {
                 code,
                 invocation_id,
+                stdout_tail,
+                stderr_tail,
             },
             Err((reason, detail)) => HelperFrame::Refused {
                 reason: reason.as_str().to_string(),
@@ -409,7 +411,7 @@ mod linux_impl {
     fn spawn_child(
         d: &SpawnDirective,
         no_privilege_drop: bool,
-    ) -> Result<i32, (RefuseReason, String)> {
+    ) -> Result<(i32, String, String), (RefuseReason, String)> {
         let binary_str = d
             .binary_path
             .to_str()
@@ -491,15 +493,56 @@ mod linux_impl {
 
         set_cloexec(write_fd).map_err(|e| (RefuseReason::SpawnFailed, e))?;
 
+        // stdout/stderr capture pipes. Previously the child's output
+        // was inherited onto the helper's own fds and never reached the
+        // daemon — headless brokered commands saw an exit code with no
+        // output. The child dup2's the write ends onto fd 1/2 and
+        // closes the originals (below); the parent drains the read ends
+        // and returns the tails in the `Exit` reply. No cloexec needed:
+        // these are managed by hand across this explicit fork (the
+        // child closes its copies; the parent never execs).
+        let mut out_pipe: [libc::c_int; 2] = [-1, -1];
+        let mut err_pipe: [libc::c_int; 2] = [-1, -1];
+        // SAFETY: out_pipe is a 2-int array libc::pipe writes into; rc checked.
+        if unsafe { libc::pipe(out_pipe.as_mut_ptr()) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: read_fd/write_fd are valid open fds from the status pipe.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err((RefuseReason::SpawnFailed, format!("pipe(stdout): {e}")));
+        }
+        // SAFETY: err_pipe is a 2-int array libc::pipe writes into; rc checked.
+        if unsafe { libc::pipe(err_pipe.as_mut_ptr()) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: all four are valid open fds here.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+                libc::close(out_pipe[0]);
+                libc::close(out_pipe[1]);
+            }
+            return Err((RefuseReason::SpawnFailed, format!("pipe(stderr): {e}")));
+        }
+        let out_rd = out_pipe[0];
+        let out_wr = out_pipe[1];
+        let err_rd = err_pipe[0];
+        let err_wr = err_pipe[1];
+
         // SAFETY: libc::fork is fork(2); after fork the parent and
         // child diverge below. No malloc in child before execve.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            // SAFETY: pipefd[0]/[1] are valid open fds we just got
-            // from pipe(2).
+            // SAFETY: the status pipe + both capture pipes are valid
+            // open fds we just got from pipe(2).
             unsafe {
                 libc::close(read_fd);
                 libc::close(write_fd);
+                libc::close(out_rd);
+                libc::close(out_wr);
+                libc::close(err_rd);
+                libc::close(err_wr);
             }
             return Err((
                 RefuseReason::SpawnFailed,
@@ -510,10 +553,17 @@ mod linux_impl {
         if pid == 0 {
             // ============ CHILD ==============
             // Async-signal-safe-only zone until execve. NO ALLOCATION.
-            // SAFETY: read_fd is unused in child; closing it frees
-            // the fd.
+            // SAFETY: read_fd + the capture read ends are unused in the
+            // child; the capture write ends are dup2'd onto fd 1/2 and
+            // their originals closed. dup2/close are async-signal-safe.
             unsafe {
                 libc::close(read_fd);
+                libc::close(out_rd);
+                libc::close(err_rd);
+                libc::dup2(out_wr, 1);
+                libc::dup2(err_wr, 2);
+                libc::close(out_wr);
+                libc::close(err_wr);
             }
 
             // SAFETY: cwd_c is a valid CString that outlives the call.
@@ -569,10 +619,20 @@ mod linux_impl {
         }
 
         // ============ PARENT ==============
-        // SAFETY: write_fd is unused in parent; closing frees it.
+        // SAFETY: write_fd + the capture write ends are unused in the
+        // parent; closing them lets the capture read ends observe EOF
+        // once the child's fd 1/2 close.
         unsafe {
             libc::close(write_fd);
+            libc::close(out_wr);
+            libc::close(err_wr);
         }
+
+        // Drain captured stdout/stderr on dedicated threads so a chatty
+        // child that fills a pipe buffer keeps making progress instead
+        // of deadlocking against our status read + waitpid.
+        let out_h = std::thread::spawn(move || read_tail_fd(out_rd, STDOUT_TAIL_CAP));
+        let err_h = std::thread::spawn(move || read_tail_fd(err_rd, STDERR_TAIL_CAP));
 
         let mut buf = [0u8; 64];
         let n_read = read_all(read_fd, &mut buf);
@@ -587,6 +647,8 @@ mod linux_impl {
             // SAFETY: status is a valid out-param for waitpid.
             let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
             if rc < 0 {
+                let _ = out_h.join();
+                let _ = err_h.join();
                 return Err((
                     RefuseReason::SpawnFailed,
                     format!("waitpid: {}", std::io::Error::last_os_error()),
@@ -599,20 +661,66 @@ mod linux_impl {
             } else {
                 -1
             };
-            return Ok(exit_code);
+            let (out_bytes, out_total) = out_h.join().unwrap_or_default();
+            let (err_bytes, err_total) = err_h.join().unwrap_or_default();
+            return Ok((
+                exit_code,
+                format_tail(&out_bytes, out_total),
+                format_tail(&err_bytes, err_total),
+            ));
         }
 
         // Pre-exec failure path. Parse "TAG:errno\n" and reap the
-        // child.
+        // child. Join the drain threads so their fds close (the child
+        // never reached execve, so there is no useful output).
         let mut status: libc::c_int = 0;
         // SAFETY: status is a valid out-param for waitpid.
         unsafe {
             libc::waitpid(pid, &mut status, 0);
         }
+        let _ = out_h.join();
+        let _ = err_h.join();
 
         let payload = &buf[..n_read];
         let (tag, errno) = parse_child_error(payload);
         Err(map_child_error(&tag, errno, &d.binary_path))
+    }
+
+    /// Read a raw fd to EOF, retaining only the last `cap` bytes.
+    /// Returns the retained tail plus the total byte count seen (so the
+    /// caller can render a truncation marker via [`format_tail`]).
+    /// Closes `fd` on exit. Runs on a dedicated drain thread.
+    fn read_tail_fd(fd: RawFd, cap: usize) -> (Vec<u8>, usize) {
+        let mut retained: Vec<u8> = Vec::new();
+        let mut total: usize = 0;
+        let mut chunk = [0u8; 8192];
+        loop {
+            // SAFETY: chunk is a valid buffer of chunk.len() bytes; fd
+            // is owned by this thread.
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+            if n > 0 {
+                let n = n as usize;
+                total += n;
+                retained.extend_from_slice(&chunk[..n]);
+                if retained.len() > cap {
+                    let excess = retained.len() - cap;
+                    retained.drain(..excess);
+                }
+            } else if n == 0 {
+                break; // EOF — child closed its write end.
+            } else {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        }
+        // SAFETY: fd is owned by this thread and not used after close.
+        unsafe {
+            libc::close(fd);
+        }
+        (retained, total)
     }
 
     fn set_cloexec(fd: RawFd) -> Result<(), String> {

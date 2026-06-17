@@ -15,7 +15,7 @@
 //! 6. Re-instantiate the vault via `Vault::new(recovered)` and
 //!    successfully decrypt the credential written in step 2.
 //!
-//! This is Slice C4 of implementation-note-420-
+//! This is Slice C4 of implementation-note-380-
 //! IMPORT-SEALED. C1 (the sealed-blob format + `export_mek_sealed` /
 //! `import_mek_sealed` substrate) shipped as prior change. C2/C3 (the RPC +
 //! `ember vault export --sealed` / `--import --sealed` CLI surfaces)
@@ -27,7 +27,7 @@
 
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::{
-    export_mek_sealed, import_mek_sealed, mek_fingerprint_hex, Vault, VaultScope,
+    Vault, VaultScope, export_mek_sealed, import_mek_sealed, mek_fingerprint_hex,
 };
 
 /// Operator-flow round-trip:
@@ -70,7 +70,7 @@ fn vault_sealed_export_import_landed_operator_flow() {
         let same_session = live_vault
             .get(VaultScope::Interactive, &store, "recovery-test-cred")
             .expect("get within live session");
-        assert_eq!(same_session, b"secret-payload");
+        assert_eq!(same_session.as_slice(), b"secret-payload");
     }
 
     // --- Step 3: export the sealed MEK blob. ----------------------------
@@ -92,8 +92,7 @@ fn vault_sealed_export_import_landed_operator_flow() {
     assert_eq!(mek, [0u8; 32], "local MEK copy is wiped");
 
     // --- Step 5: import the sealed blob on the "fresh machine". ---------
-    let recovered =
-        import_mek_sealed(&blob, passphrase, &fingerprint).expect("import sealed MEK");
+    let recovered = import_mek_sealed(&blob, passphrase, &fingerprint).expect("import sealed MEK");
     assert_eq!(
         recovered.len(),
         32,
@@ -116,7 +115,8 @@ fn vault_sealed_export_import_landed_operator_flow() {
         .get(VaultScope::Interactive, &store, "recovery-test-cred")
         .expect("get credential after sealed-MEK import");
     assert_eq!(
-        plaintext, b"secret-payload",
+        plaintext.as_slice(),
+        b"secret-payload",
         "credential plaintext must round-trip after sealed-MEK import"
     );
 }

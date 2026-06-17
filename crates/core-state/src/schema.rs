@@ -19,6 +19,13 @@ CREATE TABLE IF NOT EXISTS event_refs (
     event_id TEXT NOT NULL,
     relation TEXT NOT NULL,
     target_event_id TEXT NOT NULL,
+    -- Per-root monotonic sequence number of the referenced edge. This is part of
+    -- the canonical signing pre-image (`EventRef` → `.seq=` in core-events), so it
+    -- MUST round-trip through persistence or a reloaded chain fails external
+    -- `verify_chain` (design AC-1). Defaulted for rows written before the column
+    -- existed; the idempotent ADD COLUMN migration in `from_connection` backfills
+    -- the column on pre-existing databases.
+    seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (event_id, relation, target_event_id)
 );
 
@@ -51,7 +58,17 @@ CREATE TABLE IF NOT EXISTS devices_current (
     active_encryption_key_id TEXT NOT NULL,
     active_encryption_public_key TEXT NOT NULL,
     status TEXT NOT NULL,
-    replacement_device_id TEXT
+    replacement_device_id TEXT,
+    -- design: key-custody class (daemon|presence|co-authority|container) and
+    -- the raw vendor attestation statement proving it (NULL for daemon-class).
+    custody_class TEXT NOT NULL DEFAULT 'daemon',
+    attestation_statement TEXT,
+    -- design §3 two-axis model: attestation_tier (none|genuine_app|vendor_hw) is
+    -- the CLAIMED attestation strength (authority reads the tier verify_chain
+    -- proves, never this column blind); presence_factor (unattended|user_presence|
+    -- biometric|hardware_touch) is the use-time human-presence gate.
+    attestation_tier TEXT NOT NULL DEFAULT 'none',
+    presence_factor TEXT NOT NULL DEFAULT 'unattended'
 );
 
 CREATE TABLE IF NOT EXISTS personas_current (
@@ -274,6 +291,32 @@ CREATE TABLE IF NOT EXISTS service_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_service_bindings_persona_id ON service_bindings(persona_id);
 
+-- design §10b / design: structured claim-event action identity for
+-- Authority Catalog service rollups. `legacy_flat=1` marks rows whose old
+-- flat `tool` string could not be deterministically decomposed.
+CREATE TABLE IF NOT EXISTS claim_events (
+    event_id TEXT NOT NULL PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    claim_kind TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    action_plugin_address TEXT,
+    action_key TEXT,
+    action_version TEXT,
+    runner_class TEXT,
+    execution_domain TEXT,
+    materialization_class TEXT,
+    legacy_flat INTEGER NOT NULL DEFAULT 0,
+    persona_id TEXT,
+    grant_id TEXT,
+    input_hash TEXT NOT NULL,
+    input_redacted_json TEXT NOT NULL,
+    resolved_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claim_events_plugin_time
+    ON claim_events(action_plugin_address, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_claim_events_action_full
+    ON claim_events(action_plugin_address, action_key, action_version);
+
 -- Performance indexes for FK lookups and common query patterns
 CREATE INDEX IF NOT EXISTS idx_event_refs_event_id ON event_refs(event_id);
 CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
@@ -462,6 +505,18 @@ mod tests {
             ],
         );
         map.insert("grant_offers", vec!["conditions_json"]);
+        map.insert(
+            "claim_events",
+            vec![
+                "action_plugin_address",
+                "action_key",
+                "action_version",
+                "runner_class",
+                "execution_domain",
+                "materialization_class",
+                "legacy_flat",
+            ],
+        );
         map
     }
 
@@ -508,6 +563,14 @@ mod tests {
             index_names.contains("idx_credential_access_log_agent"),
             "expected idx_credential_access_log_agent in {index_names:?}",
         );
+        assert!(
+            index_names.contains("idx_claim_events_plugin_time"),
+            "expected idx_claim_events_plugin_time in {index_names:?}",
+        );
+        assert!(
+            index_names.contains("idx_claim_events_action_full"),
+            "expected idx_claim_events_action_full in {index_names:?}",
+        );
     }
 
     #[test]
@@ -526,5 +589,74 @@ mod tests {
             })
             .expect("count credential_access_log rows");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn claim_events_schema_supports_service_rollup_index_plan() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(SQLITE_INIT_DDL).expect("run init ddl");
+
+        let legacy_default: String = conn
+            .query_row(
+                "SELECT dflt_value
+                   FROM pragma_table_info('claim_events')
+                  WHERE name = 'legacy_flat'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy_flat default");
+        assert_eq!(legacy_default, "0");
+
+        conn.execute(
+            "INSERT INTO claim_events
+                (event_id, occurred_at, claim_kind, tool, action_plugin_address, action_key, action_version, runner_class, execution_domain, materialization_class, input_hash, input_redacted_json, resolved_json)
+             VALUES
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                "evt-1",
+                "2026-05-22T12:00:00Z",
+                "credential_vended",
+                "registry.ember.systems/ember-systems/ember-gh/pr_create@v1",
+                "registry.ember.systems/ember-systems/ember-gh",
+                "pr_create",
+                "v1",
+                "local_trusted",
+                "host",
+                "brokered_credential",
+                "h1",
+                "{}",
+                "{}"
+            ],
+        )
+        .expect("insert claim_event");
+
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*)
+                   FROM claim_events
+                  WHERE action_plugin_address = ?1
+                    AND occurred_at >= ?2
+                    AND occurred_at <= ?3
+                    AND legacy_flat = 0",
+            )
+            .expect("prepare query plan");
+        let plan = stmt
+            .query_map(
+                rusqlite::params![
+                    "registry.ember.systems/ember-systems/ember-gh",
+                    "2026-05-22T00:00:00Z",
+                    "2026-05-23T00:00:00Z"
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect query plan")
+            .join("\n");
+        assert!(
+            plan.contains("idx_claim_events_plugin_time"),
+            "expected claim_events service rollup to use plugin_time index, got:\n{plan}"
+        );
     }
 }

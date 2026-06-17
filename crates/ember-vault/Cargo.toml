@@ -25,3 +25,6 @@ core-broker = { path = "../core-broker" }
 proptest = "1"
 secrecy = "0.10"
 tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

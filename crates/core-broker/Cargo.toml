@@ -7,6 +7,8 @@ description = "Broker trait, request/response types, and MockBroker for the Embe
 publish = false
 
 [dependencies]
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,3 +25,6 @@ ureq = { version = "3", default-features = false, features = ["json", "rustls"],
 default = []
 anthropic = ["dep:chrono", "dep:ureq"]
 cloudflare = ["dep:chrono", "dep:ureq"]
+
+[lints]
+workspace = true

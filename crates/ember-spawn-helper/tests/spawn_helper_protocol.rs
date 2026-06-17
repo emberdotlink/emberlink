@@ -1,3 +1,4 @@
+// CLASSIFICATION: PUBLIC
 
 //! Cross-platform protocol-level integration tests for
 //! `ember-spawn-helper`. Exercises the wire types without spawning
@@ -49,10 +50,14 @@ async fn protocol_helper_frame_variants_roundtrip() {
         HelperFrame::Exit {
             code: 0,
             invocation_id: None,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
         },
         HelperFrame::Exit {
             code: 137,
             invocation_id: Some("01HXAMPLE".to_string()),
+            stdout_tail: "captured stdout\n".to_string(),
+            stderr_tail: "captured stderr\n".to_string(),
         },
         HelperFrame::HashMismatch {
             expected: "aa".to_string(),

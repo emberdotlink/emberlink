@@ -1,5 +1,6 @@
 //! core-grant-types — grant-protocol type definitions.
 //!
+//! CLASSIFICATION: PUBLIC
 //!
 //! Holds the grant-protocol type definitions: `grant_link`,
 //! `grant_conditions`, `grant_receipt`, `approval`, `policy`,
@@ -28,8 +29,8 @@ pub mod qr_encoding;
 pub use grant_chain::{
     AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantSummary, Action,
     ApprovalChallenge, ApprovalMethod, AttestationBinding, AttestationStatus, Block, Budget,
-    Condition, GrantMode, GrantProposal, GrantStatus, RecipientProfile, ResourceSelector,
-    ResourceType, SignedBlock, Statement, StatementId, StatementProposal, Usage,
+    CanDelegate, Condition, GrantMode, GrantProposal, GrantStatus, PrincipalId, RecipientProfile,
+    ResourceSelector, ResourceType, SignedBlock, Statement, StatementId, StatementProposal, Usage,
 };
 
 pub use grant_link::GrantLink;

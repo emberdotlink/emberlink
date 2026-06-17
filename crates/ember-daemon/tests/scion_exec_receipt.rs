@@ -1,4 +1,4 @@
-//! implementation-note-45 — T2 tests for the emberd-side
+//! implementation-note-48 — T2 tests for the emberd-side
 //! `exec.completion` Receipt v2 emission path.
 //!
 //! Two tests:
@@ -44,6 +44,65 @@ use tokio::net::UnixListener;
 use uuid::Uuid;
 
 const TEST_VAULT_KEY: [u8; 32] = [0xACu8; 32];
+
+fn write_runner_manifest(home: &std::path::Path, tool_name: &str, binary_path: &std::path::Path) {
+    let manifest_dir = home.join(".ember/binaries");
+    std::fs::create_dir_all(&manifest_dir).expect("mkdir manifest dir");
+    let manifest_body = format!(
+        "\
+[[entries]]
+tool_name = \"{tool_name}\"
+version = \"1.0.0\"
+content_hash = \"blake3:test\"
+absolute_path = \"{}\"
+installed_at = 1735689600
+publisher = \"did:emberlink\"
+channel = \"bundled\"
+",
+        binary_path.display()
+    );
+    std::fs::write(manifest_dir.join("manifest.toml"), manifest_body)
+        .expect("write runner manifest");
+}
+
+fn write_managed_worktree(home: &std::path::Path, runtime_id: &str) -> PathBuf {
+    let worktree_path = home.join("repo/.ember/worktrees/demo");
+    std::fs::create_dir_all(worktree_path.join(".git")).expect("mkdir worktree git dir");
+    std::fs::write(
+        worktree_path.join(".agent-session"),
+        format!(
+            "runtime_id: {runtime_id}\nworktree_path: {}\n",
+            worktree_path.display()
+        ),
+    )
+    .expect("write managed worktree metadata");
+    worktree_path
+}
+
+struct HomeGuard(Option<std::ffi::OsString>);
+
+impl HomeGuard {
+    fn set(home: &std::path::Path) -> Self {
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+    }
+}
 
 /// Build an in-memory store with a vault attached so broker_exec
 /// auxiliary paths that touch persona-secret encryption have a stable
@@ -166,21 +225,38 @@ async fn test_handle_exit_frame_emits_receipt() {
     let listener = UnixListener::bind(&socket_path).expect("bind UDS");
 
     let store = store_with_vault();
+    let runner_home = TempDir::new().expect("runner tempdir");
+    let _home_guard = HomeGuard::set(runner_home.path());
+    let fake_gh = runner_home.path().join("bin/ember-gh");
+    std::fs::create_dir_all(fake_gh.parent().expect("parent")).expect("mkdir bin dir");
+    if std::os::unix::fs::symlink("/usr/bin/true", &fake_gh).is_err() {
+        std::fs::write(&fake_gh, b"#!/bin/sh\nexec /usr/bin/true \"$@\"\n").expect("write fake gh");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake_gh).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).expect("chmod fake gh");
+    }
+    write_runner_manifest(runner_home.path(), "ember-gh", &fake_gh);
+    let runtime_id = format!("rt-{}", Uuid::new_v4().simple());
+    write_managed_worktree(runner_home.path(), &runtime_id);
 
     // Build a broker_exec request that routes through the
-    // in-container branch via `scion_exec_socket`. /usr/bin/true is
-    // the binary we report as "what the daemon approved" — the
-    // receipt records its blake3 hash. The mock listener never
-    // actually execs anything; it just emits the Exit frame.
-    //
-    // Use /usr/bin/true (not /bin/true): macOS ships /usr/bin/true
-    // but not /bin/true, so the blake3 read fails ENOENT on Darwin.
-    // Same fix-shape as prior change for broker_exec_* tests
-    // (memory project_broker_exec_tests_sandbox_blocked).
+    // in-container branch via `scion_exec_socket`. The resolved
+    // runner binary must still look like an `ember-gh` tool so the
+    // daemon-side classifier can map argv back to `pr_merge`; the
+    // symlink target is `/usr/bin/true` so the content hash stays
+    // stable and universally available.
+    let action_ref = core_event_types::ActionRef::new(
+        "registry.ember.systems/ember-systems/ember-gh",
+        "pr_merge",
+        "v1",
+    );
+    let workspace_ref = format!("managed_worktree:{runtime_id}");
+    let mut execution_contract = core_event_types::ExecutionContract::new(action_ref.clone());
+    execution_contract.workspace_ref = Some(workspace_ref.clone());
     let req = serde_json::json!({
-        "binary": "/usr/bin/true",
-        "argv": [],
-        "cwd": null,
+        "execution_contract": execution_contract,
+        "argv": ["pr", "merge", "123"],
         "env_passthrough": [],
         "scion_exec_socket": socket_path.to_string_lossy(),
         "scion_target_uid": 4242u32,
@@ -261,7 +337,7 @@ async fn test_handle_exit_frame_emits_receipt() {
             // caller (no caller_persona in params).
             let body: ExecCompletionBody =
                 serde_json::from_value(envelope.body.clone()).expect("body deserialize");
-            assert_eq!(body.binary_path, "/usr/bin/true");
+            assert_eq!(body.binary_path, fake_gh.display().to_string());
             assert_eq!(body.exit_code, 0);
             assert_eq!(body.target_uid, 4242);
             assert!(

@@ -1,10 +1,11 @@
 //! core-grant-types::capabilities — per-capability container-isolation map.
 //!
+//! CLASSIFICATION: PUBLIC
 //!
-//! Per implementation-note-56. The
+//! Per implementation-note-63. The
 //! [`CAPABILITY_ISOLATION_MAP`] (anchor: `capability_isolation_map`) is the
 //! operator-locked baseline that the container-split heuristic in
-//! implementation-note-57 consumes. Each [`Capability`]
+//! implementation-note-64 consumes. Each [`Capability`]
 //! enum variant carries a [`CapabilitySpec`] that names whether the capability
 //! shares a trust domain with the broker (and therefore stays in-process) or
 //! triggers a container-isolation boundary.
@@ -214,7 +215,7 @@ impl CapabilitySpec {
 }
 
 /// The per-capability container-isolation map. Operator-locked baseline per
-/// implementation-note-56; refined in the adversarial-review
+/// implementation-note-63; refined in the adversarial-review
 /// pass captured in the PR body.
 ///
 /// Anchor: `capability_isolation_map` (referenced by `target_state_anchor`

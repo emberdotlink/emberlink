@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-123 — emberd refuses to start when
+//! implementation-note-122 — emberd refuses to start when
 //! no on-disk config exists. Closes the production silent-fallback
 //! that was the May-12 25-hour leaked-daemon incident root cause.
 
@@ -8,15 +9,15 @@ use std::process::Command;
 #[test]
 fn emberd_with_no_config_exits_loudly() {
     let tmp = tempfile::tempdir().expect("create tempdir");
+    let missing_config = tmp.path().join("missing-config.toml");
 
     let exe = env!("CARGO_BIN_EXE_emberd");
     let output = Command::new(exe)
-        // Point HOME at an empty tmpdir so default_config_path() resolves to
-        // a non-existent file. Clear EMBER_CONFIG so the env override doesn't
-        // accidentally point at the operator's real config from the
-        // surrounding test-runner env.
+        // Force config resolution to a missing temp path. The default daemon
+        // config is now an design system path and may exist on a developer
+        // host, so HOME isolation alone is not sufficient.
         .env("HOME", tmp.path())
-        .env_remove("EMBER_CONFIG")
+        .env("EMBER_CONFIG", &missing_config)
         .output()
         .expect("spawn emberd");
 

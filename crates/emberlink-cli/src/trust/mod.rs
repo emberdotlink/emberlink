@@ -3,8 +3,8 @@
 //! Per design §Component 2. Phase 1 ships `ember trust list`. Phase 2
 //! ships `ember trust show <root-id>` drill-down. Phase 3 ships
 //! `ember trust explain <artifact-path>` chain walk (binary_manifest +
-//! receipt artifact kinds at minimum; workflow_grant lands in
-//! implementation-note-410).
+//! receipt artifact kinds at minimum; authority_delegation lands in
+//! implementation-note-362).
 //!
 //! All three surfaces are wired in `crates/emberlink-cli/src/bin/ember.rs`
 //! via `TrustAction::{List,Show,Explain}` dispatch arms. Daemon-side
@@ -17,12 +17,16 @@
 //! `trust_list_show_explain_landed` (umbrella — all three surfaces live).
 //!
 //! Component 4 (`ember trust backup` / `ember trust restore`) lives in
-//! the `backup` + `restore` submodules — encrypted IR export for
-//! cross-workstation portability + F-AUTHORITY-3/4 recovery.
-//! Anchor: `trust_backup_restore_landed` (implementation-note-32).
+//! the `backup` + `restore` submodules — encrypted operator-role /
+//! workstation Durable Persona export for compatibility recovery of
+//! software-custodied material. Device-rooted operator-authority
+//! recovery is handled by presence-device enrollment.
+//! Anchor: `trust_backup_restore_landed` (implementation-note-34).
 
 pub mod backup;
 pub mod explain;
 pub mod list;
+pub mod principal_keychain;
 pub mod restore;
+pub mod rotate;
 pub mod show;

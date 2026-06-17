@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `docs/cli-reference.md`, `docs/current-architecture.md`, `crates/emberlink-cli/src/trust/list.rs`, `crates/emberlink-cli/src/trust/show.rs`, `crates/emberlink-cli/src/trust/explain.rs`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Trust and Verification
 
 Emberlink exposes a **read-only trust inspection surface** today.
@@ -93,4 +93,3 @@ contract.
 - [CLI reference](./cli-reference/)
 - [Receipts and audit](../concepts/receipts-and-audit/)
 - [CLI and troubleshooting](../use/cli-and-troubleshooting/)
-

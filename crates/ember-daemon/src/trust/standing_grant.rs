@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use core_event_types::{ActionRef, ActionSelector};
 use uuid::Uuid;
 
 use core_proxy_forward::r#match::host_matches_domain;
@@ -22,7 +23,7 @@ pub struct StandingStatementMatch {
 pub struct StandingGrantInfo {
     pub id: String,
     pub persona_id: String,
-    pub action_pattern: String,
+    pub action_selector: ActionSelector,
     pub scope: String,
     pub expires_at: Option<String>,
 }
@@ -30,8 +31,10 @@ pub struct StandingGrantInfo {
 /// Check `resource` against a grant's `allowed_targets` field.
 ///
 /// - `None`  → no restriction; allowed.
-/// - `Some("")` (empty after trimming all entries) → deny-all; not allowed.
-/// - `Some("a.com,b.com")` → `resource` must match at least one entry.
+/// - Empty / whitespace-only / empty JSON-array → deny-all; not allowed.
+/// - `Some("[\"a.com\",\"*.b.com\"]")` → `resource` must match at least one
+///   entry. Storage encoding is the JSON array written by `create_grant`
+///   (`allowed_targets_storage_and_parse_one_encoding` reconciliation).
 ///
 /// Entry matching mirrors the proxy's FINDING-1-fixed logic: an entry
 /// without a `*.` prefix requires an exact host match; `*.domain` matches
@@ -41,11 +44,7 @@ fn resource_matches_allowed_targets(allowed_targets: Option<&str>, resource: &st
     let Some(targets) = allowed_targets else {
         return true; // no restriction
     };
-    let entries: Vec<&str> = targets
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let entries = core_proxy_forward::parse_allowed_targets(targets);
     if entries.is_empty() {
         return false; // empty list is deny-all
     }
@@ -63,7 +62,7 @@ fn resource_matches_allowed_targets(allowed_targets: Option<&str>, resource: &st
         if let Some(domain) = pattern.strip_prefix("*.") {
             host_matches_domain(&candidate, domain)
         } else {
-            candidate.as_str() == *pattern
+            candidate.as_str() == pattern.as_str()
         }
     })
 }
@@ -72,7 +71,7 @@ impl DaemonStore {
     pub fn create_standing_grant(
         &self,
         persona_id: &str,
-        action_pattern: &str,
+        action_selector: &ActionSelector,
         scope: &str,
         expires_at: Option<&str>,
     ) -> Result<(), StoreError> {
@@ -104,6 +103,9 @@ impl DaemonStore {
                 )));
             }
         }
+        action_selector
+            .validate()
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO standing_grants \
@@ -112,7 +114,7 @@ impl DaemonStore {
                 rusqlite::params![
                     format!("sg-{}", Uuid::new_v4()),
                     persona_id,
-                    action_pattern,
+                    action_selector.to_string(),
                     scope,
                     expires_at,
                 ],
@@ -122,18 +124,25 @@ impl DaemonStore {
     }
 
     pub fn check_standing_grant(&self, persona_id: &str, action: &str) -> Result<bool, StoreError> {
-        let count: i64 = self
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM standing_grants \
-                 WHERE persona_id = ?1 \
-                   AND (?2 GLOB action_pattern OR action_pattern = '*') \
-                   AND (expires_at IS NULL OR expires_at > datetime('now'))",
-                rusqlite::params![persona_id, action],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::Sqlite)?;
-        Ok(count > 0)
+        Ok(self
+            .list_standing_grants()?
+            .into_iter()
+            .filter(|grant| grant.persona_id == persona_id)
+            .filter(|grant| standing_grant_is_active(grant.expires_at.as_deref()))
+            .any(|grant| grant.action_selector.matches_action(action)))
+    }
+
+    pub fn check_standing_grant_action_ref(
+        &self,
+        persona_id: &str,
+        action_ref: &ActionRef,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .list_standing_grants()?
+            .into_iter()
+            .filter(|grant| grant.persona_id == persona_id)
+            .filter(|grant| standing_grant_is_active(grant.expires_at.as_deref()))
+            .any(|grant| grant.action_selector.matches_action_ref(action_ref)))
     }
 
     pub fn list_standing_grants(&self) -> Result<Vec<StandingGrantInfo>, StoreError> {
@@ -146,10 +155,11 @@ impl DaemonStore {
             .map_err(StoreError::Sqlite)?;
         let rows = stmt
             .query_map([], |row| {
+                let stored_action_pattern: String = row.get(2)?;
                 Ok(StandingGrantInfo {
                     id: row.get(0)?,
                     persona_id: row.get(1)?,
-                    action_pattern: row.get(2)?,
+                    action_selector: parse_action_selector(&stored_action_pattern)?,
                     scope: row.get(3)?,
                     expires_at: row.get(4)?,
                 })
@@ -211,9 +221,32 @@ impl DaemonStore {
     }
 }
 
+fn parse_action_selector(stored: &str) -> rusqlite::Result<ActionSelector> {
+    ActionSelector::parse(stored).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            stored.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })
+}
+
+fn standing_grant_is_active(expires_at: Option<&str>) -> bool {
+    match expires_at {
+        None => true,
+        Some(value) => DateTime::parse_from_rfc3339(value)
+            .map(|parsed| parsed.with_timezone(&Utc) > Utc::now())
+            .unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named_selector(pattern: &str) -> ActionSelector {
+        ActionSelector::named(pattern)
+    }
 
     fn setup() -> DaemonStore {
         let store = DaemonStore::open_in_memory().expect("in-memory store");
@@ -236,12 +269,15 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         store
-            .create_standing_grant(&pid, "credential.access", "*", None)
+            .create_standing_grant(&pid, &named_selector("credential.access"), "*", None)
             .unwrap();
         let grants = store.list_standing_grants().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].persona_id, pid);
-        assert_eq!(grants[0].action_pattern, "credential.access");
+        assert_eq!(
+            grants[0].action_selector,
+            named_selector("credential.access")
+        );
         assert_eq!(grants[0].scope, "*");
         assert!(grants[0].id.starts_with("sg-"));
         assert!(grants[0].expires_at.is_none());
@@ -252,7 +288,7 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         store
-            .create_standing_grant(&pid, "credential.access", "*", None)
+            .create_standing_grant(&pid, &named_selector("credential.access"), "*", None)
             .unwrap();
         assert!(
             store
@@ -271,7 +307,7 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         store
-            .create_standing_grant(&pid, "credential.*", "*", None)
+            .create_standing_grant(&pid, &named_selector("credential.*"), "*", None)
             .unwrap();
         assert!(
             store
@@ -290,8 +326,48 @@ mod tests {
     fn check_standing_grant_star_pattern_matches_all() {
         let store = setup();
         let pid = persona_id(&store);
-        store.create_standing_grant(&pid, "*", "*", None).unwrap();
+        store
+            .create_standing_grant(&pid, &named_selector("*"), "*", None)
+            .unwrap();
         assert!(store.check_standing_grant(&pid, "any.action").unwrap());
+    }
+
+    #[test]
+    fn check_standing_grant_structured_action_ref_match() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let selector = ActionSelector::action_ref(core_event_types::ActionRefPattern::new(
+            "registry.ember.systems/ember-systems/ember-gh",
+            "pr_merge",
+            "v1",
+        ));
+        store
+            .create_standing_grant(&pid, &selector, "*", None)
+            .unwrap();
+        assert!(
+            store
+                .check_standing_grant_action_ref(
+                    &pid,
+                    &ActionRef::new(
+                        "registry.ember.systems/ember-systems/ember-gh",
+                        "pr_merge",
+                        "v1",
+                    ),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .check_standing_grant_action_ref(
+                    &pid,
+                    &ActionRef::new(
+                        "registry.ember.systems/ember-systems/ember-gh",
+                        "pr_create",
+                        "v1",
+                    ),
+                )
+                .unwrap()
+        );
     }
 
     #[test]
@@ -299,7 +375,7 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         store
-            .create_standing_grant(&pid, "credential.access", "*", None)
+            .create_standing_grant(&pid, &named_selector("credential.access"), "*", None)
             .unwrap();
         let grants = store.list_standing_grants().unwrap();
         assert_eq!(grants.len(), 1);
@@ -313,10 +389,15 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         store
-            .create_standing_grant(&pid, "credential.access", "read", None)
+            .create_standing_grant(&pid, &named_selector("credential.access"), "read", None)
             .unwrap();
         store
-            .create_standing_grant(&pid, "credential.access", "read:write", None)
+            .create_standing_grant(
+                &pid,
+                &named_selector("credential.access"),
+                "read:write",
+                None,
+            )
             .unwrap();
         let grants = store.list_standing_grants().unwrap();
         assert_eq!(grants.len(), 1);
@@ -328,7 +409,7 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         store
-            .create_standing_grant(&pid, "credential.access", "*", None)
+            .create_standing_grant(&pid, &named_selector("credential.access"), "*", None)
             .unwrap();
         assert!(
             !store
@@ -347,7 +428,7 @@ mod tests {
         // cap (secs_from_now is negative).
         let past = (Utc::now() - chrono::Duration::days(7300)).to_rfc3339();
         store
-            .create_standing_grant(&pid, "credential.access", "*", Some(&past))
+            .create_standing_grant(&pid, &named_selector("credential.access"), "*", Some(&past))
             .unwrap();
         // Must not match even though the action and persona are correct.
         assert!(
@@ -365,7 +446,12 @@ mod tests {
         // future date within MAX_GRANT_TTL_SECS. 1 day satisfies both.
         let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         store
-            .create_standing_grant(&pid, "credential.access", "*", Some(&future))
+            .create_standing_grant(
+                &pid,
+                &named_selector("credential.access"),
+                "*",
+                Some(&future),
+            )
             .unwrap();
         assert!(
             store
@@ -383,7 +469,12 @@ mod tests {
         let pid = persona_id(&store);
         let past_cap = (Utc::now() + chrono::Duration::days(60)).to_rfc3339();
         let err = store
-            .create_standing_grant(&pid, "credential.access", "*", Some(&past_cap))
+            .create_standing_grant(
+                &pid,
+                &named_selector("credential.access"),
+                "*",
+                Some(&past_cap),
+            )
             .expect_err("expected MAX_GRANT_TTL_SECS refusal");
         match err {
             StoreError::InvalidInput(msg) => {
@@ -404,7 +495,12 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         let err = store
-            .create_standing_grant(&pid, "credential.access", "*", Some("2099-01-01T00:00:00"))
+            .create_standing_grant(
+                &pid,
+                &named_selector("credential.access"),
+                "*",
+                Some("2099-01-01T00:00:00"),
+            )
             .expect_err("expected RFC-3339 refusal");
         match err {
             StoreError::InvalidInput(msg) => {
@@ -519,7 +615,11 @@ mod tests {
 
     #[test]
     fn resource_matches_allowed_targets_multi_entry() {
-        let targets = "api.github.com,anthropic.com";
+        // Canonical storage encoding is JSON array
+        // (allowed_targets_storage_and_parse_one_encoding) — comma-form is
+        // not recognised; per-entry validation at the write site refuses
+        // it before any reader sees it.
+        let targets = "[\"api.github.com\",\"anthropic.com\"]";
         assert!(resource_matches_allowed_targets(
             Some(targets),
             "api.github.com"

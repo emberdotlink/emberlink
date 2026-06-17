@@ -1,8 +1,6 @@
+// CLASSIFICATION: PUBLIC
 
-//! `emberd-spawn-helper-macos` — root-privileged LaunchDaemon for ADR
-//! 155 Component 3.
-//!
-//! implementation-note-186
+//! `emberd-spawn-helper-macos` — root-privileged LaunchDaemon spawn helper.
 //!
 //! ## Architecture
 //!
@@ -33,17 +31,16 @@
 //!
 //! On SIGTERM the accept loop drains for up to 5 seconds then exits.
 //!
-//! ## MACOS-PRIMITIVES Decision 5 — why no `pre_exec`
+//! ## Why no `pre_exec`
 //!
 //! The previous Path-B drop used `Command::pre_exec({ sandbox_init +
 //! chroot + setuid })`. That path is invalid on macOS because the
 //! post-fork pre-execve window inherits the parent's Mach IPC ports
 //! and `sandbox_init` is a Security-framework call that talks to
 //! `sandboxd` over Mach IPC — deadlock-prone, fork-without-exec quirk
-//! per TN2050. Decision 5 — locked 2026-05-15 — replaces that with
-//! `posix_spawn(emberd-spawn-shim)`; the shim is a fresh process
-//! image after the kernel's atomic fork+exec, with clean Mach IPC
-//! state.
+//! per TN2050. The helper therefore uses `posix_spawn(emberd-spawn-shim)`;
+//! the shim is a fresh process image after the kernel's atomic fork+exec, with
+//! clean Mach IPC state.
 //!
 //! A regression-guard grep in `tests/spawn_shim_e2e.rs` enforces zero
 //! `pre_exec` references in THIS file.
@@ -57,7 +54,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use ember_spawn_helper::{
-    DEFAULT_SHIM_PATH, HelperFrame, RefuseReason, SpawnDirective,
+    DEFAULT_SHIM_PATH, HelperFrame, RefuseReason, STDERR_TAIL_CAP, STDOUT_TAIL_CAP, SpawnDirective,
+    format_tail,
     hash::{VerifyError, verify_content_hash},
     peercred::peer_uid,
     read_frame, refuse, validate_directive, write_frame,
@@ -68,7 +66,7 @@ use tokio::signal::unix::{SignalKind, signal};
 #[derive(Parser, Debug)]
 #[command(
     name = "emberd-spawn-helper-macos",
-    about = "Root-privileged spawn helper for emberd (design Component 3, MACOS-PRIMITIVES Decision 5)",
+    about = "Root-privileged macOS spawn helper for emberd",
     long_about = None,
 )]
 struct Cli {
@@ -363,11 +361,10 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // 5) Hash-pin the shim. MACOS-PRIMITIVES Decision 5 — the helper
-    // MUST refuse to invoke a tampered shim. EXPECTED_SHIM_HASH is
-    // rendered into the LaunchDaemon plist at install time; missing
-    // env var is treated as a refusal (a misconfigured deploy must
-    // not silently fall through to an unverified shim).
+    // 5) Hash-pin the shim. The helper MUST refuse to invoke a tampered shim.
+    // EXPECTED_SHIM_HASH is rendered into the LaunchDaemon plist at install
+    // time; missing env var is treated as a refusal (a misconfigured deploy
+    // must not silently fall through to an unverified shim).
     match verify_shim_hash(shim_path) {
         ShimVerify::Ok => {}
         ShimVerify::Mismatch { expected, actual } => {
@@ -431,12 +428,14 @@ async fn handle_connection(
     let invocation_id = directive.invocation_id.clone();
     let result = spawn_through_shim(&directive, shim_path, scratch_dir).await;
     match result {
-        Ok(code) => {
+        Ok((code, stdout_tail, stderr_tail)) => {
             let _ = write_frame(
                 &mut stream,
                 &HelperFrame::Exit {
                     code,
                     invocation_id,
+                    stdout_tail,
+                    stderr_tail,
                 },
             )
             .await;
@@ -484,7 +483,7 @@ async fn spawn_through_shim(
     directive: &SpawnDirective,
     shim_path: &Path,
     scratch_dir: &Path,
-) -> Result<i32, (RefuseReason, String)> {
+) -> Result<(i32, String, String), (RefuseReason, String)> {
     // a) Write the sandbox profile (if any) to a per-spawn tmpfile.
     //    Keeping profile bytes out of argv → not visible in `ps -ww`.
     let spawn_id = format!(
@@ -578,25 +577,52 @@ async fn spawn_through_shim(
     // c) Drive the posix_spawn. Use the libc primitive directly. The
     //    workspace's `nix = 0.29` doesn't expose `posix_spawn` (only
     //    landed on master; not in 0.29.x). Inline ~40 lines of libc::
-    //    posix_spawn{,attr,_file_actions} suffices.
-    let pid = posix_spawn_libc(&shim_argv, &directive.env)?;
+    //    posix_spawn{,attr,_file_actions} suffices. The child's
+    //    stdout/stderr are wired to pipes whose read ends come back
+    //    here so the helper can carry the output back to the daemon.
+    let (pid, stdout_rd, stderr_rd) = posix_spawn_libc(&shim_argv, &directive.env)?;
 
-    // d) waitpid the shim/construct. The shim either `execve`s the
-    //    construct (success, exit code is construct's) or `_exit(127)`
-    //    on setup failure (which the shim's stderr captures).
-    let exit_code = tokio::task::spawn_blocking(move || waitpid(pid))
+    // d) Drain the output pipes and waitpid the shim/construct. The
+    //    shim either `execve`s the construct (success, exit code is
+    //    construct's) or `_exit(127)` on setup failure (which the
+    //    shim's stderr captures, now surfaced in `stderr_tail`).
+    //    Draining happens on dedicated threads so a child writing more
+    //    than the pipe buffer never deadlocks against our wait.
+    tokio::task::spawn_blocking(move || drain_and_wait(pid, stdout_rd, stderr_rd))
         .await
-        .map_err(|e| (RefuseReason::SpawnFailed, format!("wait task join: {e}")))??;
-    Ok(exit_code)
+        .map_err(|e| (RefuseReason::SpawnFailed, format!("wait task join: {e}")))?
+}
+
+/// Set `FD_CLOEXEC` on a raw fd so it closes at the next `execve` in a
+/// child that inherits it (without disturbing the parent's own copy).
+fn set_cloexec(fd: libc::c_int) -> Result<(), (RefuseReason, String)> {
+    // SAFETY: F_GETFD/F_SETFD are integer-only fcntl ops on an fd we own.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err((
+            RefuseReason::SpawnFailed,
+            format!("fcntl(F_GETFD): {}", std::io::Error::last_os_error()),
+        ));
+    }
+    // SAFETY: as above.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc < 0 {
+        return Err((
+            RefuseReason::SpawnFailed,
+            format!("fcntl(F_SETFD): {}", std::io::Error::last_os_error()),
+        ));
+    }
+    Ok(())
 }
 
 /// Call `posix_spawn(2)` with file actions for stdin/stdout/stderr
-/// (null in, inherit out+err) and the shim path. Returns the spawned
-/// pid.
+/// (null in, captured out+err) and the shim path. Returns the spawned
+/// pid plus the read ends of the stdout/stderr capture pipes; the
+/// caller drains them via [`drain_and_wait`].
 fn posix_spawn_libc(
     argv_strings: &[String],
     env: &[(String, String)],
-) -> Result<libc::pid_t, (RefuseReason, String)> {
+) -> Result<(libc::pid_t, libc::c_int, libc::c_int), (RefuseReason, String)> {
     // CStrings own the underlying bytes. We hold them in vecs that
     // outlive the posix_spawn call.
     let argv_c: Vec<std::ffi::CString> = argv_strings
@@ -690,8 +716,93 @@ fn posix_spawn_libc(
             format!("posix_spawn_file_actions_addopen(stdin): errno={rc}"),
         ));
     }
-    // stdout/stderr are inherited from the helper (no add* — file
-    // actions only run AT setup time; absence means "inherit fd").
+    // stdout/stderr → capture pipes. Without this the child's output
+    // was inherited onto the helper's own fds (the LaunchDaemon log)
+    // and lost to the daemon — headless brokered commands saw exit
+    // codes with no output. Create one pipe per stream, dup2 the write
+    // end onto the child's fd 1/2, and keep the read ends here.
+    //
+    // cloexec discipline: all four raw fds are FD_CLOEXEC. In the
+    // posix_spawn'd child the file actions run first (dup2 write→1/2,
+    // creating non-cloexec fd 1/2), then the exec closes every
+    // cloexec fd — so the original pipe fds vanish in the child while
+    // the dup'd 1/2 survive across the shim's later execve into the
+    // construct. The parent keeps its read ends (cloexec is inert for
+    // a process that never execs) and closes the write ends below so
+    // the read ends observe EOF when the child's fd 1/2 close.
+    let mut out_pipe = [-1 as libc::c_int; 2];
+    let mut err_pipe = [-1 as libc::c_int; 2];
+    // SAFETY: out_pipe is a 2-int array libc::pipe writes into; rc checked.
+    if unsafe { libc::pipe(out_pipe.as_mut_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: attr + file_actions are owned and initialized above.
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut file_actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+        }
+        return Err((RefuseReason::SpawnFailed, format!("pipe(stdout): {e}")));
+    }
+    // SAFETY: err_pipe is a 2-int array libc::pipe writes into; rc checked.
+    if unsafe { libc::pipe(err_pipe.as_mut_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: out_pipe fds + attr/file_actions are all valid here.
+        unsafe {
+            libc::close(out_pipe[0]);
+            libc::close(out_pipe[1]);
+            libc::posix_spawn_file_actions_destroy(&mut file_actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+        }
+        return Err((RefuseReason::SpawnFailed, format!("pipe(stderr): {e}")));
+    }
+    for fd in [out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]] {
+        if let Err(e) = set_cloexec(fd) {
+            // SAFETY: all four are valid open pipe fds; attr/file_actions owned.
+            unsafe {
+                libc::close(out_pipe[0]);
+                libc::close(out_pipe[1]);
+                libc::close(err_pipe[0]);
+                libc::close(err_pipe[1]);
+                libc::posix_spawn_file_actions_destroy(&mut file_actions);
+                libc::posix_spawnattr_destroy(&mut attr);
+            }
+            return Err(e);
+        }
+    }
+    // SAFETY: file_actions is owned; out_pipe[1]/err_pipe[1] are valid
+    // write ends; 1/2 are the child's stdout/stderr fds.
+    let rc = unsafe { libc::posix_spawn_file_actions_adddup2(&mut file_actions, out_pipe[1], 1) };
+    if rc != 0 {
+        // SAFETY: all four pipe fds + attr/file_actions are valid here.
+        unsafe {
+            libc::close(out_pipe[0]);
+            libc::close(out_pipe[1]);
+            libc::close(err_pipe[0]);
+            libc::close(err_pipe[1]);
+            libc::posix_spawn_file_actions_destroy(&mut file_actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+        }
+        return Err((
+            RefuseReason::SpawnFailed,
+            format!("posix_spawn_file_actions_adddup2(stdout): errno={rc}"),
+        ));
+    }
+    // SAFETY: as above.
+    let rc = unsafe { libc::posix_spawn_file_actions_adddup2(&mut file_actions, err_pipe[1], 2) };
+    if rc != 0 {
+        // SAFETY: all four pipe fds + attr/file_actions are valid here.
+        unsafe {
+            libc::close(out_pipe[0]);
+            libc::close(out_pipe[1]);
+            libc::close(err_pipe[0]);
+            libc::close(err_pipe[1]);
+            libc::posix_spawn_file_actions_destroy(&mut file_actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+        }
+        return Err((
+            RefuseReason::SpawnFailed,
+            format!("posix_spawn_file_actions_adddup2(stderr): errno={rc}"),
+        ));
+    }
 
     // SAFETY: posix_spawn reads attr, file_actions, argv_ptr,
     // env_ptr; we own all of them and they outlive the call.
@@ -711,6 +822,13 @@ fn posix_spawn_libc(
         libc::posix_spawnattr_destroy(&mut attr);
     }
     if rc != 0 {
+        // SAFETY: all four pipe fds are valid open fds here.
+        unsafe {
+            libc::close(out_pipe[0]);
+            libc::close(out_pipe[1]);
+            libc::close(err_pipe[0]);
+            libc::close(err_pipe[1]);
+        }
         return Err((
             RefuseReason::SpawnFailed,
             format!(
@@ -719,7 +837,73 @@ fn posix_spawn_libc(
             ),
         ));
     }
-    Ok(pid)
+    // Close the parent's copy of the write ends so the read ends see
+    // EOF once the child's fd 1/2 close. The read ends go back to the
+    // caller for draining.
+    // SAFETY: out_pipe[1]/err_pipe[1] are valid write ends we own.
+    unsafe {
+        libc::close(out_pipe[1]);
+        libc::close(err_pipe[1]);
+    }
+    Ok((pid, out_pipe[0], err_pipe[0]))
+}
+
+/// Drain the child's captured stdout/stderr to EOF and reap it. The
+/// two pipes are drained on dedicated threads so a child that fills a
+/// pipe buffer keeps making progress instead of deadlocking against
+/// our `waitpid`. Returns the exit code plus the formatted output
+/// tails (last [`STDOUT_TAIL_CAP`] / [`STDERR_TAIL_CAP`] bytes).
+fn drain_and_wait(
+    pid: libc::pid_t,
+    stdout_rd: libc::c_int,
+    stderr_rd: libc::c_int,
+) -> Result<(i32, String, String), (RefuseReason, String)> {
+    let out_h = std::thread::spawn(move || read_tail_fd(stdout_rd, STDOUT_TAIL_CAP));
+    let err_h = std::thread::spawn(move || read_tail_fd(stderr_rd, STDERR_TAIL_CAP));
+    let code = waitpid(pid)?;
+    let (out_bytes, out_total) = out_h.join().unwrap_or_default();
+    let (err_bytes, err_total) = err_h.join().unwrap_or_default();
+    Ok((
+        code,
+        format_tail(&out_bytes, out_total),
+        format_tail(&err_bytes, err_total),
+    ))
+}
+
+/// Read a raw fd to EOF, retaining only the last `cap` bytes. Returns
+/// the retained tail plus the total byte count seen (so the caller can
+/// render a truncation marker). Closes `fd` on exit.
+fn read_tail_fd(fd: libc::c_int, cap: usize) -> (Vec<u8>, usize) {
+    let mut retained: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        // SAFETY: chunk is a valid buffer of chunk.len() bytes; fd is
+        // owned by this thread.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        if n > 0 {
+            let n = n as usize;
+            total += n;
+            retained.extend_from_slice(&chunk[..n]);
+            if retained.len() > cap {
+                let excess = retained.len() - cap;
+                retained.drain(..excess);
+            }
+        } else if n == 0 {
+            break; // EOF — child closed its write end.
+        } else {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+    }
+    // SAFETY: fd is owned by this thread and not used after close.
+    unsafe {
+        libc::close(fd);
+    }
+    (retained, total)
 }
 
 /// `waitpid(pid, &status, 0)` blocking. Converts to exit code with

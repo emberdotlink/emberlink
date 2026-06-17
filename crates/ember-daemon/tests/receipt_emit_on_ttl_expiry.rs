@@ -1,4 +1,4 @@
-//! implementation-note-416 regression coverage.
+//! implementation-note-377 regression coverage.
 //!
 //! Reproduces the bug where the TTL-expiry sweep silently failed to emit
 //! a Grant Receipt: the sweep call site discarded the wrapper's return
@@ -186,6 +186,10 @@ fn ttl_expiry_sweep_emits_session_composite_grant_v2_when_claim_journal_present(
                 occurred_at: "2026-05-22T12:00:00Z".to_string(),
                 claim_kind: core_events::receipt::ClaimKind::CredentialVended,
                 tool: "gh.pr_create".to_string(),
+                action_ref: None,
+                runner_class: None,
+                execution_domain: None,
+                materialization_class: None,
                 input_hash: "ttl-claim-hash-1".to_string(),
                 input_redacted: serde_json::json!({"kind": "broker_resolve", "grant_id": grant.id}),
                 resolved: serde_json::json!({"allowed": true}),
@@ -197,8 +201,9 @@ fn ttl_expiry_sweep_emits_session_composite_grant_v2_when_claim_journal_present(
                     details: Some("{\"kind\":\"broker_resolve_materialized\"}".to_string()),
                 },
                 persona_id: Some(persona.id.clone()),
+                grant_id: Some(grant.id.clone()),
                 device_id: None,
-                workflow_id: None,
+                delegation_id: None,
                 materialization_id: Some("mat-ttl-1".to_string()),
                 credential_name: Some("github-token".to_string()),
             },

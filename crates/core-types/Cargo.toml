@@ -24,3 +24,6 @@ sha2.workspace = true
 core-grant-types = { path = "../core-grant-types" }
 core-event-types = { path = "../core-event-types" }
 core-principals = { path = "../core-principals" }
+
+[lints]
+workspace = true

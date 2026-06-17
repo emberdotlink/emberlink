@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! T2 integration tests for ember-relay.
 //!

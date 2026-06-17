@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! Auto-update decision composition (subtask A of `update-policy`).
 //!
@@ -8,12 +9,12 @@
 //! hidden preset over the same path) and the daemon's image-rotation
 //! tick both need a single pure function that combines the three
 //! update-flow primitives — the signed channel pointer, the in-toto
-//! signed manifest verification, and the revocations document — into
+//! signed manifest verification, and the signed revocations document — into
 //! one `UpdateDecision`. This module is that function.
 //!
 //! The function is **pure**: no I/O, no clock reads, no network. All
 //! inputs (current digest, channel pointer, channel-signer public key,
-//! revocations document bytes, the current Unix time) are passed in.
+//! signed revocations document bytes, the current Unix time) are passed in.
 //! Network fetching of the pointer and revocations lives in the caller
 //! (the daemon's revocation poller + a separate channel-pointer
 //! fetcher); pinning the decision to a pure function keeps the trust
@@ -27,15 +28,16 @@
 //!    a tampered pointer is the same threat shape as the daemon
 //!    accepting an unsigned manifest. No-update is the wrong default;
 //!    refuse-to-decide is right.
-//! 2. **Revocations document fails to parse** → return
+//! 2. **Revocations document fails to parse or verify** → return
 //!    [`UpdateDecisionError::RevocationsInvalid`]. Same fail-closed
-//!    posture as pointer-invalid — an unparseable revocations document
-//!    cannot be safely treated as "no revocations".
-//! 3. **Revocations document is stale (older than 30 min by default,
-//!    per update-policy D5)** → every entry
-//!    maps to [`RevocationAction::FailClosed`]. Return
+//!    posture as pointer-invalid — an unsigned or unverifiable revocations
+//!    document cannot be safely treated as "no revocations".
+//! 3. **Signed revocations document is stale (older than 30 min by default,
+//!    per update-policy D5)** → return
 //!    [`UpdateDecision::BlockedByStaleRevocations`] so the operator
 //!    sees the staleness, not a misleading "no update available".
+//!    Other revocation trust failures, including future-issued documents,
+//!    return [`UpdateDecisionError::RevocationsInvalid`].
 //! 4. **Current digest is in the (fresh) revocations document** →
 //!    return [`UpdateDecision::CurrentRevoked`] with the matched
 //!    entry's severity and action. The caller routes per severity per
@@ -106,9 +108,9 @@ pub enum UpdateDecisionError {
     /// expired / not-yet-valid. The pointer cannot be trusted.
     #[error("channel pointer trust failure: {0}")]
     PointerInvalid(#[from] ChannelPointerError),
-    /// The revocations document could not be parsed as JSON, or
-    /// failed schema validation. Same fail-closed posture as a
-    /// tampered pointer.
+    /// The revocations document could not be parsed as a signed envelope,
+    /// failed signature verification, or failed schema validation. Same
+    /// fail-closed posture as a tampered pointer.
     #[error("revocations document trust failure: {0}")]
     RevocationsInvalid(#[from] RevocationPollError),
 }
@@ -124,9 +126,10 @@ pub enum UpdateDecisionError {
 /// `now_unix_ms` is the wall-clock at decision time, passed in so the
 /// function stays deterministic for testing. The caller normally
 /// reads it from `SystemTime::now()` immediately before the call.
-/// `revocations_poller` controls the stale-threshold for fail-closed
-/// behavior — production passes
-/// [`RevocationsPoller::new()`][crate::revocations::RevocationsPoller::new].
+/// `revocations_poller` controls the signer pin and stale-threshold for
+/// fail-closed behavior. [`RevocationsPoller::new()`] has no trusted signer and
+/// therefore fails closed; owned signing infrastructure must provide a poller
+/// from [`RevocationsPoller::with_trusted_signer`].
 ///
 /// ember_up_auto_update.
 pub fn decide_update(
@@ -142,12 +145,25 @@ pub fn decide_update(
 
     // 2. Parse + evaluate revocations.
     let now_unix_secs = now_unix_ms / 1000;
-    let decisions = revocations_poller.evaluate(revocations_raw, now_unix_secs)?;
+    let decisions = match revocations_poller.evaluate(revocations_raw, now_unix_secs) {
+        Ok(decisions) => decisions,
+        Err(RevocationPollError::StaleDocument {
+            age_secs,
+            threshold_secs,
+        }) => {
+            return Ok(UpdateDecision::BlockedByStaleRevocations {
+                reason: format!(
+                    "revocation document stale: age {age_secs}s > threshold {threshold_secs}s"
+                ),
+            });
+        }
+        Err(e) => return Err(UpdateDecisionError::RevocationsInvalid(e)),
+    };
 
-    // 3. Stale-document fail-closed — any FailClosed action means the
-    //    poller refused to authoritatively answer "is current_digest
-    //    safe to keep running". Surface that to the operator instead
-    //    of silently treating it as "no revocations".
+    // 3. Legacy compatibility guard — older poller variants represented
+    //    staleness as a per-entry FailClosed action. Current signed pollers
+    //    return RevocationPollError::StaleDocument above, but keep this branch
+    //    so callers never silently treat FailClosed as "no revocations".
     if let Some(stale) = decisions
         .iter()
         .find(|d| matches!(d.action, RevocationAction::FailClosed { .. }))
@@ -184,6 +200,8 @@ pub fn decide_update(
 mod tests {
     use super::*;
     use crate::channel::{Channel, sign_channel_pointer};
+    use crate::in_toto;
+    use crate::revocations::{RevocationDocument, RevocationEntry, revocation_statement};
     use ed25519_dalek::SigningKey;
 
     /// Helper: produce a deterministic signing key + verifying key for
@@ -192,6 +210,12 @@ mod tests {
     /// this crate's own internal tests can spin a fixed seed.
     fn fixture_keys() -> (SigningKey, VerifyingKey) {
         let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let vk = sk.verifying_key();
+        (sk, vk)
+    }
+
+    fn revocation_fixture_keys() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::from_bytes(&[77u8; 32]);
         let vk = sk.verifying_key();
         (sk, vk)
     }
@@ -207,27 +231,44 @@ mod tests {
         )
     }
 
-    fn empty_revocations(now_unix_secs: u64) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "revocations": [],
-            "issued_at_unix_secs": now_unix_secs,
-        }))
-        .unwrap()
+    fn empty_revocations(signer: &SigningKey, now_unix_secs: u64) -> Vec<u8> {
+        let doc = RevocationDocument {
+            revocations: Vec::new(),
+            issued_at_unix_secs: now_unix_secs,
+        };
+        sign_revocations(signer, doc)
     }
 
-    fn revocations_with(entries: &[(&str, &str, &str)], now_unix_secs: u64) -> Vec<u8> {
-        let revs: Vec<_> = entries
+    fn revocations_with(
+        signer: &SigningKey,
+        entries: &[(&str, RevocationSeverity, &str)],
+        now_unix_secs: u64,
+    ) -> Vec<u8> {
+        let revocations = entries
             .iter()
-            .map(|(digest, sev, reason)| {
-                serde_json::json!({
-                    "digest": digest,
-                    "severity": sev,
-                    "reason": reason,
-                })
+            .map(|(digest, severity, reason)| RevocationEntry {
+                digest: (*digest).to_string(),
+                severity: severity.clone(),
+                reason: (*reason).to_string(),
             })
             .collect();
+        sign_revocations(
+            signer,
+            RevocationDocument {
+                revocations,
+                issued_at_unix_secs: now_unix_secs,
+            },
+        )
+    }
+
+    fn sign_revocations(signer: &SigningKey, doc: RevocationDocument) -> Vec<u8> {
+        let signed = in_toto::sign(revocation_statement(doc), signer).unwrap();
+        serde_json::to_vec(&signed).unwrap()
+    }
+
+    fn unsigned_empty_revocations(now_unix_secs: u64) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "revocations": revs,
+            "revocations": [],
             "issued_at_unix_secs": now_unix_secs,
         }))
         .unwrap()
@@ -239,8 +280,9 @@ mod tests {
         let now_ms = 1_800_000_000_000u64;
         let current = "sha256:aaaaaaaa";
         let p = make_pointer(&sk, current, now_ms);
-        let revs = empty_revocations(now_ms / 1000);
-        let poller = RevocationsPoller::new();
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
+        let revs = empty_revocations(&rev_sk, now_ms / 1000);
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
         // ember_up_auto_update — anchor mirrored in a test body so
         // grep verification covers production + test paths.
@@ -254,8 +296,9 @@ mod tests {
         let current = "sha256:aaaaaaaa";
         let new = "sha256:bbbbbbbb";
         let p = make_pointer(&sk, new, now_ms);
-        let revs = empty_revocations(now_ms / 1000);
-        let poller = RevocationsPoller::new();
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
+        let revs = empty_revocations(&rev_sk, now_ms / 1000);
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
         match decision {
             UpdateDecision::UpdateAvailable {
@@ -275,11 +318,13 @@ mod tests {
         let now_ms = 1_800_000_000_000u64;
         let current = "sha256:aaaaaaaa";
         let p = make_pointer(&sk, "sha256:bbbbbbbb", now_ms);
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
         let revs = revocations_with(
-            &[(current, "critical", "CVE-2026-1234")],
+            &rev_sk,
+            &[(current, RevocationSeverity::Critical, "CVE-2026-1234")],
             now_ms / 1000,
         );
-        let poller = RevocationsPoller::new();
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
         match decision {
             UpdateDecision::CurrentRevoked {
@@ -301,12 +346,14 @@ mod tests {
         let now_ms = 1_800_000_000_000u64;
         let current = "sha256:aaaaaaaa";
         let p = make_pointer(&sk, current, now_ms);
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
         // Revocations issued 2 hours ago — past the 30-min stale threshold.
         let revs = revocations_with(
-            &[("sha256:cccccccc", "low", "stale-test")],
+            &rev_sk,
+            &[("sha256:cccccccc", RevocationSeverity::Low, "stale-test")],
             (now_ms / 1000) - 2 * 3600,
         );
-        let poller = RevocationsPoller::new();
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
         match decision {
             UpdateDecision::BlockedByStaleRevocations { reason } => {
@@ -325,8 +372,9 @@ mod tests {
         // Different signing key → wrong verifying key
         let wrong_sk = SigningKey::from_bytes(&[99u8; 32]);
         let wrong_vk = wrong_sk.verifying_key();
-        let revs = empty_revocations(now_ms / 1000);
-        let poller = RevocationsPoller::new();
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
+        let revs = empty_revocations(&rev_sk, now_ms / 1000);
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let err = decide_update(current, &p, &wrong_vk, &revs, &poller, now_ms).unwrap_err();
         match err {
             UpdateDecisionError::PointerInvalid(_) => {}
@@ -341,7 +389,8 @@ mod tests {
         let current = "sha256:aaaaaaaa";
         let p = make_pointer(&sk, current, now_ms);
         let bad_revs = b"not valid json";
-        let poller = RevocationsPoller::new();
+        let (_rev_sk, rev_vk) = revocation_fixture_keys();
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let err = decide_update(current, &p, &vk, bad_revs, &poller, now_ms).unwrap_err();
         match err {
             UpdateDecisionError::RevocationsInvalid(_) => {}
@@ -355,12 +404,14 @@ mod tests {
         let now_ms = 1_800_000_000_000u64;
         let current = "sha256:aaaaaaaa";
         let p = make_pointer(&sk, current, now_ms);
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
         // Revocation lists a DIFFERENT digest.
         let revs = revocations_with(
-            &[("sha256:cccccccc", "high", "other-cve")],
+            &rev_sk,
+            &[("sha256:cccccccc", RevocationSeverity::High, "other-cve")],
             now_ms / 1000,
         );
-        let poller = RevocationsPoller::new();
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
         assert_eq!(decision, UpdateDecision::NoUpdate);
     }
@@ -376,11 +427,13 @@ mod tests {
         let now_ms = 1_800_000_000_000u64;
         let current = "sha256:aaaaaaaa";
         let p = make_pointer(&sk, "sha256:bbbbbbbb", now_ms);
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
         let revs = revocations_with(
-            &[(current, "high", "regression-found")],
+            &rev_sk,
+            &[(current, RevocationSeverity::High, "regression-found")],
             now_ms / 1000,
         );
-        let poller = RevocationsPoller::new();
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
         assert!(matches!(
             decision,
@@ -390,5 +443,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unsigned_revocations_cannot_produce_no_update() {
+        let (sk, vk) = fixture_keys();
+        let (_rev_sk, rev_vk) = revocation_fixture_keys();
+        let now_ms = 1_800_000_000_000u64;
+        let current = "sha256:aaaaaaaa";
+        let p = make_pointer(&sk, current, now_ms);
+        let unsigned_revs = unsigned_empty_revocations(now_ms / 1000);
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
+
+        let err = decide_update(current, &p, &vk, &unsigned_revs, &poller, now_ms).unwrap_err();
+        assert!(matches!(err, UpdateDecisionError::RevocationsInvalid(_)));
+    }
+
+    #[test]
+    fn future_dated_revocations_cannot_produce_no_update() {
+        let (sk, vk) = fixture_keys();
+        let (rev_sk, rev_vk) = revocation_fixture_keys();
+        let now_ms = 1_800_000_000_000u64;
+        let current = "sha256:aaaaaaaa";
+        let p = make_pointer(&sk, current, now_ms);
+        let revs = empty_revocations(&rev_sk, now_ms / 1000 + 60);
+        let poller = RevocationsPoller::with_trusted_signer(rev_vk);
+
+        let err = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap_err();
+        assert!(matches!(err, UpdateDecisionError::RevocationsInvalid(_)));
+    }
+
+    #[test]
+    fn missing_revocation_signer_cannot_produce_update_available() {
+        let (sk, vk) = fixture_keys();
+        let (rev_sk, _rev_vk) = revocation_fixture_keys();
+        let now_ms = 1_800_000_000_000u64;
+        let current = "sha256:aaaaaaaa";
+        let p = make_pointer(&sk, "sha256:bbbbbbbb", now_ms);
+        let revs = empty_revocations(&rev_sk, now_ms / 1000);
+        let poller = RevocationsPoller::new();
+
+        let err = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap_err();
+        assert!(matches!(err, UpdateDecisionError::RevocationsInvalid(_)));
     }
 }

@@ -172,14 +172,19 @@ impl BrokerAuthorityResolver {
     pub async fn github_authority_source(
         &self,
     ) -> Result<Option<GithubAuthoritySource>, BrokerAuthorityError> {
-        Ok(self.resolve_github().await?.map(|authority| match authority {
-            ResolvedBrokerAuthority::GithubApp(_) => GithubAuthoritySource::App,
-            ResolvedBrokerAuthority::GithubPat(_) => GithubAuthoritySource::Pat,
-            _ => unreachable!("resolve_github only returns github authority"),
-        }))
+        Ok(self
+            .resolve_github()
+            .await?
+            .map(|authority| match authority {
+                ResolvedBrokerAuthority::GithubApp(_) => GithubAuthoritySource::App,
+                ResolvedBrokerAuthority::GithubPat(_) => GithubAuthoritySource::Pat,
+                _ => unreachable!("resolve_github only returns github authority"),
+            }))
     }
 
-    async fn resolve_github(&self) -> Result<Option<ResolvedBrokerAuthority>, BrokerAuthorityError> {
+    async fn resolve_github(
+        &self,
+    ) -> Result<Option<ResolvedBrokerAuthority>, BrokerAuthorityError> {
         let app = match self.precedence {
             CredentialPrecedence::VaultFirst => {
                 match crate::broker::github_config::github_config_from_store(&*self.store).await {
@@ -188,9 +193,8 @@ impl BrokerAuthorityResolver {
                         .map_err(|err| self.file_error(BrokerProvider::Github, err))?,
                     Err(err) => {
                         warn_store_fallback(BrokerProvider::Github, &err);
-                        crate::broker::github_config::load_gh_app_credentials().map_err(
-                            |load_err| self.file_error(BrokerProvider::Github, load_err),
-                        )?
+                        crate::broker::github_config::load_gh_app_credentials()
+                            .map_err(|load_err| self.file_error(BrokerProvider::Github, load_err))?
                     }
                 }
             }
@@ -738,6 +742,8 @@ async fn azure_store_configured_from_metadata(
         && (has("azure/client-secret") || has("azure/oidc-token-path")))
 }
 
+// allow(dead_code): broker authority-enrollment helper; no current caller but kept (auth-relevant, reversible).
+#[allow(dead_code)]
 pub(crate) fn local_store_authority_keys_from_metadata(
     keys: &[String],
 ) -> Result<Vec<String>, BrokerAuthorityError> {
@@ -1355,6 +1361,13 @@ fn issue_github_pat(
         token,
         expires_at,
         materialization_id,
+        // GitHub PAT authority path — echo capture is a follow-up.
+        // `Unwired` is the G3 variant for "this adapter has not
+        // wired echo capture yet" (design §D4 — distinct from anthropic's
+        // architectural-G3 `Opaque`). A future BKR-5
+        // follow-up that calls `GET /user` to enumerate scopes would
+        // upgrade this to `MintStamp::Permissions { bound }`.
+        mint_stamp: core_broker::MintStamp::Unwired,
     })
 }
 
@@ -1679,9 +1692,11 @@ mod tests {
 
     #[test]
     fn local_store_authority_keys_for_refs_includes_github_pat() {
-        let keys =
-            local_store_authority_keys_for_refs(&[GITHUB_PAT_STORE_KEY.to_string()], &["github".to_string()])
-                .unwrap();
+        let keys = local_store_authority_keys_for_refs(
+            &[GITHUB_PAT_STORE_KEY.to_string()],
+            &["github".to_string()],
+        )
+        .unwrap();
         assert_eq!(keys, vec![GITHUB_PAT_STORE_KEY.to_string()]);
     }
 

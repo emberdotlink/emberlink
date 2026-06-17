@@ -3,7 +3,7 @@
 //! by setting `status=inactive` via `PATCH /v1/organizations/api_keys/<id>`.
 //!
 //! Phase 2 of design + design. The trait shape is async-by-default
-//! (per `implementation-note-12`); the HTTP transport itself is `ureq`
+//! (per `implementation-note-15`); the HTTP transport itself is `ureq`
 //! (sync) — each `issue` / `revoke` call is wrapped so the future
 //! returned by the trait method completes once the blocking call returns.
 //! This is acceptable here because the daemon runs broker calls on a
@@ -22,7 +22,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokerUsage, BrokeredCredential,
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokerUsage, BrokeredCredential, MintStamp,
     UsagePeriod,
 };
 
@@ -318,6 +318,12 @@ impl Broker for AnthropicBroker {
             token: SecretString::from(parsed.api_key),
             expires_at,
             materialization_id: parsed.id,
+            // Anthropic is introspection-less (design G3): the workspace key
+            // yields no scope echo — enforcement is the proxy-mediated
+            // budget/ttl, not a checkable native scope. `MintStamp::Opaque`
+            // is the canonical encoding for "no attestation" (replaces the
+            // legacy `provider_scope_attestable = Some(false)` discriminator).
+            mint_stamp: MintStamp::Opaque,
         })
     }
 
@@ -537,6 +543,13 @@ mod tests {
             provider: BrokerProvider::Anthropic,
             scope: json!({ "name": name }),
             ttl: Duration::from_secs(900),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "unit test".to_string(),
             caller_persona: None,
             grants_file_rev: None,

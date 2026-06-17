@@ -1,10 +1,9 @@
-//! Image revocations flow — 60-second polling of `revocations/current.json`.
+//! Image revocations flow — 60-second polling of signed `revocations/current.json`.
 //!
 //! # image_revocations_flow
 //!
-//! Per update-policy D5, the daemon polls a
-//! `revocations/current.json` endpoint every 60 seconds and applies a
-//! severity-driven response:
+//! The daemon polls a `revocations/current.json` endpoint every 60 seconds and
+//! applies a severity-driven response:
 //!
 //! | Severity | Action |
 //! |---|---|
@@ -13,27 +12,43 @@
 //! | `medium` | log + warn (`Log`) |
 //! | `low` | log (`Log`) |
 //!
-//! ## Stale-document fail-closed
+//! ## Signature and stale-document fail-closed
 //!
-//! If the revocation document's `fetched_at` timestamp is older than 30
-//! minutes the poller returns `FailClosed { reason }` for all severities,
-//! regardless of the document's content. This ensures that a network
-//! partition or CDN failure causes the daemon to act conservatively rather
-//! than silently passing revoked images.
+//! The poller accepts only an in-toto signed revocation envelope verified
+//! against a trusted Ed25519 signer. Unsigned, wrong-key, malformed, or
+//! tampered inputs return a trust error before they can influence release
+//! posture. If the signed revocation document's `issued_at_unix_secs` timestamp
+//! is in the future, or older than 30 minutes, the poller returns a trust error
+//! before evaluating entries. This ensures that a clock-skewed or stale cached
+//! empty document cannot silently pass revoked images.
 //!
 //! ## Integration point
 //!
-//! `RevocationsPoller::new()` is cheap to construct. The daemon runtime
-//! creates one instance and calls `poll()` on each 60-second tick inside
-//! a `tokio::spawn` task (see `crates/ember-daemon/src/infra/runtime.rs`).
+//! `RevocationsPoller::new()` is cheap to construct, but intentionally has no
+//! trusted signing key and therefore fails closed. Owned callers must provide a
+//! pinned revocation signer with [`RevocationsPoller::with_trusted_signer`]
+//! before fetched bytes can affect release posture.
+// CLASSIFICATION: PUBLIC
 
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+use crate::in_toto::{self, EnvelopeError, InTotoStatementV1, SignedEnvelope, Subject};
 
 /// Maximum age of a fetched revocation document before it is treated as stale
 /// and triggers fail-closed behaviour for all severities.
 pub const STALE_DOC_THRESHOLD_SECS: u64 = 30 * 60; // 30 minutes
+
+/// Predicate type for signed image-revocation documents.
+pub const REVOCATION_PREDICATE_TYPE: &str = "https://emberlink.dev/predicate/revocations/v1";
+
+/// Bound subject name for the revocation stream. The subject is included in
+/// the in-toto signing payload so a valid signature over a different statement
+/// cannot be lifted into the release-safety revocation lane.
+pub const REVOCATION_SUBJECT_NAME: &str = "revocations/current.json";
 
 /// The severity of a revocation entry as declared in `revocations/current.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,8 +63,8 @@ pub enum RevocationSeverity {
 impl RevocationSeverity {
     /// Map this severity to the daemon action that should be taken.
     ///
-    /// The stale-doc path calls this after substituting every severity with
-    /// `FailClosed`, so this method is only reached for fresh documents.
+    /// The stale-doc path returns [`RevocationPollError::StaleDocument`] before
+    /// this method is reached, so this method only maps fresh signed documents.
     pub fn to_action(&self) -> RevocationAction {
         match self {
             RevocationSeverity::Critical => RevocationAction::IsolateDrainKill,
@@ -96,13 +111,38 @@ pub struct RevocationDocument {
     pub issued_at_unix_secs: u64,
 }
 
+/// Signed revocation document envelope accepted by [`RevocationsPoller`].
+pub type SignedRevocationDocument = SignedEnvelope<RevocationDocument>;
+
 /// Errors returned by [`RevocationsPoller::poll`].
 #[derive(Debug, Error)]
 pub enum RevocationPollError {
     #[error("revocation document is stale: age {age_secs}s > threshold {threshold_secs}s")]
     StaleDocument { age_secs: u64, threshold_secs: u64 },
-    #[error("failed to deserialize revocation document: {0}")]
+    #[error(
+        "signed revocation document is not yet valid: issued_at={issued_at_unix_secs}s > now={now_unix_secs}s"
+    )]
+    NotYetValid {
+        issued_at_unix_secs: u64,
+        now_unix_secs: u64,
+    },
+    #[error("failed to deserialize signed revocation document: {0}")]
     Deserialize(#[from] serde_json::Error),
+    #[error(
+        "revocations poller has no trusted revocation signer configured; refusing revocation input"
+    )]
+    TrustedSignerUnavailable,
+    #[error("signed revocation document failed verification: {0}")]
+    Signature(#[from] EnvelopeError),
+    #[error(
+        "signed revocation document predicate_type mismatch: expected '{expected}', got '{actual}'"
+    )]
+    PredicateTypeMismatch {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("signed revocation document subject mismatch: expected '{expected}'")]
+    SubjectMismatch { expected: &'static str },
     #[error("system clock error: {0}")]
     Clock(String),
 }
@@ -118,32 +158,53 @@ pub struct RevocationDecision {
 
 /// Polls `revocations/current.json` and returns per-entry [`RevocationDecision`]s.
 ///
-/// The poller is intentionally stateless — each call to [`poll`] operates on
-/// the document bytes passed in, making it straightforward to test without a
-/// live HTTP server. The daemon runtime owns the fetch transport and the
-/// 60-second tick interval.
+/// Each call to [`poll`] operates on the signed document bytes passed in,
+/// making it straightforward to test without a live HTTP server. The poller
+/// owns only the pinned revocation signer and stale threshold; the daemon
+/// runtime owns the fetch transport and the 60-second tick interval.
 ///
 /// [`poll`]: RevocationsPoller::poll
 pub struct RevocationsPoller {
     /// Maximum document age in seconds before fail-closed. Configurable for
     /// tests; production uses [`STALE_DOC_THRESHOLD_SECS`].
     pub stale_threshold_secs: u64,
+    trusted_signer: Option<VerifyingKey>,
 }
 
 impl RevocationsPoller {
-    /// Create a new poller with the default 30-minute stale threshold.
+    /// Create a fail-closed poller with the default 30-minute stale threshold.
+    ///
+    /// This constructor deliberately has no trusted signer. Until owned release
+    /// signing infrastructure supplies a pinned revocation key through
+    /// [`Self::with_trusted_signer`], every evaluation returns
+    /// [`RevocationPollError::TrustedSignerUnavailable`].
     pub fn new() -> Self {
         Self {
             stale_threshold_secs: STALE_DOC_THRESHOLD_SECS,
+            trusted_signer: None,
         }
     }
 
-    /// Parse and evaluate a raw revocation document.
+    /// Create a poller that verifies revocation envelopes with `trusted_signer`.
+    pub fn with_trusted_signer(trusted_signer: VerifyingKey) -> Self {
+        Self {
+            stale_threshold_secs: STALE_DOC_THRESHOLD_SECS,
+            trusted_signer: Some(trusted_signer),
+        }
+    }
+
+    /// Return whether this poller has a trusted revocation signer configured.
+    pub fn has_trusted_signer(&self) -> bool {
+        self.trusted_signer.is_some()
+    }
+
+    /// Parse, signature-verify, and evaluate a signed revocation document.
     ///
     /// Returns a `Vec` of [`RevocationDecision`]s — one per entry in the
-    /// document. If the document is stale, every entry maps to
-    /// [`RevocationAction::FailClosed`] regardless of severity. An empty
-    /// `revocations` list is valid and returns an empty `Vec`.
+    /// document. If the document is stale, evaluation returns
+    /// [`RevocationPollError::StaleDocument`] so even an empty stale document
+    /// cannot be treated as "no revocations". An empty fresh `revocations`
+    /// list is valid and returns an empty `Vec`.
     ///
     /// `now_unix_secs` is accepted as a parameter so callers (including tests)
     /// can inject a deterministic clock without patching global state.
@@ -152,25 +213,34 @@ impl RevocationsPoller {
         raw: &[u8],
         now_unix_secs: u64,
     ) -> Result<Vec<RevocationDecision>, RevocationPollError> {
-        let doc: RevocationDocument = serde_json::from_slice(raw)?;
+        let trusted_signer = self
+            .trusted_signer
+            .as_ref()
+            .ok_or(RevocationPollError::TrustedSignerUnavailable)?;
+        let signed: SignedRevocationDocument = serde_json::from_slice(raw)?;
+        verify_signed_revocation_document(&signed, trusted_signer)?;
+        let doc = signed.statement.predicate;
 
-        let age_secs = now_unix_secs.saturating_sub(doc.issued_at_unix_secs);
-        let is_stale = age_secs > self.stale_threshold_secs;
+        if doc.issued_at_unix_secs > now_unix_secs {
+            return Err(RevocationPollError::NotYetValid {
+                issued_at_unix_secs: doc.issued_at_unix_secs,
+                now_unix_secs,
+            });
+        }
+
+        let age_secs = now_unix_secs - doc.issued_at_unix_secs;
+        if age_secs > self.stale_threshold_secs {
+            return Err(RevocationPollError::StaleDocument {
+                age_secs,
+                threshold_secs: self.stale_threshold_secs,
+            });
+        }
 
         let decisions = doc
             .revocations
             .into_iter()
             .map(|entry| {
-                let action = if is_stale {
-                    RevocationAction::FailClosed {
-                        reason: format!(
-                            "revocation document stale: age {}s > threshold {}s",
-                            age_secs, self.stale_threshold_secs
-                        ),
-                    }
-                } else {
-                    entry.severity.to_action()
-                };
+                let action = entry.severity.to_action();
                 RevocationDecision { entry, action }
             })
             .collect();
@@ -192,6 +262,43 @@ impl RevocationsPoller {
     }
 }
 
+/// Build the expected subject for signed revocation documents.
+pub fn revocation_subject() -> Subject {
+    Subject {
+        name: REVOCATION_SUBJECT_NAME.to_string(),
+        digest: BTreeMap::new(),
+    }
+}
+
+/// Build an in-toto statement for a revocation document predicate.
+pub fn revocation_statement(doc: RevocationDocument) -> InTotoStatementV1<RevocationDocument> {
+    InTotoStatementV1::new(
+        vec![revocation_subject()],
+        REVOCATION_PREDICATE_TYPE.to_string(),
+        doc,
+    )
+}
+
+/// Verify a signed revocation document envelope against a pinned signer.
+pub fn verify_signed_revocation_document(
+    signed: &SignedRevocationDocument,
+    trusted_signer: &VerifyingKey,
+) -> Result<(), RevocationPollError> {
+    in_toto::verify(signed, trusted_signer)?;
+    if signed.statement.predicate_type != REVOCATION_PREDICATE_TYPE {
+        return Err(RevocationPollError::PredicateTypeMismatch {
+            expected: REVOCATION_PREDICATE_TYPE,
+            actual: signed.statement.predicate_type.clone(),
+        });
+    }
+    if signed.statement.subject != [revocation_subject()] {
+        return Err(RevocationPollError::SubjectMismatch {
+            expected: REVOCATION_SUBJECT_NAME,
+        });
+    }
+    Ok(())
+}
+
 impl Default for RevocationsPoller {
     fn default() -> Self {
         Self::new()
@@ -199,18 +306,13 @@ impl Default for RevocationsPoller {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// update-checkpoint — HTTP fetch surface.
+// HTTP fetch surface for revocation documents.
 //
-// implementation marker
-//
-// Replaces the `poll(&[])` stub at runtime.rs:2189 with a real fetch
-// path. Stateless fetcher; one instance per daemon runtime; reused
-// across 60s ticks for connection-pool warmth.
+// Stateless fetcher; one instance per daemon runtime; reused across 60s ticks
+// for connection-pool warmth.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Anchor — greppable marker confirming the HTTP fetch wiring is
-/// in place. Anchors the update-checkpoint
-/// stale-check at this line.
+/// Greppable marker confirming the HTTP fetch wiring is in place.
 pub const REVOCATIONS_HTTP_CLIENT_IMPLEMENTED: &str = "revocations_http_client_implemented";
 
 /// Default fetch timeout — long enough for a slow CDN edge, short
@@ -248,8 +350,8 @@ pub enum RevocationFetchError {
 /// `reqwest::Client` across 60s ticks for connection-pool warmth,
 /// and converts fetch failures to "skip the cycle, fail-closed".
 ///
-/// The parser ([`RevocationsPoller`]) remains stateless and sync —
-/// this struct owns the only async surface.
+/// The verifier/parser ([`RevocationsPoller`]) remains sync — this struct owns
+/// the only async surface.
 pub struct RevocationsFetcher {
     endpoint_url: String,
     timeout_secs: u64,
@@ -295,9 +397,9 @@ impl RevocationsFetcher {
         self.timeout_secs
     }
 
-    /// Fetch the current revocations document. Returns the raw bytes
-    /// on 2xx; classifies errors so the caller can distinguish
-    /// timeout (cycle skip) from status (endpoint misconfig).
+    /// Fetch the current signed revocations document envelope. Returns the raw
+    /// bytes on 2xx; classifies errors so the caller can distinguish timeout
+    /// (cycle skip) from status (endpoint misconfig).
     pub async fn fetch(&self) -> Result<Vec<u8>, RevocationFetchError> {
         let resp = self
             .client
@@ -330,37 +432,55 @@ impl RevocationsFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::in_toto;
+    use ed25519_dalek::SigningKey;
 
-    fn make_doc(severity: RevocationSeverity, issued_at_unix_secs: u64) -> Vec<u8> {
-        let doc = serde_json::json!({
-            "revocations": [
-                {
-                    "digest": "sha256:deadbeef",
-                    "severity": severity,
-                    "reason": "test revocation"
-                }
-            ],
-            "issued_at_unix_secs": issued_at_unix_secs
-        });
-        serde_json::to_vec(&doc).unwrap()
+    fn fixture_keys() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::from_bytes(&[77u8; 32]);
+        let vk = sk.verifying_key();
+        (sk, vk)
     }
 
-    fn make_empty_doc(issued_at_unix_secs: u64) -> Vec<u8> {
-        let doc = serde_json::json!({
-            "revocations": [],
-            "issued_at_unix_secs": issued_at_unix_secs
-        });
-        serde_json::to_vec(&doc).unwrap()
+    fn trusted_poller() -> (SigningKey, RevocationsPoller) {
+        let (sk, vk) = fixture_keys();
+        (sk, RevocationsPoller::with_trusted_signer(vk))
+    }
+
+    fn make_doc(severity: RevocationSeverity, issued_at_unix_secs: u64) -> RevocationDocument {
+        RevocationDocument {
+            revocations: vec![RevocationEntry {
+                digest: "sha256:deadbeef".to_string(),
+                severity,
+                reason: "test revocation".to_string(),
+            }],
+            issued_at_unix_secs,
+        }
+    }
+
+    fn make_empty_doc(issued_at_unix_secs: u64) -> RevocationDocument {
+        RevocationDocument {
+            revocations: Vec::new(),
+            issued_at_unix_secs,
+        }
+    }
+
+    fn sign_doc(doc: RevocationDocument, sk: &SigningKey) -> Vec<u8> {
+        let signed = in_toto::sign(revocation_statement(doc), sk).expect("sign revocation doc");
+        serde_json::to_vec(&signed).expect("serialize signed revocation doc")
+    }
+
+    fn unsigned_doc(doc: RevocationDocument) -> Vec<u8> {
+        serde_json::to_vec(&doc).expect("serialize unsigned revocation doc")
     }
 
     const BASE_TIME: u64 = 1_700_000_000; // arbitrary unix epoch seconds
 
     #[test]
     fn critical_revocation_maps_to_isolate_drain_kill() {
-        let poller = RevocationsPoller::new();
+        let (sk, poller) = trusted_poller();
         let issued_at = BASE_TIME;
         let now = BASE_TIME + 60; // 1 minute after issue — well within 30-minute threshold
-        let raw = make_doc(RevocationSeverity::Critical, issued_at);
+        let raw = sign_doc(make_doc(RevocationSeverity::Critical, issued_at), &sk);
 
         let decisions = poller.evaluate(&raw, now).expect("should not error");
         assert_eq!(decisions.len(), 1);
@@ -373,10 +493,10 @@ mod tests {
 
     #[test]
     fn high_revocation_maps_to_drain_to_ttl() {
-        let poller = RevocationsPoller::new();
+        let (sk, poller) = trusted_poller();
         let issued_at = BASE_TIME;
         let now = BASE_TIME + 60;
-        let raw = make_doc(RevocationSeverity::High, issued_at);
+        let raw = sign_doc(make_doc(RevocationSeverity::High, issued_at), &sk);
 
         let decisions = poller.evaluate(&raw, now).unwrap();
         assert_eq!(decisions.len(), 1);
@@ -385,10 +505,10 @@ mod tests {
 
     #[test]
     fn medium_revocation_maps_to_log() {
-        let poller = RevocationsPoller::new();
+        let (sk, poller) = trusted_poller();
         let issued_at = BASE_TIME;
         let now = BASE_TIME + 60;
-        let raw = make_doc(RevocationSeverity::Medium, issued_at);
+        let raw = sign_doc(make_doc(RevocationSeverity::Medium, issued_at), &sk);
 
         let decisions = poller.evaluate(&raw, now).unwrap();
         assert_eq!(decisions.len(), 1);
@@ -397,10 +517,10 @@ mod tests {
 
     #[test]
     fn low_revocation_maps_to_log() {
-        let poller = RevocationsPoller::new();
+        let (sk, poller) = trusted_poller();
         let issued_at = BASE_TIME;
         let now = BASE_TIME + 60;
-        let raw = make_doc(RevocationSeverity::Low, issued_at);
+        let raw = sign_doc(make_doc(RevocationSeverity::Low, issued_at), &sk);
 
         let decisions = poller.evaluate(&raw, now).unwrap();
         assert_eq!(decisions.len(), 1);
@@ -408,25 +528,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_doc_returns_fail_closed_for_critical() {
-        let poller = RevocationsPoller::new();
+    fn stale_doc_returns_stale_error_for_critical() {
+        let (sk, poller) = trusted_poller();
         let issued_at = BASE_TIME;
         // now = issued_at + 31 minutes → stale (threshold is 30 min)
         let now = BASE_TIME + 31 * 60;
-        let raw = make_doc(RevocationSeverity::Critical, issued_at);
+        let raw = sign_doc(make_doc(RevocationSeverity::Critical, issued_at), &sk);
 
-        let decisions = poller.evaluate(&raw, now).unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert!(
-            matches!(&decisions[0].action, RevocationAction::FailClosed { .. }),
-            "stale document must produce FailClosed for critical, got {:?}",
-            decisions[0].action
-        );
+        let err = poller.evaluate(&raw, now).unwrap_err();
+        assert!(matches!(err, RevocationPollError::StaleDocument { .. }));
     }
 
     #[test]
-    fn stale_doc_returns_fail_closed_for_all_severities() {
-        let poller = RevocationsPoller::new();
+    fn stale_doc_returns_stale_error_for_all_severities() {
+        let (sk, poller) = trusted_poller();
         // Document issued 35 minutes ago — exceeds 30-minute threshold.
         let issued_at = BASE_TIME;
         let now = BASE_TIME + 35 * 60;
@@ -437,25 +552,24 @@ mod tests {
             RevocationSeverity::Medium,
             RevocationSeverity::Low,
         ] {
-            let raw = make_doc(severity.clone(), issued_at);
-            let decisions = poller.evaluate(&raw, now).unwrap();
-            assert_eq!(decisions.len(), 1);
+            let raw = sign_doc(make_doc(severity.clone(), issued_at), &sk);
+            let err = poller.evaluate(&raw, now).unwrap_err();
             assert!(
-                matches!(&decisions[0].action, RevocationAction::FailClosed { .. }),
-                "stale document must FailClosed for {:?}, got {:?}",
+                matches!(err, RevocationPollError::StaleDocument { .. }),
+                "stale document must fail closed for {:?}, got {:?}",
                 severity,
-                decisions[0].action
+                err
             );
         }
     }
 
     #[test]
     fn fresh_doc_exactly_at_threshold_is_not_stale() {
-        let poller = RevocationsPoller::new();
+        let (sk, poller) = trusted_poller();
         let issued_at = BASE_TIME;
         // Exactly at 30 minutes — age == threshold, not stale (> not >=)
         let now = BASE_TIME + 30 * 60;
-        let raw = make_doc(RevocationSeverity::Critical, issued_at);
+        let raw = sign_doc(make_doc(RevocationSeverity::Critical, issued_at), &sk);
 
         let decisions = poller.evaluate(&raw, now).unwrap();
         assert_eq!(decisions.len(), 1);
@@ -468,8 +582,8 @@ mod tests {
 
     #[test]
     fn empty_revocations_list_returns_empty_decisions() {
-        let poller = RevocationsPoller::new();
-        let raw = make_empty_doc(BASE_TIME);
+        let (sk, poller) = trusted_poller();
+        let raw = sign_doc(make_empty_doc(BASE_TIME), &sk);
         let now = BASE_TIME + 60;
 
         let decisions = poller.evaluate(&raw, now).unwrap();
@@ -480,8 +594,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_empty_revocations_list_fails_closed() {
+        let (sk, poller) = trusted_poller();
+        let raw = sign_doc(make_empty_doc(BASE_TIME), &sk);
+        let now = BASE_TIME + 31 * 60;
+
+        let err = poller.evaluate(&raw, now).unwrap_err();
+        assert!(
+            matches!(err, RevocationPollError::StaleDocument { .. }),
+            "stale empty revocation doc must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn future_dated_revocations_list_fails_closed() {
+        let (sk, poller) = trusted_poller();
+        let raw = sign_doc(make_empty_doc(BASE_TIME + 60), &sk);
+
+        let err = poller.evaluate(&raw, BASE_TIME).unwrap_err();
+        assert!(
+            matches!(err, RevocationPollError::NotYetValid { .. }),
+            "future-dated signed revocation doc must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
     fn deserialize_error_on_malformed_json() {
-        let poller = RevocationsPoller::new();
+        let (_sk, poller) = trusted_poller();
         let raw = b"not valid json";
         let now = BASE_TIME + 60;
 
@@ -490,5 +629,78 @@ mod tests {
             matches!(result, Err(RevocationPollError::Deserialize(_))),
             "malformed json must return Deserialize error"
         );
+    }
+
+    #[test]
+    fn unsigned_revocation_document_is_refused() {
+        let (_sk, poller) = trusted_poller();
+        let raw = unsigned_doc(make_empty_doc(BASE_TIME));
+
+        let err = poller.evaluate(&raw, BASE_TIME + 60).unwrap_err();
+        assert!(
+            matches!(err, RevocationPollError::Deserialize(_)),
+            "bare unsigned revocation JSON must not be trusted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_poller_refuses_without_trusted_signer() {
+        let (sk, _trusted) = trusted_poller();
+        let raw = sign_doc(make_empty_doc(BASE_TIME), &sk);
+        let poller = RevocationsPoller::new();
+
+        let err = poller.evaluate(&raw, BASE_TIME + 60).unwrap_err();
+        assert!(matches!(err, RevocationPollError::TrustedSignerUnavailable));
+    }
+
+    #[test]
+    fn tampered_signed_revocation_document_is_refused() {
+        let (sk, poller) = trusted_poller();
+        let raw = sign_doc(make_doc(RevocationSeverity::Critical, BASE_TIME), &sk);
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["statement"]["predicate"]["revocations"][0]["severity"] =
+            serde_json::Value::String("low".to_string());
+        let tampered = serde_json::to_vec(&value).unwrap();
+
+        let err = poller.evaluate(&tampered, BASE_TIME + 60).unwrap_err();
+        assert!(
+            matches!(err, RevocationPollError::Signature(_)),
+            "tampered signed revocation JSON must fail signature verification, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_predicate_type_is_refused() {
+        let (sk, poller) = trusted_poller();
+        let statement = InTotoStatementV1::new(
+            vec![revocation_subject()],
+            "https://example.invalid/wrong-predicate".to_string(),
+            make_empty_doc(BASE_TIME),
+        );
+        let signed = in_toto::sign(statement, &sk).unwrap();
+        let raw = serde_json::to_vec(&signed).unwrap();
+
+        let err = poller.evaluate(&raw, BASE_TIME + 60).unwrap_err();
+        assert!(matches!(
+            err,
+            RevocationPollError::PredicateTypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn extra_subject_is_refused() {
+        let (sk, poller) = trusted_poller();
+        let mut subject = revocation_subject();
+        subject.name = "other.json".to_string();
+        let statement = InTotoStatementV1::new(
+            vec![revocation_subject(), subject],
+            REVOCATION_PREDICATE_TYPE.to_string(),
+            make_empty_doc(BASE_TIME),
+        );
+        let signed = in_toto::sign(statement, &sk).unwrap();
+        let raw = serde_json::to_vec(&signed).unwrap();
+
+        let err = poller.evaluate(&raw, BASE_TIME + 60).unwrap_err();
+        assert!(matches!(err, RevocationPollError::SubjectMismatch { .. }));
     }
 }

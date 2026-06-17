@@ -1,10 +1,6 @@
+// CLASSIFICATION: PUBLIC
 
-//! Daemon-side client for the spawn-helper sibling daemon (design
-//! Components 2 + 3 + MACOS-PRIMITIVES Decision 5).
-//!
-//! implementation-note-186
-//! implementation-note-187
-//! implementation-note-188
+//! Daemon-side client for the root-privileged spawn-helper sibling daemon.
 //!
 //! ## Architecture
 //!
@@ -24,8 +20,8 @@
 //! - **Hardened Linux** (`unprivileged_userns_clone=0`): routes
 //!   through `/var/run/emberd-spawn-helper.sock`.
 //! - **macOS**: routes through `/var/run/emberd-spawn-helper.sock`.
-//!   The helper itself `posix_spawn`s `emberd-spawn-shim` per
-//!   MACOS-PRIMITIVES Decision 5.
+//!   The helper itself `posix_spawn`s `emberd-spawn-shim` so sandbox setup
+//!   happens after a clean exec boundary.
 //!
 //! [`should_use_spawn_helper`] reads the kernel sysctl on Linux at
 //! process start, caches the answer, and returns true only on
@@ -66,10 +62,9 @@ pub enum SpawnHelperError {
         reason: String,
         detail: Option<String>,
     },
-    /// MACOS-PRIMITIVES Decision 5: the helper's on-disk shim hash
-    /// did not match `EXPECTED_SHIM_HASH`. Surfaced as a typed variant
-    /// so the daemon's RPC layer can map it to a distinct error code
-    /// vs a generic refusal.
+    /// The helper's on-disk shim hash did not match `EXPECTED_SHIM_HASH`.
+    /// Surfaced as a typed variant so the daemon's RPC layer can map it to a
+    /// distinct error code vs a generic refusal.
     #[error("shim hash mismatch (helper refused to invoke shim): {detail:?}")]
     ShimHashMismatch { detail: Option<String> },
     #[error("hash mismatch: expected {expected} actual {actual}")]
@@ -165,7 +160,11 @@ pub use ember_spawn_helper::DEFAULT_SOCKET_PATH as SOCKET_PATH;
 /// Connect to the spawn-helper UDS, send one directive, and await the
 /// terminal reply.
 ///
-/// On success returns the child's exit code. On `HashMismatch`,
+/// On success returns `(exit_code, stdout_tail, stderr_tail)` — the
+/// helper drains the child's output and carries the (capped) tails in
+/// the `Exit` frame so headless brokered commands surface their output
+/// even with no PTY bridge. A pre-capture helper omits the tail fields
+/// and they decode as empty strings (serde default). On `HashMismatch`,
 /// `Refused`, or transport error, returns the corresponding typed
 /// [`SpawnHelperError`] so the caller can map to the right JSON-RPC
 /// error code:
@@ -186,7 +185,7 @@ pub async fn send_spawn_directive(
     socket: &Path,
     directive: SpawnDirective,
     timeout: Option<Duration>,
-) -> Result<i32, SpawnHelperError> {
+) -> Result<(i32, String, String), SpawnHelperError> {
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|e| SpawnHelperError::Connect {
@@ -206,7 +205,12 @@ pub async fn send_spawn_directive(
     };
 
     match frame {
-        HelperFrame::Exit { code, .. } => Ok(code),
+        HelperFrame::Exit {
+            code,
+            stdout_tail,
+            stderr_tail,
+            ..
+        } => Ok((code, stdout_tail, stderr_tail)),
         HelperFrame::HashMismatch { expected, actual } => {
             Err(SpawnHelperError::HashMismatch { expected, actual })
         }
@@ -227,7 +231,7 @@ pub async fn send_spawn_directive(
     _socket: &Path,
     _directive: SpawnDirective,
     _timeout: Option<Duration>,
-) -> Result<i32, SpawnHelperError> {
+) -> Result<(i32, String, String), SpawnHelperError> {
     Err(SpawnHelperError::UnsupportedPlatform)
 }
 
@@ -296,16 +300,56 @@ mod tests {
                 &HelperFrame::Exit {
                     code: 0,
                     invocation_id: None,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
                 },
             )
             .await
             .unwrap();
         });
 
-        let exit = send_spawn_directive(&socket, sample_directive(), Some(Duration::from_secs(5)))
-            .await
-            .expect("happy path");
+        let (exit, _out, _err) =
+            send_spawn_directive(&socket, sample_directive(), Some(Duration::from_secs(5)))
+                .await
+                .expect("happy path");
         assert_eq!(exit, 0);
+        mock.await.unwrap();
+    }
+
+    /// T1 — the helper's captured output tails are threaded back to the
+    /// caller so headless brokered commands surface their stdout/stderr.
+    #[tokio::test]
+    async fn send_spawn_directive_returns_output_tails() {
+        let dir = tempfile::Builder::new()
+            .prefix("spawn-helper-client-t-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("h.sock");
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = read_frame(&mut s).await.unwrap().unwrap();
+            write_frame(
+                &mut s,
+                &HelperFrame::Exit {
+                    code: 0,
+                    invocation_id: Some("01HXAMPLE".to_string()),
+                    stdout_tail: "#1\topen\tfix: thing\n".to_string(),
+                    stderr_tail: "warning: rate limited\n".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let (exit, out, err) =
+            send_spawn_directive(&socket, sample_directive(), Some(Duration::from_secs(5)))
+                .await
+                .expect("happy path");
+        assert_eq!(exit, 0);
+        assert_eq!(out, "#1\topen\tfix: thing\n");
+        assert_eq!(err, "warning: rate limited\n");
         mock.await.unwrap();
     }
 

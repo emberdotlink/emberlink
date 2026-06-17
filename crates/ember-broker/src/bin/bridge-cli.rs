@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! `bridge-cli` — mTLS bridge management CLI.
 //!

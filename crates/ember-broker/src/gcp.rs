@@ -67,7 +67,15 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
+// Shared native scope (`GcpNativeScope`) re-exported here as `GcpScope` so
+// the broker and the daemon's I7 clamp path (`broker_resolve` →
+// `identity_upper_bound`) speak ONE typed wire shape; implementation-note-16
+// (mirrors the AWS STS `pub use core_broker::project::{AwsStsMode, AwsStsScope};`
+// shape from prior change). The projector and broker can no longer drift.
+pub use core_broker::GcpNativeScope as GcpScope;
+use core_broker::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, IdentityRef, MintStamp,
+};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -146,35 +154,12 @@ pub struct GcpServiceAccountKey {
     pub auth_method: GcpAuthMethod,
 }
 
-/// Provider-specific scope payload for the GCP broker.
-///
-/// Deserialized from the opaque `BrokerRequest::scope`
-/// (`serde_json::Value`) inside `issue()`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GcpScope {
-    /// Email of the service account to impersonate. The broker's
-    /// long-lived SA must have `roles/iam.serviceAccountTokenCreator`
-    /// on this target SA for the impersonation to succeed.
-    pub target_service_account: String,
-
-    /// OAuth scopes to attach to the impersonated access token.
-    /// Example: `["https://www.googleapis.com/auth/cloud-platform"]`.
-    pub scopes: Vec<String>,
-
-    /// Requested credential lifetime. The IAM Credentials API caps
-    /// `generateAccessToken` lifetimes at 3600s by default
-    /// (12h with org-policy override). We pass the value through and
-    /// let the API clamp.
-    pub ttl_seconds: u64,
-
-    /// Optional impersonation delegation chain — each element is a
-    /// service-account email between the broker SA and
-    /// `target_service_account` that further intermediates the
-    /// impersonation. Empty for direct impersonation, which is the
-    /// typical case.
-    #[serde(default)]
-    pub delegates: Vec<String>,
-}
+// `GcpScope` lives in `core-broker` as `GcpNativeScope` (re-exported above
+// as `GcpScope` for backward compatibility with the broker's existing
+// callsites + tests). The shared definition lets the projector
+// (`core_broker::gcp::GcpProjector::native_upper_bound`) and the broker
+// here speak one typed wire shape — daemon's I7 clamp re-parses the same
+// JSON the broker minted from. implementation-note-16.
 
 /// Minimal HTTP client trait so tests inject a mock without spinning up
 /// a real TLS stack or hitting `oauth2.googleapis.com` /
@@ -406,6 +391,12 @@ impl GcpBroker {
             token: token_secret,
             expires_at,
             materialization_id,
+            mint_stamp: MintStamp::Identity {
+                identity: IdentityRef {
+                    provider: BrokerProvider::Gcp,
+                    identity: self.key.client_email.clone(),
+                },
+            },
         })
     }
 }
@@ -607,10 +598,21 @@ async fn gcp_workload_identity_exchange(
         },
     );
 
+    let mint_stamp = match service_account_email {
+        Some(sa) => MintStamp::Identity {
+            identity: IdentityRef {
+                provider: BrokerProvider::Gcp,
+                identity: sa.to_string(),
+            },
+        },
+        None => MintStamp::Opaque,
+    };
+
     Ok(BrokeredCredential {
         token: token_secret,
         expires_at,
         materialization_id,
+        mint_stamp,
     })
 }
 
@@ -680,6 +682,7 @@ pub fn build_gcp_jwt(
         // Space-separated scope list per RFC 6749.
         scope: scopes.join(" "),
     };
+    crate::install_jwt_crypto_provider();
     let header = Header::new(Algorithm::RS256);
     let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
         .map_err(|e| BrokerError::Other(format!("jwt key parse: {e}")))?;
@@ -1104,6 +1107,13 @@ mod tests {
             provider: BrokerProvider::Gcp,
             scope,
             ttl: Duration::from_secs(ttl_secs),
+            contract_id: None,
+            action_ref: None,
+            workspace_ref: None,
+            subject_ref: None,
+            coordination_ref: None,
+            caller_ref: None,
+            authority_ref: None,
             reason: "test".to_string(),
             caller_persona: None,
             grants_file_rev: None,
@@ -1477,7 +1487,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Workload Identity Federation tests — implementation-note-81
+    // Workload Identity Federation tests — implementation-note-91
     // ---------------------------------------------------------------
 
     #[test]
@@ -1797,6 +1807,97 @@ mod tests {
         assert_eq!(
             form_calls[0], "https://oauth2.googleapis.com/token",
             "SA-key path must POST to oauth2.googleapis.com, not sts.googleapis.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_sa_key_mint_stamp_records_service_account_identity() {
+        let mock = Arc::new(
+            MockGcpClient::new()
+                .with_form(200, oauth_ok_body())
+                .with_json(200, impersonate_ok_body()),
+        );
+        let broker = GcpBroker::with_client(fixture_key(), None, mock);
+        let req = gcp_request(
+            serde_json::json!({
+                "target_service_account": "deployer@target-proj.iam.gserviceaccount.com",
+                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                "ttl_seconds": 3600,
+                "delegates": [],
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        match &cred.mint_stamp {
+            MintStamp::Identity { identity } => {
+                assert_eq!(identity.provider, BrokerProvider::Gcp);
+                assert_eq!(
+                    identity.identity, "ember-broker@test-project.iam.gserviceaccount.com",
+                    "SA-key path stamps the broker's own client_email, not the impersonation target"
+                );
+            }
+            other => panic!("expected MintStamp::Identity for SA-key path, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_wif_with_impersonation_mint_stamp_records_sa_identity() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let oidc_path = write_oidc_token(tmp.path(), fake_oidc_jwt());
+        let sa = "deployer@target.iam.gserviceaccount.com";
+        let key = fixture_key_wif(oidc_path, FIXTURE_AUDIENCE, Some(sa.to_string()));
+        let mock = Arc::new(
+            MockGcpClient::new()
+                .with_form(200, sts_ok_body())
+                .with_json(200, impersonate_ok_body()),
+        );
+        let broker = GcpBroker::with_client(key, None, mock);
+        let req = gcp_request(
+            serde_json::json!({
+                "target_service_account": "",
+                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                "ttl_seconds": 3600,
+                "delegates": [],
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        match &cred.mint_stamp {
+            MintStamp::Identity { identity } => {
+                assert_eq!(identity.provider, BrokerProvider::Gcp);
+                assert_eq!(identity.identity, sa);
+            }
+            other => panic!("expected MintStamp::Identity for WIF+impersonation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_wif_without_impersonation_mint_stamp_is_opaque() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let oidc_path = write_oidc_token(tmp.path(), fake_oidc_jwt());
+        let key = fixture_key_wif(oidc_path, FIXTURE_AUDIENCE, None);
+        let mock = Arc::new(MockGcpClient::new().with_form(200, sts_ok_body()));
+        let broker = GcpBroker::with_client(key, None, mock);
+        let req = gcp_request(
+            serde_json::json!({
+                "target_service_account": "",
+                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                "ttl_seconds": 3600,
+                "delegates": [],
+            }),
+            3600,
+        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        assert!(
+            matches!(cred.mint_stamp, MintStamp::Opaque),
+            "WIF without impersonation should be Opaque, got {:?}",
+            cred.mint_stamp
         );
     }
 }

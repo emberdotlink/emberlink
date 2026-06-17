@@ -1,135 +1,227 @@
 # CLASSIFICATION: PUBLIC
-# Construct manifest for ember-terraform per design §2.
-#
-# Action schema: each [[actions]] declares an allowed action_key, optional
-# budget caps, biometric requirement, and a permit/deny default. The daemon's
-# broker.resolve consults this to decide whether the action requires a
-# credential mint, an existing grant, or refuses.
-#
-# Credential injection: NONE at the Construct level. Terraform is a state-
-# management CLI that consumes existing cloud-provider credentials (AWS /
-# GCP / Azure / etc.) via standard provider env vars. The credential broker
-# lives in the cloud-provider Constructs (`ember-aws`, `ember-az`,
-# `ember-gcloud`, etc.); this Construct only gates destructive state
-# operations. Cloud creds flow through whatever child invocation the Terraform
-# providers make.
-#
-# Read-only verbs (`plan`, `validate`, `show`, `state list`, `state show`,
-# `output`, `version`, `providers`, `init`, `fmt`, `console`) classify to
-# `None` (passthrough) and never reach this manifest.
+# Construct manifest for ember-terraform per design.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
 
 [meta]
 name = "ember-terraform"
-version = "0.1.0"
+plugin_address = "registry.ember.systems/ember-systems/ember-terraform"
+plugin_version = "0.1.0"
 publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Terraform CLI Construct"
 description = "HashiCorp Terraform CLI Construct (sister to ember-tofu). Mediates `terraform` state mutations through ember's broker: `terraform destroy` (catastrophic — tears down everything), `terraform force-unlock` (manual lock override), `terraform state {rm, replace-provider, push}` (direct state mutation), and `terraform workspace delete` (workspace-scoped destruction) all require biometric approval. `terraform apply` gates without biometric — apply is the normal operational path and the destructive subset is constrained by what the underlying providers allow (gated by ember-aws / ember-az / ember-gcloud separately). `terraform taint` / `terraform untaint` / `terraform refresh` / `terraform import` / `terraform workspace {new, select}` / `terraform state mv` are gated. NO credential injection at this layer — cloud creds flow through the provider Constructs."
 
-# Default policy for unlisted action keys.
-default = "deny"
+[defaults]
+materialization_class = "none"
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
 
-# --- top-level mutating verbs ---
+[runtime.cli]
+wrapped_binary = "terraform"
 
-# terraform apply: normal operational path. Gate without biometric — the
-# destructive subset of any apply is constrained by what the underlying
-# providers allow, which the cloud-provider Constructs (ember-aws, ember-az,
-# ember-gcloud, etc.) gate separately.
 [[actions]]
 key = "terraform.apply"
+action_version = "v1"
+summary = "Run terraform.apply"
+input_schema = { kind = "argv", classifier = "apply *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.apply"
+semantic_labels = ["terraform.apply"]
 
-# terraform destroy: catastrophic — tears down every managed resource.
-# Biometric required.
 [[actions]]
 key = "terraform.destroy"
+action_version = "v1"
+summary = "Run terraform.destroy"
+input_schema = { kind = "argv", classifier = "destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.destroy"
+semantic_labels = ["terraform.destroy"]
 
-# terraform import: mutates state to reflect an existing resource. Gated.
 [[actions]]
 key = "terraform.import"
+action_version = "v1"
+summary = "Run terraform.import"
+input_schema = { kind = "argv", classifier = "import *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.import"
+semantic_labels = ["terraform.import"]
 
-# terraform taint / untaint: marks resources for replacement on next apply.
-# Gated (state-mutating; not catastrophic on its own).
 [[actions]]
 key = "terraform.taint"
+action_version = "v1"
+summary = "Run terraform.taint"
+input_schema = { kind = "argv", classifier = "taint *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.taint"
+semantic_labels = ["terraform.taint"]
 
 [[actions]]
 key = "terraform.untaint"
+action_version = "v1"
+summary = "Run terraform.untaint"
+input_schema = { kind = "argv", classifier = "untaint *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.untaint"
+semantic_labels = ["terraform.untaint"]
 
-# terraform refresh: state refresh — touches state file but does not change
-# infrastructure. Gated.
 [[actions]]
 key = "terraform.refresh"
+action_version = "v1"
+summary = "Run terraform.refresh"
+input_schema = { kind = "argv", classifier = "refresh *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.refresh"
+semantic_labels = ["terraform.refresh"]
 
-# terraform force-unlock: manual state-lock override. Risky — bypasses the
-# concurrency safeguard. Biometric required.
 [[actions]]
 key = "terraform.force-unlock"
+action_version = "v1"
+summary = "Run terraform.force-unlock"
+input_schema = { kind = "argv", classifier = "force-unlock *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.force-unlock"
+semantic_labels = ["terraform.force-unlock"]
 
-# --- state subcommand (3-level prefix) ---
-
-# terraform state rm: direct removal of resources from state. Resources
-# persist in cloud (orphaned). Biometric required.
 [[actions]]
 key = "terraform.state.rm"
+action_version = "v1"
+summary = "Run terraform.state.rm"
+input_schema = { kind = "argv", classifier = "state rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.rm"
+semantic_labels = ["terraform.state.rm"]
 
-# terraform state mv: rename / re-address resources within state. Gated
-# (reversible by another mv).
 [[actions]]
 key = "terraform.state.mv"
+action_version = "v1"
+summary = "Run terraform.state.mv"
+input_schema = { kind = "argv", classifier = "state mv *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.mv"
+semantic_labels = ["terraform.state.mv"]
 
-# terraform state replace-provider: rewrites provider references across
-# state. Catastrophic if the wrong source/target — biometric required.
 [[actions]]
 key = "terraform.state.replace-provider"
+action_version = "v1"
+summary = "Run terraform.state.replace-provider"
+input_schema = { kind = "argv", classifier = "state replace-provider *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.replace-provider"
+semantic_labels = ["terraform.state.replace-provider"]
 
-# terraform state push: overwrites remote state with a local file. High-
-# risk — biometric required.
 [[actions]]
 key = "terraform.state.push"
+action_version = "v1"
+summary = "Run terraform.state.push"
+input_schema = { kind = "argv", classifier = "state push *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.push"
+semantic_labels = ["terraform.state.push"]
 
-# --- workspace subcommand (3-level prefix) ---
-
-# terraform workspace new: creates a new workspace. Gated.
 [[actions]]
 key = "terraform.workspace.new"
+action_version = "v1"
+summary = "Run terraform.workspace.new"
+input_schema = { kind = "argv", classifier = "workspace new *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.workspace.new"
+semantic_labels = ["terraform.workspace.new"]
 
-# terraform workspace select: switches active workspace. Gated.
 [[actions]]
 key = "terraform.workspace.select"
+action_version = "v1"
+summary = "Run terraform.workspace.select"
+input_schema = { kind = "argv", classifier = "workspace select *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.workspace.select"
+semantic_labels = ["terraform.workspace.select"]
 
-# terraform workspace delete: workspace-scoped destruction (deletes the
-# state for that workspace). Biometric required.
 [[actions]]
 key = "terraform.workspace.delete"
+action_version = "v1"
+summary = "Run terraform.workspace.delete"
+input_schema = { kind = "argv", classifier = "workspace delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
 default = "permit"
 mode = "gate"
 biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.workspace.delete"
+semantic_labels = ["terraform.workspace.delete"]

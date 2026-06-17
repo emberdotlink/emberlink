@@ -8,8 +8,21 @@ use std::time::Duration;
 
 const MOCK_SESSION_ID: &str = "sess_isolated_cli_smoke_001";
 const MOCK_GRANT_ID: &str = "grt_isolated_cli_smoke_001";
+const MOCK_ATTACHMENT_ID: &str = "att_isolated_cli_smoke_001";
+const MOCK_ATTACHMENT_ENDPOINT_TOKEN: &str = "ep_isolated_cli_smoke_001";
 const MOCK_PROXY_URL: &str = "http://127.0.0.1:19484";
+const MOCK_ANTHROPIC_HEADERS: &str = "X-Ember-Credential: anthropic/oauth-token\nX-Ember-Target: https://api.anthropic.com\nX-Ember-Attachment-Id: att_isolated_cli_smoke_001\nX-Ember-Endpoint-Token: ep_isolated_cli_smoke_001";
 const MOCK_PRESENCE_TOKEN_JSON: &str = r#"{"uid":501,"scope":"class:session-runtime","expiry":{"secs_since_epoch":1779507461,"nanos_since_epoch":807776000},"signature":[1,2,3]}"#;
+const MOCK_BRIDGE_CLIENT_CERT_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nmock-client-cert\n-----END CERTIFICATE-----\n";
+const MOCK_BRIDGE_CLIENT_KEY_PEM: &str = concat!(
+    "-----BEGIN ",
+    "PRIVATE KEY-----\nmock-client-key\n",
+    "-----END ",
+    "PRIVATE KEY-----\n"
+);
+const MOCK_BRIDGE_CA_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----\n";
 
 static ISOLATED_SMOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -32,7 +45,10 @@ fn isolated_session_run_root(home: &Path) -> PathBuf {
             .join("emberlink")
             .join("session-open")
     } else {
-        home.join(".local").join("share").join("emberlink").join("session-open")
+        home.join(".local")
+            .join("share")
+            .join("emberlink")
+            .join("session-open")
     }
 }
 
@@ -46,8 +62,12 @@ fn assert_standalone_worker_compose_contract(compose: &str) {
         "standalone worker compose must omit orchestrator service: {compose}"
     );
     assert!(
-        !compose.contains("EMBER_BRIDGE_URL"),
-        "standalone worker compose must not inject bridge env: {compose}"
+        compose.contains("EMBER_BRIDGE_URL: \"https://host.docker.internal:4243\""),
+        "standalone worker compose must inject the host bridge endpoint: {compose}"
+    );
+    assert!(
+        compose.contains("target: /run/ember"),
+        "standalone worker compose must mount the bridge client bundle at /run/ember: {compose}"
     );
     assert!(
         compose.contains("- \"tail -f /dev/null\""),
@@ -109,15 +129,33 @@ fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
 
             let method = req["method"].as_str().unwrap_or("");
             let resp = match method {
-                "register_session" => serde_json::json!({
-                    "id": req["id"],
-                    "result": {
+                "register_session" => {
+                    let mut result = serde_json::json!({
                         "session_id": MOCK_SESSION_ID,
                         "grant_id": MOCK_GRANT_ID,
+                        "attachment_id": MOCK_ATTACHMENT_ID,
+                        "attachment_endpoint_token": MOCK_ATTACHMENT_ENDPOINT_TOKEN,
                         "proxy_url": MOCK_PROXY_URL,
+                        "anthropic_base_url": MOCK_PROXY_URL,
+                        "anthropic_custom_headers": MOCK_ANTHROPIC_HEADERS,
                         "presence_token": mock_presence_token_value(),
+                    });
+                    if req["params"]["bridge_client_bundle"]
+                        .as_bool()
+                        .unwrap_or(false)
+                    {
+                        result["bridge_client_bundle"] = serde_json::json!({
+                            "port": 4243,
+                            "client_cert_pem": MOCK_BRIDGE_CLIENT_CERT_PEM,
+                            "client_key_pem": MOCK_BRIDGE_CLIENT_KEY_PEM,
+                            "ca_cert_pem": MOCK_BRIDGE_CA_PEM,
+                        });
                     }
-                }),
+                    serde_json::json!({
+                        "id": req["id"],
+                        "result": result
+                    })
+                }
                 "close_session" => {
                     assert_eq!(
                         req["params"]["session_id"].as_str().unwrap_or(""),
@@ -201,7 +239,7 @@ fn write_default_home_config(home_dir: &Path) {
 
     std::fs::create_dir_all(&ember_dir).expect("create ~/.ember");
     let cfg = format!(
-        "[daemon]\ndata_dir = \"{}\"\nsocket_dir = \"{}\"\npid_file = \"{}\"\npolicy_file = \"{}\"\nlog_level = \"info\"\n",
+        "[daemon]\ndata_dir = \"{}\"\nsocket_dir = \"{}\"\npid_file = \"{}\"\npolicy_file = \"{}\"\nlog_level = \"info\"\nbridge_bind = \"127.0.0.1:4243\"\n\n[keyring]\nservice = \"ember-daemon-test\"\naccount = \"vault\"\n",
         data_dir.display(),
         socket_dir.display(),
         pid_file.display(),
@@ -224,6 +262,8 @@ fn ember_cli_binary_claude_isolated_uses_standalone_worker_handoff() {
     write_default_home_config(&home_dir);
 
     let docker_log = install_fake_docker(&fake_bin_dir, 23);
+    write_executable(&fake_bin_dir.join("gh"), "#!/bin/sh\nexit 0\n");
+    write_executable(&fake_bin_dir.join("git"), "#!/bin/sh\nexit 0\n");
     let socket_path = home_dir.join(".ember").join("run").join("daemon.sock");
     std::fs::create_dir_all(socket_path.parent().expect("socket parent"))
         .expect("create socket dir");
@@ -235,15 +275,20 @@ fn ember_cli_binary_claude_isolated_uses_standalone_worker_handoff() {
         .arg("--isolated")
         .arg("--preset")
         .arg("dev")
+        .arg("--delegated")
+        .arg("emberd-development")
         .arg("--")
-        .arg("--help")
+        .arg("-p")
+        .arg("Reply with OK only.")
         .env("HOME", &home_dir)
+        .env("EMBER_CONFIG", home_dir.join(".ember/config.toml"))
         .env("EMBER_PERSONA", "persona-main")
+        .env("EMBER_VAULT_PASSPHRASE", "test-isolated-bridge-passphrase")
         .env("PATH", fake_bin_dir.display().to_string())
         .env(
             "EMBER_COMPOSE_TEMPLATE",
             workspace_root()
-                .join("crates/headless-runtime/templates/compose.yml.j2")
+                .join("crates/emberlink-cli/templates/compose.yml.j2")
                 .display()
                 .to_string(),
         )
@@ -267,7 +312,9 @@ fn ember_cli_binary_claude_isolated_uses_standalone_worker_handoff() {
 
     let session_open_root = isolated_session_run_root(&home_dir);
     assert!(
-        session_open_root.join(format!("claude-home-{MOCK_SESSION_ID}")).exists(),
+        session_open_root
+            .join(format!("claude-home-{MOCK_SESSION_ID}"))
+            .exists(),
         "isolated worker home must live under the operator-owned session-open root"
     );
 
@@ -280,10 +327,129 @@ fn ember_cli_binary_claude_isolated_uses_standalone_worker_handoff() {
     assert_eq!(compose_files.len(), 1, "expected one compose render");
     let compose = std::fs::read_to_string(&compose_files[0]).expect("read compose file");
     assert_standalone_worker_compose_contract(&compose);
+    let expected_shadow_root = session_open_root.join(format!("shadow-{MOCK_SESSION_ID}"));
+    let expected_shadow_source = expected_shadow_root.join("bin");
+    assert!(
+        compose.contains(&expected_shadow_source.display().to_string()),
+        "isolated worker compose must bind-mount the projected isolated shadow/bin into the worker for brokered tools: {compose}"
+    );
+    assert!(
+        compose.contains("target: /usr/local/lib/shadow/bin"),
+        "isolated worker compose must mount the brokered tool shims at /usr/local/lib/shadow/bin: {compose}"
+    );
+    assert_eq!(
+        std::fs::read_link(expected_shadow_source.join("gh")).expect("read projected gh link"),
+        std::path::PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+        "isolated launcher must project gh to the image-baked Linux broker shim"
+    );
+    assert_eq!(
+        std::fs::read_link(expected_shadow_source.join("ember-gh"))
+            .expect("read projected ember-gh link"),
+        std::path::PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+        "isolated launcher must project ember-gh to the image-baked Linux broker shim"
+    );
+    assert_eq!(
+        std::fs::read_link(expected_shadow_source.join("git")).expect("read projected git link"),
+        std::path::PathBuf::from("/usr/local/lib/ember/binaries/ember-git"),
+        "isolated launcher must project git to the image-baked Linux broker shim"
+    );
+    assert_eq!(
+        std::fs::read_link(expected_shadow_source.join("ember-git"))
+            .expect("read projected ember-git link"),
+        std::path::PathBuf::from("/usr/local/lib/ember/binaries/ember-git"),
+        "isolated launcher must project ember-git to the image-baked Linux broker shim"
+    );
 
     let docker_log = std::fs::read_to_string(docker_log).expect("read docker log");
     assert!(docker_log.contains("[up] [-d]"));
     assert!(docker_log.contains("[exec] [-T] [-w] [/work/repo]"));
-    assert!(docker_log.contains("[down] [-v] [--timeout] [10]"));
-    assert!(docker_log.contains("[worker] [claude] [--help]"));
+    assert!(docker_log.contains("[down] [-v] [--timeout] [1]"));
+    assert!(
+        docker_log.contains("[-e] [ANTHROPIC_BASE_URL=http://host.docker.internal:19484]"),
+        "isolated launcher must rewrite the brokered Anthropic gateway for the container: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("X-Ember-Credential: anthropic/oauth-token"),
+        "isolated launcher must advertise the brokered OAuth credential identity: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[-e] [ANTHROPIC_AUTH_TOKEN=ember-proxy-session]"),
+        "isolated launcher must seed the Claude auth placeholder for pristine isolated homes: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[-e] [PATH=/usr/local/lib/shadow/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin]"),
+        "isolated launcher must prepend the brokered shadow/bin to PATH inside the worker: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[-e] [EMBER_BRIDGE_URL=https://host.docker.internal:4243]"),
+        "isolated launcher must pass the bridge endpoint into the worker child env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains(&format!(
+            "[-e] [EMBER_BROKER_CWD={}]",
+            workspace_root().display()
+        )),
+        "isolated launcher must pass the host-real broker cwd into the worker child env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[-e] [EMBER_CLIENT_CERT=/run/ember/client.crt]"),
+        "isolated launcher must pass the bridge client cert path into the worker child env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[-e] [EMBER_CLIENT_KEY=/run/ember/client.key]"),
+        "isolated launcher must pass the bridge client key path into the worker child env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[-e] [EMBER_CA_CERT=/run/ember/ca.crt]"),
+        "isolated launcher must pass the bridge CA path into the worker child env: {docker_log}"
+    );
+    assert!(
+        !docker_log.contains("[-e] [EMBER_SOCKET_PATH=/run/emberd-host/daemon.sock]"),
+        "bridge-enabled isolated Claude launch must not forward legacy UDS env: {docker_log}"
+    );
+    assert!(
+        !docker_log.contains("[-e] [EMBER_DAEMON_SOCKET=/run/emberd-host/daemon.sock]"),
+        "bridge-enabled isolated Claude launch must not forward legacy UDS env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains(&format!(
+            "[-e] [EMBER_GH_BINARY={}]",
+            fake_bin_dir.join("gh").display()
+        )),
+        "isolated launcher must pass the host-real gh binary override into the worker child env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains(&format!(
+            "[-e] [EMBER_GIT_BINARY={}]",
+            fake_bin_dir.join("git").display()
+        )),
+        "isolated launcher must pass the host-real git binary override into the worker child env: {docker_log}"
+    );
+    assert!(
+        docker_log.contains("[worker] [claude] [-p] [Reply with OK only.]"),
+        "Claude isolated handoff must forward trailing args into compose exec: {docker_log}"
+    );
+}
+
+#[test]
+fn isolated_claude_worker_image_includes_jq_for_trusted_hooks() {
+    let dockerfile =
+        std::fs::read_to_string(workspace_root().join("containers/ember-claude-code/Dockerfile"))
+            .expect("read worker image Dockerfile");
+    assert!(
+        dockerfile.contains("\n      jq \\"),
+        "isolated Claude worker image must install jq so repo-trusted hooks keep parity with host launches: {dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("\n      gh \\"),
+        "isolated Claude worker image must install the downstream gh CLI so brokered ember-gh has a real wrapped binary: {dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY build-context/ember-gh /usr/local/lib/ember/binaries/ember-gh"),
+        "isolated Claude worker image must carry a Linux ember-gh broker shim: {dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY build-context/ember-git /usr/local/lib/ember/binaries/ember-git"),
+        "isolated Claude worker image must carry a Linux ember-git broker shim: {dockerfile}"
+    );
 }

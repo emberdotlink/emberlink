@@ -8,7 +8,11 @@ use std::time::Duration;
 
 const MOCK_SESSION_ID: &str = "sess_codex_host_cli_smoke_001";
 const MOCK_GRANT_ID: &str = "grt_codex_host_cli_smoke_001";
+const MOCK_ATTACHMENT_ID: &str = "att_codex_host_cli_smoke_001";
+const MOCK_ATTACHMENT_ENDPOINT_TOKEN: &str = "ep_codex_host_cli_smoke_001";
 const MOCK_PROXY_URL: &str = "http://127.0.0.1:19494";
+const MOCK_CODEX_RESPONSES_PROXY_URL: &str = "http://127.0.0.1:19495/v1";
+const MOCK_PERSONA_ID: &str = "persona_codex_host_cli_smoke_001";
 const MOCK_PRESENCE_TOKEN_JSON: &str = r#"{"uid":501,"scope":"class:session-runtime","expiry":{"secs_since_epoch":1779507461,"nanos_since_epoch":807776000},"signature":[1,2,3]}"#;
 
 static HOST_CODEX_SMOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -76,7 +80,11 @@ fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
                     "result": {
                         "session_id": MOCK_SESSION_ID,
                         "grant_id": MOCK_GRANT_ID,
+                        "attachment_id": MOCK_ATTACHMENT_ID,
+                        "attachment_endpoint_token": MOCK_ATTACHMENT_ENDPOINT_TOKEN,
                         "proxy_url": MOCK_PROXY_URL,
+                        "codex_responses_proxy_url": MOCK_CODEX_RESPONSES_PROXY_URL,
+                        "persona_id": MOCK_PERSONA_ID,
                         "presence_token": mock_presence_token_value(),
                     }
                 }),
@@ -156,13 +164,13 @@ fn make_fake_ember_binary(tmp_dir: &Path, tool: &str) {
 fn make_fake_codex_binary(bin_path: &Path, capture_file: &Path) {
     let capture_path = capture_file.display();
     let body = format!(
-        "#!/bin/sh\nset -eu\nworkspace=\"\"\nif [ \"${{1:-}}\" = \"-C\" ] || [ \"${{1:-}}\" = \"--cd\" ]; then\n  workspace=\"$2\"\n  shift 2\nfi\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$workspace\" \"$EMBER_SESSION_ID\" \"$EMBER_GRANT_ID\" \"$EMBER_PROXY_URL\" \"$EMBER_SOCKET_PATH\" \"$EMBER_PERSONA\" \"$PATH\" \"$EMBER_OPERATOR_PRESENCE_TOKEN\" > '{capture_path}'\nexit 0\n"
+        "#!/bin/sh\nset -eu\nworkspace=\"\"\nif [ \"${{1:-}}\" = \"-C\" ] || [ \"${{1:-}}\" = \"--cd\" ]; then\n  workspace=\"$2\"\n  shift 2\nfi\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$workspace\" \"$EMBER_SESSION_ID\" \"$EMBER_ATTACHMENT_ID\" \"$EMBER_ATTACHMENT_ENDPOINT_TOKEN\" \"$EMBER_PROXY_URL\" \"$EMBER_SOCKET_PATH\" \"$EMBER_PERSONA\" \"$EMBER_PERSONA_ID\" \"$PATH\" \"${{EMBER_OPERATOR_PRESENCE_TOKEN-}}\" \"${{CODEX_HOME-}}\" > '{capture_path}'\nexit 0\n"
     );
     write_executable(bin_path, &body);
 }
 
 #[test]
-fn ember_cli_binary_codex_host_registers_grant_proxy_and_socket_path() {
+fn ember_cli_binary_codex_host_registers_attachment_proxy_and_socket_path() {
     let _guard = HOST_CODEX_SMOKE_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -191,8 +199,10 @@ fn ember_cli_binary_codex_host_registers_grant_proxy_and_socket_path() {
         .arg("codex")
         .arg("--host")
         .env("HOME", &home_dir)
+        .env("EMBER_CONFIG", home_dir.join(".ember/config.toml"))
         .env("EMBER_CODEX_BIN", &fake_codex_bin)
         .env("EMBER_PERSONA", "codex-binary-test")
+        .env("XDG_CACHE_HOME", home_dir.join(".cache"))
         .env("PATH", fake_bin_dir.display().to_string())
         .status()
         .expect("spawn ember cli binary");
@@ -224,21 +234,40 @@ fn ember_cli_binary_codex_host_registers_grant_proxy_and_socket_path() {
         )
     );
     assert_eq!(lines.next(), Some(MOCK_SESSION_ID));
-    assert_eq!(lines.next(), Some(MOCK_GRANT_ID));
+    assert_eq!(lines.next(), Some(MOCK_ATTACHMENT_ID));
+    assert_eq!(lines.next(), Some(MOCK_ATTACHMENT_ENDPOINT_TOKEN));
     assert_eq!(lines.next(), Some(MOCK_PROXY_URL));
     assert_eq!(lines.next(), Some(socket_path.to_string_lossy().as_ref()));
     assert_eq!(lines.next(), Some("codex-binary-test"));
+    assert_eq!(lines.next(), Some(MOCK_PERSONA_ID));
     let path_line = lines.next().unwrap_or_default();
     assert!(
         path_line.starts_with(&shadow_bin.display().to_string()),
         "binary launcher PATH must start with prod shadow/bin: {path_line}"
     );
     let token_line = lines.next().unwrap_or_default();
-    let token_json: serde_json::Value =
-        serde_json::from_str(token_line).expect("presence token env must be valid json");
-    assert_eq!(token_json.get("uid").and_then(|v| v.as_u64()), Some(501));
-    assert_eq!(
-        token_json.get("scope").and_then(|v| v.as_str()),
-        Some("class:session-runtime")
+    assert!(
+        token_line.is_empty(),
+        "host codex launcher child must not receive EMBER_OPERATOR_PRESENCE_TOKEN now that broker runtime authority is session-bound: {token_line}"
     );
+    let codex_home_line = lines.next().unwrap_or_default();
+    assert!(
+        !codex_home_line.is_empty(),
+        "host codex launcher child must receive relocated CODEX_HOME"
+    );
+    let codex_config = std::fs::read_to_string(Path::new(codex_home_line).join("config.toml"))
+        .expect("relocated CODEX_HOME must contain config.toml");
+    assert!(codex_config.contains(&format!("base_url = \"{MOCK_CODEX_RESPONSES_PROXY_URL}\"")));
+    assert!(codex_config.contains("requires_openai_auth = false"));
+    assert!(codex_config.contains("default_permissions = \"ember-brokered\""));
+    assert!(codex_config.contains("[features]\nnetwork_proxy = true"));
+    assert!(codex_config.contains("[permissions.ember-brokered]"));
+    assert!(codex_config.contains("extends = \":workspace\""));
+    assert!(codex_config.contains("[permissions.ember-brokered.network]\nenabled = true"));
+    assert!(codex_config.contains("[permissions.ember-brokered.network.domains]"));
+    assert!(codex_config.contains("\"localhost\" = \"allow\""));
+    assert!(codex_config.contains("\"127.0.0.1\" = \"allow\""));
+    assert!(codex_config.contains("[permissions.ember-brokered.network.unix_sockets]"));
+    let socket_root = std::fs::canonicalize(socket_path.parent().unwrap()).unwrap();
+    assert!(codex_config.contains(&format!("\"{}\" = \"allow\"", socket_root.display())));
 }

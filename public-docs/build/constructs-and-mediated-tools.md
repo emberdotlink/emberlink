@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `README.md`, `QUICKSTART.md`, `docs/current-architecture.md`, `docs/cli-reference.md`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Constructs and Mediated Tools
 
 Emberlink does not only ship a launcher and a daemon. It also ships

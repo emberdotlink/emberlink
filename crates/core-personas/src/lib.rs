@@ -11,9 +11,12 @@ pub fn create_persona(
     survival_mode: SurvivalMode,
     active_key: PublicKeyMaterial,
 ) -> Persona {
+    // Per design 2026-06-15 amendment: Persona is a transitional alias
+    // for the unified `Principal` type; `root_id` becomes the recursive
+    // `parent_id` slot. Wire/canonical attribution remains the same.
     Persona {
         id: id.into(),
-        root_id: root_id.into(),
+        parent_id: root_id.into(),
         label: label.into(),
         disclosure_profile,
         survival_mode,
@@ -21,7 +24,7 @@ pub fn create_persona(
     }
 }
 
-/// implementation-note-66 (design §9 + §6) — factory for
+/// implementation-note-74 (design §9 + §6) — factory for
 /// a workload Persona bound to a SCION agent's container identity.
 ///
 /// Returns the persona alongside the container_id + parent_grant_id
@@ -48,7 +51,7 @@ pub fn create_agent_persona(
     AgentPersona {
         persona: Persona {
             id: id.into(),
-            root_id: root_id.into(),
+            parent_id: root_id.into(),
             label: label.into(),
             disclosure_profile,
             survival_mode,
@@ -59,7 +62,7 @@ pub fn create_agent_persona(
     }
 }
 
-/// implementation-note-66 — workload Persona + container
+/// implementation-note-74 — workload Persona + container
 /// binding metadata. Returned by [`create_agent_persona`] so the
 /// daemon can persist the binding atomically with the persona row.
 ///
@@ -96,15 +99,16 @@ pub struct AgentPersona {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtlsPrincipal {
     /// Persona id resolved from the SPIFFE URI SAN of the client cert
-    /// (design component 1 — see `implementation-note-39`).
+    /// (design component 1 — see `implementation-note-40`).
     pub persona_id: String,
     /// Container id resolved from the secondary SAN entry. Cross-checked
     /// against the persona's `agent_personas.container_id` binding to
     /// refuse mismatched-SAN certs at dispatch time (design ESC-3).
     pub container_id: String,
-    /// SHA-256 of the DER-encoded client cert. Stored in the audit log
-    /// per call so a revoked cert can be retroactively correlated to
-    /// its bridge-lane traffic.
+    /// BLAKE3 of the DER-encoded client cert. This matches the persona
+    /// row's `client_cert_fingerprint` pin so refresh handlers can compare
+    /// the presented cert to daemon-side state without converting hash
+    /// algorithms at the trust boundary.
     pub cert_fingerprint: [u8; 32],
 }
 
@@ -305,7 +309,7 @@ mod tests {
         assert_eq!(personas.len(), 1);
     }
 
-    // implementation-note-66 tests.
+    // implementation-note-74 tests.
 
     #[test]
     fn create_agent_persona_carries_container_binding() {
@@ -325,7 +329,8 @@ mod tests {
         );
 
         assert_eq!(ap.persona.id, "persona-agent-1");
-        assert_eq!(ap.persona.root_id, "root-1");
+        // Per design 2026-06-15 amendment: `root_id` → `parent_id`.
+        assert_eq!(ap.persona.parent_id, "root-1");
         assert_eq!(ap.persona.label, "scion-ml-eval");
         assert_eq!(ap.container_id, "ctr-abc123");
         assert_eq!(ap.parent_grant_id, "grant-parent-001");

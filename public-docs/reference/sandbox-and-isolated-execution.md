@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `docs/cli-reference.md`, `docs/current-architecture.md`, `QUICKSTART.md`, `crates/emberlink-cli/src/bin/ember.rs`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Sandbox and Isolated Execution
 
 Emberlink exposes a real `ember sandbox ...` surface for managed isolated

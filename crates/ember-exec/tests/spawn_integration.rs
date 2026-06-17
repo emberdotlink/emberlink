@@ -1,5 +1,6 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-427: integration coverage for two
+//! implementation-note-387: integration coverage for two
 //! parent-task acceptance criteria that subtasks B/C/D shipped behavior for
 //! but did not test end-to-end via `handle_spawn_directive`:
 //!
@@ -35,6 +36,7 @@ fn id_path() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn blake3_of_file(path: &std::path::Path) -> String {
     let mut f = std::fs::File::open(path).expect("open binary for hash");
     let mut hasher = blake3::Hasher::new();
@@ -42,12 +44,13 @@ fn blake3_of_file(path: &std::path::Path) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// implementation-note-427: dispatch a `SpawnDirective` for
+/// implementation-note-387: dispatch a `SpawnDirective` for
 /// `/usr/bin/id` and assert the child's output reports the expected uid.
 /// Because the test runs as the current user with `target_uid = current
 /// uid`, the privilege-drop codepath (when running as root) reduces to a
 /// no-op `setresuid` to the current uid — but the `id` output proves the
 /// child still observed the right uid through the spawn path.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_setuid_drop_before_execve() {
     let Some(id_bin) = id_path() else {
@@ -96,7 +99,7 @@ async fn test_setuid_drop_before_execve() {
     );
 }
 
-/// implementation-note-427: dispatch a `SpawnDirective` with a
+/// implementation-note-387: dispatch a `SpawnDirective` with a
 /// wrong `content_hash_expected`. The hash gate must close the connection
 /// with a `HashMismatch` frame before any privilege drop or spawn. The
 /// stricter assertion is that NO `OutputBytes` and NO `Exit` precede

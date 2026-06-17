@@ -33,6 +33,9 @@
 //! | read-only (`plan`, `validate`, `show`, `state list`, `state show`, `output`, `version`, `providers`, `init`, `fmt`, `console`) | `None` (passthrough) |
 
 use core_construct_runtime::ActionKey;
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 
 /// Terraform global flags that take a value as the *next* argv token (when
 /// written as `-flag value`). The `-chdir=<dir>` form (and any future
@@ -504,5 +507,201 @@ mod tests {
             let class2 = classify_terraform_argv(&with_flag).unwrap();
             proptest::prop_assert_eq!(base_class.0, class2.0);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TerraformFactory — construct-factory contract for the terraform construct
+// ---------------------------------------------------------------------------
+
+static TERRAFORM_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!(
+            "../construct/terraform.toml"
+        ))
+        .expect("bundled terraform.toml must be valid")
+    });
+
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    let suffix = action_key.strip_prefix("terraform.")?;
+    TERRAFORM_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| a.key == action_key || a.key == format!("terraform.{suffix}"))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+fn action_in_manifest(action_key: &str) -> bool {
+    TERRAFORM_MANIFEST.manifest.actions.iter().any(|a| {
+        a.key == action_key
+            || action_key
+                .strip_prefix("terraform.")
+                .is_some_and(|suffix| a.key == format!("terraform.{suffix}"))
+    })
+}
+
+const UNSUPPORTED_KEYS: &[&str] = &[
+    "terraform.state.push",
+    "terraform.state.rm",
+    "terraform.state.replace-provider",
+    "terraform.force-unlock",
+];
+
+#[derive(Debug, Default, Clone)]
+pub struct TerraformFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerraformFactoryTarget {
+    pub provider: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerraformFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for TerraformFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_terraform_argv(argv)
+    }
+}
+
+impl TargetExtractor for TerraformFactory {
+    type Target = TerraformFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, _argv: &[String]) -> Option<Self::Target> {
+        None
+    }
+}
+
+impl NeedTemplate for TerraformFactory {
+    type Need = TerraformFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(TerraformFactoryNeed)
+    }
+}
+
+impl ConstructFactory for TerraformFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        _argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        if key.0 == "terraform.apply" || key.0 == "terraform.destroy" {
+            return FactoryDisposition::PayloadAnalysisRequired;
+        }
+
+        if UNSUPPORTED_KEYS.iter().any(|k| key.0 == *k) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if action_in_manifest(&key.0) {
+            return FactoryDisposition::ResolverRequired;
+        }
+
+        FactoryDisposition::ResolverRequired
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn terraform_factory_version_credentialless() {
+        let f = TerraformFactory;
+        let a = argv(&["version"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn terraform_factory_apply_is_payload_analysis() {
+        let f = TerraformFactory;
+        let a = argv(&["apply", "-auto-approve"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn terraform_factory_destroy_is_payload_analysis() {
+        let f = TerraformFactory;
+        let a = argv(&["destroy", "-auto-approve"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::PayloadAnalysisRequired
+        );
+    }
+
+    #[test]
+    fn terraform_factory_workspace_delete_is_resolver_required() {
+        let f = TerraformFactory;
+        let a = argv(&["workspace", "delete", "prod"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn terraform_factory_state_push_fails_closed() {
+        let f = TerraformFactory;
+        let a = argv(&["state", "push", "terraform.tfstate"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn terraform_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/terraform/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/terraform.toml"),
+        )
+        .expect("terraform manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &TerraformFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
     }
 }

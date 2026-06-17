@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! design Path A — broker_exec PTY + subuid combo refusal (-32031).
 //!
@@ -18,16 +19,79 @@
 //! `test_mode = true` bypasses the Finding-14 refusal so the test
 //! process's own uid can be checked out.
 //!
-//! implementation-note-167 — follow-up task name for the
+//! implementation-note-143 — follow-up task name for the
 //! future state where PTY constructs ARE routed through the
 //! user-namespace primitive; until then the refusal here is the
 //! correct behavior.
 
 #![cfg(target_os = "linux")]
 
+use std::path::{Path, PathBuf};
+
+use core_event_types::{ActionRef, ExecutionContract};
 use ember_daemon::broker::handler::handle_broker_exec;
 use ember_daemon::broker::uid_alloc;
 use ember_daemon::infra::store::DaemonStore;
+use uuid::Uuid;
+
+fn write_runner_manifest(home: &Path, tool_name: &str, binary_path: &Path) {
+    let manifest_dir = home.join(".ember/binaries");
+    std::fs::create_dir_all(&manifest_dir).expect("mkdir manifest dir");
+    let manifest_body = format!(
+        "\
+[[entries]]
+tool_name = \"{tool_name}\"
+version = \"1.0.0\"
+content_hash = \"blake3:test\"
+absolute_path = \"{}\"
+installed_at = 1735689600
+publisher = \"did:emberlink\"
+channel = \"bundled\"
+",
+        binary_path.display()
+    );
+    std::fs::write(manifest_dir.join("manifest.toml"), manifest_body)
+        .expect("write runner manifest");
+}
+
+fn write_managed_worktree(home: &Path, runtime_id: &str) -> PathBuf {
+    let worktree_path = home.join("repo/.ember/worktrees/demo");
+    std::fs::create_dir_all(worktree_path.join(".git")).expect("mkdir worktree git dir");
+    std::fs::write(
+        worktree_path.join(".agent-session"),
+        format!(
+            "runtime_id: {runtime_id}\nworktree_path: {}\n",
+            worktree_path.display()
+        ),
+    )
+    .expect("write managed worktree metadata");
+    worktree_path
+}
+
+struct HomeGuard(Option<std::ffi::OsString>);
+
+impl HomeGuard {
+    fn set(home: &Path) -> Self {
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+    }
+}
 
 /// T2 — broker_exec with `pty_socket_path = Some(_)` AND a subuid-
 /// flagged global pool refuses with JSON-RPC code -32031 and a clear
@@ -54,11 +118,33 @@ async fn pty_subuid_routing_refused_with_clear_error() {
     // dummy path. The refusal fires on the predicate alone — the
     // socket doesn't need to exist or be listening because the daemon
     // never reaches the forkpty step.
+    let home = tempfile::tempdir().expect("tempdir");
+    let _home_guard = HomeGuard::set(home.path());
+    let fake_gh = home.path().join("bin/ember-gh");
+    std::fs::create_dir_all(fake_gh.parent().expect("parent")).expect("mkdir bin dir");
+    if std::os::unix::fs::symlink("/usr/bin/true", &fake_gh).is_err() {
+        std::fs::write(&fake_gh, b"#!/bin/sh\nexec /usr/bin/true \"$@\"\n").expect("write fake gh");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake_gh).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).expect("chmod fake gh");
+    }
+    write_runner_manifest(home.path(), "ember-gh", &fake_gh);
+    let runtime_id = format!("rt-{}", Uuid::new_v4().simple());
+    write_managed_worktree(home.path(), &runtime_id);
+
     let store = DaemonStore::open_in_memory().expect("in-memory store");
+    let action_ref = ActionRef::new(
+        "registry.ember.systems/ember-systems/ember-gh",
+        "pr_merge",
+        "v1",
+    );
+    let workspace_ref = format!("managed_worktree:{runtime_id}");
+    let mut execution_contract = ExecutionContract::new(action_ref.clone());
+    execution_contract.workspace_ref = Some(workspace_ref.clone());
     let req = serde_json::json!({
-        "binary": "/usr/bin/true",
-        "argv": [],
-        "cwd": null,
+        "execution_contract": execution_contract,
+        "argv": ["pr", "merge", "123"],
         "env_passthrough": [],
         "pty_socket_path": "/tmp/ember-test-nonexistent-pty.sock",
     });
@@ -75,7 +161,7 @@ async fn pty_subuid_routing_refused_with_clear_error() {
         "error must explain PTY-not-yet-routed: got {msg}"
     );
     assert!(
-        msg.contains("implementation-note-167"),
+        msg.contains("implementation-note-143"),
         "error must name the follow-up task: got {msg}"
     );
     assert!(

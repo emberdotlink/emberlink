@@ -1,4 +1,4 @@
-//! implementation-note-220 regression: when the configured
+//! implementation-note-198 regression: when the configured
 //! dashboard port is already bound by another process, the daemon must
 //! report the failure truthfully via `runtime.dashboard_actual_addr`
 //! (== `None`) and via `/api/status`'s `dashboard_addr_bound` field
@@ -11,16 +11,15 @@
 //! test pins the new contract.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::dashboard::run_dashboard;
-use ember_daemon::infra::runtime::DaemonRuntime;
+use ember_daemon::infra::runtime::{DaemonRuntime, DashboardBind};
 use ember_daemon::infra::store::DaemonStore;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// Bind-failure path: holding the dashboard port forces `run_dashboard`
 /// onto its `Failed` branch. The runtime must still come up (PID file +
@@ -57,29 +56,43 @@ fn runtime_dashboard_actual_addr_is_none_when_bind_fails() {
         ..DaemonConfig::for_test(tmp.path())
     };
 
-    // `Arc<DaemonRuntime>` so the runtime survives the daemon-driver future
-    // (which borrows `&self`) and the test thread's post-startup readback.
-    // `DaemonRuntime` carries a `PidFile` (not `Send`/`Sync`); we only share
-    // the Arc within a single thread (the current-thread tokio runtime), so
-    // the standard test-only allow applies — same as the dashboard module's
-    // own `arc_with_non_send_sync` pattern.
-    #[allow(clippy::arc_with_non_send_sync)]
-    let runtime = Arc::new(DaemonRuntime::new(config));
+    let runtime = DaemonRuntime::new(config);
 
-    // Drive `run()` for ~1.5 seconds. The bind + bind-result fan-in
-    // completes within the 2-second startup timeout in `runtime.rs`, so
-    // by the time the sleep fires `dashboard_actual_addr` is populated.
-    let runtime_for_run = Arc::clone(&runtime);
+    // The full daemon startup path opens the broker/credential plane before
+    // it reaches the accept loop, which makes this bind contract vulnerable
+    // to unrelated startup stalls. Drive the dashboard listener directly,
+    // then apply the same bind outcome method used by `DaemonRuntime::run`.
+    let db_path = tmp.path().join("daemon.db");
+    let _ = DaemonStore::open(&db_path).unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (bind_tx, bind_rx) = oneshot::channel();
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
-        tokio::select! {
-            res = runtime_for_run.run(None) => {
-                // run() should not return early — if it does the test
-                // surfaces the underlying error rather than silently passing.
-                let _ = res;
-            }
-            _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
-        }
+    local.block_on(&rt, async {
+        tokio::task::spawn_local(run_dashboard(
+            blocked_addr,
+            db_path,
+            "0.0.0-test".to_string(),
+            None,
+            shutdown_rx,
+            Some(bind_tx),
+        ));
+        let bind_result = tokio::time::timeout(Duration::from_secs(2), bind_rx)
+            .await
+            .expect("dashboard bind result timed out")
+            .expect("dashboard bind result channel closed");
+        let _ = shutdown_tx.send(true);
+        let dashboard_bind = match bind_result {
+            Ok(addr) => DashboardBind::Bound(addr),
+            Err(err) => DashboardBind::Failed {
+                addr: blocked_addr,
+                error: err.to_string(),
+            },
+        };
+        assert!(
+            matches!(dashboard_bind, DashboardBind::Failed { .. }),
+            "expected occupied dashboard port to produce a failed bind, got {dashboard_bind:?}"
+        );
+        runtime.record_dashboard_bind(&dashboard_bind);
     });
 
     let actual = runtime

@@ -1,49 +1,35 @@
+//! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-142 — T2 integration tests for
+//! implementation-note-20 — T2 integration tests for
 //! design §Component 2. Asserts the load-bearing invariants:
 //!
 //! 1. The BrokerRegistry distinguishes real-broker vs Mock-registered
 //!    providers (via `register` vs `register_mock`) and surfaces this
 //!    via `is_mock(provider)`.
-//! 2. Materialization Receipt envelopes built for Mock-registered
-//!    providers stamp `mock_broker: true`; envelopes built for real
-//!    brokers stamp `mock_broker: false`.
+//! 2. The `mock_broker` audit signal distinguishes Mock-registered from
+//!    real-broker credentials. For REVOCATION (a signed broker Receipt) it is
+//!    stamped on the envelope body; for MATERIALIZATION — an AUDIT event, not a
+//!    Receipt, per design §B.6 — it is stamped on the hash-chained audit row
+//!    (asserted in `broker::handler` unit tests). Both stamp it always-present
+//!    (never omit-when-false) so absent==unknown.
 //! 3. The `EMBER_ALLOW_MOCK_BROKERS` parser is the only place where
-//!    operator opt-in is consumed; the daemon-startup broker-registration
-//!    loop fails-loud with `DaemonError::BrokerCredsMissing` when creds
-//!    are missing AND the provider is not in the parsed allowlist.
+//!    operator opt-in is consumed. When creds are missing AND the provider
+//!    is not in the parsed allowlist, the daemon-startup broker-registration
+//!    loop SKIPS that provider (boots without it; the provider's actions
+//!    fail closed when attempted) rather than registering a silent Mock.
+//!    Per design §Decision 3 (operator 2026-05-29) this is now uniform across
+//!    all providers including GitHub, which was previously load-bearing and
+//!    refused startup when absent — the no-silent-Mock invariant is intact
+//!    (skipping is not mocking); only the boot-refusal was dropped so a fresh
+//!    product install boots before first-use credential provisioning.
 //!
 //! Checkpoint marker: `dev_prod_parity_mock_broker_explicit_landed` —
 //! grep for this string to confirm Phase 2 of design has landed.
 
-use core_broker::{BrokerProvider, BrokerRequest, BrokeredCredential, MockBroker};
+use core_broker::{BrokerProvider, MockBroker};
 use ember_daemon::broker::handler::BrokerRegistry;
 use ember_daemon::broker::mock_allowlist::{ALLOW_MOCK_BROKERS_ENV, parse_allow_mock_brokers};
-use ember_daemon::infra::receipt::{
-    build_broker_materialization_envelope, build_broker_revocation_envelope,
-};
-use secrecy::SecretString;
-use std::time::{Duration, SystemTime};
-
-fn fixture_request(provider: BrokerProvider) -> BrokerRequest {
-    BrokerRequest {
-        provider,
-        scope: serde_json::json!({"scope": "test"}),
-        ttl: Duration::from_secs(600),
-        reason: "T2: mock-broker explicit opt-in".to_string(),
-        caller_persona: Some("persona-t2".to_string()),
-        grants_file_rev: None,
-        grants_file_credential_name: None,
-    }
-}
-
-fn fixture_credential(materialization_id: &str) -> BrokeredCredential {
-    BrokeredCredential {
-        token: SecretString::from("t2-fixture-token".to_string()),
-        expires_at: SystemTime::now() + Duration::from_secs(600),
-        materialization_id: materialization_id.to_string(),
-    }
-}
+use ember_daemon::infra::receipt::build_broker_revocation_envelope;
 
 /// T2: registry.register_mock flags the provider, registry.register does not.
 /// The `is_mock` query is the load-bearing audit signal that the receipt-
@@ -84,47 +70,6 @@ fn registry_distinguishes_real_from_mock_registration() {
     );
 }
 
-/// T2: a Receipt envelope built for a Mock-registered broker stamps
-/// `mock_broker: true`; an envelope for a real broker stamps
-/// `mock_broker: false`. This is the audit-trail signal design
-/// §Component 2 requires every credential_provisioned / credential_revoked
-/// Receipt to carry.
-#[test]
-fn materialization_receipt_stamps_mock_broker_from_registry_flag() {
-    let req = fixture_request(BrokerProvider::Github);
-    let cred = fixture_credential("mat-t2-mock");
-
-    // mock_broker: true variant — what the runtime would emit when the
-    // registry has Github mock-registered.
-    let env_mock = build_broker_materialization_envelope(&req, &cred, "daemon-root-t2", true);
-    assert_eq!(
-        env_mock.body.get("mock_broker").and_then(|v| v.as_bool()),
-        Some(true),
-        "mock-registered envelope must stamp mock_broker: true"
-    );
-
-    // mock_broker: false variant — what the runtime would emit for a
-    // real-broker registration.
-    let req2 = fixture_request(BrokerProvider::AwsSts);
-    let cred2 = fixture_credential("mat-t2-real");
-    let env_real = build_broker_materialization_envelope(&req2, &cred2, "daemon-root-t2", false);
-    assert_eq!(
-        env_real.body.get("mock_broker").and_then(|v| v.as_bool()),
-        Some(false),
-        "real-broker envelope must stamp mock_broker: false"
-    );
-
-    // Per design §Component 2 + design schema conventions, the field
-    // is ALWAYS present so absent==unknown rather than absent==implicitly-
-    // false. Confirm the JSON serialization does NOT omit the field
-    // when the value is false.
-    let serialized = serde_json::to_string(&env_real.body).expect("body serializes");
-    assert!(
-        serialized.contains("\"mock_broker\":false"),
-        "real-broker body JSON must explicitly carry mock_broker: false; got: {serialized}"
-    );
-}
-
 /// T2: revocation Receipt envelopes also stamp the `mock_broker` audit
 /// signal — symmetric with materialization (Component 2 says "every
 /// credential_provisioned / credential_revoked Receipt").
@@ -144,6 +89,15 @@ fn revocation_receipt_stamps_mock_broker_from_registry_flag() {
         env_real.body.get("mock_broker").and_then(|v| v.as_bool()),
         Some(false),
         "real-broker revocation envelope must stamp mock_broker: false"
+    );
+
+    // Per design §Component 2 + design schema conventions, the field is
+    // ALWAYS present so absent==unknown rather than absent==implicitly-false.
+    // Confirm the JSON serialization does NOT omit the field when false.
+    let serialized = serde_json::to_string(&env_real.body).expect("body serializes");
+    assert!(
+        serialized.contains("\"mock_broker\":false"),
+        "real-broker body JSON must explicitly carry mock_broker: false; got: {serialized}"
     );
 }
 

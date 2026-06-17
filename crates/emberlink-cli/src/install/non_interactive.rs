@@ -205,16 +205,18 @@ fn run_steps_with_phase_emission<P: InstallPrimitives>(
 ) -> Result<(), WizardError> {
     use super::wizard::{
         wizard_step_add_user_to_group, wizard_step_chown_data_dirs, wizard_step_emit_launch_spec,
-        wizard_step_load_apparmor, wizard_step_provision_mek, wizard_step_provision_user,
-        wizard_step_verify,
+        wizard_step_ensure_config, wizard_step_load_apparmor, wizard_step_provision_mek,
+        wizard_step_provision_spawn_helper, wizard_step_provision_user, wizard_step_verify,
     };
 
     for step in WIZARD_STEPS.iter() {
         let result = match *step {
             "provision-user" => wizard_step_provision_user(ctx, primitives),
+            "ensure-config" => wizard_step_ensure_config(ctx, primitives),
             "chown-data-dirs" => wizard_step_chown_data_dirs(ctx, primitives),
             "provision-mek" => wizard_step_provision_mek(ctx, primitives),
             "emit-launch-spec" => wizard_step_emit_launch_spec(ctx, primitives),
+            "provision-spawn-helper" => wizard_step_provision_spawn_helper(ctx, primitives),
             "load-apparmor" => wizard_step_load_apparmor(ctx, primitives),
             "add-user-to-group" => wizard_step_add_user_to_group(ctx, primitives),
             "verify" => wizard_step_verify(ctx, primitives),
@@ -309,6 +311,10 @@ mod tests {
     impl InstallPrimitives for StubPrimitives {
         fn provision_ember_user(&self) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("provision_ember_user");
+            Ok(())
+        }
+        fn write_default_config(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("write_default_config");
             Ok(())
         }
         fn chown_ember_data_dirs(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
@@ -451,6 +457,7 @@ mod tests {
             stub.calls.borrow().clone(),
             vec![
                 "provision_ember_user",
+                "write_default_config",
                 "chown_ember_data_dirs",
                 "provision_se_mek",
                 "install_launch_spec",
@@ -475,6 +482,7 @@ mod tests {
             stub.calls.borrow().clone(),
             vec![
                 "provision_ember_user",
+                "write_default_config",
                 "chown_ember_data_dirs",
                 "provision_se_mek",
                 "install_launch_spec",

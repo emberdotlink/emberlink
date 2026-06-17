@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 
 pub mod auto_update;
 pub mod builder_identity;

@@ -136,6 +136,20 @@ pub enum UiAction {
         conditions: Vec<core_grant_types::grant_conditions::GrantCondition>,
     },
 
+    /// Create a grant offer from typed statements rather than CLI shorthand.
+    ///
+    /// Recovery-plane callers use this for scopes such as guardian enrollment,
+    /// which are not credential shorthand and must not be forced through
+    /// `parse_statement_spec`.
+    CreateGrantOfferTyped {
+        issuing_persona_id: String,
+        mode: String,
+        statements: Vec<core_grant_types::Statement>,
+        expires_in_secs: Option<u64>,
+        relay_hint: Option<String>,
+        conditions: Vec<core_grant_types::grant_conditions::GrantCondition>,
+    },
+
     /// Claim a grant offer from a link URL or QR string.
     ///
     /// If `claiming_persona_id` is `None` and no identity exists, a new identity

@@ -17,6 +17,7 @@
 //! Per design: dev/prod daemons run the SAME code path; only the
 //! input trust-set varies. These tests pin that invariant.
 //!
+//! CLASSIFICATION: PUBLIC
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};

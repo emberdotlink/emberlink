@@ -1,7 +1,6 @@
+// CLASSIFICATION: PUBLIC
 
-//! `emberd-spawn-shim` — MACOS-PRIMITIVES Decision 5 shim.
-//!
-//! implementation-note-188
+//! `emberd-spawn-shim` — macOS spawn shim.
 //!
 //! ## Why this binary exists
 //!
@@ -13,8 +12,7 @@
 //! Running it in the post-fork pre-execve window of `Command::pre_
 //! exec` deadlocks unpredictably under load.
 //!
-//! MACOS-PRIMITIVES Decision 5 — locked 2026-05-15 — replaces that
-//! pattern with **fork+exec all the way down**:
+//! The macOS helper replaces that pattern with **fork+exec all the way down**:
 //!
 //! ```text
 //!  emberd-spawn-helper-macos        kernel              emberd-spawn-shim
@@ -115,8 +113,7 @@ mod macos_impl {
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
 
-    /// CLI shape. Every argument's semantics is locked by the
-    /// MACOS-PRIMITIVES Decision 5 brief.
+    /// CLI shape for the macOS helper-to-shim boundary.
     ///
     /// `--sandbox-profile-file` is a path on a writable tmpfs that the
     /// daemon scratch-clones per spawn. Keeping profile bytes out of
@@ -132,7 +129,7 @@ mod macos_impl {
     #[derive(Parser, Debug)]
     #[command(
         name = "emberd-spawn-shim",
-        about = "MACOS-PRIMITIVES Decision 5 spawn shim (helper → shim → construct chain)",
+        about = "macOS spawn shim (helper → shim → construct chain)",
         long_about = None,
     )]
     struct Cli {
@@ -368,10 +365,10 @@ mod macos_impl {
     /// Call `sandbox_init_with_parameters(profile, 0, NULL, errbuf)`.
     /// Returns the `c_int` rc; 0 = applied, non-zero = error.
     ///
-    /// SBPL is officially unsupported per `sandbox(7)` since ~2017
-    /// but is still in active use by `sandboxd`, `airportd`,
-    /// `mdworker`, and every WebKit content process. MACOS-PRIMITIVES
-    /// Decision 1 accepts the deprecation risk on this path.
+    /// SBPL is officially unsupported per `sandbox(7)` since ~2017 but is
+    /// still in active use by `sandboxd`, `airportd`, `mdworker`, and every
+    /// WebKit content process. This path accepts that deprecation risk to keep
+    /// the macOS sandbox boundary local and deterministic.
     ///
     /// # Safety
     /// Caller is responsible for ensuring `profile` is a valid UTF-8

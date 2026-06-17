@@ -233,7 +233,7 @@ pub fn seal_credentials_for_exec(creds: &[(&str, &str)]) -> Result<SealedEnv, Se
 }
 
 /// Read the plaintext from a Phase-1-sealed memfd and return it as a
-/// `String`. The caller is responsible for closing the fd afterward —
+/// zeroizing `String`. The caller is responsible for closing the fd afterward —
 /// `read_sealed_fd` does NOT take ownership.
 ///
 /// Used by the Slice B pre-exec closure in `handler.rs` to recover the
@@ -245,7 +245,7 @@ pub fn seal_credentials_for_exec(creds: &[(&str, &str)]) -> Result<SealedEnv, Se
 ///
 /// Returns `InvalidData` if the buffer isn't valid UTF-8.
 #[cfg(target_os = "linux")]
-pub fn read_sealed_fd(fd: std::os::fd::RawFd) -> std::io::Result<String> {
+pub fn read_sealed_fd(fd: std::os::fd::RawFd) -> std::io::Result<zeroize::Zeroizing<String>> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::FromRawFd;
 
@@ -256,12 +256,16 @@ pub fn read_sealed_fd(fd: std::os::fd::RawFd) -> std::io::Result<String> {
     file.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
-    String::from_utf8(buf).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("sealed fd contents not valid UTF-8: {e}"),
-        )
-    })
+    String::from_utf8(buf)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|e| {
+            let mut bytes = e.into_bytes();
+            zeroize::Zeroize::zeroize(&mut bytes);
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sealed fd contents not valid UTF-8",
+            )
+        })
 }
 
 #[cfg(target_os = "linux")]

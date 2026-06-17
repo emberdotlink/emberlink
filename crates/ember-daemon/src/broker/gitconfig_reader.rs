@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //! Bounded INI parser for `.git/config` — resolves a remote's URL by name.
 //!
 //! implementation-note-135 — Phase 2 subtask of

@@ -60,12 +60,16 @@ fn assert_standalone_worker_compose_contract(compose: &str) {
         "standalone worker compose must omit orchestrator service: {compose}"
     );
     assert!(
-        !compose.contains("EMBER_BRIDGE_URL"),
-        "standalone worker compose must not inject bridge env: {compose}"
+        compose.contains("EMBER_BRIDGE_URL"),
+        "standalone worker compose must inject bridge env: {compose}"
     );
     assert!(
         compose.contains("- \"tail -f /dev/null\""),
         "standalone worker compose must keep the worker sidecar idle: {compose}"
+    );
+    assert!(
+        compose.contains("target: /run/ember"),
+        "standalone worker compose must mount the staged bridge client bundle: {compose}"
     );
 }
 
@@ -81,7 +85,7 @@ fn mock_presence_token_value() -> serde_json::Value {
     serde_json::from_str(MOCK_PRESENCE_TOKEN_JSON).expect("mock presence token json")
 }
 
-fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
+fn spawn_mock_daemon(socket_path: PathBuf, ssh_auth_sock: Option<PathBuf>) -> Arc<AtomicBool> {
     let close_called = Arc::new(AtomicBool::new(false));
     let close_flag = Arc::clone(&close_called);
 
@@ -123,15 +127,28 @@ fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
 
             let method = req["method"].as_str().unwrap_or("");
             let resp = match method {
-                "register_session" => serde_json::json!({
-                    "id": req["id"],
-                    "result": {
+                "register_session" => {
+                    let mut result = serde_json::json!({
                         "session_id": MOCK_SESSION_ID,
                         "grant_id": MOCK_GRANT_ID,
                         "proxy_url": MOCK_PROXY_URL,
                         "presence_token": mock_presence_token_value(),
+                        "bridge_client_bundle": {
+                            "port": 4243,
+                            "client_cert_pem": "mock-client-cert",
+                            "client_key_pem": "mock-client-key",
+                            "ca_cert_pem": "mock-ca-cert"
+                        },
+                    });
+                    if let Some(sock) = ssh_auth_sock.as_ref() {
+                        result["ssh_auth_sock"] =
+                            serde_json::Value::String(sock.display().to_string());
                     }
-                }),
+                    serde_json::json!({
+                        "id": req["id"],
+                        "result": result,
+                    })
+                }
                 "close_session" => {
                     assert_eq!(
                         req["params"]["session_id"].as_str().unwrap_or(""),
@@ -230,6 +247,11 @@ fn write_fake_codex_runtime(root: &Path) {
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\nexit 0\n");
 }
 
+fn write_fake_codex_auth_state(config_dir: &Path) {
+    std::fs::create_dir_all(config_dir).expect("create fake codex config dir");
+    std::fs::write(config_dir.join("auth.json"), "{}").expect("write fake auth json");
+}
+
 fn write_package_json(path: &Path, version: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create package parent");
@@ -305,15 +327,17 @@ fn ember_cli_binary_codex_isolated_uses_standalone_worker_handoff() {
     let fake_codex_config = home_dir.join(".codex");
     std::fs::create_dir_all(&home_dir).expect("create home");
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
-    std::fs::create_dir_all(&fake_codex_config).expect("create fake codex config dir");
+    write_fake_codex_auth_state(&fake_codex_config);
     write_default_home_config(&home_dir);
     write_fake_codex_runtime(&fake_runtime_root);
 
     let docker_log = install_fake_docker(&fake_bin_dir, 23);
     let socket_path = home_dir.join(".ember").join("run").join("daemon.sock");
+    let ssh_auth_sock = tmp.path().join("ssh-agent.sock");
     std::fs::create_dir_all(socket_path.parent().expect("socket parent"))
         .expect("create socket dir");
-    let close_called = spawn_mock_daemon(socket_path.clone());
+    std::fs::write(&ssh_auth_sock, b"").expect("write fake ssh auth sock");
+    let close_called = spawn_mock_daemon(socket_path.clone(), Some(ssh_auth_sock.clone()));
     wait_for_socket(&socket_path);
 
     let status = std::process::Command::new(ember_bin())
@@ -324,6 +348,7 @@ fn ember_cli_binary_codex_isolated_uses_standalone_worker_handoff() {
         .arg("--")
         .arg("--help")
         .env("HOME", &home_dir)
+        .env("EMBER_CONFIG", home_dir.join(".ember/config.toml"))
         .env("EMBER_PERSONA", "persona-main")
         .env(
             "EMBER_CODEX_CONTAINER_RUNTIME_ROOT",
@@ -333,7 +358,7 @@ fn ember_cli_binary_codex_isolated_uses_standalone_worker_handoff() {
         .env(
             "EMBER_COMPOSE_TEMPLATE",
             workspace_root()
-                .join("crates/headless-runtime/templates/compose.yml.j2")
+                .join("crates/emberlink-cli/templates/compose.yml.j2")
                 .display()
                 .to_string(),
         )
@@ -372,11 +397,56 @@ fn ember_cli_binary_codex_isolated_uses_standalone_worker_handoff() {
     assert_eq!(compose_files.len(), 1, "expected one compose render");
     let compose = std::fs::read_to_string(&compose_files[0]).expect("read compose file");
     assert_standalone_worker_compose_contract(&compose);
+    let bridge_cert_dir = session_open_root.join(format!("bridge-certs-{MOCK_SESSION_ID}"));
+    assert!(bridge_cert_dir.exists(), "bridge cert dir should be staged");
+    assert!(compose.contains(&format!("source: \"{}\"", bridge_cert_dir.display())));
+    assert!(compose.contains("target: /run/ember"));
+    assert!(
+        !compose.contains("/run/emberd-host"),
+        "bridge-enabled isolated codex launch must not mount the daemon UDS: {compose}"
+    );
+    // ssh-agent-over-bridge S2: even when the registration carries a host
+    // ssh_auth_sock path, the isolated launcher mounts NO host ssh-agent socket
+    // into the worker — that bind-mount handed the in-container agent unbridged,
+    // unleased, unaudited use of every host key. In-container SSH now routes
+    // through the brokered S1 signer or fails closed.
+    assert!(
+        !compose.contains(&format!("source: \"{}\"", ssh_auth_sock.display())),
+        "host ssh-agent socket must not be bind-mounted into the worker: {compose}"
+    );
+    assert!(
+        !compose.contains("target: \"/run/ember/ssh-agent.sock\""),
+        "no /run/ember/ssh-agent.sock host mount in the isolated worker: {compose}"
+    );
 
     let docker_log = std::fs::read_to_string(docker_log).expect("read docker log");
     assert!(docker_log.contains("[up] [-d]"));
     assert!(docker_log.contains("[exec] [-T] [-w] [/work/repo]"));
-    assert!(docker_log.contains("[down] [-v] [--timeout] [10]"));
+    assert!(docker_log.contains("[down] [-v] [--timeout] [1]"));
+    assert!(docker_log.contains("[-e] [EMBER_BRIDGE_URL=https://host.docker.internal:4243]"));
+    assert!(docker_log.contains("[-e] [EMBER_CLIENT_CERT=/run/ember/client.crt]"));
+    assert!(docker_log.contains("[-e] [EMBER_CLIENT_KEY=/run/ember/client.key]"));
+    assert!(docker_log.contains("[-e] [EMBER_CA_CERT=/run/ember/ca.crt]"));
+    assert!(
+        !docker_log.contains("[-e] [EMBER_SOCKET_PATH=/run/emberd-host/daemon.sock]"),
+        "bridge-enabled isolated codex launch must not forward legacy UDS env"
+    );
+    assert!(
+        !docker_log.contains("[-e] [EMBER_DAEMON_SOCKET=/run/emberd-host/daemon.sock]"),
+        "bridge-enabled isolated codex launch must not forward legacy UDS env"
+    );
+    assert!(
+        !docker_log.contains("SSH_AUTH_SOCK="),
+        "isolated worker env must not point SSH_AUTH_SOCK at a host-agent mount: {docker_log}"
+    );
+    assert!(
+        !docker_log.contains("EMBER_SOCKET_PATH"),
+        "bridge-enabled isolated worker must not use legacy daemon socket env"
+    );
+    assert!(
+        !docker_log.contains("EMBER_DAEMON_SOCKET"),
+        "bridge-enabled isolated worker must not use legacy daemon socket env"
+    );
     assert!(docker_log.contains("[worker] [/usr/local/lib/ember/codex-runtime/bin/codex]"));
     assert!(docker_log.contains("[-C] [/work/repo] [--help]"));
 }
@@ -395,7 +465,7 @@ fn ember_cli_binary_codex_isolated_stages_runtime_from_host_install() {
     let xdg_data_home = tmp.path().join("xdg-data");
     std::fs::create_dir_all(&home_dir).expect("create home");
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
-    std::fs::create_dir_all(&fake_codex_config).expect("create fake codex config dir");
+    write_fake_codex_auth_state(&fake_codex_config);
     std::fs::create_dir_all(&xdg_data_home).expect("create xdg data home");
     write_default_home_config(&home_dir);
     write_fake_host_runtime(&fake_host_runtime, "1.2.3");
@@ -404,7 +474,7 @@ fn ember_cli_binary_codex_isolated_stages_runtime_from_host_install() {
     let socket_path = home_dir.join(".ember").join("run").join("daemon.sock");
     std::fs::create_dir_all(socket_path.parent().expect("socket parent"))
         .expect("create socket dir");
-    let close_called = spawn_mock_daemon(socket_path.clone());
+    let close_called = spawn_mock_daemon(socket_path.clone(), None);
     wait_for_socket(&socket_path);
 
     let status = std::process::Command::new(ember_bin())
@@ -416,20 +486,20 @@ fn ember_cli_binary_codex_isolated_stages_runtime_from_host_install() {
         .arg("--help")
         .env("HOME", &home_dir)
         .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("EMBER_CONFIG", home_dir.join(".ember/config.toml"))
         .env("EMBER_PERSONA", "persona-main")
         .env(
-            "EMBER_CODEX_BIN",
-            fake_host_runtime
-                .join("bin")
-                .join("codex")
-                .display()
-                .to_string(),
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin_dir.display(),
+                fake_host_runtime.join("bin").display()
+            ),
         )
-        .env("PATH", fake_bin_dir.display().to_string())
         .env(
             "EMBER_COMPOSE_TEMPLATE",
             workspace_root()
-                .join("crates/headless-runtime/templates/compose.yml.j2")
+                .join("crates/emberlink-cli/templates/compose.yml.j2")
                 .display()
                 .to_string(),
         )
@@ -493,14 +563,17 @@ fn ember_cli_binary_codex_isolated_requires_host_codex_auth_state() {
     let tmp = short_tempdir();
     let home_dir = tmp.path().join("home");
     let fake_bin_dir = tmp.path().join("bin");
+    let codex_config_dir = home_dir.join(".codex");
     std::fs::create_dir_all(&home_dir).expect("create home");
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
+    std::fs::create_dir_all(&codex_config_dir).expect("create fake codex config dir");
+    std::fs::write(codex_config_dir.join("hooks.json"), "{}").expect("write fake hooks json");
     write_default_home_config(&home_dir);
 
     let socket_path = home_dir.join(".ember").join("run").join("daemon.sock");
     std::fs::create_dir_all(socket_path.parent().expect("socket parent"))
         .expect("create socket dir");
-    let _close_called = spawn_mock_daemon(socket_path.clone());
+    let _close_called = spawn_mock_daemon(socket_path.clone(), None);
     wait_for_socket(&socket_path);
 
     let out = std::process::Command::new(ember_bin())
@@ -509,6 +582,7 @@ fn ember_cli_binary_codex_isolated_requires_host_codex_auth_state() {
         .arg("--")
         .arg("--help")
         .env("HOME", &home_dir)
+        .env("EMBER_CONFIG", home_dir.join(".ember/config.toml"))
         .env("EMBER_PERSONA", "persona-main")
         .env("PATH", fake_bin_dir.display().to_string())
         .current_dir(workspace_root())
@@ -521,6 +595,8 @@ fn ember_cli_binary_codex_isolated_requires_host_codex_auth_state() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("~/.codex"), "stderr:\n{stderr}");
+    assert!(stderr.contains("auth.json"), "stderr:\n{stderr}");
+    assert!(stderr.contains("hooks.json"), "stderr:\n{stderr}");
     assert!(stderr.contains("codex login"), "stderr:\n{stderr}");
     assert!(
         stderr.contains("codex login --device-auth"),

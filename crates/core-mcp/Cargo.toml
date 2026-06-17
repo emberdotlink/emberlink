@@ -14,3 +14,6 @@ tokio = { version = "1", features = ["io-util", "io-std", "rt"], optional = true
 [features]
 default = []
 async-stdio = ["tokio"]
+
+[lints]
+workspace = true

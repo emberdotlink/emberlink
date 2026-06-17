@@ -1,3 +1,4 @@
+//! CLASSIFICATION: PUBLIC
 //!
 //! per_agent_volume — per-agent-persona named volume helpers for build-artifact
 //! caches (`target/`, `node_modules/`, `.venv/`, `.cargo/`).
@@ -68,9 +69,9 @@ pub fn purge_per_agent_volumes(agent_ids: &[&str]) -> io::Result<Vec<String>> {
                 if stderr.contains("No such volume") {
                     warnings.push(vol_name);
                 } else {
-                    return Err(io::Error::other(
-                        format!("docker volume rm {vol_name} failed: {stderr}"),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "docker volume rm {vol_name} failed: {stderr}"
+                    )));
                 }
             }
         }

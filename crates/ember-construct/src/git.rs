@@ -31,6 +31,9 @@
 //!   `gc --aggressive`           → git.gc.destructive (gated)
 //!   `gc --prune=now`            → git.gc.destructive (gated)
 
+use core_construct_runtime::factory::{
+    ConstructFactory, FactoryDisposition, InvocationGrammar, NeedTemplate, TargetExtractor,
+};
 use core_construct_runtime::{ActionKey, ClassifyArgv};
 
 /// Struct wrapper for daemon-side classify calls (design §3).
@@ -253,6 +256,288 @@ pub fn extract_git_remote_name(verb: &str, rest: &[String]) -> Option<String> {
     rest.iter().find(|a| !a.starts_with('-')).cloned()
 }
 
+/// Classification of a git remote URL for least-privilege GitHub token minting
+/// (design BKR-2). Lets the mint path bound a GitHub installation token to the
+/// concrete repo, while **degrading gracefully** — never refusing a push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubRemote {
+    /// A `github.com` remote with a concrete `owner/repo` — bind the mint to it.
+    Repo(String),
+    /// A `github.com` remote whose `owner/repo` could not be extracted (a
+    /// malformed/exotic URL). The mint should fall back to the action's declared
+    /// (unbounded) scope rather than refuse — this is the rare safety valve.
+    GithubUnparseable,
+    /// Not a `github.com` remote (GitLab, internal git, a non-URL, …). A GitHub
+    /// installation token is useless here, so the mint should be **skipped**
+    /// entirely; the operation proceeds with its own auth.
+    NotGithub,
+}
+
+/// Parse the host + path out of a git remote URL. Handles `scheme://[user@]host[:port]/path`
+/// and scp-like `[user@]host:path`. Returns `(host, path)`.
+fn split_remote_host_path(url: &str) -> Option<(&str, String)> {
+    let url = url.trim();
+    if let Some((_scheme, rest)) = url.split_once("://") {
+        // URL form: [userinfo@]host[:port]/path
+        let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        Some((host.split(':').next().unwrap_or(host), path.to_string()))
+    } else if let Some((hostpart, path)) = url.split_once(':') {
+        // scp-like form: [user@]host:path
+        let host = hostpart.split('@').next_back().unwrap_or(hostpart);
+        Some((host, path.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Classify a git remote URL for GitHub least-privilege minting. The host must
+/// be **exactly** `github.com` (lookalikes like `github.company.com` and
+/// `evil.com/github.com/...` are `NotGithub`). See [`GithubRemote`].
+pub fn classify_github_remote(url: &str) -> GithubRemote {
+    let Some((host, path)) = split_remote_host_path(url) else {
+        return GithubRemote::NotGithub;
+    };
+    if host != "github.com" {
+        return GithubRemote::NotGithub;
+    }
+    let mut segs = path.trim_start_matches('/').split('/');
+    let (Some(owner), Some(repo)) = (segs.next(), segs.next()) else {
+        return GithubRemote::GithubUnparseable;
+    };
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if owner.is_empty() || repo.is_empty() || owner.contains('*') || repo.contains('*') {
+        return GithubRemote::GithubUnparseable;
+    }
+    GithubRemote::Repo(format!("{owner}/{repo}"))
+}
+
+/// Concrete `owner/repo` of a `github.com` remote, or `None` for any other host
+/// / malformed URL. Thin wrapper over [`classify_github_remote`].
+pub fn owner_repo_from_remote_url(url: &str) -> Option<String> {
+    match classify_github_remote(url) {
+        GithubRemote::Repo(r) => Some(r),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitFactory — construct-factory contract for the git construct
+// ---------------------------------------------------------------------------
+
+static GIT_MANIFEST: std::sync::LazyLock<core_events::construct_toml::ParsedActionManifest> =
+    std::sync::LazyLock::new(|| {
+        core_events::construct_toml::parse_action_manifest(include_str!("../construct/git.toml"))
+            .expect("bundled git.toml must be valid")
+    });
+
+fn manifest_need_for_action(action_key: &str) -> Option<Vec<String>> {
+    GIT_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .find(|a| action_key.ends_with(&a.key))
+        .and_then(|a| {
+            let need = &a.need;
+            if need.is_empty() {
+                None
+            } else {
+                Some(need.clone())
+            }
+        })
+}
+
+fn action_in_manifest(action_key: &str) -> bool {
+    GIT_MANIFEST
+        .manifest
+        .actions
+        .iter()
+        .any(|a| action_key.ends_with(&a.key))
+}
+
+/// factory implementation for the `git` construct.
+#[derive(Debug, Default, Clone)]
+pub struct GitFactory;
+
+/// Provider-specific target extracted from a `git` argv invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFactoryTarget {
+    pub provider: &'static str,
+    pub host: String,
+    pub repo: String,
+    pub refspec: Option<String>,
+}
+
+/// Need atoms derived from the bundled manifest for one `git` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFactoryNeed(pub Vec<String>);
+
+impl InvocationGrammar for GitFactory {
+    fn action_key_for_argv(&self, argv: &[String]) -> Option<ActionKey> {
+        classify_git_argv(argv)
+    }
+}
+
+impl TargetExtractor for GitFactory {
+    type Target = GitFactoryTarget;
+
+    fn target_for_argv(&self, _action_key: &ActionKey, argv: &[String]) -> Option<Self::Target> {
+        let verb_idx = first_verb_index(argv)?;
+        let verb = argv[verb_idx].as_str();
+        let rest = &argv[verb_idx + 1..];
+
+        match verb {
+            "push" | "fetch" | "pull" | "clone" => {}
+            _ => return None,
+        }
+
+        let remote = rest.iter().find(|a| !a.starts_with('-'))?.as_str();
+
+        if !remote.contains("://") && !remote.contains(':') {
+            return None;
+        }
+
+        let (host, path) = split_remote_host_path(remote)?;
+        if host != "github.com" {
+            return None;
+        }
+
+        let mut segs = path.trim_start_matches('/').split('/');
+        let (owner, repo_raw) = (segs.next()?, segs.next()?);
+        let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+
+        let refspec = rest.iter().filter(|a| !a.starts_with('-')).nth(1).cloned();
+
+        Some(GitFactoryTarget {
+            provider: "github",
+            host: host.to_string(),
+            repo: format!("{owner}/{repo}"),
+            refspec,
+        })
+    }
+}
+
+impl NeedTemplate for GitFactory {
+    type Need = GitFactoryNeed;
+
+    fn need_for_target(
+        &self,
+        action_key: &ActionKey,
+        _target: &Self::Target,
+        _argv: &[String],
+    ) -> Option<Self::Need> {
+        manifest_need_for_action(&action_key.0).map(GitFactoryNeed)
+    }
+}
+
+/// Returns `true` when `argv` contains `--mirror` (unbounded ref mutation).
+fn has_mirror_flag(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "--mirror")
+}
+
+impl ConstructFactory for GitFactory {
+    fn disposition_for_argv(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+    ) -> FactoryDisposition {
+        let Some(key) = action_key else {
+            return FactoryDisposition::Credentialless;
+        };
+
+        if has_mirror_flag(argv) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if !action_in_manifest(&key.0) {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        if manifest_need_for_action(&key.0).is_none() {
+            return FactoryDisposition::UnsupportedFailClosed;
+        }
+
+        let verb_idx = first_verb_index(argv);
+        let has_url_remote = verb_idx
+            .and_then(|i| {
+                let rest = &argv[i + 1..];
+                rest.iter().find(|a| !a.starts_with('-'))
+            })
+            .is_some_and(|remote| remote.contains("://") || remote.contains(':'));
+
+        if has_url_remote {
+            FactoryDisposition::Mediated
+        } else {
+            FactoryDisposition::ResolverRequired
+        }
+    }
+
+    /// Trusted resolver: derive the github origin URL from cwd's
+    /// `.git/config`, then synthesize the argv by replacing the
+    /// remote-alias positional (e.g. `origin`) with the URL — or
+    /// appending the URL when argv has no remote positional. The
+    /// resulting argv has the URL inline, so the existing
+    /// `disposition_for_argv` flips ResolverRequired → Mediated and the
+    /// daemon's existing `target ⊆ grant.resource` clamp gates the
+    /// derived target.
+    ///
+    /// Skipped for `clone` (its argv already requires a URL positional)
+    /// and when the first positional is already URL-shaped.
+    fn resolve_target_from_environment(
+        &self,
+        action_key: Option<&ActionKey>,
+        argv: &[String],
+        cwd: &std::path::Path,
+    ) -> Option<Vec<String>> {
+        let _key = action_key?;
+        let verb_idx = first_verb_index(argv)?;
+        let verb = argv[verb_idx].as_str();
+        // `clone` always carries the URL inline; no env-derive applies.
+        if verb == "clone" {
+            return None;
+        }
+        let rest_start = verb_idx + 1;
+        let alias_pos = argv[rest_start..]
+            .iter()
+            .position(|a| !a.starts_with('-'))
+            .map(|p| rest_start + p);
+        // If a positional is already URL-shaped, don't derive.
+        if let Some(pos) = alias_pos {
+            let candidate = argv[pos].as_str();
+            if candidate.contains("://") || candidate.contains(':') {
+                return None;
+            }
+        }
+
+        let url = crate::env_derive::cwd_git_remote_origin_url(cwd)?;
+        // Synthesize only when the derived URL is a github URL — the
+        // existing GitFactory disposition flips to Mediated only on
+        // github URLs (`target_for_argv` is github-only), so a non-github
+        // origin won't unlock the Mediated path. Fall through to the
+        // existing refusal in that case rather than emit confusing argv.
+        if !matches!(classify_github_remote(&url), GithubRemote::Repo(_)) {
+            return None;
+        }
+
+        let mut synthesized = argv.to_vec();
+        match alias_pos {
+            Some(pos) => {
+                // Replace alias (e.g. `origin`) with the derived URL.
+                synthesized[pos] = url;
+            }
+            None => {
+                // No positional — append URL at the canonical
+                // post-options position for `git push [options] [repo]`.
+                synthesized.push(url);
+            }
+        }
+        Some(synthesized)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +548,95 @@ mod tests {
 
     fn key(strs: &[&str]) -> Option<String> {
         classify_git_argv(&args(strs)).map(|k| k.0)
+    }
+
+    // --- github remote classification (design BKR-2) ---
+
+    #[test]
+    fn owner_repo_from_https_with_and_without_dot_git() {
+        assert_eq!(
+            owner_repo_from_remote_url("https://github.com/emberdotlink/emberlink-dev.git")
+                .as_deref(),
+            Some("emberdotlink/emberlink-dev")
+        );
+        assert_eq!(
+            owner_repo_from_remote_url("https://github.com/emberdotlink/emberlink-dev").as_deref(),
+            Some("emberdotlink/emberlink-dev")
+        );
+    }
+
+    #[test]
+    fn owner_repo_from_embedded_token_and_port() {
+        assert_eq!(
+            owner_repo_from_remote_url(&format!(
+                "https://{}@github.com/acme/widgets.git",
+                "x-access-token:example-token"
+            ))
+            .as_deref(),
+            Some("acme/widgets")
+        );
+        assert_eq!(
+            owner_repo_from_remote_url("https://github.com:443/acme/widgets").as_deref(),
+            Some("acme/widgets")
+        );
+    }
+
+    #[test]
+    fn owner_repo_from_scp_and_ssh_forms() {
+        assert_eq!(
+            owner_repo_from_remote_url("git@github.com:acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
+        assert_eq!(
+            owner_repo_from_remote_url("ssh://git@github.com/acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
+    }
+
+    #[test]
+    fn classify_non_github_host_is_not_github_not_unparseable() {
+        // The hot-path-safety distinction: a real non-github remote must be
+        // NotGithub (skip the mint), NOT GithubUnparseable (which would
+        // unbounded-fallback). A non-URL is also NotGithub.
+        for url in [
+            "https://gitlab.com/a/b.git",
+            "https://evil.com/github.com/a/b", // host is evil.com
+            "https://github.company.com/a/b",  // lookalike host
+            "git@gitlab.com:a/b.git",
+            "not a url",
+        ] {
+            assert_eq!(
+                classify_github_remote(url),
+                GithubRemote::NotGithub,
+                "{url}"
+            );
+            assert_eq!(owner_repo_from_remote_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn classify_github_host_but_malformed_is_unparseable() {
+        // github.com host but no concrete owner/repo → unbounded-fallback, not skip.
+        for url in [
+            "https://github.com/owner",   // missing repo segment
+            "https://github.com/owner/*", // wildcard repo
+            "https://github.com//",       // empty segments
+        ] {
+            assert_eq!(
+                classify_github_remote(url),
+                GithubRemote::GithubUnparseable,
+                "{url}"
+            );
+            assert_eq!(owner_repo_from_remote_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn classify_github_repo_form() {
+        assert_eq!(
+            classify_github_remote("https://github.com/acme/widgets.git"),
+            GithubRemote::Repo("acme/widgets".to_string())
+        );
     }
 
     // --- push ---
@@ -637,5 +1011,378 @@ mod tests {
             extract_git_remote_name("commit", &["-m".into(), "msg".into()]),
             None
         );
+    }
+
+    // --- GitFactory tests ---
+
+    #[test]
+    fn git_factory_push_exact_https_is_mediated() {
+        let f = GitFactory;
+        let a = args(&[
+            "push",
+            "https://github.com/emberdotlink/emberlink-dev.git",
+            "HEAD:main",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Mediated
+        );
+    }
+
+    #[test]
+    fn git_factory_push_origin_is_resolver_required() {
+        let f = GitFactory;
+        let a = args(&["push", "origin", "main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn git_factory_push_mirror_is_unsupported() {
+        let f = GitFactory;
+        let a = args(&["push", "--mirror", "origin"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn git_factory_force_push_no_need_is_unsupported() {
+        let f = GitFactory;
+        let a = args(&["push", "--force", "origin", "main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn git_factory_push_bare_is_resolver_required() {
+        let f = GitFactory;
+        let a = args(&["push"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::ResolverRequired
+        );
+    }
+
+    #[test]
+    fn git_factory_reset_hard_is_unsupported() {
+        let f = GitFactory;
+        let a = args(&["reset", "--hard", "HEAD~1"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::UnsupportedFailClosed
+        );
+    }
+
+    #[test]
+    fn git_factory_commit_passthrough_is_credentialless() {
+        let f = GitFactory;
+        let a = args(&["commit", "-m", "msg"]);
+        let key = f.action_key_for_argv(&a);
+        assert!(key.is_none());
+        assert_eq!(
+            f.disposition_for_argv(key.as_ref(), &a),
+            FactoryDisposition::Credentialless
+        );
+    }
+
+    #[test]
+    fn git_factory_target_extraction_https() {
+        let f = GitFactory;
+        let a = args(&[
+            "push",
+            "https://github.com/emberdotlink/emberlink-dev.git",
+            "HEAD:main",
+        ]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.provider, "github");
+        assert_eq!(target.host, "github.com");
+        assert_eq!(target.repo, "emberdotlink/emberlink-dev");
+        assert_eq!(target.refspec, Some("HEAD:main".to_string()));
+    }
+
+    #[test]
+    fn git_factory_target_extraction_scp() {
+        let f = GitFactory;
+        let a = args(&["push", "git@github.com:acme/widgets.git", "main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target extracted");
+        assert_eq!(target.repo, "acme/widgets");
+        assert_eq!(target.refspec, Some("main".to_string()));
+    }
+
+    #[test]
+    fn git_factory_target_alias_returns_none() {
+        let f = GitFactory;
+        let a = args(&["push", "origin", "main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert!(f.target_for_argv(&key, &a).is_none());
+    }
+
+    #[test]
+    fn git_factory_target_non_github_returns_none() {
+        let f = GitFactory;
+        let a = args(&["push", "https://gitlab.com/acme/widgets.git", "main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert!(f.target_for_argv(&key, &a).is_none());
+    }
+
+    #[test]
+    fn git_factory_need_resolution_push() {
+        let f = GitFactory;
+        let a = args(&["push", "https://github.com/acme/widgets.git", "main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        let target = f.target_for_argv(&key, &a).expect("target");
+        let need = f.need_for_target(&key, &target, &a).expect("need resolved");
+        assert_eq!(
+            need.0,
+            vec!["github:metadata:read", "github:contents:write"]
+        );
+    }
+
+    #[test]
+    fn git_factory_push_ssh_url_is_mediated() {
+        let f = GitFactory;
+        let a = args(&["push", "ssh://git@github.com/acme/widgets.git", "HEAD:main"]);
+        let key = f.action_key_for_argv(&a).expect("classified");
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &a),
+            FactoryDisposition::Mediated
+        );
+    }
+
+    #[test]
+    fn git_factory_contract_runs_conformance_corpus() {
+        let corpus = core_construct_runtime::factory::parse_factory_fixture_corpus(include_str!(
+            "../conformance/git/factory-fixtures.toml"
+        ))
+        .expect("fixture corpus parses");
+        let validation_errors =
+            core_construct_runtime::factory::validate_factory_fixture_corpus(&corpus);
+        assert!(validation_errors.is_empty(), "{validation_errors:#?}");
+
+        let carrier = core_construct_runtime::factory::ActionManifestV2Carrier::parse(
+            include_str!("../construct/git.toml"),
+        )
+        .expect("git manifest carrier parses");
+        let report = core_construct_runtime::factory::run_factory_fixtures(
+            &GitFactory,
+            Some(&carrier),
+            &corpus,
+        );
+        assert!(report.is_clean(), "{:#?}", report.failures);
+    }
+
+    // -----------------------------------------------------------------------
+    // V030-FACTORY-RESOLVER-implementation-note-101: GitFactory::resolve_target_from_environment
+    //
+    // AC: derive github origin URL from cwd, replace remote-alias positional
+    //     (e.g. `origin`) with the derived URL, or append URL on bare push.
+    //     Non-github origins return None. Already-URL argv returns None.
+    //     `clone` returns None (URL is always explicit).
+    // -----------------------------------------------------------------------
+
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    static GIT_RESOLVER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn make_git_repo_with_origin(remote_url: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+        let init = Command::new(crate::env_derive::SYSTEM_GIT_BINARY)
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        let remote = Command::new(crate::env_derive::SYSTEM_GIT_BINARY)
+            .args(["remote", "add", "origin", remote_url])
+            .current_dir(cwd)
+            .output()
+            .expect("git remote add");
+        assert!(remote.status.success(), "git remote add failed: {remote:?}");
+        tmp
+    }
+
+    fn skip_if_no_system_git() -> bool {
+        if !std::path::Path::new(crate::env_derive::SYSTEM_GIT_BINARY).exists() {
+            eprintln!(
+                "skipping: {} not present on this host",
+                crate::env_derive::SYSTEM_GIT_BINARY
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Happy path: `git push origin main` with origin → github URL.
+    /// Synthesised argv replaces `origin` with the URL.
+    #[test]
+    fn git_factory_resolver_replaces_origin_alias_with_derived_url() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let repo = make_git_repo_with_origin("https://github.com/acme/widgets.git");
+
+        let f = GitFactory;
+        let argv = args(&["push", "origin", "main"]);
+        let key = f.action_key_for_argv(&argv).expect("classified");
+        let synthesized = f
+            .resolve_target_from_environment(Some(&key), &argv, repo.path())
+            .expect("resolver derived target");
+
+        assert_eq!(
+            synthesized,
+            vec![
+                "push".to_string(),
+                "https://github.com/acme/widgets.git".to_string(),
+                "main".to_string()
+            ]
+        );
+
+        // Synthesised argv flips disposition to Mediated.
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &synthesized),
+            FactoryDisposition::Mediated
+        );
+    }
+
+    /// Bare `git push` (no positional) → append URL at end.
+    #[test]
+    fn git_factory_resolver_appends_url_on_bare_push() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let repo = make_git_repo_with_origin("https://github.com/acme/widgets.git");
+
+        let f = GitFactory;
+        let argv = args(&["push"]);
+        let key = f.action_key_for_argv(&argv).expect("classified");
+        let synthesized = f
+            .resolve_target_from_environment(Some(&key), &argv, repo.path())
+            .expect("resolver derived target");
+        assert_eq!(
+            synthesized,
+            vec![
+                "push".to_string(),
+                "https://github.com/acme/widgets.git".to_string()
+            ]
+        );
+        assert_eq!(
+            f.disposition_for_argv(Some(&key), &synthesized),
+            FactoryDisposition::Mediated
+        );
+    }
+
+    /// `git push -u origin main` → preserve `-u` flag, replace alias.
+    #[test]
+    fn git_factory_resolver_preserves_flags_when_replacing_alias() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let repo = make_git_repo_with_origin("https://github.com/acme/widgets.git");
+
+        let f = GitFactory;
+        let argv = args(&["push", "-u", "origin", "feature/x"]);
+        let key = f.action_key_for_argv(&argv).expect("classified");
+        let synthesized = f
+            .resolve_target_from_environment(Some(&key), &argv, repo.path())
+            .expect("resolver derived target");
+        assert_eq!(
+            synthesized,
+            vec![
+                "push".to_string(),
+                "-u".to_string(),
+                "https://github.com/acme/widgets.git".to_string(),
+                "feature/x".to_string()
+            ]
+        );
+    }
+
+    /// Argv already URL-shaped → resolver is a no-op (returns None).
+    #[test]
+    fn git_factory_resolver_no_op_when_argv_already_has_url() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let repo = make_git_repo_with_origin("https://github.com/acme/widgets.git");
+
+        let f = GitFactory;
+        let argv = args(&["push", "https://github.com/explicit/target.git", "main"]);
+        let key = f.action_key_for_argv(&argv).expect("classified");
+        let synthesized = f.resolve_target_from_environment(Some(&key), &argv, repo.path());
+        assert_eq!(synthesized, None);
+    }
+
+    /// `clone` always carries its URL inline; resolver returns None.
+    #[test]
+    fn git_factory_resolver_skips_clone() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let repo = make_git_repo_with_origin("https://github.com/acme/widgets.git");
+
+        let f = GitFactory;
+        // `clone` is classified as None (passthrough) — but if the
+        // hook is ever called for clone, it must still return None.
+        let argv = args(&["clone"]);
+        // For this test we synthesise an action_key since the
+        // classifier would return None for `clone`.
+        let synthesized = f.resolve_target_from_environment(
+            Some(&ActionKey("git.clone".to_string())),
+            &argv,
+            repo.path(),
+        );
+        assert_eq!(synthesized, None);
+    }
+
+    /// Non-github origin → resolver returns None (won't unlock Mediated).
+    #[test]
+    fn git_factory_resolver_returns_none_for_non_github_origin() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let repo = make_git_repo_with_origin("https://gitlab.com/acme/widgets.git");
+
+        let f = GitFactory;
+        let argv = args(&["push", "origin", "main"]);
+        let key = f.action_key_for_argv(&argv).expect("classified");
+        let synthesized = f.resolve_target_from_environment(Some(&key), &argv, repo.path());
+        assert_eq!(synthesized, None);
+    }
+
+    /// Outside any git repo → resolver returns None.
+    #[test]
+    fn git_factory_resolver_outside_git_repo_returns_none() {
+        if skip_if_no_system_git() {
+            return;
+        }
+        let _guard = GIT_RESOLVER_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let f = GitFactory;
+        let argv = args(&["push", "origin"]);
+        let key = f.action_key_for_argv(&argv).expect("classified");
+        let synthesized = f.resolve_target_from_environment(Some(&key), &argv, tmp.path());
+        assert_eq!(synthesized, None);
     }
 }

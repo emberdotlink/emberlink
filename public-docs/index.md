@@ -1,8 +1,8 @@
 
 
 > [!NOTE]
-> Support level: **Preview**.
-> Source truth: `README.md`, `QUICKSTART.md`, `docs/current-architecture.md`.
+> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
+
 # Emberlink Docs
 
 Emberlink is the **Grant Warden for AI agents**. It keeps credentials in the
@@ -29,4 +29,3 @@ If you are evaluating Emberlink today, start here:
 Some surfaces remain pre-release. Pages on this site are labeled
 `Supported`, `Preview`, or `Experimental` so the support story is visible at
 read time.
-
