@@ -1,0 +1,26 @@
+[package]
+name = "ember-presence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ember-presence — shared client-side presence acquisition: the Touch ID / LocalAuthentication FFI, the daemon vault-unlock (presence) ceremony, and a plain daemon UDS JSON-RPC client. Consumed by emberlink-cli and internal-automation so the biometric FFI and presence dance live in one audited place."
+publish = false
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "2"
+
+# Objective-C block bridge for the LocalAuthentication reply callback. Only
+# referenced under `#[cfg(target_os = "macos")]` in `biometric::macos`, so the
+# dep is macOS-target-scoped to keep the Linux autopilot-host build lean.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

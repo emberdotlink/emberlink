@@ -1,0 +1,530 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-okta per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-okta"
+plugin_address = "registry.ember.systems/ember-systems/ember-okta"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Okta CLI Construct"
+description = "Okta admin CLI Construct. Mediates `okta` mutations through ember's broker: account-removal verbs (users delete/deactivate/suspend, users reset-password — account-takeover risk), group/app/policy/factor/idps destruction (groups delete, apps delete/deactivate, policies delete/deactivate, factors reset/deactivate, idps delete/deactivate), and session.end (force user logout) all require biometric approval. system-log.export gates without biometric (auditable read but not destructive). All other classified mutating verbs (creates, updates, assignments) gate without biometric. OKTA_API_TOKEN injects via env; daemon zeroizes on child exit."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "okta" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "okta"
+
+[[actions]]
+key = "okta.users.create"
+action_version = "v1"
+summary = "Run okta.users.create"
+input_schema = { kind = "argv", classifier = "users create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.users.create"
+semantic_labels = ["okta.users.create"]
+
+[[actions]]
+key = "okta.users.delete"
+action_version = "v1"
+summary = "Run okta.users.delete"
+input_schema = { kind = "argv", classifier = "users delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.users.delete"
+semantic_labels = ["okta.users.delete"]
+
+[[actions]]
+key = "okta.users.deactivate"
+action_version = "v1"
+summary = "Run okta.users.deactivate"
+input_schema = { kind = "argv", classifier = "users deactivate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.users.deactivate"
+semantic_labels = ["okta.users.deactivate"]
+
+[[actions]]
+key = "okta.users.suspend"
+action_version = "v1"
+summary = "Run okta.users.suspend"
+input_schema = { kind = "argv", classifier = "users suspend *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.users.suspend"
+semantic_labels = ["okta.users.suspend"]
+
+[[actions]]
+key = "okta.users.update"
+action_version = "v1"
+summary = "Run okta.users.update"
+input_schema = { kind = "argv", classifier = "users update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.users.update"
+semantic_labels = ["okta.users.update"]
+
+[[actions]]
+key = "okta.users.reset-password"
+action_version = "v1"
+summary = "Run okta.users.reset-password"
+input_schema = { kind = "argv", classifier = "users reset-password *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.users.reset-password"
+semantic_labels = ["okta.users.reset-password"]
+
+[[actions]]
+key = "okta.groups.create"
+action_version = "v1"
+summary = "Run okta.groups.create"
+input_schema = { kind = "argv", classifier = "groups create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.groups.create"
+semantic_labels = ["okta.groups.create"]
+
+[[actions]]
+key = "okta.groups.delete"
+action_version = "v1"
+summary = "Run okta.groups.delete"
+input_schema = { kind = "argv", classifier = "groups delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.groups.delete"
+semantic_labels = ["okta.groups.delete"]
+
+[[actions]]
+key = "okta.groups.add-user"
+action_version = "v1"
+summary = "Run okta.groups.add-user"
+input_schema = { kind = "argv", classifier = "groups add-user *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.groups.add-user"
+semantic_labels = ["okta.groups.add-user"]
+
+[[actions]]
+key = "okta.groups.remove-user"
+action_version = "v1"
+summary = "Run okta.groups.remove-user"
+input_schema = { kind = "argv", classifier = "groups remove-user *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.groups.remove-user"
+semantic_labels = ["okta.groups.remove-user"]
+
+[[actions]]
+key = "okta.groups.update"
+action_version = "v1"
+summary = "Run okta.groups.update"
+input_schema = { kind = "argv", classifier = "groups update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.groups.update"
+semantic_labels = ["okta.groups.update"]
+
+[[actions]]
+key = "okta.apps.create"
+action_version = "v1"
+summary = "Run okta.apps.create"
+input_schema = { kind = "argv", classifier = "apps create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.create"
+semantic_labels = ["okta.apps.create"]
+
+[[actions]]
+key = "okta.apps.delete"
+action_version = "v1"
+summary = "Run okta.apps.delete"
+input_schema = { kind = "argv", classifier = "apps delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.delete"
+semantic_labels = ["okta.apps.delete"]
+
+[[actions]]
+key = "okta.apps.deactivate"
+action_version = "v1"
+summary = "Run okta.apps.deactivate"
+input_schema = { kind = "argv", classifier = "apps deactivate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.deactivate"
+semantic_labels = ["okta.apps.deactivate"]
+
+[[actions]]
+key = "okta.apps.update"
+action_version = "v1"
+summary = "Run okta.apps.update"
+input_schema = { kind = "argv", classifier = "apps update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.update"
+semantic_labels = ["okta.apps.update"]
+
+[[actions]]
+key = "okta.apps.assign-user"
+action_version = "v1"
+summary = "Run okta.apps.assign-user"
+input_schema = { kind = "argv", classifier = "apps assign-user *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.assign-user"
+semantic_labels = ["okta.apps.assign-user"]
+
+[[actions]]
+key = "okta.apps.unassign-user"
+action_version = "v1"
+summary = "Run okta.apps.unassign-user"
+input_schema = { kind = "argv", classifier = "apps unassign-user *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.unassign-user"
+semantic_labels = ["okta.apps.unassign-user"]
+
+[[actions]]
+key = "okta.apps.assign-group"
+action_version = "v1"
+summary = "Run okta.apps.assign-group"
+input_schema = { kind = "argv", classifier = "apps assign-group *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.assign-group"
+semantic_labels = ["okta.apps.assign-group"]
+
+[[actions]]
+key = "okta.apps.unassign-group"
+action_version = "v1"
+summary = "Run okta.apps.unassign-group"
+input_schema = { kind = "argv", classifier = "apps unassign-group *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.apps.unassign-group"
+semantic_labels = ["okta.apps.unassign-group"]
+
+[[actions]]
+key = "okta.policies.create"
+action_version = "v1"
+summary = "Run okta.policies.create"
+input_schema = { kind = "argv", classifier = "policies create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.policies.create"
+semantic_labels = ["okta.policies.create"]
+
+[[actions]]
+key = "okta.policies.delete"
+action_version = "v1"
+summary = "Run okta.policies.delete"
+input_schema = { kind = "argv", classifier = "policies delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.policies.delete"
+semantic_labels = ["okta.policies.delete"]
+
+[[actions]]
+key = "okta.policies.update"
+action_version = "v1"
+summary = "Run okta.policies.update"
+input_schema = { kind = "argv", classifier = "policies update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.policies.update"
+semantic_labels = ["okta.policies.update"]
+
+[[actions]]
+key = "okta.policies.deactivate"
+action_version = "v1"
+summary = "Run okta.policies.deactivate"
+input_schema = { kind = "argv", classifier = "policies deactivate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.policies.deactivate"
+semantic_labels = ["okta.policies.deactivate"]
+
+[[actions]]
+key = "okta.factors.enroll"
+action_version = "v1"
+summary = "Run okta.factors.enroll"
+input_schema = { kind = "argv", classifier = "factors enroll *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.factors.enroll"
+semantic_labels = ["okta.factors.enroll"]
+
+[[actions]]
+key = "okta.factors.reset"
+action_version = "v1"
+summary = "Run okta.factors.reset"
+input_schema = { kind = "argv", classifier = "factors reset *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.factors.reset"
+semantic_labels = ["okta.factors.reset"]
+
+[[actions]]
+key = "okta.factors.deactivate"
+action_version = "v1"
+summary = "Run okta.factors.deactivate"
+input_schema = { kind = "argv", classifier = "factors deactivate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.factors.deactivate"
+semantic_labels = ["okta.factors.deactivate"]
+
+[[actions]]
+key = "okta.idps.create"
+action_version = "v1"
+summary = "Run okta.idps.create"
+input_schema = { kind = "argv", classifier = "idps create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.idps.create"
+semantic_labels = ["okta.idps.create"]
+
+[[actions]]
+key = "okta.idps.delete"
+action_version = "v1"
+summary = "Run okta.idps.delete"
+input_schema = { kind = "argv", classifier = "idps delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.idps.delete"
+semantic_labels = ["okta.idps.delete"]
+
+[[actions]]
+key = "okta.idps.deactivate"
+action_version = "v1"
+summary = "Run okta.idps.deactivate"
+input_schema = { kind = "argv", classifier = "idps deactivate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.idps.deactivate"
+semantic_labels = ["okta.idps.deactivate"]
+
+[[actions]]
+key = "okta.idps.update"
+action_version = "v1"
+summary = "Run okta.idps.update"
+input_schema = { kind = "argv", classifier = "idps update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.idps.update"
+semantic_labels = ["okta.idps.update"]
+
+[[actions]]
+key = "okta.zones.create"
+action_version = "v1"
+summary = "Run okta.zones.create"
+input_schema = { kind = "argv", classifier = "zones create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.zones.create"
+semantic_labels = ["okta.zones.create"]
+
+[[actions]]
+key = "okta.zones.delete"
+action_version = "v1"
+summary = "Run okta.zones.delete"
+input_schema = { kind = "argv", classifier = "zones delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.zones.delete"
+semantic_labels = ["okta.zones.delete"]
+
+[[actions]]
+key = "okta.zones.update"
+action_version = "v1"
+summary = "Run okta.zones.update"
+input_schema = { kind = "argv", classifier = "zones update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.zones.update"
+semantic_labels = ["okta.zones.update"]
+
+[[actions]]
+key = "okta.session.end"
+action_version = "v1"
+summary = "Run okta.session.end"
+input_schema = { kind = "argv", classifier = "session end *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.session.end"
+semantic_labels = ["okta.session.end"]
+
+[[actions]]
+key = "okta.system-log.export"
+action_version = "v1"
+summary = "Run okta.system-log.export"
+input_schema = { kind = "argv", classifier = "system-log export *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:okta.system-log.export"
+semantic_labels = ["okta.system-log.export"]

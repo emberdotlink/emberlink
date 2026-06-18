@@ -1,0 +1,30 @@
+[package]
+name = "core-construct-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared per-Construct runtime boilerplate: env-detect → classify → broker.resolve → broker.exec → ExitCode (per ADR 124)"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+core-event-types = { path = "../core-event-types" }
+core-events = { path = "../core-events" }
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml.workspace = true
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
+
+[lints]
+workspace = true

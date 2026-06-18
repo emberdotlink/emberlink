@@ -1,0 +1,17 @@
+[package]
+name = "core-personas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

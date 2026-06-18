@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Emberlink authority lifecycle</title>
+  <desc id="desc">A standing credential stays in daemon custody. A grant bounds what may happen. An action request is checked, narrowed authority is materialized for execution, and a receipt records evidence.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#15803d"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#b91c1c"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 34px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 18px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .label { font: 700 20px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .body { font: 15px system-ui, -apple-system, Segoe UI, sans-serif; fill: #334155; }
+      .small { font: 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 18; }
+      .custody { fill: #eff6ff; stroke: #2563eb; }
+      .grant { fill: #f0fdf4; stroke: #16a34a; }
+      .decision { fill: #fff7ed; stroke: #ea580c; }
+      .receipt { fill: #f5f3ff; stroke: #7c3aed; }
+      .danger { fill: #fef2f2; stroke: #dc2626; }
+      .line { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .line-green { stroke: #15803d; stroke-width: 3; fill: none; marker-end: url(#arrow-green); }
+      .line-red { stroke: #b91c1c; stroke-width: 3; fill: none; marker-end: url(#arrow-red); stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="620"/>
+  <text class="title" x="60" y="58">Grant the action, not the key</text>
+  <text class="subtitle" x="60" y="90">Emberlink keeps standing credentials in authority space and releases only bounded, action-shaped authority.</text>
+
+  <rect class="box custody" x="60" y="150" width="190" height="110"/>
+  <text class="label" x="88" y="188">Standing</text>
+  <text class="label" x="88" y="214">credential</text>
+  <text class="body" x="88" y="242">kept by emberd</text>
+
+  <rect class="box grant" x="310" y="150" width="170" height="110"/>
+  <text class="label" x="342" y="188">Grant</text>
+  <text class="body" x="342" y="218">persona</text>
+  <text class="body" x="342" y="240">action, target, limit</text>
+
+  <rect class="box" x="540" y="150" width="180" height="110"/>
+  <text class="label" x="572" y="188">Action</text>
+  <text class="label" x="572" y="214">request</text>
+  <text class="body" x="572" y="242">from a session</text>
+
+  <rect class="box decision" x="780" y="132" width="180" height="146"/>
+  <text class="label" x="815" y="170">Daemon</text>
+  <text class="label" x="815" y="196">decision</text>
+  <text class="body" x="815" y="226">allow, prompt,</text>
+  <text class="body" x="815" y="248">narrow, or deny</text>
+
+  <rect class="box grant" x="780" y="380" width="180" height="110"/>
+  <text class="label" x="810" y="418">Narrowed</text>
+  <text class="label" x="810" y="444">authority</text>
+  <text class="body" x="810" y="472">short-lived token</text>
+
+  <rect class="box" x="1008" y="380" width="150" height="110"/>
+  <text class="label" x="1038" y="418">Tool</text>
+  <text class="label" x="1038" y="444">action</text>
+  <text class="body" x="1038" y="472">gh, git, kubectl</text>
+
+  <rect class="box receipt" x="540" y="380" width="180" height="110"/>
+  <text class="label" x="575" y="418">Receipt</text>
+  <text class="label" x="575" y="444">and audit</text>
+  <text class="body" x="575" y="472">evidence survives</text>
+
+  <rect class="box danger" x="310" y="380" width="170" height="110"/>
+  <text class="label" x="345" y="418">Deny</text>
+  <text class="body" x="345" y="448">no authority</text>
+  <text class="body" x="345" y="470">is released</text>
+
+  <path class="line" d="M250 205 H310"/>
+  <path class="line" d="M480 205 H540"/>
+  <path class="line" d="M720 205 H780"/>
+  <path class="line-green" d="M870 278 V380"/>
+  <path class="line-green" d="M960 435 H1008"/>
+  <path class="line" d="M1008 458 C915 550 695 550 630 490"/>
+  <path class="line-red" d="M780 240 C660 332 540 395 480 435"/>
+
+  <text class="small" x="72" y="320">The standing credential does not enter the agent process.</text>
+  <text class="small" x="72" y="346">If the request fits the grant, the daemon materializes only the action-shaped authority.</text>
+  <text class="small" x="72" y="372">If it does not fit, the request is denied, narrowed, or sent for approval.</text>
+</svg>

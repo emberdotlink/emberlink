@@ -1,0 +1,227 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-tofu per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-tofu"
+plugin_address = "registry.ember.systems/ember-systems/ember-tofu"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "OpenTofu CLI Construct"
+description = "OpenTofu CLI Construct. Mediates `tofu` state mutations through ember's broker: `tofu destroy` (catastrophic — tears down everything), `tofu force-unlock` (manual lock override), `tofu state {rm, replace-provider, push}` (direct state mutation), and `tofu workspace delete` (workspace-scoped destruction) all require biometric approval. `tofu apply` gates without biometric — apply is the normal operational path and the destructive subset is constrained by what the underlying providers allow (gated by ember-aws / ember-az / ember-gcloud separately). `tofu taint` / `tofu untaint` / `tofu refresh` / `tofu import` / `tofu workspace {new, select}` / `tofu state mv` are gated. NO credential injection at this layer — cloud creds flow through the provider Constructs."
+
+[defaults]
+materialization_class = "none"
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "tofu"
+
+[[actions]]
+key = "tofu.apply"
+action_version = "v1"
+summary = "Run tofu.apply"
+input_schema = { kind = "argv", classifier = "apply *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.apply"
+semantic_labels = ["tofu.apply"]
+
+[[actions]]
+key = "tofu.destroy"
+action_version = "v1"
+summary = "Run tofu.destroy"
+input_schema = { kind = "argv", classifier = "destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.destroy"
+semantic_labels = ["tofu.destroy"]
+
+[[actions]]
+key = "tofu.import"
+action_version = "v1"
+summary = "Run tofu.import"
+input_schema = { kind = "argv", classifier = "import *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.import"
+semantic_labels = ["tofu.import"]
+
+[[actions]]
+key = "tofu.taint"
+action_version = "v1"
+summary = "Run tofu.taint"
+input_schema = { kind = "argv", classifier = "taint *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.taint"
+semantic_labels = ["tofu.taint"]
+
+[[actions]]
+key = "tofu.untaint"
+action_version = "v1"
+summary = "Run tofu.untaint"
+input_schema = { kind = "argv", classifier = "untaint *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.untaint"
+semantic_labels = ["tofu.untaint"]
+
+[[actions]]
+key = "tofu.refresh"
+action_version = "v1"
+summary = "Run tofu.refresh"
+input_schema = { kind = "argv", classifier = "refresh *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.refresh"
+semantic_labels = ["tofu.refresh"]
+
+[[actions]]
+key = "tofu.force-unlock"
+action_version = "v1"
+summary = "Run tofu.force-unlock"
+input_schema = { kind = "argv", classifier = "force-unlock *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.force-unlock"
+semantic_labels = ["tofu.force-unlock"]
+
+[[actions]]
+key = "tofu.state.rm"
+action_version = "v1"
+summary = "Run tofu.state.rm"
+input_schema = { kind = "argv", classifier = "state rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.state.rm"
+semantic_labels = ["tofu.state.rm"]
+
+[[actions]]
+key = "tofu.state.mv"
+action_version = "v1"
+summary = "Run tofu.state.mv"
+input_schema = { kind = "argv", classifier = "state mv *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.state.mv"
+semantic_labels = ["tofu.state.mv"]
+
+[[actions]]
+key = "tofu.state.replace-provider"
+action_version = "v1"
+summary = "Run tofu.state.replace-provider"
+input_schema = { kind = "argv", classifier = "state replace-provider *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.state.replace-provider"
+semantic_labels = ["tofu.state.replace-provider"]
+
+[[actions]]
+key = "tofu.state.push"
+action_version = "v1"
+summary = "Run tofu.state.push"
+input_schema = { kind = "argv", classifier = "state push *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.state.push"
+semantic_labels = ["tofu.state.push"]
+
+[[actions]]
+key = "tofu.workspace.new"
+action_version = "v1"
+summary = "Run tofu.workspace.new"
+input_schema = { kind = "argv", classifier = "workspace new *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.workspace.new"
+semantic_labels = ["tofu.workspace.new"]
+
+[[actions]]
+key = "tofu.workspace.select"
+action_version = "v1"
+summary = "Run tofu.workspace.select"
+input_schema = { kind = "argv", classifier = "workspace select *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.workspace.select"
+semantic_labels = ["tofu.workspace.select"]
+
+[[actions]]
+key = "tofu.workspace.delete"
+action_version = "v1"
+summary = "Run tofu.workspace.delete"
+input_schema = { kind = "argv", classifier = "workspace delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:tofu.workspace.delete"
+semantic_labels = ["tofu.workspace.delete"]

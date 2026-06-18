@@ -1,0 +1,227 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-terraform per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-terraform"
+plugin_address = "registry.ember.systems/ember-systems/ember-terraform"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Terraform CLI Construct"
+description = "HashiCorp Terraform CLI Construct (sister to ember-tofu). Mediates `terraform` state mutations through ember's broker: `terraform destroy` (catastrophic — tears down everything), `terraform force-unlock` (manual lock override), `terraform state {rm, replace-provider, push}` (direct state mutation), and `terraform workspace delete` (workspace-scoped destruction) all require biometric approval. `terraform apply` gates without biometric — apply is the normal operational path and the destructive subset is constrained by what the underlying providers allow (gated by ember-aws / ember-az / ember-gcloud separately). `terraform taint` / `terraform untaint` / `terraform refresh` / `terraform import` / `terraform workspace {new, select}` / `terraform state mv` are gated. NO credential injection at this layer — cloud creds flow through the provider Constructs."
+
+[defaults]
+materialization_class = "none"
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "terraform"
+
+[[actions]]
+key = "terraform.apply"
+action_version = "v1"
+summary = "Run terraform.apply"
+input_schema = { kind = "argv", classifier = "apply *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.apply"
+semantic_labels = ["terraform.apply"]
+
+[[actions]]
+key = "terraform.destroy"
+action_version = "v1"
+summary = "Run terraform.destroy"
+input_schema = { kind = "argv", classifier = "destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.destroy"
+semantic_labels = ["terraform.destroy"]
+
+[[actions]]
+key = "terraform.import"
+action_version = "v1"
+summary = "Run terraform.import"
+input_schema = { kind = "argv", classifier = "import *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.import"
+semantic_labels = ["terraform.import"]
+
+[[actions]]
+key = "terraform.taint"
+action_version = "v1"
+summary = "Run terraform.taint"
+input_schema = { kind = "argv", classifier = "taint *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.taint"
+semantic_labels = ["terraform.taint"]
+
+[[actions]]
+key = "terraform.untaint"
+action_version = "v1"
+summary = "Run terraform.untaint"
+input_schema = { kind = "argv", classifier = "untaint *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.untaint"
+semantic_labels = ["terraform.untaint"]
+
+[[actions]]
+key = "terraform.refresh"
+action_version = "v1"
+summary = "Run terraform.refresh"
+input_schema = { kind = "argv", classifier = "refresh *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.refresh"
+semantic_labels = ["terraform.refresh"]
+
+[[actions]]
+key = "terraform.force-unlock"
+action_version = "v1"
+summary = "Run terraform.force-unlock"
+input_schema = { kind = "argv", classifier = "force-unlock *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.force-unlock"
+semantic_labels = ["terraform.force-unlock"]
+
+[[actions]]
+key = "terraform.state.rm"
+action_version = "v1"
+summary = "Run terraform.state.rm"
+input_schema = { kind = "argv", classifier = "state rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.rm"
+semantic_labels = ["terraform.state.rm"]
+
+[[actions]]
+key = "terraform.state.mv"
+action_version = "v1"
+summary = "Run terraform.state.mv"
+input_schema = { kind = "argv", classifier = "state mv *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.mv"
+semantic_labels = ["terraform.state.mv"]
+
+[[actions]]
+key = "terraform.state.replace-provider"
+action_version = "v1"
+summary = "Run terraform.state.replace-provider"
+input_schema = { kind = "argv", classifier = "state replace-provider *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.replace-provider"
+semantic_labels = ["terraform.state.replace-provider"]
+
+[[actions]]
+key = "terraform.state.push"
+action_version = "v1"
+summary = "Run terraform.state.push"
+input_schema = { kind = "argv", classifier = "state push *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.state.push"
+semantic_labels = ["terraform.state.push"]
+
+[[actions]]
+key = "terraform.workspace.new"
+action_version = "v1"
+summary = "Run terraform.workspace.new"
+input_schema = { kind = "argv", classifier = "workspace new *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.workspace.new"
+semantic_labels = ["terraform.workspace.new"]
+
+[[actions]]
+key = "terraform.workspace.select"
+action_version = "v1"
+summary = "Run terraform.workspace.select"
+input_schema = { kind = "argv", classifier = "workspace select *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.workspace.select"
+semantic_labels = ["terraform.workspace.select"]
+
+[[actions]]
+key = "terraform.workspace.delete"
+action_version = "v1"
+summary = "Run terraform.workspace.delete"
+input_schema = { kind = "argv", classifier = "workspace delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:terraform.workspace.delete"
+semantic_labels = ["terraform.workspace.delete"]

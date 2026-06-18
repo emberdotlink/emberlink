@@ -1,0 +1,30 @@
+# autopilot — headless-enrollable workflow for autopilot tick workers (no
+# operator at the keyboard). The only template that ships with a
+# `spawn_subagent` capability — autopilot is the one workflow that legitimately
+# fans out into sub-agents per ADR 158 §Component 6.
+#
+# Per ADR 158 §Component 1 + §Component 6.
+# Anchor: onboarding_delegation_templates_landed.
+
+name = "autopilot"
+description = "Autopilot tick workers — git, gh, cargo, kubectl, npm, ember-scion (headless-enrollable)"
+ttl = "4h"
+
+scopes = [
+    "registry.ember.systems/ember-systems/ember-git/*@v1",
+    "registry.ember.systems/ember-systems/ember-gh/*@v1",
+    "registry.ember.systems/ember-systems/ember-cargo/*@v1",
+    "registry.ember.systems/ember-systems/ember-kubectl/*@v1",
+    "registry.ember.systems/ember-systems/ember-npm/*@v1",
+    "registry.ember.systems/ember-systems/ember-scion/start@v1",
+    "registry.ember.systems/ember-systems/ember-scion/stop@v1",
+    "registry.ember.systems/ember-systems/ember-scion/list@v1",
+]
+
+excludes = [
+    "registry.ember.systems/ember-systems/ember-trust/*@v1",
+    "registry.ember.systems/ember-systems/ember-gh/repo_delete@v1",
+]
+
+[capability.spawn_subagent]
+max_depth = 3

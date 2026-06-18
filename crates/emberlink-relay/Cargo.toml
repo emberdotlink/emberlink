@@ -1,0 +1,42 @@
+[package]
+name = "emberlink-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-sync = { path = "../core-sync" }
+core-trust = { path = "../core-trust" }
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+hex = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+rcgen = "0.14"
+tungstenite = "0.29"
+webpki-roots = "1.0"
+
+# Dev-only deps for the ADR 146 §2.b JWKS endpoint integration tests in
+# `tests/relay_integration.rs`. base64 decodes the JWKS `x` field for
+# the EIC-pod-auth round-trip check; ed25519-dalek + serde_json build the
+# fixture DID and parse the relay's JSON response.
+[dev-dependencies]
+base64 = "0.22"
+ed25519-dalek = "2.1.1"
+serde_json = "1"
+
+[features]
+# Default: TLS is mandatory. The `--no-tls` flag is rejected as unknown.
+default = []
+# AUDIT-V030-RELAY-TLS-AND-RESPOND-GRANT-SIGNATURE: opt-in escape hatch that
+# re-exposes the `--no-tls` flag for integration tests that spawn the relay
+# binary against a plain-TCP loopback (see crates/core-sim/tests/agent_e2e.rs).
+# MUST NOT be enabled in production builds — the `./x insiders` release lane
+# never sets this feature; the relay's release binary always refuses
+# `--no-tls`. Anchor: `respond_grant_request_signed_no_tls_test_only_feature`.
+insecure-no-tls = []
+
+[lints]
+workspace = true

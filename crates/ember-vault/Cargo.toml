@@ -1,0 +1,30 @@
+# CLASSIFICATION: PUBLIC
+[package]
+name = "ember-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Construct binary: thin RPC shim for `vault` (HashiCorp Vault CLI) per ADR 124 — gates secret reveal, policy/auth/secrets-engine mutations, token lifecycle, and audit-backend changes through ember's broker."
+publish = false
+
+[[bin]]
+name = "ember-vault"
+path = "src/main.rs"
+
+[dependencies]
+core-construct-runtime = { path = "../core-construct-runtime" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+core-broker = { path = "../core-broker" }
+proptest = "1"
+secrecy = "0.10"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

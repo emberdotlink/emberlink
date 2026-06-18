@@ -1,0 +1,56 @@
+[package]
+name = "proxy-forward-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "proxy-forward-runtime — generic LLM/HTTP credential-injection forwarding core, linkable without emberd's vault/MEK."
+repository = "https://github.com/emberdotlink/emberlink"
+publish = false
+
+[features]
+# Test-support surface. Exposes the `#[cfg(test)]`-only constructors,
+# accessors, and pure-logic helpers (TeeBody/PassthroughBody test ctors,
+# StreamingSlot::inflight, check_scope, subtarget_matches, ScopeViolation)
+# so ember-daemon's in-tree proxy tests — which still live in
+# `ember-daemon/src/infra/proxy/tests.rs` because they reach DaemonStore /
+# Vault / DaemonPolicyBackend — can exercise the moved types. ember-daemon
+# enables this in its `[dev-dependencies]`. Off by default so production
+# builds never link the test scaffolding.
+test-support = []
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-tokio"] }
+hyper-util = { version = "0.1", features = ["full"] }
+serde_json = "1"
+sha2.workspace = true
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-service = "0.3"
+tracing = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+core-grant-types = { path = "../core-grant-types" }
+core-proxy-forward = { path = "../core-proxy-forward" }
+# Shared engine on-disk layout contract (event-log path + primary-worktree-root
+# resolver + append helper). This forwarding core is "linkable without emberd's
+# vault and depends on no daemon types" — it must not depend UP into the
+# autopilot engine either. Per ADR 183/184 the layout contract lives below both
+# in core-construct-runtime; the former `internal-automation` edge is deleted.
+core-construct-runtime = { path = "../core-construct-runtime" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+# Test-only: the live gemini smoke test installs the process-level rustls
+# CryptoProvider the production daemon installs at boot (runtime.rs) — the
+# guarded forward client assumes one is already present. `ring` matches the
+# `hyper-rustls` provider feature above.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[lints]
+workspace = true

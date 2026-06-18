@@ -1,0 +1,48 @@
+# CLASSIFICATION: PUBLIC
+# P24 flyctl construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "version-credentialless"
+argv = ["version"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-flyctl/fly.version@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "local CLI version inspection must not inherit Fly credentials"
+
+[[fixtures]]
+name = "apps-destroy-needs-resolver"
+argv = ["apps", "destroy", "prod-app"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "app/org identity and token authority must be resolved before projection exists"
+
+[[fixtures]]
+name = "deploy-needs-payload-analysis"
+argv = ["deploy", "--config", "fly.toml"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "deployment config and Dockerfile can carry service, region, secret, and image authority"
+
+[[fixtures]]
+name = "access-token-flag-fails-closed"
+argv = ["--access-token", "fly-token", "apps", "destroy", "prod-app"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "token flag selects provider credential material"
+
+[[fixtures]]
+name = "auth-login-fails-closed"
+argv = ["auth", "login"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "interactive credential-source mutation is outside the factory mediation contract"
+
+[[fixtures]]
+name = "apps-list-credentialless"
+argv = ["apps", "list"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-flyctl/fly.apps.list@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "read-only list verb is not classified — no broker mediation needed"

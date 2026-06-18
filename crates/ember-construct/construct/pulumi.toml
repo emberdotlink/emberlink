@@ -1,0 +1,165 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-pulumi per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-pulumi"
+plugin_address = "registry.ember.systems/ember-systems/ember-pulumi"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Pulumi CLI Construct"
+description = "Pulumi CLI Construct. Mediates `pulumi` invocations through ember's credential broker: destructive operations (up, destroy, import) require biometric approval; config mutations (config set, config rm) require biometric approval to protect stack-secret state; destroy is budget-capped at 1 per session. Canonical unattended posture is a runtime KMS-backed secrets provider (`hashivault://...` / ember-kms per ADR 100). Legacy `PULUMI_CONFIG_PASSPHRASE` injection from vault key pulumi/<fqn> per ADR 086 remains for dev/local stacks only. Read-only verbs (preview, stack ls, config get, about, version) are passthrough — no broker mediation."
+
+[defaults]
+materialization_class = "declared_host_material"
+material_classes = [{ kind = "env", name = "PULUMI_CONFIG_PASSPHRASE" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = ["runtime_kms"]
+
+[runtime.cli]
+wrapped_binary = "pulumi"
+
+[[actions]]
+key = "pulumi.up"
+action_version = "v1"
+summary = "Run pulumi.up"
+input_schema = { kind = "argv", classifier = "up *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.up"
+semantic_labels = ["pulumi.up"]
+
+[[actions]]
+key = "pulumi.destroy"
+action_version = "v1"
+summary = "Run pulumi.destroy"
+input_schema = { kind = "argv", classifier = "destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 1 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.destroy"
+semantic_labels = ["pulumi.destroy"]
+
+[[actions]]
+key = "pulumi.stack.rm"
+action_version = "v1"
+summary = "Run pulumi.stack.rm"
+input_schema = { kind = "argv", classifier = "stack rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 1 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.stack.rm"
+semantic_labels = ["pulumi.stack.rm"]
+
+[[actions]]
+key = "pulumi.state.delete"
+action_version = "v1"
+summary = "Run pulumi.state.delete"
+input_schema = { kind = "argv", classifier = "state delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.state.delete"
+semantic_labels = ["pulumi.state.delete"]
+
+[[actions]]
+key = "pulumi.refresh"
+action_version = "v1"
+summary = "Run pulumi.refresh"
+input_schema = { kind = "argv", classifier = "refresh *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.refresh"
+semantic_labels = ["pulumi.refresh"]
+
+[[actions]]
+key = "pulumi.render"
+action_version = "v1"
+summary = "Run pulumi.render"
+input_schema = { kind = "argv", classifier = "render *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.render"
+semantic_labels = ["pulumi.render"]
+
+[[actions]]
+key = "pulumi.config.set"
+action_version = "v1"
+summary = "Run pulumi.config.set"
+input_schema = { kind = "argv", classifier = "config set *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.config.set"
+semantic_labels = ["pulumi.config.set"]
+
+[[actions]]
+key = "pulumi.config.rm"
+action_version = "v1"
+summary = "Run pulumi.config.rm"
+input_schema = { kind = "argv", classifier = "config rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.config.rm"
+semantic_labels = ["pulumi.config.rm"]
+
+[[actions]]
+key = "pulumi.import"
+action_version = "v1"
+summary = "Run pulumi.import"
+input_schema = { kind = "argv", classifier = "import *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.import"
+semantic_labels = ["pulumi.import"]
+
+[[actions]]
+key = "pulumi.policy.publish"
+action_version = "v1"
+summary = "Run pulumi.policy.publish"
+input_schema = { kind = "argv", classifier = "policy publish *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:pulumi.policy.publish"
+semantic_labels = ["pulumi.policy.publish"]

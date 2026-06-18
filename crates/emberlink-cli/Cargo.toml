@@ -1,0 +1,135 @@
+[package]
+name = "emberlink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ember CLI — the trust layer for AI agents. Manage personas, credentials, grants, sandboxes, and policy."
+repository = "https://github.com/emberdotlink/emberlink"
+homepage = "https://ember.link"
+keywords = ["agent", "trust", "cli", "credentials", "security"]
+categories = ["authentication", "command-line-utilities"]
+# Disable bin auto-discovery so `src/bin/daemon_agent.rs` is treated as a
+# module of the `ember` binary, not a separate binary of its own.
+autobins = false
+publish = false
+
+[[bin]]
+name = "ember"
+path = "src/bin/ember.rs"
+
+[features]
+# Real Secure Enclave for the operator presence-device signing path
+# (`ember device enroll --secure-enclave`, ADR 200 §5 / PR4c). OFF by default so
+# dev/test/CI/unsigned builds use the in-memory software stub and `--secure-enclave`
+# fails closed (refuses to bind a software key as a presence device). The SIGNED
+# macOS release MUST build with `--features se-real` AND carry the SE keychain
+# entitlement, or operator SE enrollment is unavailable. Forwards to the broker's
+# `se-real` gate.
+se-real = ["ember-broker/se-real"]
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-events = { path = "../core-events" }
+core-identity = { path = "../core-identity" }
+core-personas = { path = "../core-personas" }
+core-receipts = { path = "../core-receipts" }
+core-recovery = { path = "../core-recovery" }
+core-sync = { path = "../core-sync" }
+core-approval = { path = "../core-approval" }
+core-state = { path = "../core-state" }
+emberlink-app = { path = "../emberlink-app" }
+core-storage = { path = "../core-storage" }
+core-grants-toml = { path = "../core-grants-toml" }
+core-trust = { path = "../core-trust" }
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
+blake3.workspace = true
+sha2.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+# ciborium: CBOR encoder for the retired v0.3.0 survey artifact schema
+# retained in `v030_survey.rs` for compatibility with historical tests.
+# Already used across the core-* crates for receipt/grant CBOR; this
+# binary needs its own direct dep because `serde::Serialize` derives don't
+# go through the core crates.
+ciborium = "0.2"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2.1.1"
+hex = "0.4"
+# inventory: compile-time `submit!` macros for the F-code symptom registry
+# in `src/recover/symptoms.rs` (per ADR 161 §Component 3). New F-code
+# checks register themselves without editing a central enum. Tiny crate
+# (~250 lines), no transitive deps.
+inventory = "0.3"
+toml.workspace = true
+clap_complete = "4"
+directories-next = "2"
+dirs-next = "2"
+minijinja = "2"
+ember-update = { path = "../ember-update" }
+ember-daemon = { path = "../ember-daemon" }
+ember-broker = { path = "../ember-broker" }
+ember-construct = { path = "../ember-construct" }
+core-construct-runtime = { path = "../core-construct-runtime" }
+# Shared presence acquisition (Touch ID FFI + vault-unlock ceremony + plain
+# daemon RPC client). Extracted from this crate so internal-automation reuses the same
+# audited code; the CLI now drives it via a CeremonyHost impl.
+ember-presence = { path = "../ember-presence" }
+# keyring-core 1.0 + apple-native-keyring-store split (post-keyring-v3 upstream
+# rewrite). The CLI registers the default store in main() before any vault op.
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio = { version = "1", features = ["full"] }
+# rpassword: cross-platform no-echo TTY read for `ember vault add` interactive
+# prompt. Tiny crate (~few hundred LOC, libc/winapi only). Used over manual
+# tcsetattr because Windows support is otherwise non-trivial.
+rpassword = "7"
+# `getrandom` used directly for OS entropy (passphrase generation). `rand`'s
+# 0.9/0.10 API reorg moved `sample_iter`/`fill_bytes` behind extension traits;
+# going through `getrandom` avoids that surface entirely.
+getrandom = "0.4"
+pem = "3"
+# `sigstore` (cosign feature) verifies Rekor-backed cosign signed-artifact
+# bundles for `verify_manifest_dual_witness`. The `cosign` feature drags in
+# `oci-client`, which needs a TLS backend on `reqwest` to build at all; we
+# enable `rustls-tls` (already present in this crate via the `rustls` dep)
+# to satisfy that transitive requirement without adding a second TLS stack.
+sigstore = { version = "0.14", default-features = false, features = ["cosign", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.18"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+webpki-roots = "1.0"
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+# `jsonwebtoken` is used to build the GitHub App RS256 JWT for the slug
+# canonicalization call (same flow as ember-broker::github_app::build_jwt).
+jsonwebtoken = { workspace = true }
+# N6-deeper: Zeroizing<String> wraps the local-state content key end-to-end so
+# the symmetric secret zeroizes on drop.
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# se-stub is DEV-ONLY (resolver 2 keeps dev-dep features out of production
+# builds): the software SE stub must not compile into the shipped CLI. Test
+# modules get se_register_stub_key/new_stub_key via this edge. ADR 206 §4.
+ember-broker = { path = "../ember-broker", features = ["se-stub"] }
+tempfile = "3"
+# `core-broker` provides `MockBroker`/`BrokerProvider` so the broker CLI
+# integration tests can install a registry on the in-test daemon without
+# depending on real provider plumbing.
+core-broker = { path = "../core-broker" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+
+[lints]
+workspace = true

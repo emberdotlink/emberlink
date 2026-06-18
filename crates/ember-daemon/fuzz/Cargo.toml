@@ -1,0 +1,76 @@
+
+# Empty [workspace] table here makes the fuzz crate a standalone
+# workspace root — belt-and-suspenders alongside the root
+# `Cargo.toml`'s `exclude` directive. Without this, a `cd
+# crates/ember-daemon/fuzz && cargo …` invocation from a worktree
+# whose parent dir contains a different (older) workspace Cargo.toml
+# would error with "current package believes it's in a workspace
+# when it's not." With it, `crates/ember-daemon/fuzz/` is
+# self-describing.
+[workspace]
+
+[package]
+name = "ember-daemon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Daemon-side parser entry points under fuzz. Path deps point at the
+# workspace crates; cargo-fuzz resolves the dep graph from this manifest.
+# `ember-daemon` is built with default features off to avoid pulling in
+# `age` / `webauthn-rs` / `se-real` (none of which are reached by the
+# parser-level entry points fuzzed here). The fuzz targets only touch
+# `infra::socket::{Request, Response}` and `infra::bridge_frame`.
+ember-daemon = { path = "..", default-features = false }
+ember-rpc = { path = "../../ember-rpc" }
+
+[[bin]]
+name = "fuzz_jsonrpc_request_decode"
+path = "fuzz_targets/fuzz_jsonrpc_request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_jsonrpc_response_decode"
+path = "fuzz_targets/fuzz_jsonrpc_response_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bridge_frame_decode"
+path = "fuzz_targets/fuzz_bridge_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bridge_frame_validate"
+path = "fuzz_targets/fuzz_bridge_frame_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_jsonrpc_request_arbitrary"
+path = "fuzz_targets/fuzz_jsonrpc_request_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bridge_frame_arbitrary"
+path = "fuzz_targets/fuzz_bridge_frame_arbitrary.rs"
+test = false
+doc = false
+bench = false

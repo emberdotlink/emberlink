@@ -1,0 +1,413 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-kubectl per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-kubectl"
+plugin_address = "registry.ember.systems/ember-systems/ember-kubectl"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "kubectl CLI Construct"
+description = "kubectl CLI Construct. Mediates `kubectl` invocations through ember's broker: apply/patch/edit/replace/create require biometric approval; delete is budget-capped at 3/session with biometric confirmation; exec/cp are biometric-gated (privileged pod access); rollout pause/resume/undo/restart, set image/env/resources, label, annotate, port-forward, proxy, cordon/drain/uncordon/taint, scale, run, and debug are gated. Read-only verbs (get, describe, logs, top, auth, cluster-info, version, api-resources, api-versions, explain, wait, events) and config context ops are passthrough — no broker mediation."
+
+[defaults]
+materialization_class = "declared_host_material"
+material_classes = [{ kind = "file_env", name = "KUBECONFIG" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "kubectl"
+
+[[actions]]
+key = "kubectl.apply"
+action_version = "v1"
+summary = "Run kubectl.apply"
+input_schema = { kind = "argv", classifier = "apply *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.apply"
+semantic_labels = ["kubectl.apply"]
+
+[[actions]]
+key = "kubectl.patch"
+action_version = "v1"
+summary = "Run kubectl.patch"
+input_schema = { kind = "argv", classifier = "patch *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.patch"
+semantic_labels = ["kubectl.patch"]
+
+[[actions]]
+key = "kubectl.edit"
+action_version = "v1"
+summary = "Run kubectl.edit"
+input_schema = { kind = "argv", classifier = "edit *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.edit"
+semantic_labels = ["kubectl.edit"]
+
+[[actions]]
+key = "kubectl.replace"
+action_version = "v1"
+summary = "Run kubectl.replace"
+input_schema = { kind = "argv", classifier = "replace *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.replace"
+semantic_labels = ["kubectl.replace"]
+
+[[actions]]
+key = "kubectl.delete"
+action_version = "v1"
+summary = "Run kubectl.delete"
+input_schema = { kind = "argv", classifier = "delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { wall_clock_secs = 86400, max_uses = 3 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.delete"
+semantic_labels = ["kubectl.delete"]
+
+[[actions]]
+key = "kubectl.exec"
+action_version = "v1"
+summary = "Run kubectl.exec"
+input_schema = { kind = "argv", classifier = "exec *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.exec"
+semantic_labels = ["kubectl.exec"]
+
+[[actions]]
+key = "kubectl.cp"
+action_version = "v1"
+summary = "Run kubectl.cp"
+input_schema = { kind = "argv", classifier = "cp *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.cp"
+semantic_labels = ["kubectl.cp"]
+
+[[actions]]
+key = "kubectl.port_forward"
+action_version = "v1"
+summary = "Run kubectl.port_forward"
+input_schema = { kind = "argv", classifier = "port forward *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.port_forward"
+semantic_labels = ["kubectl.port_forward"]
+
+[[actions]]
+key = "kubectl.proxy"
+action_version = "v1"
+summary = "Run kubectl.proxy"
+input_schema = { kind = "argv", classifier = "proxy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.proxy"
+semantic_labels = ["kubectl.proxy"]
+
+[[actions]]
+key = "kubectl.node.cordon"
+action_version = "v1"
+summary = "Run kubectl.node.cordon"
+input_schema = { kind = "argv", classifier = "node cordon *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.node.cordon"
+semantic_labels = ["kubectl.node.cordon"]
+
+[[actions]]
+key = "kubectl.node.drain"
+action_version = "v1"
+summary = "Run kubectl.node.drain"
+input_schema = { kind = "argv", classifier = "node drain *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.node.drain"
+semantic_labels = ["kubectl.node.drain"]
+
+[[actions]]
+key = "kubectl.node.uncordon"
+action_version = "v1"
+summary = "Run kubectl.node.uncordon"
+input_schema = { kind = "argv", classifier = "node uncordon *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.node.uncordon"
+semantic_labels = ["kubectl.node.uncordon"]
+
+[[actions]]
+key = "kubectl.node.taint"
+action_version = "v1"
+summary = "Run kubectl.node.taint"
+input_schema = { kind = "argv", classifier = "node taint *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.node.taint"
+semantic_labels = ["kubectl.node.taint"]
+
+[[actions]]
+key = "kubectl.scale"
+action_version = "v1"
+summary = "Run kubectl.scale"
+input_schema = { kind = "argv", classifier = "scale *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.scale"
+semantic_labels = ["kubectl.scale"]
+
+[[actions]]
+key = "kubectl.rollout.pause"
+action_version = "v1"
+summary = "Run kubectl.rollout.pause"
+input_schema = { kind = "argv", classifier = "rollout pause *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.rollout.pause"
+semantic_labels = ["kubectl.rollout.pause"]
+
+[[actions]]
+key = "kubectl.rollout.resume"
+action_version = "v1"
+summary = "Run kubectl.rollout.resume"
+input_schema = { kind = "argv", classifier = "rollout resume *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.rollout.resume"
+semantic_labels = ["kubectl.rollout.resume"]
+
+[[actions]]
+key = "kubectl.rollout.undo"
+action_version = "v1"
+summary = "Run kubectl.rollout.undo"
+input_schema = { kind = "argv", classifier = "rollout undo *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.rollout.undo"
+semantic_labels = ["kubectl.rollout.undo"]
+
+[[actions]]
+key = "kubectl.rollout.restart"
+action_version = "v1"
+summary = "Run kubectl.rollout.restart"
+input_schema = { kind = "argv", classifier = "rollout restart *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.rollout.restart"
+semantic_labels = ["kubectl.rollout.restart"]
+
+[[actions]]
+key = "kubectl.set.image"
+action_version = "v1"
+summary = "Run kubectl.set.image"
+input_schema = { kind = "argv", classifier = "set image *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.set.image"
+semantic_labels = ["kubectl.set.image"]
+
+[[actions]]
+key = "kubectl.set.env"
+action_version = "v1"
+summary = "Run kubectl.set.env"
+input_schema = { kind = "argv", classifier = "set env *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.set.env"
+semantic_labels = ["kubectl.set.env"]
+
+[[actions]]
+key = "kubectl.set.resources"
+action_version = "v1"
+summary = "Run kubectl.set.resources"
+input_schema = { kind = "argv", classifier = "set resources *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.set.resources"
+semantic_labels = ["kubectl.set.resources"]
+
+[[actions]]
+key = "kubectl.set"
+action_version = "v1"
+summary = "Run kubectl.set"
+input_schema = { kind = "argv", classifier = "set *" }
+risk_tier = "high"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.set"
+semantic_labels = ["kubectl.set"]
+
+[[actions]]
+key = "kubectl.label"
+action_version = "v1"
+summary = "Run kubectl.label"
+input_schema = { kind = "argv", classifier = "label *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.label"
+semantic_labels = ["kubectl.label"]
+
+[[actions]]
+key = "kubectl.annotate"
+action_version = "v1"
+summary = "Run kubectl.annotate"
+input_schema = { kind = "argv", classifier = "annotate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.annotate"
+semantic_labels = ["kubectl.annotate"]
+
+[[actions]]
+key = "kubectl.create"
+action_version = "v1"
+summary = "Run kubectl.create"
+input_schema = { kind = "argv", classifier = "create *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.create"
+semantic_labels = ["kubectl.create"]
+
+[[actions]]
+key = "kubectl.run"
+action_version = "v1"
+summary = "Run kubectl.run"
+input_schema = { kind = "argv", classifier = "run *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.run"
+semantic_labels = ["kubectl.run"]
+
+[[actions]]
+key = "kubectl.debug"
+action_version = "v1"
+summary = "Run kubectl.debug"
+input_schema = { kind = "argv", classifier = "debug *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.debug"
+semantic_labels = ["kubectl.debug"]
+
+[[actions]]
+key = "kubectl.read"
+action_version = "v1"
+summary = "Run kubectl.read"
+input_schema = { kind = "argv", classifier = "read *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:kubectl.read"
+semantic_labels = ["kubectl.read"]

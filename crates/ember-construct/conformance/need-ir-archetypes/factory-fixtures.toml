@@ -1,0 +1,63 @@
+# CLASSIFICATION: PUBLIC
+# ADR 213 D5.2 need-IR archetype conformance examples.
+#
+# These rows are schema/conformance fixtures only. They prove the closed
+# construct.toml archetype-data vocabulary future provider adapters consume;
+# they do not enable provider echo clamps or use-time verifier wiring.
+
+[[fixtures]]
+name = "policy-document-aws-s3-write"
+argv = ["aws", "s3", "cp", "dist/app.tar.gz", "s3://assets/releases/app.tar.gz"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3.cp@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", bucket = "assets", key = "releases/app.tar.gz" }
+expected_need = { provider_ir = "policy-document", actions = ["aws:s3:PutObject"] }
+expected_need_ir = { archetype = "policy-document", provider = "aws", policy_language = "aws-iam", statements = [{ effect = "allow", actions = ["s3:PutObject"], resources = ["arn:aws:s3:::assets/releases/app.tar.gz"] }] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "oauth-scope-github-workflow"
+argv = ["gh", "workflow", "run", "release.yml", "--repo", "emberdotlink/emberlink-dev"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-gh/workflow_run@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "github", repo = "emberdotlink/emberlink-dev", workflow = "release.yml" }
+expected_need = { provider_ir = "github_need", actions = ["github:actions:write"] }
+expected_need_ir = { archetype = "OAuth-scope", provider = "github", scopes = ["actions:write"], audience = "https://api.github.com" }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "identity-only-aws-sts-role"
+argv = ["aws", "sts", "assume-role", "--role-arn", "arn:aws:iam::123456789012:role/publish-site"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.sts.assume-role@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws_sts", role_arn = "arn:aws:iam::123456789012:role/publish-site" }
+expected_need = { provider_ir = "identity-only", actions = ["aws_sts:identity:role_arn:arn:aws:iam::123456789012:role/publish-site"] }
+expected_need_ir = { archetype = "identity-only", provider = "aws_sts", identity = { kind = "role_arn", value = "arn:aws:iam::123456789012:role/publish-site" } }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "registry-jwt-npm-publish"
+argv = ["npm", "publish", "--registry", "https://registry.npmjs.org/"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-npm/npm.publish@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "npm", registry = "registry.npmjs.org", package = "@emberlink/cli" }
+expected_need = { provider_ir = "registry-jwt", actions = ["npm:registry:registry.npmjs.org", "npm:audience:npm", "npm:claim:package:@emberlink/cli", "npm:claim:access:publish"] }
+expected_need_ir = { archetype = "registry-JWT", provider = "npm", registry = "registry.npmjs.org", audience = "npm", claims = [{ name = "package", values = ["@emberlink/cli"] }, { name = "access", values = ["publish"] }] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "budget-anthropic-messages"
+argv = ["anthropic", "messages", "create", "--model", "claude-sonnet-4"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-anthropic/anthropic.messages.create@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "anthropic", model = "claude-sonnet-4" }
+expected_need = { provider_ir = "budget", actions = ["anthropic:budget:requests", "anthropic:budget:cents"] }
+expected_need_ir = { archetype = "budget", provider = "anthropic", requests = 25, cents = 100 }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "unknown-archetype-carrier-field-fails-closed"
+argv = ["provider", "raw-scope", "--scope-json", "{\"admin\":true}"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "raw native provider scope is not an ADR 213 archetype-data authoring surface"

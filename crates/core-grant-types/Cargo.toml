@@ -1,0 +1,29 @@
+[package]
+name = "core-grant-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Grant-protocol type definitions: grant_link, grant_conditions,
+# grant_receipt, approval, policy, qr_encoding + the Biscuit-inspired
+# grant chain types previously squatting in core-types/src/storage.rs's
+# bottom half. Distinct from `core-grants` (Layer-3 protocol logic).
+# Per ADR 156.
+
+[dependencies]
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+hex = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = { version = "0.2", default-features = false }
+base45 = "3"
+
+[dev-dependencies]
+proptest = "1"
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+# CLASSIFICATION: PUBLIC
+# P24 Git construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "push-exact-https-remote"
+argv = ["push", "https://github.com/emberdotlink/emberlink-dev.git", "HEAD:main"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-git/git.push@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "github", host = "github.com", repo = "emberdotlink/emberlink-dev", ref = "HEAD:main" }
+expected_need = { provider_ir = "github_need", actions = ["contents:write"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "push-origin-main-needs-resolver"
+argv = ["push", "origin", "main"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "remote alias and default host/repo must be resolved from trusted git config"
+
+[[fixtures]]
+name = "mirror-push-fails-closed"
+argv = ["push", "--mirror", "origin"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "mirror push can mutate every ref and has no bounded target fixture yet"

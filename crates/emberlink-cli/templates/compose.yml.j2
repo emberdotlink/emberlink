@@ -1,0 +1,327 @@
+# CLASSIFICATION: PUBLIC
+#
+# compose.yml.j2 — Docker Compose template for the ember bridge + orchestrator
+# topology. Rendered by emberlink-cli at launch time with per-run variables.
+#
+# EMBER_OVERRIDE_SHADOW / EMBER_OVERRIDE_CLAUDE override pattern — see crates/emberlink-cli/src/up/overrides.rs
+#
+# == Service dependency ordering ==
+#
+# The bridge container is the trust anchor for the entire compose stack.
+# `service_healthy` gates the orchestrator + worker sidecars so they cannot
+# start until the bridge's mTLS listener is ready and verified.
+#
+# == Docker Swarm foot-gun ==
+#
+# `service_healthy` is NOT honored under Docker Swarm mode. Swarm ignores
+# `depends_on: condition: service_healthy` when scheduling services across
+# a swarm; all services may start in any order regardless of healthcheck
+# outcome. The healthcheck itself still executes and produces healthy /
+# unhealthy status visible via `docker service inspect`, but the ordering
+# guarantee does not apply. Callers in Swarm environments MUST implement
+# their own retry logic (e.g. exponential backoff in the orchestrator sidecar)
+# rather than relying on Compose dependency ordering.
+#
+# See: https://docs.docker.com/engine/swarm/
+# See: ADR 154 Component 1 — mTLS bridge transport
+#
+# chmod_real_git: agent images chmod /usr/bin/{git,gh} to 0750 so the shadow
+# wrappers stay on the controlled execution path.
+
+services:
+{% if bridge_enabled | default(true) %}
+  bridge:
+    image: "{{ bridge_image | default('ember-bridge:latest') }}"
+    restart: unless-stopped
+    environment:
+      EMBER_BRIDGE_BIND: "{{ bridge_bind | default('0.0.0.0:4243') }}"
+    volumes:
+      - type: bind
+        source: "{{ bridge_cert_dir }}"
+        target: /run/ember
+        read_only: true
+    ports:
+      - "{{ bridge_port | default('4243') }}:4243"
+    healthcheck:
+      # bridge-cli ping performs a single mTLS handshake against the bridge
+      # endpoint and exits 0 on success. Classified error codes:
+      #   1 = BRIDGE_CONNECT_REFUSED
+      #   2 = BRIDGE_CONNECT_TIMEOUT
+      #   3 = BRIDGE_TLS_HANDSHAKE_FAIL
+      #   4 = config error (unreadable PEM, bad path)
+      #
+      # NOTE: `service_healthy` is NOT honored under Docker Swarm — see
+      # the file-level comment above for the foot-gun documentation.
+      test: ["CMD", "bridge-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+{% endif %}
+
+{% if orchestrator_enabled | default(true) %}
+  orchestrator:
+    image: "{{ orchestrator_image | default('ember-orchestrator:latest') }}"
+    restart: unless-stopped
+    depends_on:
+      bridge:
+        # Waits for bridge healthcheck to pass before starting.
+        # Under Docker Swarm this ordering guarantee does NOT apply — see
+        # the file-level foot-gun note.
+        condition: service_healthy
+    environment:
+      EMBER_BRIDGE_URL: "https://bridge:4243"
+      EMBER_CLIENT_CERT: /run/ember/client.crt
+      EMBER_CLIENT_KEY: /run/ember/client.key
+      EMBER_CA_CERT: /run/ember/ca.crt
+    volumes:
+      - type: bind
+        source: "{{ orchestrator_cert_dir | default(bridge_cert_dir) }}"
+        target: /run/ember
+        read_only: true
+{% endif %}
+
+{% if worker_enabled | default(true) %}
+  # hidepid=2 + /proc masking — close published proc-leakage side channels per ADR 166 §Component 9 (T1+T3 partial). See ARCH-CONTAINER-HIDEPID-AND-PROC-MASK.
+  worker:
+    image: "{{ worker_image | default('ember-worker:latest') }}"
+    restart: unless-stopped
+{% if worker_entrypoint is defined %}
+    entrypoint:
+{% for arg in worker_entrypoint %}
+      - "{{ arg }}"
+{% endfor %}
+{% endif %}
+{% if worker_command is defined %}
+    command:
+{% for arg in worker_command %}
+      - "{{ arg }}"
+{% endfor %}
+{% endif %}
+{% if worker_extra_hosts is defined %}
+    extra_hosts:
+{% for host in worker_extra_hosts %}
+      - "{{ host }}"
+{% endfor %}
+{% endif %}
+{% if worker_procfs_hardening_enabled | default(false) %}
+    # Remount /proc with hidepid=2 so container processes cannot see each other's
+    # /proc/<pid> entries. gid=0 (root) is used instead of gid=ember because the
+    # ember group may not exist in all base images; gid=0 is universally safe and
+    # allows privileged tooling to access /proc when needed.
+    tmpfs:
+      - "/proc:hidepid=2,gid=0"
+{% endif %}
+    # userns: container UID/GID maps back to host operator's UID/GID per ADR 166 §Component 9 M1.2. See crates/emberlink-cli/src/up/userns.rs for preflight validation.
+    userns_mode: "{{ userns_mode | default('keep-id') }}"
+    security_opt:
+      # Seccomp profile — deny unshare/mount/ptrace/bpf class per ADR 166 §Component 9 (T1). See ARCH-CONTAINER-SECCOMP-PROFILE.
+      - "seccomp={{ worker_seccomp_profile_path | default('infra/seccomp/agent-seccomp.json') }}"
+      # AppArmor profile — deny mount/proc-mem-write/sys-security per ADR 166 §Component 9 M1.3. Installed via 'apparmor_parser -r' on first ember up. See infra/apparmor/ember-agent.profile.
+      # AppArmor profile — Linux-only; ignored on macOS Docker Desktop / OrbStack. See ember-agent-apparmor.
+      - "apparmor=ember-agent"
+{% if worker_procfs_hardening_enabled | default(false) %}
+      - "proc-masks=/proc/kcore"
+      - "proc-masks=/proc/keys"
+      - "proc-masks=/proc/timer_list"
+      - "proc-masks=/proc/sched_debug"
+      - "proc-masks=/proc/scsi"
+      - "proc-masks=/sys/firmware"
+{% endif %}
+{% if (bridge_enabled | default(true)) or (worker_worktree_path is defined and not (idmapped_supported | default(false))) %}
+    depends_on:
+{% if bridge_enabled | default(true) %}
+      bridge:
+        # service_started (not service_healthy) — workers retry independently
+        # via their own connection loop. The bridge healthcheck passing is a
+        # sufficient signal for the orchestrator; workers can tolerate a brief
+        # bridge unavailability window at startup.
+        condition: service_started
+{% endif %}
+{% if worker_worktree_path is defined and not (idmapped_supported | default(false)) %}
+      # idmapped_fallback: block until the init container has corrected ownership.
+      worker-chown-init:
+        condition: service_completed_successfully
+{% endif %}
+{% endif %}
+    environment:
+      PATH: "{{ worker_path | default('/usr/local/lib/shadow/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin') }}"
+{% if worker_persona_id is defined %}
+      EMBER_PERSONA_ID: "{{ worker_persona_id }}"
+{% endif %}
+{% if worker_bridge_url is defined %}
+      EMBER_BRIDGE_URL: "{{ worker_bridge_url }}"
+      EMBER_CLIENT_CERT: /run/ember/client.crt
+      EMBER_CLIENT_KEY: /run/ember/client.key
+      EMBER_CA_CERT: /run/ember/ca.crt
+{% endif %}
+{% if worker_worktree_path is defined and not (idmapped_supported | default(false)) %}
+      # idmapped_fallback: worker entrypoint reads EMBER_GIT_SAFE_DIRECTORY and
+      # runs `git config --global safe.directory '*'` before any git operations.
+      # Ownership is corrected host-side by worker-chown-init before this service
+      # starts (ARCH-COMPOSE-IDMAPPED-FALLBACK-OLDER-RUNTIMES).
+      EMBER_GIT_SAFE_DIRECTORY: "*"
+{% endif %}
+    volumes:
+{% if worker_bridge_cert_dir is defined %}
+      - type: bind
+        source: "{{ worker_bridge_cert_dir }}"
+        target: /run/ember
+        read_only: true
+{% endif %}
+      # ADR 166 Component 3 — Construct library + Claude binary bind-mounts.
+      # Sources default to well-known host paths; override via env vars
+      # EMBER_OVERRIDE_SHADOW / EMBER_OVERRIDE_CLAUDE before rendering
+      # (see crates/emberlink-cli/src/up/overrides.rs).
+      #
+      # image-bake fallback: /ember/shadow is read-only at the OCI layer; the
+      # bind-mount remains :ro regardless of source.
+      - type: bind
+        source: "{{ ember_override_shadow }}"
+        target: /usr/local/lib/shadow/bin
+        read_only: true
+{% if ember_override_claude is defined %}
+      - type: bind
+        source: "{{ ember_override_claude }}"
+        target: /usr/local/bin/claude
+        read_only: true
+{% endif %}
+{% if ember_override_codex is defined %}
+      - type: bind
+        source: "{{ ember_override_codex }}"
+        target: /usr/local/lib/ember/codex-runtime
+        read_only: true
+{% endif %}
+{% if worker_home_path is defined %}
+      - type: bind
+        source: "{{ worker_home_path }}"
+        target: "{{ worker_home_target | default('/home/agent') }}"
+{% endif %}
+{% if worker_codex_config_path is defined %}
+      - type: bind
+        source: "{{ worker_codex_config_path }}"
+        target: "{{ worker_codex_config_target | default('/home/agent/.codex') }}"
+{% endif %}
+{% if worker_codex_authority_path is defined %}
+      - type: bind
+        source: "{{ worker_codex_authority_path }}"
+        target: "{{ worker_codex_authority_target | default('/home/agent/.codex') }}"
+{% endif %}
+{% if worker_overlay_mounts is defined %}
+{% for mount in worker_overlay_mounts %}
+      - type: bind
+        source: "{{ mount.source }}"
+        target: "{{ mount.target }}"
+{% if mount.read_only %}
+        read_only: true
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if worker_extra_mounts is defined %}
+{% for mount in worker_extra_mounts %}
+      - type: bind
+        source: "{{ mount.source }}"
+        target: "{{ mount.target }}"
+{% if mount.read_only %}
+        read_only: true
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if worker_worktree_path is defined %}
+      # Per-agent worktree bind-mount (ADR 166 Component 4).
+      # When idmapped_supported=true: host-operator UID ↔ container agent UID 1000
+      # are translated at the mount layer — no chown, no safe.directory exemption.
+      # When idmapped_supported=false: idmapped_fallback path — plain rw bind-mount
+      # with chown-on-mount via the worker-chown-init service and safe.directory
+      # bypass for git (ARCH-COMPOSE-IDMAPPED-FALLBACK-OLDER-RUNTIMES).
+{% if idmapped_supported | default(false) %}
+      - type: bind
+        source: "{{ worker_worktree_path }}"
+        target: /work/repo
+        bind:
+          create_host_path: true
+          idmap:
+            uids:
+              - host_uid: {{ host_uid | default(1000) }}
+                container_uid: 1000
+                range: 1
+            gids:
+              # host_gid_distinct_from_host_uid: GID has its own default (and
+              # caller-supplied value). On macOS the typical user has uid=501
+              # / gid=20 ("staff"); defaulting GID to UID silently miswrites
+              # container ownership.
+              - host_gid: {{ host_gid | default(1000) }}
+                container_gid: 1000
+                range: 1
+{% else %}
+      # idmapped_fallback: plain rw bind-mount. worker-chown-init (below) corrects
+      # ownership before this service starts so the agent UID 1000 can write.
+      - type: bind
+        source: "{{ worker_worktree_path }}"
+        target: /work/repo
+        bind:
+          create_host_path: true
+{% endif %}
+{% endif %}
+{% if agent_id is defined %}
+      # Per-agent-persona named volumes for build-artifact caches (ADR 166 Component 4
+      # §Volume mount policy). Scoped per-agent — never shared across agents in a fleet.
+      # Cross-agent cache reuse would allow agent A to poison build-script-build
+      # artifacts and execute them as agent B, defeating container isolation.
+      # Fleet-wide cache acceleration is deferred to v0.3.1+ (content-addressed cache).
+      - "ember-build-cargo-{{ agent_id }}:/work/cargo-cache"
+      - "ember-build-node-modules-{{ agent_id }}:/work/node-modules-cache"
+      - "ember-build-venv-{{ agent_id }}:/work/venv-cache"
+{% endif %}
+
+{% if worker_worktree_path is defined and not (idmapped_supported | default(false)) %}
+  # idmapped_fallback init container (ARCH-COMPOSE-IDMAPPED-FALLBACK-OLDER-RUNTIMES).
+  #
+  # Runs once before the worker service starts. Mounts the worktree read-write
+  # as root, then chowns the entire tree to the agent UID:GID (1000:1000) so
+  # the container's unprivileged `agent` user can write to it.
+  #
+  # `restart: no` + `service_completed_successfully` ensures the worker does not
+  # start until chown finishes. The init container exits 0 after chown and is
+  # not restarted by Compose.
+  worker-chown-init:
+    image: "{{ worker_chown_init_image | default('busybox:latest') }}"
+    restart: "no"
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - >
+        err=/tmp/worker-chown.err;
+        fatal=/tmp/worker-chown.fatal;
+        rm -f "$$err" "$$fatal";
+        rc=0;
+        chown -R {{ host_uid | default(1000) }}:{{ host_gid | default(1000) }} /work/repo 2>"$$err" || rc=$$?;
+        if [ "$$rc" -ne 0 ]; then
+          if [ ! -s "$$err" ]; then
+            rm -f "$$err" "$$fatal";
+            exit "$$rc";
+          fi;
+          if grep -v 'No such file or directory' "$$err" >"$$fatal"; then
+            cat "$$fatal" >&2;
+            rm -f "$$err" "$$fatal";
+            exit "$$rc";
+          fi;
+        fi;
+        rm -f "$$err" "$$fatal";
+        exit 0
+    volumes:
+      - type: bind
+        source: "{{ worker_worktree_path }}"
+        target: /work/repo
+        bind:
+          create_host_path: true
+{% endif %}
+{% endif %}
+{% if agent_id is defined %}
+
+volumes:
+  "ember-build-cargo-{{ agent_id }}":
+  "ember-build-node-modules-{{ agent_id }}":
+  "ember-build-venv-{{ agent_id }}":
+{% endif %}

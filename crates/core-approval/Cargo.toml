@@ -1,0 +1,30 @@
+[package]
+name = "core-approval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+core-event-types = { path = "../core-event-types" }
+core-grants = { path = "../core-grants" }
+core-types = { path = "../core-types" }
+core-grant-types = { path = "../core-grant-types" }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+thiserror = "2"
+toml.workspace = true
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["serde", "v4", "js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+proptest = "1"
+futures = "0.3"
+async-trait = "0.1"
+tempfile = "3"
+
+[lints]
+workspace = true

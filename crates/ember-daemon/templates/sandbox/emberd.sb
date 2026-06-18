@@ -1,0 +1,82 @@
+;; CLASSIFICATION: PUBLIC
+;; emberd_macos_sandbox_profile
+;;
+;; macOS sandbox-exec profile for the emberd daemon process, the
+;; Darwin equivalent of the seccomp filter in infra/seccomp/emberd-seccomp.json.
+;;
+;; sandbox-exec uses TrustedBSD MAC + Scheme-based policy DSL. The
+;; primitives differ from seccomp (file/network/process granularity
+;; rather than syscall granularity), so the coverage map is parallel
+;; but not 1:1 with the Linux profile.
+;;
+;; Strategy: default-deny on file-write, default-allow on file-read
+;; while writes are scoped to daemon-owned state. Network: bound listener
+;; sockets + outbound mTLS only. Process: fork+exec scoped to installed
+;; daemon helper binaries. Forbidden: process-introspection, iokit-open,
+;; and kernel-extension surfaces.
+
+(version 1)
+
+;; Default-deny posture. Explicit allows below.
+(deny default)
+
+;; Allow inheriting fd 0/1/2 from the parent process (stdout/stderr logging).
+(allow file-read* file-write*
+  (literal "/dev/null")
+  (literal "/dev/stdin")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (literal "/dev/dtracehelper")
+  (literal "/dev/urandom")
+  (literal "/dev/random"))
+
+;; ── File I/O ──────────────────────────────────────────────────────
+;; Read access broadly permitted (configuration discovery, dylib loading,
+;; tzdata, etc.). Writes scoped narrowly to daemon-owned state.
+(allow file-read*)
+(allow file-read-metadata)
+
+;; Writes: install-time renderer injects the operator-home allowlist for the
+;; daemon's actual `~/.ember/...` runtime tree, plus the static /var + /tmp
+;; roots below. The raw repo asset is a template, not the final installed file.
+__EMBERD_WRITE_ALLOWLIST__
+
+;; ── Network ───────────────────────────────────────────────────────
+;; Bound listener sockets (broker Unix socket + mTLS HTTPS listener).
+;; Outbound mTLS to control plane / log shipper.
+(allow network-bind)
+(allow network-inbound)
+(allow network-outbound)
+
+;; ── Process ───────────────────────────────────────────────────────
+;; Fork is fundamental — required for the broker-supervisor exec path
+;; per ADR 124. Exec is scoped to vendor-installed daemon helper binaries.
+(allow process-fork)
+(allow process-exec
+  (regex #"^/usr/local/bin/emberd")
+  (regex #"^/usr/local/bin/ember-")
+  (regex #"^/usr/local/lib/ember(-dev)?(/|$)")
+  (literal "/bin/sh")
+  (literal "/usr/bin/env"))
+
+;; ── Synchronization + Mach IPC ────────────────────────────────────
+;; mach-lookup for system services (CFRunLoop / launchd contract).
+(allow mach-lookup)
+(allow ipc-posix-sem)
+(allow ipc-posix-shm)
+
+;; ── System info read ──────────────────────────────────────────────
+(allow sysctl-read)
+(allow signal (target self))
+
+;; ── EXPLICIT DENIES ───────────────────────────────────────────────
+;; (already covered by `(deny default)` but listed for documentation +
+;; defense-in-depth against future allow-list widening that might
+;; accidentally re-enable a forbidden surface.)
+;;
+;; deny system-info system-info        ; ptrace-equivalent (Darwin: proc_pidpath/proc_listpidspath)
+;; deny iokit-open                     ; kernel-extension I/O surface
+;; deny system-kext-load               ; kernel module loading
+;; deny system-fsctl                   ; filesystem control codes (mount/umount equivalent)
+;; deny dynamic-code-generation        ; W^X enforcement
+;; deny job-creation                   ; spawning launchd jobs from the daemon

@@ -1,0 +1,55 @@
+# CLASSIFICATION: PUBLIC
+# P24 Okta construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "version-credentialless"
+argv = ["--version"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-okta/okta.version@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "local CLI version inspection must not inherit Okta credentials"
+
+[[fixtures]]
+name = "users-delete-needs-resolver"
+argv = ["users", "delete", "alice@example.com"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "profile, org, and user id/email must be resolved to trusted target evidence"
+
+[[fixtures]]
+name = "policy-update-needs-payload-analysis"
+argv = ["policies", "update", "policy-123", "--file", "policy.json"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "policy payload carries rules, groups, conditions, and authority effects"
+
+[[fixtures]]
+name = "profile-flag-fails-closed"
+argv = ["--profile", "prod", "users", "delete", "alice@example.com"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "profile flag selects provider credential source"
+
+[[fixtures]]
+name = "login-fails-closed"
+argv = ["login"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "interactive credential-source mutation is outside the factory mediation contract"
+
+[[fixtures]]
+name = "users-list-credentialless"
+argv = ["users", "list"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-okta/okta.users.list@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "read-only user listing must not inherit Okta credentials"
+
+[[fixtures]]
+name = "token-flag-fails-closed"
+argv = ["-t", "00secret", "groups", "create", "admins"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "token flag selects credential material directly"

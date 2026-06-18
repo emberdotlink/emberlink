@@ -1,0 +1,201 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-gh per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+#
+# `need` (ADR 204 Amendment 6, checkpoint action_need_is_manifest_sourced_not_hardcoded):
+# the action's least-privilege authority need in the canonical
+# `provider:object:verb` algebra. The daemon resolves it from this bundled
+# manifest (include_str!-compiled — same trust base as the former hardcoded
+# `policy::github_action_need`) and the projector derives native scope (I6).
+# Absent ⇒ no provider credential is minted. GitHub App installation tokens
+# always carry metadata:read, so every brokered GitHub action declares that
+# provider-mandatory baseline alongside its verb-specific need. Per-verb-
+# correct: pr_close needs only the PR-object write (not contents:write);
+# workflow_run needs actions:write to dispatch (not actions:read).
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-gh"
+plugin_address = "registry.ember.systems/ember-systems/ember-gh"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "GitHub CLI Construct"
+description = "GitHub CLI (`gh`) Construct. Mediates `gh` invocations through ember's credential broker: each call mints a scoped, time-bound GitHub App installation token with permissions narrowed to the requested action (pr_create, pr_merge, pr_list, workflow_run, etc.), injects it at exec time, revokes the token on exit, and emits a signed Receipt of the invocation. The agent never holds a long-lived GitHub PAT; every credentialed call is grant-gated, audited, and revocable."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "github" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "gh"
+
+[[actions]]
+key = "pr_create"
+action_version = "v1"
+summary = "Run pr create"
+input_schema = { kind = "argv", classifier = "pr create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.pr_create"
+semantic_labels = ["github.pull_request.write", "scm.pull_request.write"]
+need = ["github:metadata:read", "github:contents:write", "github:pull_request:create"]
+
+[[actions]]
+key = "pr_merge"
+action_version = "v1"
+summary = "Run pr merge"
+input_schema = { kind = "argv", classifier = "pr merge *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.pr_merge"
+semantic_labels = ["github.pr_merge"]
+need = ["github:metadata:read", "github:contents:write", "github:pull_request:create"]
+
+[[actions]]
+key = "pr_close"
+action_version = "v1"
+summary = "Run pr close"
+input_schema = { kind = "argv", classifier = "pr close *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.pr_close"
+semantic_labels = ["github.pr_close"]
+need = ["github:metadata:read", "github:pull_request:create"]
+
+[[actions]]
+key = "pr_list"
+action_version = "v1"
+summary = "Run pr list"
+input_schema = { kind = "argv", classifier = "pr list *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+terminal_mode = "piped"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.pr_list"
+semantic_labels = ["github.pr_list"]
+need = ["github:metadata:read", "github:pull_request:read"]
+
+[[actions]]
+key = "pr_view"
+action_version = "v1"
+summary = "Run pr view"
+input_schema = { kind = "argv", classifier = "pr view *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.pr_view"
+semantic_labels = ["github.pr_view"]
+need = ["github:metadata:read", "github:pull_request:read"]
+
+[[actions]]
+key = "repo_delete"
+action_version = "v1"
+summary = "Run repo delete"
+input_schema = { kind = "argv", classifier = "repo delete *" }
+risk_tier = "critical"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "deny"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.repo_delete"
+semantic_labels = ["github.repo_delete"]
+
+[[actions]]
+key = "auth_login"
+action_version = "v1"
+summary = "Run auth login"
+input_schema = { kind = "argv", classifier = "auth login *" }
+risk_tier = "critical"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "deny"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.auth_login"
+semantic_labels = ["github.auth_login"]
+
+[[actions]]
+key = "workflow_run"
+action_version = "v1"
+summary = "Run workflow run"
+input_schema = { kind = "argv", classifier = "workflow run *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+budget_caps = { wall_clock_secs = 1800, cents = 500 }
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.workflow_run"
+semantic_labels = ["github.workflow_run"]
+need = ["github:metadata:read", "github:actions:write"]
+
+[[actions]]
+key = "repo_create"
+action_version = "v1"
+summary = "Run repo create"
+input_schema = { kind = "argv", classifier = "repo create *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.repo_create"
+semantic_labels = ["github.repo_create"]
+
+[[actions]]
+key = "release_create"
+action_version = "v1"
+summary = "Run release create"
+input_schema = { kind = "argv", classifier = "release create *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.release_create"
+semantic_labels = ["github.release_create"]
+
+[[actions]]
+key = "issue_create"
+action_version = "v1"
+summary = "Run issue create"
+input_schema = { kind = "argv", classifier = "issue create *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.issue_create"
+semantic_labels = ["github.issue_create"]
+
+[[actions]]
+key = "pr_edit"
+action_version = "v1"
+summary = "Run pr edit"
+input_schema = { kind = "argv", classifier = "pr edit *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gh.pr_edit"
+semantic_labels = ["github.pr_edit"]

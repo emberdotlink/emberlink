@@ -1,0 +1,500 @@
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch to test"
+        required: true
+      sha:
+        description: "Commit SHA to set status on"
+        required: true
+  # NOTE 2026-04-26 (META-OCCUPANCY-CI-DISABLE-TRIGGER): the workflow is in
+  # `state: disabled_manually` (cost cut). GitHub still tries to fire any
+  # listed triggers on PR open and returns HTTP 422 — `gh pr create` then
+  # propagates non-zero through ship-pr.sh's `set -euo pipefail`. Removing
+  # the `pull_request:` trigger silences the 422 at source. Re-add this
+  # block if/when CI is re-enabled.
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /home/runner/.cargo
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Detect which zones changed to skip unnecessary jobs. Runs on all events.
+  # Circuit breaker matrix:
+  #   Library crates  → wasm-build (PR) + clippy, test (dispatch only)
+  #   App crates      → clippy, test (dispatch only)
+  #   Security paths  → security-review (PR) + clippy, test, wasm-build (dispatch only)
+  #   Web only        → web-test (dispatch only)
+  #   Extension only  → ci (auto-pass)
+  #   Docs/config     → ci (auto-pass, green on PR without /gate)
+  #
+  # On workflow_dispatch (/gate): all path-filtered jobs run.
+  # On pull_request: only wasm-build + security-review + ci aggregator run.
+  #   ci aggregator sets ci=pending ("run /gate") if code paths changed,
+  #   or ci=success if only docs/config changed.
+  #
+  # IMPORTANT: The `security` filter must mirror .github/CODEOWNERS exactly.
+  # When adding new security-critical paths, update BOTH files.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust-lib: ${{ steps.filter.outputs.rust-lib }}
+      rust-any: ${{ steps.filter.outputs.rust-any }}
+      security: ${{ steps.filter.outputs.security }}
+      web: ${{ steps.filter.outputs.web }}
+      docker: ${{ steps.filter.outputs.docker }}
+      todo-rendered: ${{ steps.filter.outputs.todo-rendered }}
+      tasks-toml: ${{ steps.filter.outputs.tasks-toml }}
+      tasks: ${{ steps.filter.outputs.tasks }}
+    steps:
+      # dorny/paths-filter v4 needs a local checkout when the event isn't
+      # `pull_request` — on `workflow_dispatch` it does a local `git diff`
+      # against `base`, and without a checkout that fails with exit 128.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+        id: filter
+        with:
+          base: main
+          ref: ${{ inputs.ref || github.ref }}
+          filters: |
+            rust-lib:
+              - 'crates/core-*/**'
+              - 'Cargo.toml'
+              - '.github/workflows/ci.yml'
+            rust-any:
+              - 'crates/**'
+              - '!crates/emberlink-gui/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'web/**'
+              - 'ember-ext/src/**'
+            security:
+              - 'crates/core-eventlog/src/authorize.rs'
+              - 'crates/core-crypto/**'
+              - 'crates/core-types/src/events.rs'
+              - 'crates/core-types/src/grant_link.rs'
+              - 'crates/core-types/src/grant_conditions.rs'
+              - 'crates/core-eventlog/src/materialize.rs'
+              - 'crates/core-eventlog/src/types.rs'
+              - '.github/workflows/ci.yml'
+              - '.github/CODEOWNERS'
+            docker:
+              - 'Dockerfile'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/emberlink-relay/**'
+              - '.github/workflows/ci.yml'
+            todo-rendered:
+              - 'TODO.md'
+              - 'TODONE.md'
+            tasks-toml:
+              - 'tasks.toml'
+            tasks:
+              - 'tasks.toml'
+              - 'crates/internal-automation/src/tasks/**'
+              - '.github/CODEOWNERS'
+              - '.github/workflows/ci.yml'
+
+  fmt:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.rust-any == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.rust-any == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+      # cache-workspace-crates: "true" caches workspace-member build
+      # artifacts across runs. #541 shipped the wrong flag name
+      # (cache-all-crates — which is about dep-source caching) and #545's
+      # test job still ran ~5 min because workspace artifacts weren't
+      # actually cached. shared-key: workspace lets clippy + test reuse
+      # each other's compile. Target ≤3 min when warm.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: workspace
+          cache-workspace-crates: "true"
+      - run: cargo clippy --workspace --exclude emberlink-gui -- -D warnings
+
+  # ADR 082 Stage 2 (OURO-9): TODO.md / TODONE.md are auto-generated from
+  # tasks.toml. Direct edits will be reverted on the next render — fail the
+  # PR up front to save the contributor a confusing round-trip.
+  #
+  # Runs on `pull_request` (not dispatch-only) because this is a check that
+  # belongs at PR-author time. The render workflow itself commits TODO.md
+  # changes from the bot account, which doesn't go through PR review.
+  todo-edit-guard:
+    needs: changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject direct TODO.md / TODONE.md edits
+        run: |
+          todo="${{ needs.changes.outputs.todo-rendered }}"
+          tasks="${{ needs.changes.outputs.tasks-toml }}"
+          if [[ "$todo" == "true" && "$tasks" != "true" ]]; then
+            echo "::error::TODO.md / TODONE.md are auto-generated from tasks.toml."
+            echo "::error::Edit tasks.toml or use 'internal-automation tasks {add,edit,transition}'."
+            echo "::error::See ADR 082."
+            exit 1
+          fi
+          echo "PR does not edit TODO.md/TODONE.md without tasks.toml. OK."
+
+  # ADR 082 Stage 1 (OURO-8): tasks.toml structural lint gate.
+  #
+  # Runs `internal-automation tasks validate --schema-only` so structural drift in
+  # the task index (duplicate IDs, broken DAG, status-required-fields,
+  # codeowners mismatches, etc.) fails the PR instead of landing silently.
+  #
+  # Schema-only by default — the repo-aware target_state_anchor probe runs
+  # at queue-write via `internal-automation tasks rank` (OURO-10). Keeping the CI
+  # gate schema-only avoids per-PR git-grep cost and stays well-defined
+  # for branches whose feature additions match a future task's
+  # target_state_anchor.
+  tasks-validate:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.tasks == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: workspace
+          cache-workspace-crates: "true"
+      - name: Validate tasks.toml
+        run: cargo run --release -p internal-automation -- tasks validate --tasks-file tasks.toml --schema-only
+
+  credential-plaintext-audit:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Credential plaintext zeroize warning scan
+        run: bash scripts/lint/check-credential-plaintext-zeroize.sh
+
+  test:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.rust-any == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: workspace
+          cache-workspace-crates: "true"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --exclude emberlink-gui --profile ci
+
+  wasm-build:
+    needs: changes
+    if: needs.changes.outputs.rust-lib == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: wasm
+          cache-workspace-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build WASM
+        run: wasm-pack build ember-ext --target web --out-dir ../web/wasm --no-typescript
+
+  # Security review: only fires on pull_request when trust-boundary code changes.
+  # Mirrors .github/CODEOWNERS paths. Adds a visible label and comment
+  # so the human reviewer knows this PR touches security-critical code.
+  # Skipped on workflow_dispatch — no PR context available.
+  security-review:
+    needs: changes
+    if: >-
+      needs.changes.outputs.security == 'true' &&
+      github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Flag security-critical PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request.number;
+            // Add label
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: pr,
+              labels: ['security-review']
+            });
+            // Check if we already commented
+            const comments = await github.rest.issues.listComments({
+              owner, repo, issue_number: pr
+            });
+            const marker = '<!-- security-review-bot -->';
+            if (!comments.data.some(c => c.body.includes(marker))) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr,
+                body: `${marker}\n⚠️ **Security-critical paths changed.** This PR touches trust-boundary code (auth, crypto, events, grants). CODEOWNERS review required before merge.\n\nChanged security paths detected by CI. See \`.github/CODEOWNERS\` for the full list.`
+              });
+            }
+
+  web-test:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: wasm
+          cache-workspace-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        with:
+          version: 11
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build WASM
+        run: wasm-pack build ember-ext --target web --out-dir ../web/wasm --no-typescript
+      - run: cd web && pnpm install
+      - run: cd web && npx playwright install chromium
+      - run: cd web && npx playwright test
+
+  docker-lint:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Hadolint
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  # Trivy container scan: builds the relay image and scans for HIGH/CRITICAL CVEs.
+  # Informational — not a hard gate on the ci job, but failures are surfaced there.
+  # Only runs when Dockerfile, Cargo.lock/toml, or relay crate sources change.
+  trivy-scan:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Build relay image
+        run: DOCKER_BUILDKIT=1 docker build -t emberlink-relay:ci .
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: emberlink-relay:ci
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+
+  # Supply-chain gates: cargo deny advisories + pnpm audit.
+  # Runs on workflow_dispatch (/gate) like other heavy jobs.
+  # Flags known-vulnerable Rust deps (RustSec) and high-severity npm advisories.
+  supply-chain:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check advisories
+        run: cargo deny check advisories
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        with:
+          version: 11
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: cd web && pnpm install --frozen-lockfile
+      - name: pnpm audit
+        run: cd web && pnpm audit --audit-level=high
+
+  # ci: aggregator. Runs on every event: workflow_dispatch, Renovate PRs, and
+  # regular PR pushes (CI-REDESIGN-P3A).
+  #
+  # Three modes:
+  #   workflow_dispatch  — /gate path; all jobs ran; treat skipped=pass.
+  #   pull_request renovate/* — Renovate auto-merge; all jobs ran; treat skipped=pass.
+  #   pull_request (other) — PR-event mode; heavy jobs (clippy/test/web-test/
+  #                          trivy-scan) are dispatch-only and were skipped by
+  #                          their if: conditions, not by path-filter. If code
+  #                          paths changed (rust-any/web/docker), set ci=pending
+  #                          with "run /gate". If only docs/config changed, set
+  #                          ci=success (no heavy jobs needed, wasm-build was the
+  #                          only gating check and it either passed or was
+  #                          path-skipped).
+  #
+  # `always()` is required so the job runs even when upstream needs are skipped
+  # (GitHub Actions cancels dependent jobs by default when a needed job is
+  # skipped). Without it, docs-only PRs would leave ci=pending forever.
+  #
+  # changes is added to needs so the aggregator can read path-detector outputs
+  # to determine whether code paths changed in PR-event mode.
+  ci:
+    if: always()
+    needs: [changes, clippy, todo-edit-guard, tasks-validate, credential-plaintext-audit, test, wasm-build, security-review, web-test, trivy-scan, supply-chain]
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Verify results
+        id: gate
+        run: |
+          event="${{ github.event_name }}"
+          head_ref="${{ github.head_ref }}"
+          is_renovate=false
+          if [[ "$head_ref" == renovate/* ]]; then is_renovate=true; fi
+
+          # On workflow_dispatch or Renovate PR: all jobs ran — treat skipped=pass
+          if [[ "$event" == "workflow_dispatch" || "$is_renovate" == "true" ]]; then
+            results=("${{ needs.clippy.result }}" "${{ needs.todo-edit-guard.result }}" "${{ needs.tasks-validate.result }}" "${{ needs.credential-plaintext-audit.result }}" "${{ needs.test.result }}" "${{ needs.wasm-build.result }}" "${{ needs.security-review.result }}" "${{ needs.web-test.result }}" "${{ needs.trivy-scan.result }}" "${{ needs.supply-chain.result }}")
+            for r in "${results[@]}"; do
+              if [[ ! "$r" =~ ^(success|skipped)$ ]]; then
+                echo "mode=failure" >> "$GITHUB_OUTPUT"
+                echo "CI failed: clippy=${{ needs.clippy.result }}, todo-edit-guard=${{ needs.todo-edit-guard.result }}, tasks-validate=${{ needs.tasks-validate.result }}, credential-plaintext-audit=${{ needs.credential-plaintext-audit.result }}, test=${{ needs.test.result }}, wasm-build=${{ needs.wasm-build.result }}, security=${{ needs.security-review.result }}, web-test=${{ needs.web-test.result }}, trivy-scan=${{ needs.trivy-scan.result }}, supply-chain=${{ needs.supply-chain.result }}"
+                exit 1
+              fi
+            done
+            echo "mode=success" >> "$GITHUB_OUTPUT"
+            echo "CI passed"
+            exit 0
+          fi
+
+          # PR-event mode (non-Renovate pull_request): heavy jobs were skipped
+          # because they are dispatch-only. Determine whether code paths changed.
+          rust_any="${{ needs.changes.outputs.rust-any }}"
+          web="${{ needs.changes.outputs.web }}"
+          docker="${{ needs.changes.outputs.docker }}"
+
+          # wasm-build + todo-edit-guard run under PR-event mode; check both.
+          wasm_result="${{ needs.wasm-build.result }}"
+          guard_result="${{ needs.todo-edit-guard.result }}"
+          if [[ "$wasm_result" == "failure" ]]; then
+            echo "mode=failure" >> "$GITHUB_OUTPUT"
+            echo "wasm-build failed on PR event"
+            exit 1
+          fi
+          if [[ "$guard_result" == "failure" ]]; then
+            echo "mode=failure" >> "$GITHUB_OUTPUT"
+            echo "todo-edit-guard failed: TODO.md / TODONE.md edited without tasks.toml change"
+            exit 1
+          fi
+
+          # If any code path changed, dispatch-only jobs were deferred to /gate.
+          if [[ "$rust_any" == "true" || "$web" == "true" || "$docker" == "true" ]]; then
+            echo "mode=pending" >> "$GITHUB_OUTPUT"
+            echo "Code changes detected — dispatch-only jobs deferred to /gate"
+          else
+            echo "mode=success" >> "$GITHUB_OUTPUT"
+            echo "No code changes — docs/config only, PR-event checks passed"
+          fi
+
+      - name: Set commit status
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const mode = '${{ steps.gate.outputs.mode }}' || 'failure';
+            const event = '${{ github.event_name }}';
+
+            // Determine the SHA to set status on.
+            // workflow_dispatch: use the explicit input SHA
+            // pull_request: use the PR head SHA
+            let sha;
+            if (event === 'workflow_dispatch') {
+              sha = context.payload.inputs.sha;
+            } else {
+              sha = context.payload.pull_request.head.sha;
+            }
+
+            const stateMap = {
+              success: { state: 'success', desc: 'All checks passed' },
+              pending: { state: 'pending', desc: 'Code changed — run /gate to dispatch full CI' },
+              failure: { state: 'failure', desc: 'CI checks failed' },
+            };
+            const { state, desc } = stateMap[mode] || stateMap.failure;
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha,
+              state,
+              context: 'ci',
+              description: desc,
+              target_url: url,
+            });
+            core.info(`Set commit status: ${state} on ${sha.substring(0, 7)} — ${desc}`);

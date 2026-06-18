@@ -1,0 +1,680 @@
+name: Release Install Bundle
+
+# Builds + signs the operator-facing **install bundle** consumed by `ember
+# install`. This is distinct from `release-assets.yml` (which signs raw
+# binaries with cosign + emits SLSA provenance for end-users running
+# `cosign verify-blob` manually).
+#
+# An install bundle is a flat tarball (Linux) or notarized .pkg (macOS)
+# whose contents the wizard ([T-INSTALL-BUNDLE-SIGNING],
+# `crates/emberlink-cli/src/install/verify.rs`) verifies BEFORE the first
+# `sudo -v` prompt.
+#
+# Two attestations are produced per bundle:
+#
+#   1. cosign keyless signature (`<bundle>.sig` + `<bundle>.crt`) via Fulcio
+#      OIDC + Rekor transparency log. Mirrors the release-assets.yml flow.
+#   2. Sidecar `<bundle>.bundle.json` — the manifest the CLI verifier
+#      consumes. Carries the bundle's blake3 hash, an Ed25519 signature over
+#      the JCS-canonical payload, and the `publisher_did`. Schema version 1
+#      is documented in `docs/install-supply-chain.md`.
+#
+# macOS additionally goes through Apple notarization so Gatekeeper accepts
+# the .pkg without the "unidentified developer" warning. Notarization runs
+# `xcrun notarytool submit --wait` then `xcrun stapler staple`.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build install bundle for (e.g. v0.3.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  published-release-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require signed macOS release inputs
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_DEVELOPER_INSTALLER_ID: ${{ secrets.APPLE_DEVELOPER_INSTALLER_ID }}
+          APPLE_NOTARY_API_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+          APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_NOTARY_API_ISSUER: ${{ secrets.APPLE_NOTARY_API_ISSUER }}
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "release" ]; then
+            echo "::notice::workflow_dispatch keeps the warning-only preview path; published releases are the fail-closed lane."
+            exit 0
+          fi
+          missing=0
+          for name in \
+            APPLE_CERT_P12_BASE64 \
+            APPLE_CERT_PASSWORD \
+            APPLE_DEVELOPER_ID \
+            APPLE_KEYCHAIN_PASSWORD \
+            APPLE_PROVISIONING_PROFILE_BASE64 \
+            APPLE_DEVELOPER_INSTALLER_ID \
+            APPLE_NOTARY_API_KEY_BASE64 \
+            APPLE_NOTARY_API_KEY_ID \
+            APPLE_NOTARY_API_ISSUER \
+            EMBERLINK_RELEASE_ED25519_SEED_B64
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required for published releases"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Published releases must fail closed until the signed macOS bundle lane is fully configured."
+            exit 1
+          fi
+
+  # Linux install bundle — built on ubuntu-latest and signed via cosign
+  # keyless. This is the platform-neutral operator bundle the install wizard
+  # consumes. The older `release-installers-linux.yml` lane still emits a raw
+  # bootstrap tarball; it is not the managed runtime/install-bundle path.
+  linux-bundle:
+    needs:
+      - resolve-tag
+      - published-release-preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read    # workflow no longer writes to own-repo releases
+      id-token: write   # cosign keyless OIDC
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      # Cross-repo publish: workflows run on emberdotlink/emberlink-dev,
+      # release artifacts land on emberdotlink/emberlink. See SECURITY.md
+      # §"Build provenance — cross-repo publication".
+      - name: Mint cross-repo release publisher token
+        id: release_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: emberdotlink
+          repositories: emberlink
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: install-bundle-${{ matrix.target }}
+          cache-workspace-crates: "true"
+
+      - name: Install cross (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked
+
+      - name: Build CLI + daemon + cohort-A construct binaries
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            CMD=cross
+          else
+            CMD=cargo
+          fi
+          $CMD build --release --target ${{ matrix.target }} -p emberlink-cli
+          $CMD build --release --target ${{ matrix.target }} \
+            -p ember-daemon --bin emberd \
+            -p ember-construct --bin ember-gh --bin ember-git --bin ember-kubectl
+
+      - name: Assemble install bundle staging dir
+        id: assemble
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          STAGE="$RUNNER_TEMP/bundle-${{ matrix.target }}"
+          mkdir -p "$STAGE/bin" "$STAGE/lib/ember/binaries" "$STAGE/share"
+          cp "target/${{ matrix.target }}/release/ember" "$STAGE/bin/ember"
+          cp "target/${{ matrix.target }}/release/emberd" "$STAGE/bin/emberd"
+          cp "target/${{ matrix.target }}/release/ember-gh" "$STAGE/lib/ember/binaries/ember-gh"
+          cp "target/${{ matrix.target }}/release/ember-git" "$STAGE/lib/ember/binaries/ember-git"
+          cp "target/${{ matrix.target }}/release/ember-kubectl" "$STAGE/lib/ember/binaries/ember-kubectl"
+          # META-DIST-LINUX-TARBALL-V030P1: ship the canonical
+          # minisign-verifying installer; legacy scripts/install.sh
+          # (cosign-theater) was deleted per distribution D1.
+          # anchor: linux_tarball_v030p1_canonical
+          cp web/sh/install.sh "$STAGE/install.sh"
+          cp SECURITY.md "$STAGE/share/SECURITY.md"
+          cp docs/install-supply-chain.md "$STAGE/share/install-supply-chain.md" || true
+          # VERSION marker so the wizard can cross-check against the bundle
+          # manifest's `version` field at verify time.
+          echo "$TAG" > "$STAGE/share/VERSION"
+          BUNDLE="ember-installer-${{ matrix.target }}-${TAG}.tar.gz"
+          ( cd "$STAGE/.." && tar czf "$BUNDLE" "$(basename "$STAGE")" )
+          mkdir -p dist
+          mv "$STAGE/../$BUNDLE" "dist/$BUNDLE"
+          echo "bundle=dist/$BUNDLE" >> "$GITHUB_OUTPUT"
+          echo "bundle_name=$BUNDLE" >> "$GITHUB_OUTPUT"
+
+      # cosign keyless — same pin as release-assets.yml.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.5.0"
+
+      - name: cosign sign-blob install bundle
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ steps.assemble.outputs.bundle }}"
+          cosign sign-blob --yes \
+            --output-signature "${BUNDLE}.sig" \
+            --output-certificate "${BUNDLE}.crt" \
+            "$BUNDLE"
+
+      # Sidecar manifest the in-CLI verifier (install/verify.rs) consumes.
+      # The Ed25519 signing key is held in the project HSM and exposed to
+      # this workflow as a base64 32-byte secret. The release pipeline is
+      # the only place that ever sees the secret bytes; all other code
+      # paths only ever see the public key (bundled in the CLI's default
+      # trust list, see install/verify.rs::default_trust_list).
+      - name: Install signing dependencies
+        if: env.EMBERLINK_RELEASE_ED25519_SEED_B64 != ''
+        env:
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: pip install --user pynacl blake3
+
+      - name: Emit bundle manifest sidecar
+        if: env.EMBERLINK_RELEASE_ED25519_SEED_B64 != ''
+        env:
+          BUNDLE_PATH: ${{ steps.assemble.outputs.bundle }}
+          BUNDLE_NAME: ${{ steps.assemble.outputs.bundle_name }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          PUBLISHER_DID: did:web:ember.link
+          BUILD_TS: ${{ github.event.release.published_at || github.event.repository.updated_at }}
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: |
+          set -euo pipefail
+          OUT_PATH="${BUNDLE_PATH}.bundle.json"
+          # Sign inline — mirrors crates/emberlink-cli/src/install/verify.rs
+          # (RFC 8785 JCS canonicalization → Ed25519 over canonical bytes).
+          # The canonical form is sorted-keys, no whitespace, no ASCII escape.
+          python3 - "$BUNDLE_PATH" "$OUT_PATH" <<'PY'
+          import base64, json, os, sys
+          import blake3 as _b3
+          from nacl.signing import SigningKey
+
+          bundle_path, out_path = sys.argv[1], sys.argv[2]
+          seed = base64.b64decode(os.environ["EMBERLINK_RELEASE_ED25519_SEED_B64"])
+          if len(seed) != 32:
+              sys.exit(f"seed must be 32 bytes, got {len(seed)}")
+          sk = SigningKey(seed)
+
+          with open(bundle_path, "rb") as f:
+              h = _b3.blake3(f.read()).hexdigest()
+
+          payload = {
+              "blake3":        f"blake3:{h}",
+              "build_ts":      os.environ["BUILD_TS"],
+              "bundle_name":   os.environ["BUNDLE_NAME"],
+              "publisher_did": os.environ["PUBLISHER_DID"],
+              "version":       os.environ["TAG"],
+          }
+          canonical = json.dumps(payload, sort_keys=True,
+                                 separators=(",", ":"),
+                                 ensure_ascii=False).encode()
+          sig = sk.sign(canonical).signature
+          manifest = {
+              "schema_version": 1,
+              "publisher_did": payload["publisher_did"],
+              "bundle_name":   payload["bundle_name"],
+              "version":       payload["version"],
+              "blake3":        payload["blake3"],
+              "build_ts":      payload["build_ts"],
+              "signature":     "ed25519:" + base64.b64encode(sig).decode(),
+              "signature_alg": "ed25519",
+          }
+          with open(out_path, "w") as f:
+              json.dump(manifest, f, indent=2)
+          print(f"wrote {out_path}")
+          PY
+          echo "Sidecar manifest:"
+          cat "${BUNDLE_PATH}.bundle.json"
+
+      - name: Skip manifest sidecar (no release signing key)
+        if: env.EMBERLINK_RELEASE_ED25519_SEED_B64 == ''
+        env:
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: |
+          echo "::warning::EMBERLINK_RELEASE_ED25519_SEED_B64 not set — skipping sidecar manifest"
+          echo "                Bundle ships with cosign sig only; CLI fail-closed verifier will refuse it."
+
+      - name: Upload bundle + sigs + manifest to public release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ steps.release_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          BUNDLE="${{ steps.assemble.outputs.bundle }}"
+          # Ensure the public release exists; create as prerelease if missing.
+          # Workflow may fire on a tag that hasn't been hand-cut on the
+          # public repo yet (common for the very first cross-repo run).
+          gh release view "$TAG" --repo emberdotlink/emberlink >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo emberdotlink/emberlink \
+                 --title "$TAG" --prerelease \
+                 --notes "Build artifacts produced by emberdotlink/emberlink-dev workflow; see SECURITY.md §Build provenance."
+          for f in "$BUNDLE" "${BUNDLE}.sig" "${BUNDLE}.crt" "${BUNDLE}.bundle.json"; do
+            [ -f "$f" ] || continue
+            gh release upload "$TAG" "$f" --clobber \
+              --repo emberdotlink/emberlink
+          done
+
+      - name: Upload bundle as workflow artifact (dispatch path)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ember-installer-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sig
+            dist/*.crt
+            dist/*.bundle.json
+
+  # macOS install bundle — produces a notarized .pkg consumable by
+  # `installer -pkg`. Gatekeeper (System Settings → Privacy & Security)
+  # refuses to run an un-notarized .pkg on a default-config machine, so
+  # notarization is non-optional for macOS distribution.
+  #
+  # workflow_dispatch can still exercise this lane with warning-only skip
+  # branches, but published releases fail in preflight unless the signing,
+  # provisioning, notarization, and bundle-manifest inputs are all present.
+  macos-bundle:
+    needs:
+      - resolve-tag
+      - published-release-preflight
+    runs-on: macos-latest
+    permissions:
+      contents: read    # workflow no longer writes to own-repo releases
+      id-token: write   # cosign keyless OIDC
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      # Cross-repo publish: workflows run on emberdotlink/emberlink-dev,
+      # release artifacts land on emberdotlink/emberlink. See SECURITY.md
+      # §"Build provenance — cross-repo publication".
+      - name: Mint cross-repo release publisher token
+        id: release_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: emberdotlink
+          repositories: emberlink
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # Rust 1.96.0
+        with:
+          toolchain: 1.96.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: install-bundle-${{ matrix.target }}
+          cache-workspace-crates: "true"
+
+      - name: Build CLI + daemon + cohort-A construct binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p emberlink-cli
+          cargo build --release --target ${{ matrix.target }} \
+            -p ember-daemon --bin emberd \
+            -p ember-construct \
+            --bin ember-gh \
+            --bin ember-git \
+            --bin ember-kubectl
+
+      # Apple Developer ID signing — same pattern as
+      # release-assets.yml, but the codesigned binaries are bundled into a
+      # .pkg before notarization (notarization is a property of the .pkg,
+      # not the raw Mach-O).
+      - name: Code-sign binaries (Developer ID)
+        if: env.APPLE_CERT_P12_BASE64 != ''
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD:   ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID:    ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PWD="$APPLE_KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign: \
+            -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          for bin in ember emberd ember-gh ember-git ember-kubectl; do
+            if [ ! -f "$BIN_DIR/$bin" ]; then
+              echo "::error::missing expected release binary $BIN_DIR/$bin"
+              exit 1
+            fi
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_DEVELOPER_ID" "$BIN_DIR/$bin"
+            codesign --verify --verbose "$BIN_DIR/$bin"
+          done
+          rm -f "$CERT_PATH"
+
+      # Wrap the codesigned `emberd` Mach-O in a minimal .app bundle with the
+      # Distribution provisioning profile embedded at
+      # Contents/embedded.provisionprofile, then re-codesign with the
+      # entitlements at infra/codesign/ember-daemon.entitlements. Without
+      # this bundle the released daemon cannot call SecKeyCreateRandomKey
+      # with kSecAttrTokenIDSecureEnclave on a user machine (AMFI returns
+      # errSecMissingEntitlement -34018). See
+      # META-AP-VAULT-SE-PRODUCTION-CODESIGN for the full rationale.
+      # Gated on APPLE_PROVISIONING_PROFILE_BASE64 so this is a no-op until
+      # the operator provisions the profile in the Apple Developer portal +
+      # adds the secret.
+      - name: Bundle emberd.app for Secure Enclave
+        if: env.APPLE_PROVISIONING_PROFILE_BASE64 != '' && env.APPLE_CERT_P12_BASE64 != ''
+        env:
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_DEVELOPER_ID:                ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: |
+          set -euo pipefail
+          PROFILE_PATH="$RUNNER_TEMP/distribution.provisionprofile"
+          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          bash scripts/macos-bundle-ember.sh \
+            --binary "$BIN_DIR/emberd" \
+            --profile "$PROFILE_PATH" \
+            --identity "$APPLE_DEVELOPER_ID" \
+            --entitlements infra/codesign/ember-daemon.entitlements \
+            --bundle-out "$BIN_DIR/emberd.app"
+          rm -f "$PROFILE_PATH"
+
+      - name: Skip Secure Enclave bundle (no provisioning profile)
+        if: env.APPLE_PROVISIONING_PROFILE_BASE64 == ''
+        env:
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: echo "::warning::APPLE_PROVISIONING_PROFILE_BASE64 not set — .pkg will ship the bare emberd binary; the daemon will fail to provision the SE-bound vault MEK on user machines under ADR 131 separate-uid posture. Track at META-AP-VAULT-SE-PRODUCTION-CODESIGN."
+
+      - name: Build .pkg installer
+        id: pkg
+        env:
+          APPLE_DEVELOPER_INSTALLER_ID: ${{ secrets.APPLE_DEVELOPER_INSTALLER_ID }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          STAGE="$RUNNER_TEMP/pkgroot"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          mkdir -p "$STAGE/usr/local/bin" "$STAGE/usr/local/lib/ember/binaries"
+          # If the previous step produced an SE-capable emberd.app bundle,
+          # install it at /usr/local/lib/emberd.app and symlink
+          # /usr/local/bin/emberd → the bundle's Mach-O. AMFI resolves the
+          # symlink and walks up from the resolved exec path to find
+          # Contents/embedded.provisionprofile, so the SE entitlement gate
+          # opens. Otherwise fall through to the bare-binary layout (current
+          # pre-SE behavior; daemon will fail at SE provision time on user
+          # machines, see META-AP-VAULT-SE-PRODUCTION-CODESIGN).
+          if [ -d "$BIN_DIR/emberd.app" ]; then
+            mkdir -p "$STAGE/usr/local/lib"
+            cp -R "$BIN_DIR/emberd.app" "$STAGE/usr/local/lib/emberd.app"
+            ln -sf ../lib/emberd.app/Contents/MacOS/emberd "$STAGE/usr/local/bin/emberd"
+          else
+            cp "$BIN_DIR/emberd" "$STAGE/usr/local/bin/emberd"
+          fi
+          cp "$BIN_DIR/ember" "$STAGE/usr/local/bin/ember"
+          # v0.3.0's bundled-install channel for brokered constructs is the
+          # managed install dir. Manifest signing remains a separate follow-up,
+          # but the signed installer must still lay down the actual bundled
+          # binaries the daemon and prod launcher expect.
+          for bin in ember-gh ember-git ember-kubectl; do
+            cp "$BIN_DIR/$bin" "$STAGE/usr/local/lib/ember/binaries/$bin"
+          done
+          mkdir -p dist
+          PKG="dist/ember-installer-${{ matrix.target }}-${TAG}.pkg"
+          if [ -n "${APPLE_DEVELOPER_INSTALLER_ID:-}" ]; then
+            pkgbuild --root "$STAGE" \
+              --identifier "link.ember.installer" \
+              --version "${TAG#v}" \
+              --install-location "/" \
+              --sign "$APPLE_DEVELOPER_INSTALLER_ID" \
+              "$PKG"
+          else
+            echo "::warning::APPLE_DEVELOPER_INSTALLER_ID not set — building unsigned .pkg"
+            pkgbuild --root "$STAGE" \
+              --identifier "link.ember.installer" \
+              --version "${TAG#v}" \
+              --install-location "/" \
+              "$PKG"
+          fi
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=$(basename "$PKG")" >> "$GITHUB_OUTPUT"
+
+      # Apple notarization — `xcrun notarytool` waits for the cloud-side
+      # ticket then `xcrun stapler` embeds the ticket in the .pkg so it
+      # works offline.
+      - name: Notarize .pkg
+        if: env.APPLE_NOTARY_API_KEY_BASE64 != ''
+        env:
+          APPLE_NOTARY_API_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+          APPLE_NOTARY_API_KEY_ID:     ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_NOTARY_API_ISSUER:     ${{ secrets.APPLE_NOTARY_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.pkg.outputs.pkg }}"
+          KEY_PATH="$RUNNER_TEMP/notary.p8"
+          echo "$APPLE_NOTARY_API_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          xcrun notarytool submit "$PKG" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_NOTARY_API_KEY_ID" \
+            --issuer "$APPLE_NOTARY_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$PKG"
+          xcrun stapler validate "$PKG"
+          rm -f "$KEY_PATH"
+
+      - name: Gatekeeper assess notarized .pkg
+        if: env.APPLE_NOTARY_API_KEY_BASE64 != ''
+        env:
+          APPLE_NOTARY_API_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.pkg.outputs.pkg }}"
+          spctl -a -vv -t install "$PKG"
+
+      - name: Skip notarization (no notary credentials)
+        if: env.APPLE_NOTARY_API_KEY_BASE64 == ''
+        env:
+          APPLE_NOTARY_API_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+        run: echo "::warning::APPLE_NOTARY_API_KEY_BASE64 not set — .pkg is NOT notarized; Gatekeeper will refuse to run it on default-config Macs"
+
+      - name: Prove installed .pkg path on native runner arch
+        run: |
+          set -euo pipefail
+          runner_arch="$(uname -m)"
+          case "$runner_arch" in
+            arm64|aarch64)
+              native_target="aarch64-apple-darwin"
+              ;;
+            x86_64)
+              native_target="x86_64-apple-darwin"
+              ;;
+            *)
+              echo "::warning::unknown macOS runner architecture: $runner_arch"
+              exit 0
+              ;;
+          esac
+
+          if [ "${{ matrix.target }}" != "$native_target" ]; then
+            echo "::notice::skipping install proof for non-native target ${{ matrix.target }} on $runner_arch runner"
+            exit 0
+          fi
+
+          PKG="${{ steps.pkg.outputs.pkg }}"
+          sudo installer -pkg "$PKG" -target /
+          bash .claude/scripts/install-e2e-smoke.sh --installed-artifact
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.5.0"
+
+      - name: cosign sign-blob .pkg
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.pkg.outputs.pkg }}"
+          cosign sign-blob --yes \
+            --output-signature "${PKG}.sig" \
+            --output-certificate "${PKG}.crt" \
+            "$PKG"
+
+      - name: Install signing dependencies
+        if: env.EMBERLINK_RELEASE_ED25519_SEED_B64 != ''
+        env:
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: pip3 install --user pynacl blake3
+
+      - name: Emit bundle manifest sidecar
+        if: env.EMBERLINK_RELEASE_ED25519_SEED_B64 != ''
+        env:
+          BUNDLE_PATH: ${{ steps.pkg.outputs.pkg }}
+          BUNDLE_NAME: ${{ steps.pkg.outputs.pkg_name }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          PUBLISHER_DID: did:web:ember.link
+          BUILD_TS: ${{ github.event.release.published_at || github.event.repository.updated_at }}
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: |
+          set -euo pipefail
+          OUT_PATH="${BUNDLE_PATH}.bundle.json"
+          python3 - "$BUNDLE_PATH" "$OUT_PATH" <<'PY'
+          import base64, json, os, sys
+          import blake3 as _b3
+          from nacl.signing import SigningKey
+
+          bundle_path, out_path = sys.argv[1], sys.argv[2]
+          seed = base64.b64decode(os.environ["EMBERLINK_RELEASE_ED25519_SEED_B64"])
+          if len(seed) != 32:
+              sys.exit(f"seed must be 32 bytes, got {len(seed)}")
+          sk = SigningKey(seed)
+
+          with open(bundle_path, "rb") as f:
+              h = _b3.blake3(f.read()).hexdigest()
+
+          payload = {
+              "blake3":        f"blake3:{h}",
+              "build_ts":      os.environ["BUILD_TS"],
+              "bundle_name":   os.environ["BUNDLE_NAME"],
+              "publisher_did": os.environ["PUBLISHER_DID"],
+              "version":       os.environ["TAG"],
+          }
+          canonical = json.dumps(payload, sort_keys=True,
+                                 separators=(",", ":"),
+                                 ensure_ascii=False).encode()
+          sig = sk.sign(canonical).signature
+          manifest = {
+              "schema_version": 1,
+              "publisher_did": payload["publisher_did"],
+              "bundle_name":   payload["bundle_name"],
+              "version":       payload["version"],
+              "blake3":        payload["blake3"],
+              "build_ts":      payload["build_ts"],
+              "signature":     "ed25519:" + base64.b64encode(sig).decode(),
+              "signature_alg": "ed25519",
+          }
+          with open(out_path, "w") as f:
+              json.dump(manifest, f, indent=2)
+          print(f"wrote {out_path}")
+          PY
+
+      - name: Skip manifest sidecar (no release signing key)
+        if: env.EMBERLINK_RELEASE_ED25519_SEED_B64 == ''
+        env:
+          EMBERLINK_RELEASE_ED25519_SEED_B64: ${{ secrets.EMBERLINK_RELEASE_ED25519_SEED_B64 }}
+        run: echo "::warning::EMBERLINK_RELEASE_ED25519_SEED_B64 not set — skipping sidecar manifest"
+
+      - name: Upload bundle + sigs + manifest to public release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ steps.release_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          PKG="${{ steps.pkg.outputs.pkg }}"
+          # Ensure the public release exists; create as prerelease if missing.
+          gh release view "$TAG" --repo emberdotlink/emberlink >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo emberdotlink/emberlink \
+                 --title "$TAG" --prerelease \
+                 --notes "Build artifacts produced by emberdotlink/emberlink-dev workflow; see SECURITY.md §Build provenance."
+          for f in "$PKG" "${PKG}.sig" "${PKG}.crt" "${PKG}.bundle.json"; do
+            [ -f "$f" ] || continue
+            gh release upload "$TAG" "$f" --clobber \
+              --repo emberdotlink/emberlink
+          done
+
+      - name: Upload bundle as workflow artifact (dispatch path)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ember-installer-${{ matrix.target }}
+          path: |
+            dist/*.pkg
+            dist/*.sig
+            dist/*.crt
+            dist/*.bundle.json
+
+  # T4 is intentionally NOT a GitHub Actions job.
+  #
+  # The shipped launcher contract is `ember claude-code -- <claude args...>`,
+  # not an Ember-owned `--headless` surface. RC proof therefore stays a manual
+  # operator/Dustin rehearsal through the real local launcher path, using
+  # `tests/cohort_a_v03_t4/release_claude_smoke.sh` as an operator-assisted
+  # harness.

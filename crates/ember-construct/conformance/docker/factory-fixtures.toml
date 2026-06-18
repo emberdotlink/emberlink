@@ -1,0 +1,124 @@
+# CLASSIFICATION: PUBLIC
+# P24 Docker construct-factory conformance corpus.
+
+# --- Credentialless: local read-only operations ---
+
+[[fixtures]]
+name = "images-local-credentialless"
+argv = ["images", "--format", "{{.Repository}}:{{.Tag}}"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.images@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "local image listing must not inherit registry credentials"
+
+[[fixtures]]
+name = "ps-credentialless"
+argv = ["ps", "-a"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.ps@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "container listing is local-only"
+
+[[fixtures]]
+name = "inspect-credentialless"
+argv = ["inspect", "my_container"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.inspect@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "container inspection is local-only"
+
+# --- Credentialless: local container lifecycle ---
+
+[[fixtures]]
+name = "stop-credentialless"
+argv = ["stop", "my_container"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.stop@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "stopping a container is a local operation"
+
+[[fixtures]]
+name = "rm-credentialless"
+argv = ["rm", "-f", "old_container"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.rm@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "removing a container is a local operation"
+
+[[fixtures]]
+name = "exec-credentialless"
+argv = ["exec", "-it", "ctr", "sh"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.exec@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "exec into a running container is a local operation"
+
+[[fixtures]]
+name = "tag-credentialless"
+argv = ["tag", "source:v1", "target:v2"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-docker/docker.tag@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "image tagging is a local operation"
+
+# --- PayloadAnalysisRequired: authority-bearing payloads ---
+
+[[fixtures]]
+name = "build-context-needs-payload-analysis"
+argv = ["build", "-t", "registry.example.com/app:latest", "."]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "Dockerfile, build context, and base image pulls are authority-bearing payload evidence"
+
+[[fixtures]]
+name = "run-needs-payload-analysis"
+argv = ["run", "--rm", "alpine", "echo", "hi"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "container runtime may pull images and mount volumes — payload must be analyzed"
+
+[[fixtures]]
+name = "pull-needs-payload-analysis"
+argv = ["pull", "alpine:3.18"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "public vs private registry cannot be determined at classification time"
+
+# --- UnsupportedFailClosed: credential escapes ---
+
+[[fixtures]]
+name = "privileged-run-fails-closed"
+argv = ["run", "--privileged", "--pid=host", "alpine"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "host-privileged runtime escape is outside the construct factory contract"
+
+[[fixtures]]
+name = "login-fails-closed"
+argv = ["login", "ghcr.io"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "docker login is a credential escape vector — registry auth must be brokered"
+
+[[fixtures]]
+name = "logout-fails-closed"
+argv = ["logout"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "docker logout is a credential management vector"
+
+# --- ResolverRequired: needs unbuilt registry credential resolver ---
+
+[[fixtures]]
+name = "push-resolver-required"
+argv = ["push", "myuser/myimage:latest"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "factory knows target but cannot mint registry credentials — resolver unbuilt"

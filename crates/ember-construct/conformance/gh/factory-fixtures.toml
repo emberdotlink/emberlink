@@ -1,0 +1,25 @@
+# CLASSIFICATION: PUBLIC
+# P24 GitHub CLI construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "pr-view-exact-repo"
+argv = ["pr", "view", "123", "--repo", "emberdotlink/emberlink-dev"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-gh/pr_view@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "github", host = "github.com", repo = "emberdotlink/emberlink-dev", pull_request = "123" }
+expected_need = { provider_ir = "github_need", actions = ["pull_request:read"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "pr-create-implicit-repo-needs-resolver"
+argv = ["pr", "create", "--title", "ship", "--body", "ready"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "implicit repository must be resolved from trusted git/attachment evidence"
+
+[[fixtures]]
+name = "auth-login-fails-closed"
+argv = ["auth", "login"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "interactive credential-source mutation is outside the factory mediation contract"

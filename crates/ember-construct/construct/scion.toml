@@ -1,0 +1,99 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-scion per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-scion"
+plugin_address = "registry.ember.systems/ember-systems/ember-scion"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "SCION CLI Construct"
+description = "SCION container lifecycle Construct. Mediates ember-scion invocations through ember's broker: start and delete require just-in-time operator approval; stop, attach, logs, and list are auto-approved when a matching pre-granted scope exists. Every credentialed call is audited and revocable."
+
+[defaults]
+materialization_class = "none"
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "ember-scion"
+
+[[actions]]
+key = "start"
+action_version = "v1"
+summary = "Run start"
+input_schema = { kind = "argv", classifier = "start *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:start"
+semantic_labels = ["start"]
+
+[[actions]]
+key = "delete"
+action_version = "v1"
+summary = "Run delete"
+input_schema = { kind = "argv", classifier = "delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:delete"
+semantic_labels = ["delete"]
+
+[[actions]]
+key = "stop"
+action_version = "v1"
+summary = "Run stop"
+input_schema = { kind = "argv", classifier = "stop *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:stop"
+semantic_labels = ["stop"]
+
+[[actions]]
+key = "attach"
+action_version = "v1"
+summary = "Run attach"
+input_schema = { kind = "argv", classifier = "attach *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:attach"
+semantic_labels = ["attach"]
+
+[[actions]]
+key = "logs"
+action_version = "v1"
+summary = "Run logs"
+input_schema = { kind = "argv", classifier = "logs *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:logs"
+semantic_labels = ["logs"]
+
+[[actions]]
+key = "list"
+action_version = "v1"
+summary = "Run list"
+input_schema = { kind = "argv", classifier = "list *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "auto_approve_if_pregranted"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:list"
+semantic_labels = ["list"]

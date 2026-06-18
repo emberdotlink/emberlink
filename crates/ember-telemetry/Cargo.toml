@@ -1,0 +1,20 @@
+[package]
+name = "ember-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-process Prometheus telemetry surface for Emberlink — registry, text-exposition handler, resource-identity labels (ADR 212)."
+publish = false
+
+[dependencies]
+# Official OpenMetrics client with exemplar support (ADR 212 §6). NOT the
+# classic `prometheus` crate — exemplars are load-bearing for the
+# per-principal correlation pivot and only this crate supports them.
+prometheus-client = "0.25"
+core-metrics = { path = "../core-metrics" }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

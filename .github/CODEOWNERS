@@ -1,0 +1,83 @@
+# Security-critical paths — require human review before merge.
+# These are the trust boundary: auth, crypto, event schema, grant lifecycle.
+#
+# This file ships to the public mirror. The internal CODEOWNERS retains
+# additional path entries and direct maintainer handles; the sync
+# pipeline swaps this file in for the internal CODEOWNERS during the
+# filter step (Step 3.5 in scripts/sync-to-public/sync.sh).
+
+# All workflow files — privileged tokens (Cloudflare deploy, npm publish, release-plz)
+.github/workflows/ @emberdotlink/maintainers
+
+# Crate classification labels — security-routing input. A 50-file refactor
+# PR must NOT quietly flip a crate's class.
+**/.classification @emberdotlink/maintainers
+
+# Landing page + marketing surfaces — product positioning is security-lane
+# equivalent. Copy + visuals shape the category story and must not auto-merge.
+web/ @emberdotlink/maintainers
+
+# internal-automation bin — work-coordination substrate and trusted script-adjacent
+# maintainer tooling. Treat as a privileged operator surface.
+crates/internal-automation/ @emberdotlink/maintainers
+
+# internal-automation MCP server — exposed via project-scoped .mcp.json to every
+# Claude Code session. Agent surface area; same trust boundary as the bin.
+crates/internal-automation/ @emberdotlink/maintainers
+.mcp.json @emberdotlink/maintainers
+
+# Authorization gate — the security boundary for all event types
+crates/core-eventlog/src/authorize.rs @emberdotlink/maintainers
+
+# Cryptographic primitives — signing, AEAD, key derivation
+crates/core-crypto/ @emberdotlink/maintainers
+
+# Event type definitions — the protocol schema
+crates/core-types/src/events.rs @emberdotlink/maintainers
+
+# Grant link crypto — sealing, unsealing, link format
+crates/core-types/src/grant_link.rs @emberdotlink/maintainers
+
+# Grant conditions — badge-gated access control
+crates/core-types/src/grant_conditions.rs @emberdotlink/maintainers
+
+# State materialization — how events become state
+crates/core-eventlog/src/materialize.rs @emberdotlink/maintainers
+crates/core-eventlog/src/types.rs @emberdotlink/maintainers
+
+# Daemon policy engine — decides what's allowed
+crates/ember-daemon/src/handler.rs @emberdotlink/maintainers
+crates/ember-daemon/src/policy.rs @emberdotlink/maintainers
+
+# Daemon vault — credential encryption
+crates/ember-daemon/src/vault.rs @emberdotlink/maintainers
+
+# Dashboard HTTP endpoints — CSRF and auth surface
+crates/ember-daemon/src/dashboard.rs @emberdotlink/maintainers
+
+# Credential proxy — injects tokens into agent requests
+crates/ember-daemon/src/proxy.rs @emberdotlink/maintainers
+
+# Standing grants — auto-approval fast path
+crates/ember-daemon/src/standing_grant.rs @emberdotlink/maintainers
+
+# Rate limiter — anti-abuse gate
+crates/ember-daemon/src/rate_limit.rs @emberdotlink/maintainers
+
+# Grant revocation broadcast — security-critical notification path
+crates/ember-daemon/src/socket.rs @emberdotlink/maintainers
+crates/ember-daemon/src/events.rs @emberdotlink/maintainers
+
+# Agent runtime — agent-socket handler that can request grants
+crates/emberlink-agent/src/runtime.rs @emberdotlink/maintainers
+
+# MCP daemon transport — routes MCP tool calls to policy-gated daemon methods
+crates/emberlink-mcp/src/daemon_transport.rs @emberdotlink/maintainers
+
+# Sandbox hardening — refused-input validation, fresh-clone workspace
+crates/ember-daemon/src/sandbox.rs @emberdotlink/maintainers
+
+# gitleaks config — every entry suppresses a finding that the secret
+# scanner would otherwise flag during the public-mirror sync. Broadening
+# any allowlist regex requires operator review.
+.gitleaks.toml @emberdotlink/maintainers

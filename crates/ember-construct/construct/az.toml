@@ -1,0 +1,716 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-az per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-az"
+plugin_address = "registry.ember.systems/ember-systems/ember-az"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Azure CLI Construct"
+description = "Azure CLI Construct. Mediates `az` invocations through ember's credential broker: privilege removal (role.assignment.delete, role.definition.delete), Key Vault destruction (keyvault.delete, keyvault.key.delete, keyvault.secret.delete) and reveal (keyvault.key.decrypt, keyvault.secret.show), VM destruction (vm.delete, vm.deallocate), AKS/SQL deletion (aks.delete, sql.server.delete, sql.db.delete), storage data destruction (storage.account.delete, storage.blob.delete, storage.container.delete), and webapp/functionapp deletion (functionapp.delete, webapp.delete) all require biometric approval. Resource group deletion (group.delete) is denied by default and requires an explicit grant override. OAuth tokens inject via AZURE_ACCESS_TOKEN; SP-file fallback path uses AZURE_AUTH_LOCATION."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "azure_cli" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "az"
+
+[[actions]]
+key = "az.vm.create"
+action_version = "v1"
+summary = "Run az vm create"
+input_schema = { kind = "argv", classifier = "vm create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vm.create"
+semantic_labels = ["az.vm.create"]
+
+[[actions]]
+key = "az.vm.start"
+action_version = "v1"
+summary = "Run az vm start"
+input_schema = { kind = "argv", classifier = "vm start *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vm.start"
+semantic_labels = ["az.vm.start"]
+
+[[actions]]
+key = "az.vm.stop"
+action_version = "v1"
+summary = "Run az vm stop"
+input_schema = { kind = "argv", classifier = "vm stop *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vm.stop"
+semantic_labels = ["az.vm.stop"]
+
+[[actions]]
+key = "az.vm.restart"
+action_version = "v1"
+summary = "Run az vm restart"
+input_schema = { kind = "argv", classifier = "vm restart *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vm.restart"
+semantic_labels = ["az.vm.restart"]
+
+[[actions]]
+key = "az.vm.delete"
+action_version = "v1"
+summary = "Run az vm delete"
+input_schema = { kind = "argv", classifier = "vm delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vm.delete"
+semantic_labels = ["az.vm.delete"]
+
+[[actions]]
+key = "az.vm.deallocate"
+action_version = "v1"
+summary = "Run az vm deallocate"
+input_schema = { kind = "argv", classifier = "vm deallocate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vm.deallocate"
+semantic_labels = ["az.vm.deallocate"]
+
+[[actions]]
+key = "az.vmss.create"
+action_version = "v1"
+summary = "Run az vmss create"
+input_schema = { kind = "argv", classifier = "vmss create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vmss.create"
+semantic_labels = ["az.vmss.create"]
+
+[[actions]]
+key = "az.vmss.delete"
+action_version = "v1"
+summary = "Run az vmss delete"
+input_schema = { kind = "argv", classifier = "vmss delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vmss.delete"
+semantic_labels = ["az.vmss.delete"]
+
+[[actions]]
+key = "az.vmss.scale"
+action_version = "v1"
+summary = "Run az vmss scale"
+input_schema = { kind = "argv", classifier = "vmss scale *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vmss.scale"
+semantic_labels = ["az.vmss.scale"]
+
+[[actions]]
+key = "az.vmss.update"
+action_version = "v1"
+summary = "Run az vmss update"
+input_schema = { kind = "argv", classifier = "vmss update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.vmss.update"
+semantic_labels = ["az.vmss.update"]
+
+[[actions]]
+key = "az.storage.account.create"
+action_version = "v1"
+summary = "Run az storage account create"
+input_schema = { kind = "argv", classifier = "storage account create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.storage.account.create"
+semantic_labels = ["az.storage.account.create"]
+
+[[actions]]
+key = "az.storage.account.delete"
+action_version = "v1"
+summary = "Run az storage account delete"
+input_schema = { kind = "argv", classifier = "storage account delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.storage.account.delete"
+semantic_labels = ["az.storage.account.delete"]
+
+[[actions]]
+key = "az.storage.blob.delete"
+action_version = "v1"
+summary = "Run az storage blob delete"
+input_schema = { kind = "argv", classifier = "storage blob delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.storage.blob.delete"
+semantic_labels = ["az.storage.blob.delete"]
+
+[[actions]]
+key = "az.storage.blob.upload"
+action_version = "v1"
+summary = "Run az storage blob upload"
+input_schema = { kind = "argv", classifier = "storage blob upload *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.storage.blob.upload"
+semantic_labels = ["az.storage.blob.upload"]
+
+[[actions]]
+key = "az.storage.container.delete"
+action_version = "v1"
+summary = "Run az storage container delete"
+input_schema = { kind = "argv", classifier = "storage container delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.storage.container.delete"
+semantic_labels = ["az.storage.container.delete"]
+
+[[actions]]
+key = "az.keyvault.create"
+action_version = "v1"
+summary = "Run az keyvault create"
+input_schema = { kind = "argv", classifier = "keyvault create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.create"
+semantic_labels = ["az.keyvault.create"]
+
+[[actions]]
+key = "az.keyvault.delete"
+action_version = "v1"
+summary = "Run az keyvault delete"
+input_schema = { kind = "argv", classifier = "keyvault delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.delete"
+semantic_labels = ["az.keyvault.delete"]
+
+[[actions]]
+key = "az.keyvault.key.create"
+action_version = "v1"
+summary = "Run az keyvault key create"
+input_schema = { kind = "argv", classifier = "keyvault key create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.key.create"
+semantic_labels = ["az.keyvault.key.create"]
+
+[[actions]]
+key = "az.keyvault.key.delete"
+action_version = "v1"
+summary = "Run az keyvault key delete"
+input_schema = { kind = "argv", classifier = "keyvault key delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.key.delete"
+semantic_labels = ["az.keyvault.key.delete"]
+
+[[actions]]
+key = "az.keyvault.key.encrypt"
+action_version = "v1"
+summary = "Run az keyvault key encrypt"
+input_schema = { kind = "argv", classifier = "keyvault key encrypt *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.key.encrypt"
+semantic_labels = ["az.keyvault.key.encrypt"]
+
+[[actions]]
+key = "az.keyvault.key.decrypt"
+action_version = "v1"
+summary = "Run az keyvault key decrypt"
+input_schema = { kind = "argv", classifier = "keyvault key decrypt *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.key.decrypt"
+semantic_labels = ["az.keyvault.key.decrypt"]
+
+[[actions]]
+key = "az.keyvault.secret.set"
+action_version = "v1"
+summary = "Run az keyvault secret set"
+input_schema = { kind = "argv", classifier = "keyvault secret set *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.secret.set"
+semantic_labels = ["az.keyvault.secret.set"]
+
+[[actions]]
+key = "az.keyvault.secret.delete"
+action_version = "v1"
+summary = "Run az keyvault secret delete"
+input_schema = { kind = "argv", classifier = "keyvault secret delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.secret.delete"
+semantic_labels = ["az.keyvault.secret.delete"]
+
+[[actions]]
+key = "az.keyvault.secret.show"
+action_version = "v1"
+summary = "Run az keyvault secret show"
+input_schema = { kind = "argv", classifier = "keyvault secret show *" }
+risk_tier = "high"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.keyvault.secret.show"
+semantic_labels = ["az.keyvault.secret.show"]
+
+[[actions]]
+key = "az.role.assignment.create"
+action_version = "v1"
+summary = "Run az role assignment create"
+input_schema = { kind = "argv", classifier = "role assignment create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.role.assignment.create"
+semantic_labels = ["az.role.assignment.create"]
+
+[[actions]]
+key = "az.role.assignment.delete"
+action_version = "v1"
+summary = "Run az role assignment delete"
+input_schema = { kind = "argv", classifier = "role assignment delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.role.assignment.delete"
+semantic_labels = ["az.role.assignment.delete"]
+
+[[actions]]
+key = "az.role.definition.create"
+action_version = "v1"
+summary = "Run az role definition create"
+input_schema = { kind = "argv", classifier = "role definition create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.role.definition.create"
+semantic_labels = ["az.role.definition.create"]
+
+[[actions]]
+key = "az.role.definition.delete"
+action_version = "v1"
+summary = "Run az role definition delete"
+input_schema = { kind = "argv", classifier = "role definition delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.role.definition.delete"
+semantic_labels = ["az.role.definition.delete"]
+
+[[actions]]
+key = "az.aks.create"
+action_version = "v1"
+summary = "Run az aks create"
+input_schema = { kind = "argv", classifier = "aks create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.aks.create"
+semantic_labels = ["az.aks.create"]
+
+[[actions]]
+key = "az.aks.scale"
+action_version = "v1"
+summary = "Run az aks scale"
+input_schema = { kind = "argv", classifier = "aks scale *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.aks.scale"
+semantic_labels = ["az.aks.scale"]
+
+[[actions]]
+key = "az.aks.update"
+action_version = "v1"
+summary = "Run az aks update"
+input_schema = { kind = "argv", classifier = "aks update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.aks.update"
+semantic_labels = ["az.aks.update"]
+
+[[actions]]
+key = "az.aks.get-credentials"
+action_version = "v1"
+summary = "Run az aks get credentials"
+input_schema = { kind = "argv", classifier = "aks get-credentials *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.aks.get-credentials"
+semantic_labels = ["az.aks.get-credentials"]
+
+[[actions]]
+key = "az.aks.delete"
+action_version = "v1"
+summary = "Run az aks delete"
+input_schema = { kind = "argv", classifier = "aks delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.aks.delete"
+semantic_labels = ["az.aks.delete"]
+
+[[actions]]
+key = "az.sql.server.create"
+action_version = "v1"
+summary = "Run az sql server create"
+input_schema = { kind = "argv", classifier = "sql server create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.sql.server.create"
+semantic_labels = ["az.sql.server.create"]
+
+[[actions]]
+key = "az.sql.server.delete"
+action_version = "v1"
+summary = "Run az sql server delete"
+input_schema = { kind = "argv", classifier = "sql server delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.sql.server.delete"
+semantic_labels = ["az.sql.server.delete"]
+
+[[actions]]
+key = "az.sql.db.create"
+action_version = "v1"
+summary = "Run az sql db create"
+input_schema = { kind = "argv", classifier = "sql db create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.sql.db.create"
+semantic_labels = ["az.sql.db.create"]
+
+[[actions]]
+key = "az.sql.db.delete"
+action_version = "v1"
+summary = "Run az sql db delete"
+input_schema = { kind = "argv", classifier = "sql db delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.sql.db.delete"
+semantic_labels = ["az.sql.db.delete"]
+
+[[actions]]
+key = "az.functionapp.create"
+action_version = "v1"
+summary = "Run az functionapp create"
+input_schema = { kind = "argv", classifier = "functionapp create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.functionapp.create"
+semantic_labels = ["az.functionapp.create"]
+
+[[actions]]
+key = "az.functionapp.deploy"
+action_version = "v1"
+summary = "Run az functionapp deploy"
+input_schema = { kind = "argv", classifier = "functionapp deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.functionapp.deploy"
+semantic_labels = ["az.functionapp.deploy"]
+
+[[actions]]
+key = "az.functionapp.delete"
+action_version = "v1"
+summary = "Run az functionapp delete"
+input_schema = { kind = "argv", classifier = "functionapp delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.functionapp.delete"
+semantic_labels = ["az.functionapp.delete"]
+
+[[actions]]
+key = "az.webapp.create"
+action_version = "v1"
+summary = "Run az webapp create"
+input_schema = { kind = "argv", classifier = "webapp create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.webapp.create"
+semantic_labels = ["az.webapp.create"]
+
+[[actions]]
+key = "az.webapp.deploy"
+action_version = "v1"
+summary = "Run az webapp deploy"
+input_schema = { kind = "argv", classifier = "webapp deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.webapp.deploy"
+semantic_labels = ["az.webapp.deploy"]
+
+[[actions]]
+key = "az.webapp.delete"
+action_version = "v1"
+summary = "Run az webapp delete"
+input_schema = { kind = "argv", classifier = "webapp delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.webapp.delete"
+semantic_labels = ["az.webapp.delete"]
+
+[[actions]]
+key = "az.network.vnet.delete"
+action_version = "v1"
+summary = "Run az network vnet delete"
+input_schema = { kind = "argv", classifier = "network vnet delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.network.vnet.delete"
+semantic_labels = ["az.network.vnet.delete"]
+
+[[actions]]
+key = "az.network.nsg.rule.create"
+action_version = "v1"
+summary = "Run az network nsg rule create"
+input_schema = { kind = "argv", classifier = "network nsg rule create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.network.nsg.rule.create"
+semantic_labels = ["az.network.nsg.rule.create"]
+
+[[actions]]
+key = "az.network.nsg.rule.delete"
+action_version = "v1"
+summary = "Run az network nsg rule delete"
+input_schema = { kind = "argv", classifier = "network nsg rule delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.network.nsg.rule.delete"
+semantic_labels = ["az.network.nsg.rule.delete"]
+
+[[actions]]
+key = "az.group.create"
+action_version = "v1"
+summary = "Run az group create"
+input_schema = { kind = "argv", classifier = "group create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.group.create"
+semantic_labels = ["az.group.create"]
+
+[[actions]]
+key = "az.group.delete"
+action_version = "v1"
+summary = "Run az group delete"
+input_schema = { kind = "argv", classifier = "group delete *" }
+risk_tier = "critical"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "deny"
+mode = "deny"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:az.group.delete"
+semantic_labels = ["az.group.delete"]

@@ -1,0 +1,38 @@
+[package]
+name = "ember-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ember-relay — bidirectional UDS<->TCP relay binaries for the yolo VM trust-broker bridge."
+repository = "https://github.com/emberdotlink/emberlink"
+publish = false
+
+[[bin]]
+name = "ember-relay-host"
+path = "src/bin/ember-relay-host.rs"
+
+[[bin]]
+name = "ember-relay-vm"
+path = "src/bin/ember-relay-vm.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "io-util", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "process"] }
+
+[lints]
+workspace = true

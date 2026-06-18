@@ -1,0 +1,369 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-vault per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-vault"
+plugin_address = "registry.ember.systems/ember-systems/ember-vault"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "HashiCorp Vault CLI Construct"
+description = "HashiCorp Vault CLI Construct. Mediates `vault` invocations through ember's credential broker: secret reveals (read, kv get) gate for audit; policy mutations (policy.write/delete), auth-backend removal (auth.disable), secrets-backend removal (secrets.disable), token mass-revoke, lease.revoke-prefix, and irreversible kv.destroy require biometric; audit.disable defaults to deny. Scoped Vault child tokens inject via VAULT_TOKEN / VAULT_ADDR."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "hashi_vault" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "vault"
+
+[[actions]]
+key = "vault.write"
+action_version = "v1"
+summary = "Run vault.write"
+input_schema = { kind = "argv", classifier = "write *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.write"
+semantic_labels = ["vault.write"]
+
+[[actions]]
+key = "vault.delete"
+action_version = "v1"
+summary = "Run vault.delete"
+input_schema = { kind = "argv", classifier = "delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.delete"
+semantic_labels = ["vault.delete"]
+
+[[actions]]
+key = "vault.read"
+action_version = "v1"
+summary = "Run vault.read"
+input_schema = { kind = "argv", classifier = "read *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.read"
+semantic_labels = ["vault.read"]
+
+[[actions]]
+key = "vault.kv.put"
+action_version = "v1"
+summary = "Run vault.kv.put"
+input_schema = { kind = "argv", classifier = "kv put *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.kv.put"
+semantic_labels = ["vault.kv.put"]
+
+[[actions]]
+key = "vault.kv.get"
+action_version = "v1"
+summary = "Run vault.kv.get"
+input_schema = { kind = "argv", classifier = "kv get *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.kv.get"
+semantic_labels = ["vault.kv.get"]
+
+[[actions]]
+key = "vault.kv.delete"
+action_version = "v1"
+summary = "Run vault.kv.delete"
+input_schema = { kind = "argv", classifier = "kv delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.kv.delete"
+semantic_labels = ["vault.kv.delete"]
+
+[[actions]]
+key = "vault.kv.patch"
+action_version = "v1"
+summary = "Run vault.kv.patch"
+input_schema = { kind = "argv", classifier = "kv patch *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.kv.patch"
+semantic_labels = ["vault.kv.patch"]
+
+[[actions]]
+key = "vault.kv.undelete"
+action_version = "v1"
+summary = "Run vault.kv.undelete"
+input_schema = { kind = "argv", classifier = "kv undelete *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.kv.undelete"
+semantic_labels = ["vault.kv.undelete"]
+
+[[actions]]
+key = "vault.kv.destroy"
+action_version = "v1"
+summary = "Run vault.kv.destroy"
+input_schema = { kind = "argv", classifier = "kv destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.kv.destroy"
+semantic_labels = ["vault.kv.destroy"]
+
+[[actions]]
+key = "vault.policy.write"
+action_version = "v1"
+summary = "Run vault.policy.write"
+input_schema = { kind = "argv", classifier = "policy write *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.policy.write"
+semantic_labels = ["vault.policy.write"]
+
+[[actions]]
+key = "vault.policy.delete"
+action_version = "v1"
+summary = "Run vault.policy.delete"
+input_schema = { kind = "argv", classifier = "policy delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.policy.delete"
+semantic_labels = ["vault.policy.delete"]
+
+[[actions]]
+key = "vault.auth.enable"
+action_version = "v1"
+summary = "Run vault.auth.enable"
+input_schema = { kind = "argv", classifier = "auth enable *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.auth.enable"
+semantic_labels = ["vault.auth.enable"]
+
+[[actions]]
+key = "vault.auth.disable"
+action_version = "v1"
+summary = "Run vault.auth.disable"
+input_schema = { kind = "argv", classifier = "auth disable *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.auth.disable"
+semantic_labels = ["vault.auth.disable"]
+
+[[actions]]
+key = "vault.auth.tune"
+action_version = "v1"
+summary = "Run vault.auth.tune"
+input_schema = { kind = "argv", classifier = "auth tune *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.auth.tune"
+semantic_labels = ["vault.auth.tune"]
+
+[[actions]]
+key = "vault.secrets.enable"
+action_version = "v1"
+summary = "Run vault.secrets.enable"
+input_schema = { kind = "argv", classifier = "secrets enable *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.secrets.enable"
+semantic_labels = ["vault.secrets.enable"]
+
+[[actions]]
+key = "vault.secrets.disable"
+action_version = "v1"
+summary = "Run vault.secrets.disable"
+input_schema = { kind = "argv", classifier = "secrets disable *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.secrets.disable"
+semantic_labels = ["vault.secrets.disable"]
+
+[[actions]]
+key = "vault.secrets.tune"
+action_version = "v1"
+summary = "Run vault.secrets.tune"
+input_schema = { kind = "argv", classifier = "secrets tune *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.secrets.tune"
+semantic_labels = ["vault.secrets.tune"]
+
+[[actions]]
+key = "vault.token.create"
+action_version = "v1"
+summary = "Run vault.token.create"
+input_schema = { kind = "argv", classifier = "token create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.token.create"
+semantic_labels = ["vault.token.create"]
+
+[[actions]]
+key = "vault.token.revoke"
+action_version = "v1"
+summary = "Run vault.token.revoke"
+input_schema = { kind = "argv", classifier = "token revoke *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.token.revoke"
+semantic_labels = ["vault.token.revoke"]
+
+[[actions]]
+key = "vault.token.renew"
+action_version = "v1"
+summary = "Run vault.token.renew"
+input_schema = { kind = "argv", classifier = "token renew *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.token.renew"
+semantic_labels = ["vault.token.renew"]
+
+[[actions]]
+key = "vault.lease.revoke"
+action_version = "v1"
+summary = "Run vault.lease.revoke"
+input_schema = { kind = "argv", classifier = "lease revoke *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.lease.revoke"
+semantic_labels = ["vault.lease.revoke"]
+
+[[actions]]
+key = "vault.lease.revoke-prefix"
+action_version = "v1"
+summary = "Run vault.lease.revoke-prefix"
+input_schema = { kind = "argv", classifier = "lease revoke-prefix *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.lease.revoke-prefix"
+semantic_labels = ["vault.lease.revoke-prefix"]
+
+[[actions]]
+key = "vault.audit.enable"
+action_version = "v1"
+summary = "Run vault.audit.enable"
+input_schema = { kind = "argv", classifier = "audit enable *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.audit.enable"
+semantic_labels = ["vault.audit.enable"]
+
+[[actions]]
+key = "vault.audit.disable"
+action_version = "v1"
+summary = "Run vault.audit.disable"
+input_schema = { kind = "argv", classifier = "audit disable *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "deny"
+mode = "deny"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vault.audit.disable"
+semantic_labels = ["vault.audit.disable"]

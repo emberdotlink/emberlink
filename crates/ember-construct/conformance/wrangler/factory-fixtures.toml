@@ -1,0 +1,55 @@
+# CLASSIFICATION: PUBLIC
+# P24 Wrangler construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "version-credentialless"
+argv = ["--version"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-wrangler/wrangler.version@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "local CLI version inspection must not inherit Cloudflare credentials"
+
+[[fixtures]]
+name = "r2-delete-needs-resolver"
+argv = ["r2", "object", "delete", "bucket/key.txt"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "account, bucket namespace, and token authority must be resolved before mediation"
+
+[[fixtures]]
+name = "deploy-needs-payload-analysis"
+argv = ["deploy", "--config", "wrangler.toml"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "worker config and bundled code can carry bindings, routes, secrets, and D1/R2 authority"
+
+[[fixtures]]
+name = "api-token-flag-fails-closed"
+argv = ["--api-token", "cf-token", "secret", "put", "API_KEY"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "token flag selects provider credential material"
+
+[[fixtures]]
+name = "login-fails-closed"
+argv = ["login"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "interactive credential-source mutation is outside the factory mediation contract"
+
+[[fixtures]]
+name = "whoami-credentialless"
+argv = ["whoami"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-wrangler/wrangler.whoami@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "informational identity check must not inherit Cloudflare credentials"
+
+[[fixtures]]
+name = "secret-put-fails-closed"
+argv = ["secret", "put", "MY_SECRET"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "secret material injection is outside the factory mediation contract"

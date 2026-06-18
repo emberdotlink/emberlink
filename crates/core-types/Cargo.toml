@@ -1,0 +1,29 @@
+[package]
+name = "core-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+hex = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = { version = "0.2", default-features = false }
+base45 = "3"
+
+[dev-dependencies]
+proptest = "1"
+sha2.workspace = true
+# Dev-only — proptest_canonical.rs exercises types that moved out
+# (GrantLink in core-grant-types, EventBody / RootCreatedEvent / etc.
+# in core-event-types; PublicKeyMaterial / KeyAlgorithm / RecoveryScope /
+# SurvivalMode in core-principals) per ADR 156. Follow-up: migrate the
+# test into the destination crates' tests/ directories to eliminate these
+# dev-deps.
+core-grant-types = { path = "../core-grant-types" }
+core-event-types = { path = "../core-event-types" }
+core-principals = { path = "../core-principals" }
+
+[lints]
+workspace = true

@@ -1,0 +1,472 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-gcloud per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-gcloud"
+plugin_address = "registry.ember.systems/ember-systems/ember-gcloud"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Google Cloud CLI Construct"
+description = "Google Cloud CLI Construct. Mediates `gcloud` invocations through ember's credential broker: IAM privilege removal (service-accounts.delete, roles.delete, policies.remove-iam-policy-binding), KMS key destruction (keys.destroy) and decrypt (keys.decrypt), storage data destruction (storage.rm), VM destruction (compute.instances.delete), function/service deletion (functions.delete, run.services.delete), cluster deletion (container.clusters.delete), and secrets reveal (secrets.versions.access) all require biometric approval. Project deletion (projects.delete) is denied by default and requires an explicit grant override. OAuth tokens inject via CLOUDSDK_AUTH_ACCESS_TOKEN; SA-key fallback path uses GOOGLE_APPLICATION_CREDENTIALS."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "gcp" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "gcloud"
+
+[[actions]]
+key = "gcloud.compute.instances.create"
+action_version = "v1"
+summary = "Run gcloud compute instances create"
+input_schema = { kind = "argv", classifier = "compute instances create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.compute.instances.create"
+semantic_labels = ["gcloud.compute.instances.create"]
+
+[[actions]]
+key = "gcloud.compute.instances.start"
+action_version = "v1"
+summary = "Run gcloud compute instances start"
+input_schema = { kind = "argv", classifier = "compute instances start *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.compute.instances.start"
+semantic_labels = ["gcloud.compute.instances.start"]
+
+[[actions]]
+key = "gcloud.compute.instances.stop"
+action_version = "v1"
+summary = "Run gcloud compute instances stop"
+input_schema = { kind = "argv", classifier = "compute instances stop *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.compute.instances.stop"
+semantic_labels = ["gcloud.compute.instances.stop"]
+
+[[actions]]
+key = "gcloud.compute.instances.reset"
+action_version = "v1"
+summary = "Run gcloud compute instances reset"
+input_schema = { kind = "argv", classifier = "compute instances reset *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.compute.instances.reset"
+semantic_labels = ["gcloud.compute.instances.reset"]
+
+[[actions]]
+key = "gcloud.compute.instances.delete"
+action_version = "v1"
+summary = "Run gcloud compute instances delete"
+input_schema = { kind = "argv", classifier = "compute instances delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.compute.instances.delete"
+semantic_labels = ["gcloud.compute.instances.delete"]
+
+[[actions]]
+key = "gcloud.iam.service-accounts.create"
+action_version = "v1"
+summary = "Run gcloud iam service accounts create"
+input_schema = { kind = "argv", classifier = "iam service-accounts create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.iam.service-accounts.create"
+semantic_labels = ["gcloud.iam.service-accounts.create"]
+
+[[actions]]
+key = "gcloud.iam.service-accounts.delete"
+action_version = "v1"
+summary = "Run gcloud iam service accounts delete"
+input_schema = { kind = "argv", classifier = "iam service-accounts delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.iam.service-accounts.delete"
+semantic_labels = ["gcloud.iam.service-accounts.delete"]
+
+[[actions]]
+key = "gcloud.iam.roles.create"
+action_version = "v1"
+summary = "Run gcloud iam roles create"
+input_schema = { kind = "argv", classifier = "iam roles create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.iam.roles.create"
+semantic_labels = ["gcloud.iam.roles.create"]
+
+[[actions]]
+key = "gcloud.iam.roles.delete"
+action_version = "v1"
+summary = "Run gcloud iam roles delete"
+input_schema = { kind = "argv", classifier = "iam roles delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.iam.roles.delete"
+semantic_labels = ["gcloud.iam.roles.delete"]
+
+[[actions]]
+key = "gcloud.iam.policies.add-iam-policy-binding"
+action_version = "v1"
+summary = "Run gcloud iam policies add iam policy binding"
+input_schema = { kind = "argv", classifier = "iam policies add-iam-policy-binding *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.iam.policies.add-iam-policy-binding"
+semantic_labels = ["gcloud.iam.policies.add-iam-policy-binding"]
+
+[[actions]]
+key = "gcloud.iam.policies.remove-iam-policy-binding"
+action_version = "v1"
+summary = "Run gcloud iam policies remove iam policy binding"
+input_schema = { kind = "argv", classifier = "iam policies remove-iam-policy-binding *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.iam.policies.remove-iam-policy-binding"
+semantic_labels = ["gcloud.iam.policies.remove-iam-policy-binding"]
+
+[[actions]]
+key = "gcloud.storage.cp"
+action_version = "v1"
+summary = "Run gcloud storage cp"
+input_schema = { kind = "argv", classifier = "storage cp *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.storage.cp"
+semantic_labels = ["gcloud.storage.cp"]
+
+[[actions]]
+key = "gcloud.storage.mv"
+action_version = "v1"
+summary = "Run gcloud storage mv"
+input_schema = { kind = "argv", classifier = "storage mv *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.storage.mv"
+semantic_labels = ["gcloud.storage.mv"]
+
+[[actions]]
+key = "gcloud.storage.rm"
+action_version = "v1"
+summary = "Run gcloud storage rm"
+input_schema = { kind = "argv", classifier = "storage rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.storage.rm"
+semantic_labels = ["gcloud.storage.rm"]
+
+[[actions]]
+key = "gcloud.kms.keyrings.create"
+action_version = "v1"
+summary = "Run gcloud kms keyrings create"
+input_schema = { kind = "argv", classifier = "kms keyrings create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.kms.keyrings.create"
+semantic_labels = ["gcloud.kms.keyrings.create"]
+
+[[actions]]
+key = "gcloud.kms.keys.encrypt"
+action_version = "v1"
+summary = "Run gcloud kms keys encrypt"
+input_schema = { kind = "argv", classifier = "kms keys encrypt *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.kms.keys.encrypt"
+semantic_labels = ["gcloud.kms.keys.encrypt"]
+
+[[actions]]
+key = "gcloud.kms.keys.destroy"
+action_version = "v1"
+summary = "Run gcloud kms keys destroy"
+input_schema = { kind = "argv", classifier = "kms keys destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.kms.keys.destroy"
+semantic_labels = ["gcloud.kms.keys.destroy"]
+
+[[actions]]
+key = "gcloud.kms.keys.decrypt"
+action_version = "v1"
+summary = "Run gcloud kms keys decrypt"
+input_schema = { kind = "argv", classifier = "kms keys decrypt *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.kms.keys.decrypt"
+semantic_labels = ["gcloud.kms.keys.decrypt"]
+
+[[actions]]
+key = "gcloud.secrets.create"
+action_version = "v1"
+summary = "Run gcloud secrets create"
+input_schema = { kind = "argv", classifier = "secrets create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.secrets.create"
+semantic_labels = ["gcloud.secrets.create"]
+
+[[actions]]
+key = "gcloud.secrets.delete"
+action_version = "v1"
+summary = "Run gcloud secrets delete"
+input_schema = { kind = "argv", classifier = "secrets delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.secrets.delete"
+semantic_labels = ["gcloud.secrets.delete"]
+
+[[actions]]
+key = "gcloud.secrets.versions.add"
+action_version = "v1"
+summary = "Run gcloud secrets versions add"
+input_schema = { kind = "argv", classifier = "secrets versions add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.secrets.versions.add"
+semantic_labels = ["gcloud.secrets.versions.add"]
+
+[[actions]]
+key = "gcloud.secrets.versions.access"
+action_version = "v1"
+summary = "Run gcloud secrets versions access"
+input_schema = { kind = "argv", classifier = "secrets versions access *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.secrets.versions.access"
+semantic_labels = ["gcloud.secrets.versions.access"]
+
+[[actions]]
+key = "gcloud.functions.deploy"
+action_version = "v1"
+summary = "Run gcloud functions deploy"
+input_schema = { kind = "argv", classifier = "functions deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.functions.deploy"
+semantic_labels = ["gcloud.functions.deploy"]
+
+[[actions]]
+key = "gcloud.functions.delete"
+action_version = "v1"
+summary = "Run gcloud functions delete"
+input_schema = { kind = "argv", classifier = "functions delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.functions.delete"
+semantic_labels = ["gcloud.functions.delete"]
+
+[[actions]]
+key = "gcloud.run.deploy"
+action_version = "v1"
+summary = "Run gcloud run deploy"
+input_schema = { kind = "argv", classifier = "run deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.run.deploy"
+semantic_labels = ["gcloud.run.deploy"]
+
+[[actions]]
+key = "gcloud.run.services.delete"
+action_version = "v1"
+summary = "Run gcloud run services delete"
+input_schema = { kind = "argv", classifier = "run services delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.run.services.delete"
+semantic_labels = ["gcloud.run.services.delete"]
+
+[[actions]]
+key = "gcloud.container.clusters.create"
+action_version = "v1"
+summary = "Run gcloud container clusters create"
+input_schema = { kind = "argv", classifier = "container clusters create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.container.clusters.create"
+semantic_labels = ["gcloud.container.clusters.create"]
+
+[[actions]]
+key = "gcloud.container.clusters.update"
+action_version = "v1"
+summary = "Run gcloud container clusters update"
+input_schema = { kind = "argv", classifier = "container clusters update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.container.clusters.update"
+semantic_labels = ["gcloud.container.clusters.update"]
+
+[[actions]]
+key = "gcloud.container.clusters.delete"
+action_version = "v1"
+summary = "Run gcloud container clusters delete"
+input_schema = { kind = "argv", classifier = "container clusters delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.container.clusters.delete"
+semantic_labels = ["gcloud.container.clusters.delete"]
+
+[[actions]]
+key = "gcloud.projects.create"
+action_version = "v1"
+summary = "Run gcloud projects create"
+input_schema = { kind = "argv", classifier = "projects create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.projects.create"
+semantic_labels = ["gcloud.projects.create"]
+
+[[actions]]
+key = "gcloud.projects.delete"
+action_version = "v1"
+summary = "Run gcloud projects delete"
+input_schema = { kind = "argv", classifier = "projects delete *" }
+risk_tier = "critical"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "deny"
+mode = "deny"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:gcloud.projects.delete"
+semantic_labels = ["gcloud.projects.delete"]

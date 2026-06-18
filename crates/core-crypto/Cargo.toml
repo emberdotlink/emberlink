@@ -1,0 +1,86 @@
+[package]
+name = "core-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+age = { version = "0.11", features = ["armor"] }
+# argon2: passphrase-based KDF for `backup_envelope::seal_backup` /
+# `open_backup` — the encrypted IR backup primitive
+# (META-TRUST-BACKUP-RESTORE / ADR 162 §Component 4). Same crate pinned by
+# `ember-daemon` for vault MEK derivation; we pin matching `0.5` so a
+# future param-rotation campaign can share the OWASP-recommended cost
+# table across both surfaces.
+argon2 = "0.5"
+base64 = "0.22"
+# ciborium: deterministic CBOR encoder for the BackupEnvelope payload
+# embedded inside the sealed-backup blob. Same crate used by emberlink-cli
+# for the v030 survey artifact; CBOR keeps the wire form compact and
+# version-tolerant for the metadata fields.
+ciborium = "0.2"
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2.1.1"
+# p256: first-class ECDSA-P256 (ES256) device-signature verification (ADR 200
+# §3 / AC-4). dev0 `presence` Devices are YubiKey PIV P256 keys; this verifier
+# is deliberately SEPARATE from the Ed25519 path (algorithm-confusion bar) and
+# is wasm-compatible (the relay / verify-receipt.html re-runs it). Already in
+# Cargo.lock via ember-daemon's transitive graph.
+p256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+# Use `getrandom` directly for OS entropy. `rand_core 0.10` removed the
+# `getrandom` feature flag and relocated `OsRng`; we only need OS-provided
+# randomness, not the full RNG trait hierarchy, so `getrandom` on its own
+# is the smaller, more stable surface.
+getrandom = "0.4"
+hkdf = "0.13"
+pem = "3"
+regex = "1"
+rustls-pki-types = "1"
+time = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_jcs = "0.2"
+serde_json = "1"
+sha2.workspace = true
+thiserror = "2"
+x509-parser = "0.18"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2"
+# rcgen pulls in ring's `SystemRandom`, which doesn't implement
+# `ring::rand::sealed::SecureRandom` on `wasm32-unknown-unknown` (only
+# testutil rand types do — rcgen 0.14.7 / ring 0.17.14, E0277 from
+# `key_pair.rs::ecdsa_from_pkcs8`). Gate rcgen out of wasm32 builds and
+# cfg-gate the `ca` + `x509` modules in lib.rs accordingly. The browser
+# extension and the website's /verify-receipt.html never reach into those
+# modules — they're daemon-side X.509 / SPIFFE cert minting.
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# Transitive `getrandom 0.2` comes in via `age` → `chacha20poly1305` →
+# `aead` → `crypto-common` → `rand_core 0.6`. Pin it with `js` so the
+# browser backend is selected; without this, `wasm32` builds fail with
+# `unresolved module `imp`` from getrandom 0.2's empty default backend.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# NB: revert renovate (#5942) accidentally bumping getrandom_02 from
+# 0.2 → 0.4 with the now-removed `js` feature. The 0.2 line targets the
+# transitive `getrandom 0.2` pulled by `age` → `chacha20poly1305` →
+# `aead` → `crypto-common` → `rand_core 0.6`; bumping it to 0.4 makes
+# the package name collide with the unprefixed `getrandom = "0.4"`
+# direct dep above and Cargo refuses ("crate depends on getrandom v0.4
+# multiple times with different names"). Anchor:
+# `respond_grant_request_signed_main_unblock`.
+
+[lints]
+workspace = true

@@ -1,0 +1,241 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-git per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+#
+# `need` (ADR 204 Amendment 6): the action's least-privilege authority need in
+# the canonical `provider:object:verb` algebra; the daemon resolves it here and
+# the projector derives native scope (I6). GitHub App installation tokens always
+# carry metadata:read, so every credential-minting git action declares that
+# provider-mandatory baseline. `git.push` mutates remote refs (contents:write);
+# `git.{fetch,clone,pull}` read the remote (contents:read).
+# The fetch/clone/pull actions are passthrough at classify time (no runtime
+# gate) but are declared here so a read-only delegation template that scopes
+# them lowers to a contents:read standing grant — never silently to a write.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-git"
+plugin_address = "registry.ember.systems/ember-systems/ember-git"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Git CLI Construct"
+description = "Git CLI Construct. Mediates destructive and credential-carrying `git` invocations through ember's broker: push mints a scoped installation token (contents:write); fetch/clone/pull mint a scoped installation token (contents:read) via URL rewrite for private-repo auth; force-push, reset --hard, clean -f, commit --amend, rebase -i, branch -D, and tag -d are gated (some budget-capped at 3/session with biometric confirmation). Read-only local verbs (status, log, diff, show, etc.) and safe local writes (commit, add, checkout, etc.) are passthrough — no broker mediation."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "github" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "git"
+
+[[actions]]
+key = "git.push"
+action_version = "v1"
+summary = "Run git.push"
+input_schema = { kind = "argv", classifier = "push *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.push"
+semantic_labels = ["git.push"]
+need = ["github:metadata:read", "github:contents:write"]
+
+[[actions]]
+key = "git.push.force"
+action_version = "v1"
+summary = "Run git.push.force"
+input_schema = { kind = "argv", classifier = "push force *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.push.force"
+semantic_labels = ["git.push.force"]
+
+[[actions]]
+key = "git.push.tags"
+action_version = "v1"
+summary = "Run git.push.tags"
+input_schema = { kind = "argv", classifier = "push tags *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.push.tags"
+semantic_labels = ["git.push.tags"]
+
+[[actions]]
+key = "git.commit.amend"
+action_version = "v1"
+summary = "Run git.commit.amend"
+input_schema = { kind = "argv", classifier = "commit amend *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.commit.amend"
+semantic_labels = ["git.commit.amend"]
+
+[[actions]]
+key = "git.rebase.interactive"
+action_version = "v1"
+summary = "Run git.rebase.interactive"
+input_schema = { kind = "argv", classifier = "rebase interactive *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.rebase.interactive"
+semantic_labels = ["git.rebase.interactive"]
+
+[[actions]]
+key = "git.reset.hard"
+action_version = "v1"
+summary = "Run git.reset.hard"
+input_schema = { kind = "argv", classifier = "reset hard *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+budget_caps = { wall_clock_secs = 86400, max_uses = 3 }
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.reset.hard"
+semantic_labels = ["git.reset.hard"]
+
+[[actions]]
+key = "git.clean.force"
+action_version = "v1"
+summary = "Run git.clean.force"
+input_schema = { kind = "argv", classifier = "clean force *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+budget_caps = { wall_clock_secs = 86400, max_uses = 3 }
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.clean.force"
+semantic_labels = ["git.clean.force"]
+
+[[actions]]
+key = "git.stash.drop"
+action_version = "v1"
+summary = "Run git.stash.drop"
+input_schema = { kind = "argv", classifier = "stash drop *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.stash.drop"
+semantic_labels = ["git.stash.drop"]
+
+[[actions]]
+key = "git.branch.force_delete"
+action_version = "v1"
+summary = "Run git.branch.force_delete"
+input_schema = { kind = "argv", classifier = "branch force delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.branch.force_delete"
+semantic_labels = ["git.branch.force_delete"]
+
+[[actions]]
+key = "git.tag.delete"
+action_version = "v1"
+summary = "Run git.tag.delete"
+input_schema = { kind = "argv", classifier = "tag delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.tag.delete"
+semantic_labels = ["git.tag.delete"]
+
+[[actions]]
+key = "git.gc.destructive"
+action_version = "v1"
+summary = "Run git.gc.destructive"
+input_schema = { kind = "argv", classifier = "gc destructive *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "prompt"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.gc.destructive"
+semantic_labels = ["git.gc.destructive"]
+
+[[actions]]
+key = "git.submodule.update"
+action_version = "v1"
+summary = "Run git.submodule.update"
+input_schema = { kind = "argv", classifier = "submodule update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.submodule.update"
+semantic_labels = ["git.submodule.update"]
+
+# Read-side remote operations. Passthrough at classify time (no runtime gate);
+# declared so template lowering resolves their contents:read need (ADR 204
+# Amendment 6). A private-repo fetch/clone/pull authenticates via the broker's
+# per-host URL rewrite when a token is in play.
+[[actions]]
+key = "git.fetch"
+action_version = "v1"
+summary = "Run git.fetch"
+input_schema = { kind = "argv", classifier = "fetch *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.fetch"
+semantic_labels = ["git.fetch"]
+need = ["github:metadata:read", "github:contents:read"]
+
+[[actions]]
+key = "git.clone"
+action_version = "v1"
+summary = "Run git.clone"
+input_schema = { kind = "argv", classifier = "clone *" }
+risk_tier = "low"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.clone"
+semantic_labels = ["git.clone"]
+need = ["github:metadata:read", "github:contents:read"]
+
+[[actions]]
+key = "git.pull"
+action_version = "v1"
+summary = "Run git.pull"
+input_schema = { kind = "argv", classifier = "pull *" }
+risk_tier = "low"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:git.pull"
+semantic_labels = ["git.pull"]
+need = ["github:metadata:read", "github:contents:read"]

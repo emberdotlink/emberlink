@@ -1,0 +1,483 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-vercel per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-vercel"
+plugin_address = "registry.ember.systems/ember-systems/ember-vercel"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Vercel CLI Construct"
+description = "Vercel CLI Construct. Mediates `vercel` invocations through ember's credential broker: project/domain/team/secret/alias removals (irreversible loss) require biometric; `domains buy` (spending money) requires biometric; `tokens revoke` (privilege removal) requires biometric; `env remove` (can break prod) requires biometric. All other classified mutating verbs (deploy, env add/pull/push, projects add, domains add, dns/certs ops, alias set, integration add, rollback, promote, teams create/invite, tokens create, secrets add/rename, git disconnect) gate without biometric. VERCEL_TOKEN is the credential injection env var."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "vercel" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "vercel"
+
+[[actions]]
+key = "vercel.deploy"
+action_version = "v1"
+summary = "Run vercel.deploy"
+input_schema = { kind = "argv", classifier = "deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.deploy"
+semantic_labels = ["vercel.deploy"]
+
+[[actions]]
+key = "vercel.env.add"
+action_version = "v1"
+summary = "Run vercel.env.add"
+input_schema = { kind = "argv", classifier = "env add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.env.add"
+semantic_labels = ["vercel.env.add"]
+
+[[actions]]
+key = "vercel.env.remove"
+action_version = "v1"
+summary = "Run vercel.env.remove"
+input_schema = { kind = "argv", classifier = "env remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.env.remove"
+semantic_labels = ["vercel.env.remove"]
+
+[[actions]]
+key = "vercel.env.pull"
+action_version = "v1"
+summary = "Run vercel.env.pull"
+input_schema = { kind = "argv", classifier = "env pull *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.env.pull"
+semantic_labels = ["vercel.env.pull"]
+
+[[actions]]
+key = "vercel.env.push"
+action_version = "v1"
+summary = "Run vercel.env.push"
+input_schema = { kind = "argv", classifier = "env push *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.env.push"
+semantic_labels = ["vercel.env.push"]
+
+[[actions]]
+key = "vercel.projects.add"
+action_version = "v1"
+summary = "Run vercel.projects.add"
+input_schema = { kind = "argv", classifier = "projects add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.projects.add"
+semantic_labels = ["vercel.projects.add"]
+
+[[actions]]
+key = "vercel.projects.remove"
+action_version = "v1"
+summary = "Run vercel.projects.remove"
+input_schema = { kind = "argv", classifier = "projects remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.projects.remove"
+semantic_labels = ["vercel.projects.remove"]
+
+[[actions]]
+key = "vercel.domains.add"
+action_version = "v1"
+summary = "Run vercel.domains.add"
+input_schema = { kind = "argv", classifier = "domains add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.domains.add"
+semantic_labels = ["vercel.domains.add"]
+
+[[actions]]
+key = "vercel.domains.remove"
+action_version = "v1"
+summary = "Run vercel.domains.remove"
+input_schema = { kind = "argv", classifier = "domains remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.domains.remove"
+semantic_labels = ["vercel.domains.remove"]
+
+[[actions]]
+key = "vercel.domains.transfer-in"
+action_version = "v1"
+summary = "Run vercel.domains.transfer-in"
+input_schema = { kind = "argv", classifier = "domains transfer-in *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.domains.transfer-in"
+semantic_labels = ["vercel.domains.transfer-in"]
+
+[[actions]]
+key = "vercel.domains.transfer-out"
+action_version = "v1"
+summary = "Run vercel.domains.transfer-out"
+input_schema = { kind = "argv", classifier = "domains transfer-out *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.domains.transfer-out"
+semantic_labels = ["vercel.domains.transfer-out"]
+
+[[actions]]
+key = "vercel.domains.buy"
+action_version = "v1"
+summary = "Run vercel.domains.buy"
+input_schema = { kind = "argv", classifier = "domains buy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.domains.buy"
+semantic_labels = ["vercel.domains.buy"]
+
+[[actions]]
+key = "vercel.dns.add"
+action_version = "v1"
+summary = "Run vercel.dns.add"
+input_schema = { kind = "argv", classifier = "dns add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.dns.add"
+semantic_labels = ["vercel.dns.add"]
+
+[[actions]]
+key = "vercel.dns.remove"
+action_version = "v1"
+summary = "Run vercel.dns.remove"
+input_schema = { kind = "argv", classifier = "dns remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.dns.remove"
+semantic_labels = ["vercel.dns.remove"]
+
+[[actions]]
+key = "vercel.certs.add"
+action_version = "v1"
+summary = "Run vercel.certs.add"
+input_schema = { kind = "argv", classifier = "certs add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.certs.add"
+semantic_labels = ["vercel.certs.add"]
+
+[[actions]]
+key = "vercel.certs.remove"
+action_version = "v1"
+summary = "Run vercel.certs.remove"
+input_schema = { kind = "argv", classifier = "certs remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.certs.remove"
+semantic_labels = ["vercel.certs.remove"]
+
+[[actions]]
+key = "vercel.certs.renew"
+action_version = "v1"
+summary = "Run vercel.certs.renew"
+input_schema = { kind = "argv", classifier = "certs renew *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.certs.renew"
+semantic_labels = ["vercel.certs.renew"]
+
+[[actions]]
+key = "vercel.alias.set"
+action_version = "v1"
+summary = "Run vercel.alias.set"
+input_schema = { kind = "argv", classifier = "alias set *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.alias.set"
+semantic_labels = ["vercel.alias.set"]
+
+[[actions]]
+key = "vercel.alias.remove"
+action_version = "v1"
+summary = "Run vercel.alias.remove"
+input_schema = { kind = "argv", classifier = "alias remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.alias.remove"
+semantic_labels = ["vercel.alias.remove"]
+
+[[actions]]
+key = "vercel.teams.create"
+action_version = "v1"
+summary = "Run vercel.teams.create"
+input_schema = { kind = "argv", classifier = "teams create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.teams.create"
+semantic_labels = ["vercel.teams.create"]
+
+[[actions]]
+key = "vercel.teams.invite"
+action_version = "v1"
+summary = "Run vercel.teams.invite"
+input_schema = { kind = "argv", classifier = "teams invite *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.teams.invite"
+semantic_labels = ["vercel.teams.invite"]
+
+[[actions]]
+key = "vercel.teams.remove"
+action_version = "v1"
+summary = "Run vercel.teams.remove"
+input_schema = { kind = "argv", classifier = "teams remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.teams.remove"
+semantic_labels = ["vercel.teams.remove"]
+
+[[actions]]
+key = "vercel.tokens.create"
+action_version = "v1"
+summary = "Run vercel.tokens.create"
+input_schema = { kind = "argv", classifier = "tokens create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.tokens.create"
+semantic_labels = ["vercel.tokens.create"]
+
+[[actions]]
+key = "vercel.tokens.revoke"
+action_version = "v1"
+summary = "Run vercel.tokens.revoke"
+input_schema = { kind = "argv", classifier = "tokens revoke *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.tokens.revoke"
+semantic_labels = ["vercel.tokens.revoke"]
+
+[[actions]]
+key = "vercel.secrets.add"
+action_version = "v1"
+summary = "Run vercel.secrets.add"
+input_schema = { kind = "argv", classifier = "secrets add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.secrets.add"
+semantic_labels = ["vercel.secrets.add"]
+
+[[actions]]
+key = "vercel.secrets.remove"
+action_version = "v1"
+summary = "Run vercel.secrets.remove"
+input_schema = { kind = "argv", classifier = "secrets remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.secrets.remove"
+semantic_labels = ["vercel.secrets.remove"]
+
+[[actions]]
+key = "vercel.secrets.rename"
+action_version = "v1"
+summary = "Run vercel.secrets.rename"
+input_schema = { kind = "argv", classifier = "secrets rename *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.secrets.rename"
+semantic_labels = ["vercel.secrets.rename"]
+
+[[actions]]
+key = "vercel.integration.add"
+action_version = "v1"
+summary = "Run vercel.integration.add"
+input_schema = { kind = "argv", classifier = "integration add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.integration.add"
+semantic_labels = ["vercel.integration.add"]
+
+[[actions]]
+key = "vercel.integration.remove"
+action_version = "v1"
+summary = "Run vercel.integration.remove"
+input_schema = { kind = "argv", classifier = "integration remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.integration.remove"
+semantic_labels = ["vercel.integration.remove"]
+
+[[actions]]
+key = "vercel.rollback"
+action_version = "v1"
+summary = "Run vercel.rollback"
+input_schema = { kind = "argv", classifier = "rollback *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.rollback"
+semantic_labels = ["vercel.rollback"]
+
+[[actions]]
+key = "vercel.promote"
+action_version = "v1"
+summary = "Run vercel.promote"
+input_schema = { kind = "argv", classifier = "promote *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.promote"
+semantic_labels = ["vercel.promote"]
+
+[[actions]]
+key = "vercel.git.disconnect"
+action_version = "v1"
+summary = "Run vercel.git.disconnect"
+input_schema = { kind = "argv", classifier = "git disconnect *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:vercel.git.disconnect"
+semantic_labels = ["vercel.git.disconnect"]

@@ -1,0 +1,47 @@
+# CLASSIFICATION: PUBLIC
+# P24 gcloud construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "version-credentialless"
+argv = ["version"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-gcloud/gcloud.version@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "local CLI version inspection must not inherit Google credentials"
+
+[[fixtures]]
+name = "storage-rm-needs-resolver"
+argv = ["storage", "rm", "gs://assets/releases/app.tar.gz"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "project/account and bucket authority must be resolved before projection exists"
+
+[[fixtures]]
+name = "iam-policy-file-needs-payload-analysis"
+argv = ["projects", "set-iam-policy", "prod-project", "policy.json"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "IAM policy payload carries principals, roles, and conditions"
+
+[[fixtures]]
+name = "impersonate-service-account-fails-closed"
+argv = ["--impersonate-service-account", "deploy@prod.iam.gserviceaccount.com", "storage", "rm", "gs://assets/app.tar.gz"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "impersonation flag selects delegated credential authority"
+
+[[fixtures]]
+name = "auth-login-fails-closed"
+argv = ["auth", "login"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "auth subcommands are credential-bypass vectors"
+
+[[fixtures]]
+name = "compute-instances-list-credentialless"
+argv = ["compute", "instances", "list"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-gcloud/gcloud.compute.instances.list@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true

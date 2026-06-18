@@ -1,0 +1,63 @@
+[package]
+name = "ember-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Approval delivery channels + grant-request routing for ember-broker."
+publish = false
+
+[features]
+se-real = []
+se-stub = []
+
+[[bin]]
+name = "bridge-cli"
+path = "src/bin/bridge-cli.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+aws-credential-types = "1.2"
+aws-sigv4 = { version = "1.4", default-features = false, features = ["sign-http", "http1"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+core-broker = { path = "../core-broker" }
+ed25519-dalek = "2.1.1"
+getrandom = "0.4"
+sha2 = { workspace = true }
+http = "1"
+jsonwebtoken = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+p256 = { version = "0.13", features = ["ecdsa"] }
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+
+# Secure-Enclave bindings live in `secure_enclave.rs` which is gated
+# `#![cfg(target_os = "macos")]`. Linking is unconditional on macOS so the
+# real ECIES wrap/unwrap path (`SecKey::encrypt_data` / `decrypt_data`) is
+# available when the `se-real` feature is on; the binary linker dead-strips
+# the unused symbols when `se-real` is off.
+[target.'cfg(target_os = "macos")'.dependencies]
+# `OSX_10_15` exposes `Location::DataProtectionKeychain` — the only macOS
+# keychain Apple's `SecKeyCreateRandomKey` will accept for SE-token keys.
+# An attempt to store SE keys in the legacy file-based System.keychain
+# (via `kSecUseKeychain`) was rejected at parameter validation with
+# `OSStatus -50 errSecParam` ("inconsistent private key parameters"): SE
+# token + file keychain is not a supported combination. DPK is keyed by
+# `(uid, kSecAttrAccessGroup)`, not by security session, so the install
+# (fork+exec'd into the ember uid) and the daemon (also ember, via
+# launchd) share the same DPK identity.
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

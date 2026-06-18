@@ -1,0 +1,67 @@
+/target
+.emberlink/
+.codegraph/
+memory/
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+*.key
+*.pem
+*.p12
+*.pfx
+# Allow PEM/KEY test fixtures under crates/<crate>/tests/fixtures/. Path is
+# covered by the .gitleaks.toml allowlist (`crates/.+/tests/fixtures/.+`),
+# so the BEGIN PRIVATE KEY markers in these fixtures don't trip the
+# public-mirror sync gate.
+!crates/*/tests/fixtures/*.pem
+!crates/*/tests/fixtures/*.key
+
+# Public trust-anchor certificates embedded into the daemon binary via
+# include_str! (e.g. the Yubico PIV Root CA, ADR 200 / P23). These are PUBLIC
+# root certs (no private key), fingerprint-pinned in source + asserted by test;
+# the `*.pem` ignore above would otherwise silently drop them on `git add`,
+# which broke the build on main (the cert in #5037 was never committed).
+!crates/*/src/**/certs/*.pem
+
+scripts/sync-to-public/sync-secrets.env
+
+.ralph-log
+.ralph-done
+.claude-ctx
+.autopilot-control
+.autopilot-metrics.jsonl
+.autopilot-ready-queue.json
+.autopilot-inflight.json
+.autopilot-events.jsonl
+.autopilot-failures.jsonl
+.demo-test-outcomes.jsonl
+.demo-test-blockers.txt
+docs/operations/*.results.jsonl
+.ember/engine/
+**/.ember/engine/
+# Managed agent worktrees are repo-local runtime state, not tracked source.
+.ember/worktrees/
+**/.ember/worktrees/
+ember-ext/extension/pkg/
+web/node_modules/
+node_modules/
+packages/*/node_modules/
+web/dist/
+.claude/screenshots/
+.claude/permission-log.jsonl
+.claude/secret-leak-log.jsonl
+.claude/scheduled_tasks.lock
+.claude/scratch/*
+!.claude/scratch/.gitkeep
+# Per-worktree liveness sentinels (scripts/agent-worktree.sh +
+# worker-dispatch.sh write these; one-per-worktree state, never tracked).
+.agent-live
+.agent-session
+.playwright-cli/
+demo/screenshots/
+build/
+!docs/public-site/build/
+!docs/public-site/build/*.md
+!public-docs/build/
+!public-docs/build/*.md
+infra/pulumi/codegen/helm-values-cache/

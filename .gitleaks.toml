@@ -1,0 +1,150 @@
+# Emberlink gitleaks config — extends the default ruleset with project-
+# specific allowlists for known false-positive patterns.
+#
+# Trust boundary: every entry here suppresses a finding that gitleaks would
+# otherwise flag. Allowlist regexes MUST be narrow enough that a real
+# credential could not satisfy the same pattern. Each entry must document:
+#   1. WHERE the suppressed pattern lives (file + test/fixture name)
+#   2. WHY a real credential cannot match the regex
+#   3. WHAT the allowlist catches (the literal placeholder shape)
+#
+# CODEOWNERS-protected — broadening any allowlist here requires operator
+# review. Per REL-SYNC-GITLEAKS-TEST-FIXTURE-ALLOWLIST.
+
+title = "Emberlink gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Project-specific false-positive allowlists. Each regex must document the
+fixture it covers and why no real credential could match.
+"""
+
+regexes = [
+  # ──────────────────────────────────────────────────────────────────
+  # ember-daemon GH App credential loader test fixtures
+  # ──────────────────────────────────────────────────────────────────
+  # File:  crates/ember-daemon/src/broker/github_config.rs
+  #        (HEAD: PR #3003 moved fixtures to tests/fixtures/*.pem; this
+  #        entry covers historical commits where the literals lived
+  #        inline in src/ under `#[cfg(test)] mod tests`.)
+  # Tests: load_from_dir_*, env-missing-*, env-override-* fixtures
+  #        verifying the loader handles malformed / empty / overridden
+  #        PEM bodies correctly.
+  # Shape: a short ASCII word ("fake", "override", "fake-empty",
+  #        "fake-from-home", "fake-from-override") between BEGIN/END
+  #        PRIVATE KEY markers, with the `\n` literal escape sequence
+  #        (two source bytes: backslash + n) around the body — this is
+  #        the Rust string-literal shape, NOT real newlines.
+  # Why safe: real PEMs contain ~1600 chars of base64 between the
+  #        markers; these short ASCII-word bodies cannot appear as a
+  #        real PKCS#8 / PKCS#1 / SEC1 key. The alternation enumerates
+  #        the exact known fixture variants — adding a sixth requires
+  #        an explicit edit here, not auto-coverage.
+  '''BEGIN PRIVATE KEY-----\\n(fake|override|fake-empty|fake-from-home|fake-from-override)\\n-----END PRIVATE KEY''',
+
+  # ──────────────────────────────────────────────────────────────────
+  # Shared RSA-key test-fixture stub — HISTORICAL-ONLY post-#3036
+  # ──────────────────────────────────────────────────────────────────
+  # Files (HEAD: include_str! from tests/fixtures/rsa_pem.pem):
+  #   crates/ember-daemon/src/broker/okta_config.rs (HEAD: PR #3003 moved
+  #     the FIXTURE_PEM const to tests/fixtures/okta_service_app.pem).
+  #   crates/ember-broker/src/{github_app,github_broker,okta,gcp}.rs
+  #     (HEAD: PR #3036 moved the inline FIXTURE_RSA_PEM const to
+  #     tests/fixtures/rsa_pem.pem, mirroring PR #3003's pattern).
+  # Scope: this entry now covers ONLY historical commits prior to
+  #   PR #3036's merge — no current src/ file in HEAD carries the
+  #   `MIIEvQIB…D1K64WSvEo` literal. git-filter-repo preserves the
+  #   pre-refactor file history, so gitleaks still sees the historical
+  #   content unless this entry remains.
+  # Shape: PKCS#8 RSA private key whose modulus begins with the exact
+  #        byte sequence `D1K64WSvEo` (decoded from the base64 prefix
+  #        below). The five pre-refactor files shared the same test
+  #        key, so a single allowlist entry covers all instances.
+  # Why safe: the first ~50 chars of any PKCS#8 RSA-2048 key are the
+  #        same DER/ASN.1 wrapper bytes; the discriminator is the start
+  #        of the modulus. `D1K64WSvEo` is 10 chars of base64 (60 bits
+  #        of entropy) — the probability that a real leaked key would
+  #        begin its modulus with this exact 10-char sequence is
+  #        1 / 2^60 ≈ 10^-18. The full 60-char prefix below is more
+  #        than narrow enough to never collide with a real key.
+  # Removable when: the pre-#3036 commits fall outside the git-filter-repo
+  #        history horizon (i.e. once those commits have been GC'd or
+  #        the public mirror's history is squashed past them). Until
+  #        then, removing this entry would re-introduce a leak signal
+  #        against historical content the export still publishes.
+  '''MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD1K64WSvEo''',
+
+  # ──────────────────────────────────────────────────────────────────
+  # Files newly exposed by the public-paths.txt single-level glob fix
+  # ──────────────────────────────────────────────────────────────────
+  # Before the public-paths.txt fix that added `crates/**/src/*.rs` and
+  # `crates/**/tests/*.rs` as allowlist entries, single-level files
+  # silently fell out of the public export (git-filter-repo `**` does
+  # not match zero components). Once the glob actually catches them,
+  # four pre-existing test-fixture / struct-construction patterns
+  # become visible to the gitleaks scan. Each entry below allowlists
+  # one specific pattern with documented why-safe rationale.
+
+  # Allowlist regexes must match the SECRET that gitleaks captures
+  # (the redacted value), not the surrounding line context. Each entry
+  # below names the file:line for traceability + a regex that matches
+  # the captured secret value exactly.
+
+  # File:  crates/core-crypto/src/ca.rs:344 (and the struct def at :366+)
+  # Capture: `Ed25519SubjectKey` (the struct name itself).
+  # Why safe: gitleaks's `generic-api-key` rule false-positives on
+  #        the struct-name token (mostly capitalised alphanumerics
+  #        with an entropy score above the default threshold). It's
+  #        a Rust identifier; the actual key bytes are computed at
+  #        runtime via `csr.public_key.to_bytes()`, never a literal
+  #        secret in source.
+  '''Ed25519SubjectKey''',
+
+  # File:  crates/emberlink-native-host/src/main.rs:600
+  # Capture: the 64-hex-char body of an obvious fake xchacha20 key
+  #        (literal `aabbccddeeff…aabbccddeeff…` repeating-pattern).
+  # Why safe: a real xchacha20 key is 32 bytes of cryptographic
+  #        randomness; this is the canonical "fake key for tests"
+  #        pattern. The 64-char literal cannot be a real key.
+  '''aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899''',
+
+  # File:  crates/ember-broker/src/aws_sts.rs:1388
+  # Capture: `eyJhbGciOiJSUzI1NiIsImtpZCI6Im9pZGMifQ.body.sig` — fake
+  #        JWT in an AWS STS test asserting the form-encoded body's
+  #        verbatim shape.
+  # Why safe: the literal `.body.sig` suffix is a placeholder, not a
+  #        valid JWT body+signature. The full string is a structural
+  #        fixture: header (`{"alg":"RS256","kid":"oidc"}`), body
+  #        ("body"), sig ("sig"). Real JWTs have base64-encoded
+  #        payloads + signatures, never literal "body"/"sig" tokens.
+  '''eyJhbGciOiJSUzI1NiIsImtpZCI6Im9pZGMifQ\.body\.sig''',
+
+  # File:  crates/ember-broker/src/hashivault.rs:1006,1040
+  # Capture: `hvs.child-rev-1` — fake Vault token in a hashivault
+  #        child-token revocation test.
+  # Why safe: real Vault tokens are random base64 strings ~24-40 chars
+  #        long after the `hvs.` prefix. The literal `hvs.child-rev-1`
+  #        is 14 chars total and uses ASCII-word characters that
+  #        cannot encode the random bytes a real token carries.
+  '''hvs\.child-rev-1''',
+
+  # ──────────────────────────────────────────────────────────────────
+  # Public construct action-manifest identifier false positives
+  # ──────────────────────────────────────────────────────────────────
+  # Files:
+  #   crates/ember-construct/construct/aws.toml
+  #   crates/ember-construct/construct/flyctl.toml
+  #   crates/ember-construct/construct/wrangler.toml
+  # Capture: action `key` values in public construct manifests.
+  # Why safe: these are stable action identifiers, not credentials. The
+  #        regexes enumerate the exact values currently flagged by
+  #        gitleaks's generic-api-key rule, so a real token elsewhere in
+  #        the manifest still fails the public sync gate.
+  '''aws\.s3api\.put-bucket-policy''',
+  '''aws\.ec2\.modify-instance-attribute''',
+  '''fly\.ips\.allocate-v[46]''',
+  '''wrangler\.d1\.execute''',
+]

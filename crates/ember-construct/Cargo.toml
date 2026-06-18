@@ -1,0 +1,103 @@
+[package]
+name = "ember-construct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Consolidated crate producing all 15 bundled L2 Construct binaries per ADR 125"
+publish = false
+
+[dependencies]
+# Promoted from dev-dependency: the env_derive helper content-hash-pins
+# the trusted-resolver subprocess binary (factory_resolver_framework_landed)
+# and must run at production runtime, not only under tests.
+blake3 = "1"
+core-broker = { path = "../core-broker" }
+core-construct-runtime = { path = "../core-construct-runtime" }
+# Promoted from dev-dependency: `policy::manifest_action_need` resolves an
+# action's authority need from the bundled construct manifest at runtime via
+# `core_events::construct_toml::resolve_action_need` (ADR 204 Amendment 6).
+core-events = { path = "../core-events" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "ember-aws"
+path = "src/bin/ember-aws.rs"
+
+[[bin]]
+name = "ember-az"
+path = "src/bin/ember-az.rs"
+
+[[bin]]
+name = "ember-gcloud"
+path = "src/bin/ember-gcloud.rs"
+
+[[bin]]
+name = "ember-vercel"
+path = "src/bin/ember-vercel.rs"
+
+[[bin]]
+name = "ember-wrangler"
+path = "src/bin/ember-wrangler.rs"
+
+[[bin]]
+name = "ember-gh"
+path = "src/bin/ember-gh.rs"
+
+[[bin]]
+name = "ember-git"
+path = "src/bin/ember-git.rs"
+
+[[bin]]
+name = "ember-docker"
+path = "src/bin/ember-docker.rs"
+
+[[bin]]
+name = "ember-kubectl"
+path = "src/bin/ember-kubectl.rs"
+
+[[bin]]
+name = "ember-pulumi"
+path = "src/bin/ember-pulumi.rs"
+
+[[bin]]
+name = "ember-terraform"
+path = "src/bin/ember-terraform.rs"
+
+[[bin]]
+name = "ember-tofu"
+path = "src/bin/ember-tofu.rs"
+
+[[bin]]
+name = "ember-flyctl"
+path = "src/bin/ember-flyctl.rs"
+
+[[bin]]
+name = "ember-npm"
+path = "src/bin/ember-npm.rs"
+
+[[bin]]
+name = "ember-okta"
+path = "src/bin/ember-okta.rs"
+
+[[bin]]
+name = "ember-scion"
+path = "src/bin/ember-scion.rs"
+
+[dev-dependencies]
+blake3 = "1"
+core-broker = { path = "../core-broker" }
+proptest = "1"
+secrecy = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

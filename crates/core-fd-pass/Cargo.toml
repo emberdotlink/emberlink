@@ -1,0 +1,33 @@
+[package]
+name = "core-fd-pass"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# `socket` enables `sendmsg` / `recvmsg` + `ControlMessage::ScmRights` for the
+# cross-process fd-passing primitive. `uio` enables `IoSlice` / `IoSliceMut`
+# for the iovec payload. `fs` enables `memfd_create` + `F_ADD_SEALS` on
+# Linux for `SealedMemfd::from_bytes`.
+#
+# Pinned to 0.29 to match the workspace's existing nix usage in
+# `ember-daemon`, `ember-exec`, and `ember-spawn-helper` — avoids a duplicate
+# compile of 0.27 alongside 0.29. The task brief specified 0.27; we promote
+# to 0.29 to align with workspace convention.
+nix = { version = "0.31", features = ["socket", "uio", "fs"] }
+
+# Used by `SealedMemfd` on macOS for `shm_open` / `shm_unlink` / `ftruncate` /
+# `mmap` / `mlock`, none of which `nix 0.29` exposes via a stable feature on
+# Darwin. Linux uses `memfd_create` via `nix`.
+libc = "0.2"
+
+# Best-effort scrub of the temporary mmap buffer in `read_to_vec` before
+# returning the plaintext Vec. The Vec itself is owned by the caller.
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,722 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-flyctl per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-flyctl"
+plugin_address = "registry.ember.systems/ember-systems/ember-flyctl"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Fly.io CLI Construct"
+description = "Fly.io CLI Construct. Mediates `flyctl`/`fly` invocations through ember's credential broker: irreversible destruction (apps/machine/volumes/postgres/redis destroy) requires biometric; secrets unset (silent secret loss) requires biometric; tokens/orgs revoke (privilege removal) requires biometric; machine exec and ssh console (arbitrary code execution / interactive shell) require biometric. All other classified mutating verbs gate without biometric. FLY_API_TOKEN is the credential injection env var."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "fly_io" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "flyctl"
+
+[[actions]]
+key = "fly.apps.create"
+action_version = "v1"
+summary = "Run fly.apps.create"
+input_schema = { kind = "argv", classifier = "apps create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.apps.create"
+semantic_labels = ["fly.apps.create"]
+
+[[actions]]
+key = "fly.apps.destroy"
+action_version = "v1"
+summary = "Run fly.apps.destroy"
+input_schema = { kind = "argv", classifier = "apps destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.apps.destroy"
+semantic_labels = ["fly.apps.destroy"]
+
+[[actions]]
+key = "fly.apps.restart"
+action_version = "v1"
+summary = "Run fly.apps.restart"
+input_schema = { kind = "argv", classifier = "apps restart *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.apps.restart"
+semantic_labels = ["fly.apps.restart"]
+
+[[actions]]
+key = "fly.apps.scale"
+action_version = "v1"
+summary = "Run fly.apps.scale"
+input_schema = { kind = "argv", classifier = "apps scale *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.apps.scale"
+semantic_labels = ["fly.apps.scale"]
+
+[[actions]]
+key = "fly.apps.deploy"
+action_version = "v1"
+summary = "Run fly.apps.deploy"
+input_schema = { kind = "argv", classifier = "apps deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.apps.deploy"
+semantic_labels = ["fly.apps.deploy"]
+
+[[actions]]
+key = "fly.apps.releases.rollback"
+action_version = "v1"
+summary = "Run fly.apps.releases.rollback"
+input_schema = { kind = "argv", classifier = "apps releases rollback *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.apps.releases.rollback"
+semantic_labels = ["fly.apps.releases.rollback"]
+
+[[actions]]
+key = "fly.machine.run"
+action_version = "v1"
+summary = "Run fly.machine.run"
+input_schema = { kind = "argv", classifier = "machine run *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.run"
+semantic_labels = ["fly.machine.run"]
+
+[[actions]]
+key = "fly.machine.stop"
+action_version = "v1"
+summary = "Run fly.machine.stop"
+input_schema = { kind = "argv", classifier = "machine stop *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.stop"
+semantic_labels = ["fly.machine.stop"]
+
+[[actions]]
+key = "fly.machine.start"
+action_version = "v1"
+summary = "Run fly.machine.start"
+input_schema = { kind = "argv", classifier = "machine start *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.start"
+semantic_labels = ["fly.machine.start"]
+
+[[actions]]
+key = "fly.machine.restart"
+action_version = "v1"
+summary = "Run fly.machine.restart"
+input_schema = { kind = "argv", classifier = "machine restart *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.restart"
+semantic_labels = ["fly.machine.restart"]
+
+[[actions]]
+key = "fly.machine.destroy"
+action_version = "v1"
+summary = "Run fly.machine.destroy"
+input_schema = { kind = "argv", classifier = "machine destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.destroy"
+semantic_labels = ["fly.machine.destroy"]
+
+[[actions]]
+key = "fly.machine.exec"
+action_version = "v1"
+summary = "Run fly.machine.exec"
+input_schema = { kind = "argv", classifier = "machine exec *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.exec"
+semantic_labels = ["fly.machine.exec"]
+
+[[actions]]
+key = "fly.machine.clone"
+action_version = "v1"
+summary = "Run fly.machine.clone"
+input_schema = { kind = "argv", classifier = "machine clone *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.clone"
+semantic_labels = ["fly.machine.clone"]
+
+[[actions]]
+key = "fly.machine.update"
+action_version = "v1"
+summary = "Run fly.machine.update"
+input_schema = { kind = "argv", classifier = "machine update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.machine.update"
+semantic_labels = ["fly.machine.update"]
+
+[[actions]]
+key = "fly.volumes.create"
+action_version = "v1"
+summary = "Run fly.volumes.create"
+input_schema = { kind = "argv", classifier = "volumes create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.volumes.create"
+semantic_labels = ["fly.volumes.create"]
+
+[[actions]]
+key = "fly.volumes.destroy"
+action_version = "v1"
+summary = "Run fly.volumes.destroy"
+input_schema = { kind = "argv", classifier = "volumes destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.volumes.destroy"
+semantic_labels = ["fly.volumes.destroy"]
+
+[[actions]]
+key = "fly.volumes.extend"
+action_version = "v1"
+summary = "Run fly.volumes.extend"
+input_schema = { kind = "argv", classifier = "volumes extend *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.volumes.extend"
+semantic_labels = ["fly.volumes.extend"]
+
+[[actions]]
+key = "fly.volumes.fork"
+action_version = "v1"
+summary = "Run fly.volumes.fork"
+input_schema = { kind = "argv", classifier = "volumes fork *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.volumes.fork"
+semantic_labels = ["fly.volumes.fork"]
+
+[[actions]]
+key = "fly.secrets.set"
+action_version = "v1"
+summary = "Run fly.secrets.set"
+input_schema = { kind = "argv", classifier = "secrets set *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.secrets.set"
+semantic_labels = ["fly.secrets.set"]
+
+[[actions]]
+key = "fly.secrets.unset"
+action_version = "v1"
+summary = "Run fly.secrets.unset"
+input_schema = { kind = "argv", classifier = "secrets unset *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.secrets.unset"
+semantic_labels = ["fly.secrets.unset"]
+
+[[actions]]
+key = "fly.secrets.import"
+action_version = "v1"
+summary = "Run fly.secrets.import"
+input_schema = { kind = "argv", classifier = "secrets import *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.secrets.import"
+semantic_labels = ["fly.secrets.import"]
+
+[[actions]]
+key = "fly.secrets.deploy"
+action_version = "v1"
+summary = "Run fly.secrets.deploy"
+input_schema = { kind = "argv", classifier = "secrets deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.secrets.deploy"
+semantic_labels = ["fly.secrets.deploy"]
+
+[[actions]]
+key = "fly.deploy"
+action_version = "v1"
+summary = "Run fly.deploy"
+input_schema = { kind = "argv", classifier = "deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.deploy"
+semantic_labels = ["fly.deploy"]
+
+[[actions]]
+key = "fly.scale.count"
+action_version = "v1"
+summary = "Run fly.scale.count"
+input_schema = { kind = "argv", classifier = "scale count *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.scale.count"
+semantic_labels = ["fly.scale.count"]
+
+[[actions]]
+key = "fly.scale.vm"
+action_version = "v1"
+summary = "Run fly.scale.vm"
+input_schema = { kind = "argv", classifier = "scale vm *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.scale.vm"
+semantic_labels = ["fly.scale.vm"]
+
+[[actions]]
+key = "fly.scale.memory"
+action_version = "v1"
+summary = "Run fly.scale.memory"
+input_schema = { kind = "argv", classifier = "scale memory *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.scale.memory"
+semantic_labels = ["fly.scale.memory"]
+
+[[actions]]
+key = "fly.regions.add"
+action_version = "v1"
+summary = "Run fly.regions.add"
+input_schema = { kind = "argv", classifier = "regions add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.regions.add"
+semantic_labels = ["fly.regions.add"]
+
+[[actions]]
+key = "fly.regions.remove"
+action_version = "v1"
+summary = "Run fly.regions.remove"
+input_schema = { kind = "argv", classifier = "regions remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.regions.remove"
+semantic_labels = ["fly.regions.remove"]
+
+[[actions]]
+key = "fly.regions.set"
+action_version = "v1"
+summary = "Run fly.regions.set"
+input_schema = { kind = "argv", classifier = "regions set *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.regions.set"
+semantic_labels = ["fly.regions.set"]
+
+[[actions]]
+key = "fly.regions.backup"
+action_version = "v1"
+summary = "Run fly.regions.backup"
+input_schema = { kind = "argv", classifier = "regions backup *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.regions.backup"
+semantic_labels = ["fly.regions.backup"]
+
+[[actions]]
+key = "fly.postgres.create"
+action_version = "v1"
+summary = "Run fly.postgres.create"
+input_schema = { kind = "argv", classifier = "postgres create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.postgres.create"
+semantic_labels = ["fly.postgres.create"]
+
+[[actions]]
+key = "fly.postgres.destroy"
+action_version = "v1"
+summary = "Run fly.postgres.destroy"
+input_schema = { kind = "argv", classifier = "postgres destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.postgres.destroy"
+semantic_labels = ["fly.postgres.destroy"]
+
+[[actions]]
+key = "fly.postgres.attach"
+action_version = "v1"
+summary = "Run fly.postgres.attach"
+input_schema = { kind = "argv", classifier = "postgres attach *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.postgres.attach"
+semantic_labels = ["fly.postgres.attach"]
+
+[[actions]]
+key = "fly.postgres.detach"
+action_version = "v1"
+summary = "Run fly.postgres.detach"
+input_schema = { kind = "argv", classifier = "postgres detach *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.postgres.detach"
+semantic_labels = ["fly.postgres.detach"]
+
+[[actions]]
+key = "fly.postgres.connect"
+action_version = "v1"
+summary = "Run fly.postgres.connect"
+input_schema = { kind = "argv", classifier = "postgres connect *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.postgres.connect"
+semantic_labels = ["fly.postgres.connect"]
+
+[[actions]]
+key = "fly.redis.create"
+action_version = "v1"
+summary = "Run fly.redis.create"
+input_schema = { kind = "argv", classifier = "redis create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.redis.create"
+semantic_labels = ["fly.redis.create"]
+
+[[actions]]
+key = "fly.redis.destroy"
+action_version = "v1"
+summary = "Run fly.redis.destroy"
+input_schema = { kind = "argv", classifier = "redis destroy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.redis.destroy"
+semantic_labels = ["fly.redis.destroy"]
+
+[[actions]]
+key = "fly.redis.update"
+action_version = "v1"
+summary = "Run fly.redis.update"
+input_schema = { kind = "argv", classifier = "redis update *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.redis.update"
+semantic_labels = ["fly.redis.update"]
+
+[[actions]]
+key = "fly.certs.add"
+action_version = "v1"
+summary = "Run fly.certs.add"
+input_schema = { kind = "argv", classifier = "certs add *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.certs.add"
+semantic_labels = ["fly.certs.add"]
+
+[[actions]]
+key = "fly.certs.remove"
+action_version = "v1"
+summary = "Run fly.certs.remove"
+input_schema = { kind = "argv", classifier = "certs remove *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.certs.remove"
+semantic_labels = ["fly.certs.remove"]
+
+[[actions]]
+key = "fly.certs.check"
+action_version = "v1"
+summary = "Run fly.certs.check"
+input_schema = { kind = "argv", classifier = "certs check *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.certs.check"
+semantic_labels = ["fly.certs.check"]
+
+[[actions]]
+key = "fly.ips.allocate-v4"
+action_version = "v1"
+summary = "Run fly.ips.allocate-v4"
+input_schema = { kind = "argv", classifier = "ips allocate-v4 *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.ips.allocate-v4"
+semantic_labels = ["fly.ips.allocate-v4"]
+
+[[actions]]
+key = "fly.ips.allocate-v6"
+action_version = "v1"
+summary = "Run fly.ips.allocate-v6"
+input_schema = { kind = "argv", classifier = "ips allocate-v6 *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.ips.allocate-v6"
+semantic_labels = ["fly.ips.allocate-v6"]
+
+[[actions]]
+key = "fly.ips.release"
+action_version = "v1"
+summary = "Run fly.ips.release"
+input_schema = { kind = "argv", classifier = "ips release *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.ips.release"
+semantic_labels = ["fly.ips.release"]
+
+[[actions]]
+key = "fly.tokens.create"
+action_version = "v1"
+summary = "Run fly.tokens.create"
+input_schema = { kind = "argv", classifier = "tokens create *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.tokens.create"
+semantic_labels = ["fly.tokens.create"]
+
+[[actions]]
+key = "fly.tokens.revoke"
+action_version = "v1"
+summary = "Run fly.tokens.revoke"
+input_schema = { kind = "argv", classifier = "tokens revoke *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.tokens.revoke"
+semantic_labels = ["fly.tokens.revoke"]
+
+[[actions]]
+key = "fly.orgs.revoke"
+action_version = "v1"
+summary = "Run fly.orgs.revoke"
+input_schema = { kind = "argv", classifier = "orgs revoke *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.orgs.revoke"
+semantic_labels = ["fly.orgs.revoke"]
+
+[[actions]]
+key = "fly.ssh.issue"
+action_version = "v1"
+summary = "Run fly.ssh.issue"
+input_schema = { kind = "argv", classifier = "ssh issue *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.ssh.issue"
+semantic_labels = ["fly.ssh.issue"]
+
+[[actions]]
+key = "fly.ssh.console"
+action_version = "v1"
+summary = "Run fly.ssh.console"
+input_schema = { kind = "argv", classifier = "ssh console *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:fly.ssh.console"
+semantic_labels = ["fly.ssh.console"]

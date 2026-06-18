@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{PLIST_LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{EMBER_DEV_BIN}}</string>
+        <string>--foreground</string>
+    </array>
+    <key>UserName</key>
+    <string>_ember_dev</string>
+    <key>GroupName</key>
+    <string>_ember_dev</string>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- ADR 197 §security-req-5: throttle restart cadence so a crash-loop
+         (or an induced one) cannot become a restart storm. launchd's
+         default is 10s; we set it explicitly to document the intent. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardErrorPath</key>
+    <string>{{STDERR_PATH}}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>EMBER_TRUST_ROOTS</key>
+        <string>{{TRUST_ROOTS}}</string>
+        <key>EMBER_CONFIG</key>
+        <string>{{CONFIG_PATH}}</string>
+        <key>EMBER_DAEMON_SOCKET</key>
+        <string>{{SOCKET_PATH}}</string>
+        <key>EMBER_DAEMON_FLAVOR</key>
+        <string>dev</string>
+        <key>EMBER_APP_ENV_PATH</key>
+        <string>{{GH_APP_ENV_PATH}}</string>
+        <key>EMBER_APP_PEM_PATH</key>
+        <string>{{GH_APP_PEM_PATH}}</string>
+        <key>EMBER_VAULT_DIR</key>
+        <string>{{VAULT_DIR}}</string>
+        <key>EMBER_MANIFEST_PATH</key>
+        <string>{{MANIFEST_PATH}}</string>
+    </dict>
+</dict>
+</plist>

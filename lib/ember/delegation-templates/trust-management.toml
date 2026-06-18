@@ -1,0 +1,21 @@
+# trust-management — the one workflow that touches the trust surface. Short
+# TTL (1h, regardless of cohort — security-first per ADR 162 §Component 6)
+# and explicitly excludes every non-trust verb.
+#
+# Per ADR 158 §Component 1 + ADR 162 §Component 6.
+# Anchor: onboarding_delegation_templates_landed.
+
+name = "trust-management"
+description = "Trust-set operations — list/show/explain/rotate/backup/restore/add/revoke (1h TTL, security-first)"
+ttl = "1h"
+
+scopes = [
+    "registry.ember.systems/ember-systems/ember-trust/list@v1",
+    "registry.ember.systems/ember-systems/ember-trust/show@v1",
+    "registry.ember.systems/ember-systems/ember-trust/explain@v1",
+    "registry.ember.systems/ember-systems/ember-trust/rotate@v1",
+    "registry.ember.systems/ember-systems/ember-trust/backup@v1",
+    "registry.ember.systems/ember-systems/ember-trust/restore@v1",
+    "registry.ember.systems/ember-systems/ember-trust/add@v1",
+    "registry.ember.systems/ember-systems/ember-trust/revoke@v1",
+]

@@ -1,0 +1,72 @@
+[package]
+name = "ember-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ember-rpc — mTLS-only listener-frontend that parses JSON-RPC and forwards typed bincode requests to emberd core (ADR 155 amendment Phase B)."
+publish = false
+
+# Two binary targets — same shared entrypoint, different deployment naming. Per
+# ADR 155 amendment, ember-rpc is a sibling process to emberd core
+# that runs as the `ember` uid, terminates mTLS, parses JSON-RPC, and
+# forwards typed bincode frames to emberd over a local UDS. The
+# split exists so the structural invariant "ember-rpc has no
+# fd-passing surface" can be enforced at build time (see deliberate
+# `core-fd-pass` absence below) — keeping plaintext-bearing methods
+# off the mTLS lane is enforced in code.
+[[bin]]
+name = "emberd-rpc-linux"
+path = "src/bin/emberd-rpc-linux.rs"
+required-features = []
+
+[[bin]]
+name = "emberd-rpc-macos"
+path = "src/bin/emberd-rpc-macos.rs"
+required-features = []
+
+[dependencies]
+anyhow = "1"
+core-crypto = { path = "../core-crypto" }
+core-personas = { path = "../core-personas" }
+# bincode is named in the crate's purpose statement above and in Phase D's
+# planned wireup (typed bincode frames to emberd core), but the source has
+# zero `use bincode` / `bincode::` references today — Phase D is not yet
+# implemented. The dep was kept as a forward-looking placeholder, but
+# bincode 3.0 ships an intentional `compile_error!` (xkcd 2347) that
+# blocks workspace builds when renovate auto-bumps to it. Removed until
+# Phase D actually wires the forwarder; re-add then with a deliberate
+# version + API choice rather than a renovate-driven major-bump landing
+# on an unused declaration.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3.workspace = true
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "signal", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+x509-parser = "0.18"
+
+[dev-dependencies]
+# T2 listener smoke test mints an in-test CA + leaf certs via rcgen so the
+# test exercises the real WebPkiClientVerifier path without committing PEM
+# fixtures to the tree.
+rcgen = "0.14"
+tempfile = "3"
+# Used in M12 (ADR 173) tests to drive deterministic short-TTL not_after
+# windows on minted certs (rcgen's not_after field is `time::OffsetDateTime`).
+time = { version = "0.3", default-features = false, features = ["std"] }
+
+# DELIBERATELY ABSENT: core-fd-pass — build-time structural invariant
+# per ADR 155 amendment. ember-rpc must NOT have access to
+# fd-passing machinery; that responsibility lives exclusively in
+# emberd core, which retains the peercred UDS lane (Phase D).
+# Adding core-fd-pass here would silently widen the mTLS frontend's
+# capability and collapse the two-process split. If you find
+# yourself needing fd-pass primitives in this crate, stop and
+# revisit the ADR — the right answer is probably "this RPC stays on
+# the peercred lane and never reaches ember-rpc at all."
+
+[lints]
+workspace = true

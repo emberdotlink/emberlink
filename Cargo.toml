@@ -1,0 +1,94 @@
+[workspace]
+members = [
+    "crates/emberlink-agent",
+    "crates/emberlink-mcp",
+    "crates/emberlink-app",
+    "crates/emberlink-cli",
+    "crates/emberlink-relay",
+    "crates/core-broker",
+    "crates/core-construct-runtime",
+    "crates/ember-construct",
+    "crates/core-types",
+    "crates/core-principals",
+    "crates/core-event-types",
+    "crates/core-grant-types",
+    "crates/core-crypto",
+    "crates/core-events",
+    "crates/core-eventlog",
+    "crates/core-fd-pass",
+    "crates/core-kms",
+    "crates/core-state",
+    "crates/core-identity",
+    "crates/core-personas",
+    "crates/core-trust",
+    "crates/core-recovery",
+    "crates/core-sync",
+    "crates/core-storage",
+    "crates/core-mcp",
+    "crates/core-metrics",
+    "crates/core-proxy-forward",
+    "crates/proxy-forward-runtime",
+    "crates/core-receipts",
+    "crates/core-approval",
+    "crates/core-grants",
+    "crates/core-grants-toml",
+    "crates/ember-broker",
+    "crates/ember-daemon",
+    "crates/ember-exec",
+    "crates/ember-spawn-helper",
+    "crates/ember-telemetry",
+    "crates/ember-update",
+    "crates/ember-vault",
+    "crates/ember-warden-decryptor",
+    "crates/ember-presence",
+    "crates/ember-relay",
+    "crates/ember-rpc",
+]
+exclude = ["fuzz", "crates/ember-daemon/fuzz"]
+resolver = "2"
+
+[workspace.lints]
+# Current per-crate convention has no manifest-level lint overrides.
+# Member packages inherit this empty table so future workspace lint
+# additions are centralized here.
+
+
+# v0.3.0 audit Cluster D D1: release builds strip debug assertions
+# explicitly so `cfg!(debug_assertions)`-gated paths are guaranteed
+# off in shipping artifacts.
+[profile.release]
+debug-assertions = false
+
+[profile.test]
+debug = 0
+
+# Disk/debuginfo scalpel for dev + check builds. Cargo's default dev
+# profile is `debug = 2` (full DWARF), which dominates `target/debug/deps`:
+# every workspace rlib carries hundreds of MB of debuginfo, and each
+# worktree keeps its own `target/`, so the cost multiplies per worktree
+# (observed 2026-05-29: ~27 GB of deps/ in a single active worktree, the
+# bulk of it DWARF, on top of full-debug top-level rlibs like
+# libember_kernel.rlib at 237 MB/copy). `line-tables-only` keeps the
+# `file:line` tables that `RUST_BACKTRACE` panics resolve — the only debug
+# info an agent loop ever consumes — while dropping the variable/type DWARF
+# that only source-level debugger (lldb/gdb) stepping needs. No agent
+# attaches a debugger to a throwaway worktree, so this is a pure-win size
+# cut (~60-80% per artifact) across every build path. `[profile.test]`
+# above already runs `debug = 0`; this governs `cargo build`/`cargo check`.
+# Worktree-target lifecycle (sweep + incremental reaper) lives in
+# scripts/agent/prune-named-worktrees.sh.
+[profile.dev]
+debug = "line-tables-only"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+# version-0-3-0-bumped-cohort-a-v03: bumped 2026-05-09 for cohort-A v0.3.0 ship
+version = "0.3.0"
+
+[workspace.dependencies]
+blake3 = "1"
+sha2 = "0.11"
+toml = "1.0"
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+toml_edit = "0.25"

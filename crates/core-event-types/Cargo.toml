@@ -1,0 +1,24 @@
+[package]
+name = "core-event-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Audit-log wire format: event envelope shapes + storage relationships.
+# Per ADR 156.
+
+[dependencies]
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+hex = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
+sha2.workspace = true
+
+[lints]
+workspace = true

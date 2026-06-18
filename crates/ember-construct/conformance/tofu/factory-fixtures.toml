@@ -1,0 +1,32 @@
+# CLASSIFICATION: PUBLIC
+# P24 OpenTofu construct-factory fixture skeleton.
+
+[[fixtures]]
+name = "version-credentialless"
+argv = ["version"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-tofu/tofu.version@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "local version inspection must not inherit provider credentials"
+
+[[fixtures]]
+name = "apply-needs-payload-analysis"
+argv = ["apply", "-auto-approve"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "plan/config/provider state determines actual resource authority"
+
+[[fixtures]]
+name = "workspace-delete-needs-resolver"
+argv = ["workspace", "delete", "prod"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "workspace name must be bound to trusted backend state before authority can be checked"
+
+[[fixtures]]
+name = "state-push-fails-closed"
+argv = ["state", "push", "terraform.tfstate"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "raw state replacement is not bounded by the current factory contract"

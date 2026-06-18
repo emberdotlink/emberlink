@@ -1,0 +1,36 @@
+[package]
+name = "emberlink-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server for Emberlink agent authorization"
+publish = false
+
+[dependencies]
+core-mcp = { path = "../core-mcp" }
+serde_json = "1"
+# `rt-multi-thread` + `time` + `net` are required for the in-container
+# mTLS bridge transport (ADR 154 component 1, META-AP-EMBERLINK-MCP-MTLS-CLIENT):
+# the bridge transport owns its own multi-thread runtime so the stdio server's
+# synchronous daemon calls can block on tokio I/O without nested-runtime panics.
+tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "macros", "net", "time"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+# Parse the loaded client cert's `not_after` / `not_before` to schedule
+# the `bridge.cert_expiring_soon` warning fire at 90% TTL elapsed.
+x509-parser = "0.18"
+
+[dev-dependencies]
+ember-daemon = { path = "../ember-daemon" }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+# T2 smoke tests mint an in-test CA + leaf certs via rcgen to exercise
+# the real `rustls::ClientConfig` round-trip without committing PEM
+# fixtures. Version pinned to match `crates/ember-rpc`'s dev-dep so the
+# test substrate stays uniform across the bridge crates.
+rcgen = "0.14"
+
+[lints]
+workspace = true

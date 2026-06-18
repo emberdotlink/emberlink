@@ -1,0 +1,27 @@
+# emberd-development — daily-driver workflow for engineers iterating on the
+# Emberlink codebase (this repo). Scope is broad across the developer tools
+# the codebase actually uses; explicit excludes block destructive surfaces
+# (trust-management, gh.repo_delete, scion spawning).
+#
+# Per ADR 158 §Component 1 + ADR 162 §Component 6.
+# Anchor: onboarding_delegation_templates_landed.
+
+name = "emberd-development"
+description = "Daily emberd development — git, gh, cargo, kubectl, npm"
+ttl = "4h"
+
+scopes = [
+    "registry.ember.systems/ember-systems/ember-git/*@v1",
+    "registry.ember.systems/ember-systems/ember-gh/*@v1",
+    "registry.ember.systems/ember-systems/ember-cargo/*@v1",
+    "registry.ember.systems/ember-systems/ember-kubectl/*@v1",
+    "registry.ember.systems/ember-systems/ember-npm/*@v1",
+    "registry.ember.systems/ember-systems/ember-workflow/dev_sync@v1",
+    "registry.ember.systems/ember-systems/ember-workflow/workflow_add_scope@v1",
+]
+
+excludes = [
+    "registry.ember.systems/ember-systems/ember-trust/*@v1",
+    "registry.ember.systems/ember-systems/ember-gh/repo_delete@v1",
+    "registry.ember.systems/ember-systems/ember-scion/start@v1",
+]

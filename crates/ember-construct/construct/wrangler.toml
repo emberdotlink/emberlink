@@ -1,0 +1,210 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-wrangler per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-wrangler"
+plugin_address = "registry.ember.systems/ember-systems/ember-wrangler"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "Wrangler CLI Construct"
+description = "Wrangler CLI Construct. Gates `wrangler` invocations through ember's action policy: deploy and all mutation operations require biometric approval; delete (Worker script removal) and r2 object delete are budget-capped; d1 execute (raw SQL) requires biometric; kv:key put/delete and secret put/delete are biometric-gated. Current runtime still relies on caller-supplied `CLOUDFLARE_API_TOKEN` passthrough rather than daemon-minted scoped Cloudflare credentials. Read-only verbs (dev, tail, whoami, version, login, logout, kv:key list/get, r2 object list/get, d1 list/info, secret list) are passthrough — no broker mediation."
+
+[defaults]
+materialization_class = "declared_host_material"
+material_classes = [{ kind = "env", name = "CLOUDFLARE_API_TOKEN" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "wrangler"
+
+[[actions]]
+key = "wrangler.deploy"
+action_version = "v1"
+summary = "Run wrangler.deploy"
+input_schema = { kind = "argv", classifier = "deploy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.deploy"
+semantic_labels = ["wrangler.deploy"]
+
+[[actions]]
+key = "wrangler.delete"
+action_version = "v1"
+summary = "Run wrangler.delete"
+input_schema = { kind = "argv", classifier = "delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 1 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.delete"
+semantic_labels = ["wrangler.delete"]
+
+[[actions]]
+key = "wrangler.secret.put"
+action_version = "v1"
+summary = "Run wrangler.secret.put"
+input_schema = { kind = "argv", classifier = "secret put *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.secret.put"
+semantic_labels = ["wrangler.secret.put"]
+
+[[actions]]
+key = "wrangler.secret.delete"
+action_version = "v1"
+summary = "Run wrangler.secret.delete"
+input_schema = { kind = "argv", classifier = "secret delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.secret.delete"
+semantic_labels = ["wrangler.secret.delete"]
+
+[[actions]]
+key = "wrangler.secret.bulk"
+action_version = "v1"
+summary = "Run wrangler.secret.bulk"
+input_schema = { kind = "argv", classifier = "secret bulk *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.secret.bulk"
+semantic_labels = ["wrangler.secret.bulk"]
+
+[[actions]]
+key = "wrangler.r2.put"
+action_version = "v1"
+summary = "Run wrangler.r2.put"
+input_schema = { kind = "argv", classifier = "r2 put *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.r2.put"
+semantic_labels = ["wrangler.r2.put"]
+
+[[actions]]
+key = "wrangler.r2.delete"
+action_version = "v1"
+summary = "Run wrangler.r2.delete"
+input_schema = { kind = "argv", classifier = "r2 delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 5 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.r2.delete"
+semantic_labels = ["wrangler.r2.delete"]
+
+[[actions]]
+key = "wrangler.r2.bucket.create"
+action_version = "v1"
+summary = "Run wrangler.r2.bucket.create"
+input_schema = { kind = "argv", classifier = "r2 bucket create *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.r2.bucket.create"
+semantic_labels = ["wrangler.r2.bucket.create"]
+
+[[actions]]
+key = "wrangler.kv.put"
+action_version = "v1"
+summary = "Run wrangler.kv.put"
+input_schema = { kind = "argv", classifier = "kv put *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.kv.put"
+semantic_labels = ["wrangler.kv.put"]
+
+[[actions]]
+key = "wrangler.kv.delete"
+action_version = "v1"
+summary = "Run wrangler.kv.delete"
+input_schema = { kind = "argv", classifier = "kv delete *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.kv.delete"
+semantic_labels = ["wrangler.kv.delete"]
+
+[[actions]]
+key = "wrangler.d1.execute"
+action_version = "v1"
+summary = "Run wrangler.d1.execute"
+input_schema = { kind = "argv", classifier = "d1 execute *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.d1.execute"
+semantic_labels = ["wrangler.d1.execute"]
+
+[[actions]]
+key = "wrangler.d1.create"
+action_version = "v1"
+summary = "Run wrangler.d1.create"
+input_schema = { kind = "argv", classifier = "d1 create *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.d1.create"
+semantic_labels = ["wrangler.d1.create"]
+
+[[actions]]
+key = "wrangler.pages.deploy"
+action_version = "v1"
+summary = "Run wrangler.pages.deploy"
+input_schema = { kind = "argv", classifier = "pages deploy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:wrangler.pages.deploy"
+semantic_labels = ["wrangler.pages.deploy"]

@@ -1,0 +1,25 @@
+[package]
+name = "core-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+core-receipts = { path = "../core-receipts" }
+proptest = "1"
+
+[lints]
+workspace = true

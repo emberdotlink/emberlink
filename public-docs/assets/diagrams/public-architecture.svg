@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Public Emberlink architecture map</title>
+  <desc id="desc">Operators and agent runtimes use the Ember CLI, launchers, Constructs, MCP, or SDK clients. The local daemon evaluates authority, owns custody, and records evidence before a target tool runs with narrowed authority.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 34px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 18px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .label { font: 700 20px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .body { font: 15px system-ui, -apple-system, Segoe UI, sans-serif; fill: #334155; }
+      .small { font: 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 18; }
+      .operator { fill: #eff6ff; stroke: #2563eb; }
+      .adapter { fill: #f0fdf4; stroke: #16a34a; }
+      .daemon { fill: #fff7ed; stroke: #ea580c; }
+      .execution { fill: #f5f3ff; stroke: #7c3aed; }
+      .evidence { fill: #ecfeff; stroke: #0891b2; }
+      .pill { fill: #ffffff; stroke: #fed7aa; stroke-width: 1.5; rx: 12; }
+      .line { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="720"/>
+  <text class="title" x="60" y="58">Current public architecture</text>
+  <text class="subtitle" x="60" y="90">Most users should read Emberlink as one local authority path with several entry surfaces.</text>
+
+  <rect class="box operator" x="60" y="135" width="220" height="110"/>
+  <text class="label" x="92" y="174">Operator</text>
+  <text class="body" x="92" y="205">install, initialize,</text>
+  <text class="body" x="92" y="227">approve, inspect</text>
+
+  <rect class="box adapter" x="60" y="325" width="220" height="180"/>
+  <text class="label" x="92" y="364">Agent surface</text>
+  <text class="body" x="92" y="396">ember claude</text>
+  <text class="body" x="92" y="420">ember codex</text>
+  <text class="body" x="92" y="444">MCP clients</text>
+  <text class="body" x="92" y="468">experimental SDKs</text>
+
+  <rect class="box adapter" x="375" y="135" width="215" height="110"/>
+  <text class="label" x="410" y="174">Ember CLI</text>
+  <text class="body" x="410" y="205">status, grant, audit,</text>
+  <text class="body" x="410" y="227">receipt, repair</text>
+
+  <rect class="box daemon" x="375" y="315" width="300" height="250"/>
+  <text class="label" x="420" y="356">emberd local daemon</text>
+  <text class="body" x="420" y="386">the authority root for the local install</text>
+  <rect class="pill" x="420" y="415" width="95" height="34"/>
+  <text class="small" x="444" y="437">grants</text>
+  <rect class="pill" x="535" y="415" width="110" height="34"/>
+  <text class="small" x="560" y="437">approvals</text>
+  <rect class="pill" x="420" y="462" width="132" height="34"/>
+  <text class="small" x="440" y="484">credential custody</text>
+  <rect class="pill" x="568" y="462" width="77" height="34"/>
+  <text class="small" x="590" y="484">policy</text>
+  <rect class="pill" x="420" y="509" width="95" height="34"/>
+  <text class="small" x="442" y="531">receipts</text>
+  <rect class="pill" x="535" y="509" width="110" height="34"/>
+  <text class="small" x="565" y="531">audit</text>
+
+  <rect class="box adapter" x="760" y="135" width="220" height="135"/>
+  <text class="label" x="792" y="174">Mediated tools</text>
+  <text class="body" x="792" y="205">gh, git, kubectl</text>
+  <text class="body" x="792" y="229">through Constructs</text>
+
+  <rect class="box execution" x="760" y="340" width="220" height="135"/>
+  <text class="label" x="792" y="379">Execution</text>
+  <text class="body" x="792" y="410">runner invokes the</text>
+  <text class="body" x="792" y="434">real provider tool</text>
+
+  <rect class="box evidence" x="760" y="545" width="220" height="110"/>
+  <text class="label" x="792" y="584">Evidence</text>
+  <text class="body" x="792" y="615">signed receipts and</text>
+  <text class="body" x="792" y="637">local audit history</text>
+
+  <path class="line" d="M280 190 H375"/>
+  <path class="line" d="M482 245 V315"/>
+  <path class="line" d="M280 415 H375"/>
+  <path class="line" d="M675 420 H760"/>
+  <path class="line" d="M870 270 V340"/>
+  <path class="line" d="M870 475 V545"/>
+  <path class="line" d="M760 205 H610 C575 205 555 240 555 315"/>
+  <path class="dash" d="M675 360 C730 315 760 280 760 235"/>
+
+  <text class="small" x="60" y="615">Use the CLI and launchers for the supported local operator path.</text>
+  <text class="small" x="60" y="641">Use Constructs, MCP, or SDKs when the integration shape calls for them.</text>
+  <text class="small" x="60" y="667">All authority decisions still converge on the local daemon.</text>
+</svg>

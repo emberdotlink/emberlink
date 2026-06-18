@@ -1,0 +1,23 @@
+[package]
+name = "ember-warden-decryptor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cluster-side SOPS decryptor sidecar — decrypts ArgoCD-bound manifests via emberd-held age key (TZ-SOPS-3)."
+repository = "https://github.com/emberdotlink/emberlink"
+publish = false
+
+[lib]
+name = "ember_warden_decryptor"
+path = "src/lib.rs"
+
+[dependencies]
+age = "0.11"
+core-crypto = { path = "../core-crypto" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,202 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-npm per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-npm"
+plugin_address = "registry.ember.systems/ember-systems/ember-npm"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "npm CLI Construct"
+description = "npm CLI Construct. Gates `npm` invocations through ember's action policy: publish/version/deprecate/dist-tag/install/ci/run-script/audit-fix are classified and gated; read-only verbs (ls, view, info, outdated, audit, config get, search, ping, whoami) are passthrough. Current runtime still relies on caller-supplied registry auth via `NPM_TOKEN` / `.npmrc` passthrough rather than broker-minted registry credentials. Mutating publish-class actions (publish, version, deprecate, dist-tag) require biometric approval and are budget-capped per session."
+
+[defaults]
+materialization_class = "declared_host_material"
+material_classes = [{ kind = "env", name = "NPM_TOKEN" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "npm"
+
+[[actions]]
+key = "npm.publish"
+action_version = "v1"
+summary = "Run npm.publish"
+input_schema = { kind = "argv", classifier = "publish *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 5 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.publish"
+semantic_labels = ["npm.publish"]
+
+[[actions]]
+key = "npm.publish.npmjs.org"
+action_version = "v1"
+summary = "Run npm.publish.npmjs.org"
+input_schema = { kind = "argv", classifier = "publish npmjs org *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 5 }
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.publish.npmjs.org"
+semantic_labels = ["npm.publish.npmjs.org"]
+
+[[actions]]
+key = "npm.version"
+action_version = "v1"
+summary = "Run npm.version"
+input_schema = { kind = "argv", classifier = "version *" }
+risk_tier = "high"
+idempotency = "idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.version"
+semantic_labels = ["npm.version"]
+
+[[actions]]
+key = "npm.install"
+action_version = "v1"
+summary = "Run npm.install"
+input_schema = { kind = "argv", classifier = "install *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.install"
+semantic_labels = ["npm.install"]
+
+[[actions]]
+key = "npm.install.npmjs.org"
+action_version = "v1"
+summary = "Run npm.install.npmjs.org"
+input_schema = { kind = "argv", classifier = "install npmjs org *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.install.npmjs.org"
+semantic_labels = ["npm.install.npmjs.org"]
+
+[[actions]]
+key = "npm.ci"
+action_version = "v1"
+summary = "Run npm.ci"
+input_schema = { kind = "argv", classifier = "ci *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.ci"
+semantic_labels = ["npm.ci"]
+
+[[actions]]
+key = "npm.ci.npmjs.org"
+action_version = "v1"
+summary = "Run npm.ci.npmjs.org"
+input_schema = { kind = "argv", classifier = "ci npmjs org *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.ci.npmjs.org"
+semantic_labels = ["npm.ci.npmjs.org"]
+
+[[actions]]
+key = "npm.run-script"
+action_version = "v1"
+summary = "Run npm.run-script"
+input_schema = { kind = "argv", classifier = "run-script *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.run-script"
+semantic_labels = ["npm.run-script"]
+
+[[actions]]
+key = "npm.audit-fix"
+action_version = "v1"
+summary = "Run npm.audit-fix"
+input_schema = { kind = "argv", classifier = "audit-fix *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.audit-fix"
+semantic_labels = ["npm.audit-fix"]
+
+[[actions]]
+key = "npm.deprecate"
+action_version = "v1"
+summary = "Run npm.deprecate"
+input_schema = { kind = "argv", classifier = "deprecate *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.deprecate"
+semantic_labels = ["npm.deprecate"]
+
+[[actions]]
+key = "npm.dist-tag"
+action_version = "v1"
+summary = "Run npm.dist-tag"
+input_schema = { kind = "argv", classifier = "dist-tag *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+biometric = "required"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.dist-tag"
+semantic_labels = ["npm.dist-tag"]
+
+[[actions]]
+key = "npm.unpublish"
+action_version = "v1"
+summary = "Run npm.unpublish"
+input_schema = { kind = "argv", classifier = "unpublish *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+mode = "deny"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.unpublish"
+semantic_labels = ["npm.unpublish"]
+
+[[actions]]
+key = "npm.pack"
+action_version = "v1"
+summary = "Run npm.pack"
+input_schema = { kind = "argv", classifier = "pack *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+audit_fields = ["action_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:npm.pack"
+semantic_labels = ["npm.pack"]

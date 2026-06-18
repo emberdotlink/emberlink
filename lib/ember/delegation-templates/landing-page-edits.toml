@@ -1,0 +1,23 @@
+# landing-page-edits — narrow workflow for content/marketing edits to the
+# landing page repo. Git + GitHub PR creation + npm/wrangler for build &
+# Cloudflare deploys. No kubectl, no trust surface.
+#
+# Per ADR 158 §Component 1.
+# Anchor: onboarding_delegation_templates_landed.
+
+name = "landing-page-edits"
+description = "Landing-page content edits — git, gh PR ops, npm, wrangler"
+ttl = "2h"
+
+scopes = [
+    "registry.ember.systems/ember-systems/ember-git/*@v1",
+    "registry.ember.systems/ember-systems/ember-gh/pr_create@v1",
+    "registry.ember.systems/ember-systems/ember-gh/pr_review@v1",
+    "registry.ember.systems/ember-systems/ember-npm/*@v1",
+    "registry.ember.systems/ember-systems/ember-wrangler/*@v1",
+]
+
+excludes = [
+    "registry.ember.systems/ember-systems/ember-kubectl/*@v1",
+    "registry.ember.systems/ember-systems/ember-trust/*@v1",
+]

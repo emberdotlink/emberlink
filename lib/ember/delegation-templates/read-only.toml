@@ -1,0 +1,19 @@
+# read-only — exploration / investigation workflow. Only verbs that observe
+# state, never mutate it. 8h TTL because read-only is the safest scope.
+#
+# Per ADR 158 §Component 1.
+# Anchor: onboarding_delegation_templates_landed.
+
+name = "read-only"
+description = "Read-only investigation — git fetch/log/status/diff, gh pr_list, kubectl get/describe"
+ttl = "8h"
+
+scopes = [
+    "registry.ember.systems/ember-systems/ember-git/fetch@v1",
+    "registry.ember.systems/ember-systems/ember-git/log@v1",
+    "registry.ember.systems/ember-systems/ember-git/status@v1",
+    "registry.ember.systems/ember-systems/ember-git/diff@v1",
+    "registry.ember.systems/ember-systems/ember-gh/pr_list@v1",
+    "registry.ember.systems/ember-systems/ember-kubectl/get@v1",
+    "registry.ember.systems/ember-systems/ember-kubectl/describe@v1",
+]

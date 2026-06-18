@@ -1,0 +1,70 @@
+# CLASSIFICATION: PUBLIC
+#
+# Privileged sibling spawn-helper daemon and macOS spawn shim.
+#
+# Three binaries are conditionally compiled, sharing the lib's wire
+# protocol:
+#   - emberd-spawn-helper-linux:  systemd unit, hardened-Linux
+#     (`unprivileged_userns_clone=0`). Raw `fork()`+`execve()` in the
+#     child, async-signal-safe-only.
+#   - emberd-spawn-helper-macos:  LaunchDaemon, macOS. Uses `posix_
+#     spawn(2)` to invoke `emberd-spawn-shim`; the shim — not the helper
+#     itself — performs the privileged setup. The helper never uses
+#     `Command::pre_exec` for Security-framework work in the post-fork
+#     pre-execve window.
+#   - emberd-spawn-shim:          tiny single-purpose binary that runs
+#     under the target uid after the helper's `posix_spawn`. Does
+#     `sandbox_init` → `chroot` → `setgid`/`setuid` → `execve` and
+#     replaces itself with the construct.
+
+[package]
+name = "ember-spawn-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Privileged sibling spawn-helper for hardened Linux and macOS, plus the macOS emberd-spawn-shim."
+publish = false
+
+[lib]
+name = "ember_spawn_helper"
+path = "src/lib.rs"
+
+# macOS LaunchDaemon binary — tokio-driven accept loop. Uses
+# `posix_spawn(2)` to invoke `emberd-spawn-shim` (the shim does the
+# privileged setup, not this bin).
+[[bin]]
+name = "emberd-spawn-helper-macos"
+path = "src/bin/emberd_spawn_helper_macos.rs"
+
+# Linux hardened-systemd binary — raw fork+execve in the child for
+# async-signal-safe pre_exec + seccomp install.
+[[bin]]
+name = "emberd-spawn-helper-linux"
+path = "src/bin/emberd_spawn_helper_linux.rs"
+
+# Single-purpose shim that the macOS helper invokes via `posix_spawn`. Runs
+# as the target pool uid, performs sandbox_init/chroot/setuid, then `execve`s
+# the real construct binary, replacing itself.
+[[bin]]
+name = "emberd-spawn-shim"
+path = "src/bin/emberd_spawn_shim.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+nix = { version = "0.31", features = ["user", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "test-util", "process"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

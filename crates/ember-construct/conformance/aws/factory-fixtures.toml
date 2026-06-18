@@ -1,0 +1,154 @@
+# CLASSIFICATION: PUBLIC
+# P24 AWS construct-factory conformance corpus.
+#
+# This file records current supported exact-target PermissionSpec shapes and
+# fail-closed dispositions. It is test evidence, not construct.toml carrier
+# metadata and not native AWS policy supplied by a construct author.
+
+[[fixtures]]
+name = "s3-cp-local-to-exact-object"
+argv = ["s3", "cp", "dist/app.tar.gz", "s3://assets/releases/app.tar.gz"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3.cp@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", bucket = "assets", key = "releases/app.tar.gz" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["s3:PutObject"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "s3-rm-exact-object"
+argv = ["s3", "rm", "s3://assets/old/app.tar.gz"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3.rm@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", bucket = "assets", key = "old/app.tar.gz" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["s3:DeleteObject"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "s3-sync-local-to-bounded-prefix"
+argv = ["s3", "sync", "dist/", "s3://assets/releases/"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3.sync@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", bucket = "assets", prefix = "releases/" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["s3:ListBucket", "s3:PutObject"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "s3-mv-s3-object-to-s3-object"
+argv = ["s3", "mv", "s3://source-assets/releases/app.tar.gz", "s3://dest-assets/releases/app.tar.gz"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3.mv@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", source = "source-assets/releases/app.tar.gz", destination = "dest-assets/releases/app.tar.gz" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "s3api-put-object-bucket-key"
+argv = ["s3api", "put-object", "--bucket", "assets", "--key", "releases/app.tar.gz", "--body", "app.tar.gz"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3api.put-object@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", bucket = "assets", key = "releases/app.tar.gz" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["s3:PutObject"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "s3api-delete-object-bucket-key"
+argv = ["s3api", "delete-object", "--bucket", "assets", "--key", "old/app.tar.gz"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3api.delete-object@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "s3", bucket = "assets", key = "old/app.tar.gz" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["s3:DeleteObject"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "lambda-delete-exact-function-arn"
+argv = ["lambda", "delete-function", "--function-name", "arn:aws:lambda:us-east-1:123456789012:function:publish-site"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.lambda.delete-function@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "lambda", function_arn = "arn:aws:lambda:us-east-1:123456789012:function:publish-site" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["lambda:DeleteFunction"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "kms-schedule-deletion-exact-key-arn"
+argv = ["kms", "schedule-key-deletion", "--key-id", "arn:aws:kms:us-east-1:123456789012:key/abcd-1234"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.kms.schedule-key-deletion@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "kms", key_arn = "arn:aws:kms:us-east-1:123456789012:key/abcd-1234" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["kms:ScheduleKeyDeletion"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "cloudformation-delete-exact-stack-arn"
+argv = ["cloudformation", "delete-stack", "--stack-name", "arn:aws:cloudformation:us-east-1:123456789012:stack/publish-site/abcd-1234"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.cloudformation.delete-stack@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "cloudformation", stack_arn = "arn:aws:cloudformation:us-east-1:123456789012:stack/publish-site/abcd-1234" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["cloudformation:DeleteStack"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "secretsmanager-update-exact-secret-arn"
+argv = ["secretsmanager", "update-secret", "--secret-id", "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod-db-AbCdEf"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.secretsmanager.update-secret@v1"
+expected_disposition = "mediated"
+expected_target = { provider = "aws", service = "secretsmanager", secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod-db-AbCdEf" }
+expected_need = { provider_ir = "aws_permissionspec", actions = ["secretsmanager:UpdateSecret"] }
+expected_credential_injection = true
+
+[[fixtures]]
+name = "s3-ls-is-credentialless"
+argv = ["s3", "ls", "s3://assets"]
+expected_action_ref = "registry.ember.systems/ember-systems/ember-aws/aws.s3.ls@v1"
+expected_disposition = "credentialless"
+expected_credential_injection = false
+expected_ambient_credentials_stripped = true
+reason = "read-only compatibility path should become credentialless under the factory contract"
+
+[[fixtures]]
+name = "lambda-name-needs-resolver"
+argv = ["lambda", "invoke", "--function-name", "publish-site", "out.json"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "function name is not concrete target evidence without trusted AWS resolution"
+
+[[fixtures]]
+name = "kms-alias-needs-resolver"
+argv = ["kms", "decrypt", "--key-id", "alias/publish"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "KMS alias is not an exact key ARN"
+
+[[fixtures]]
+name = "cloudformation-name-needs-resolver"
+argv = ["cloudformation", "update-stack", "--stack-name", "publish-site"]
+expected_disposition = "resolver_required"
+expected_credential_injection = false
+reason = "stack name is not an exact stack ARN"
+
+[[fixtures]]
+name = "bucket-policy-needs-payload-analysis"
+argv = ["s3api", "put-bucket-policy", "--bucket", "assets", "--policy", "file://policy.json"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "bucket policy document can carry authority-bearing principals, actions, resources, and conditions"
+
+[[fixtures]]
+name = "cloudformation-deploy-needs-payload-analysis"
+argv = ["cloudformation", "deploy", "--stack-name", "publish-site", "--template-file", "template.yaml"]
+expected_disposition = "payload_analysis_required"
+expected_credential_injection = false
+reason = "template payload can create or mutate resources beyond the stack name"
+
+[[fixtures]]
+name = "profile-global-flag-fails-closed"
+argv = ["--profile", "prod", "s3", "rm", "s3://assets/old.tar.gz"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "--profile selects provider credential source and cannot be ignored as harmless"
+
+[[fixtures]]
+name = "no-sign-request-global-flag-fails-closed"
+argv = ["--no-sign-request", "s3", "rm", "s3://assets/old.tar.gz"]
+expected_disposition = "unsupported_fail_closed"
+expected_credential_injection = false
+reason = "--no-sign-request changes signing and credential posture"

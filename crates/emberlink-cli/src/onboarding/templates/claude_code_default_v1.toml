@@ -1,0 +1,45 @@
+[template]
+id = "claude-code-default-v1"
+description = "Default cohort A grant scope"
+
+[permit.read_write_edit]
+project_root = "git_toplevel"
+
+[permit.bash]
+allowlist_patterns = [
+    "^cargo( |$)", "^npm( |$)", "^pnpm( |$)", "^node( |$)",
+    "^git (status|diff|log|add|commit)( |$)",
+    "^rg( |$)", "^grep( |$)", "^find( |$)", "^ls( |$)",
+    "^cat( |$)", "^head( |$)", "^tail( |$)", "^make( |$)",
+]
+
+[permit.web_fetch]
+url_allowlist = [
+    "^http://localhost(:|/)", "^https://docs\\.",
+    "^https://github\\.com", "^https://[^/]+\\.github\\.io",
+    "^https://crates\\.io", "^https://developer\\.mozilla\\.org",
+]
+
+[approval.cross_project_file_access]
+trigger = "read_write_edit_outside_project_root"
+
+[approval.credential_path_read]
+path_patterns = [
+    "~/.aws/", "~/.ssh/", "~/.config/.*credentials.*",
+    "(^|/)\\.env($|\\.)",
+]
+
+[approval.git_push]
+bash_pattern = "^git push"
+
+[approval.novel_bash]
+trigger = "bash_outside_allowlist"
+
+[approval.package_install]
+bash_patterns = [
+    "^apt(-get)? install", "^brew install", "^cargo install --force",
+    "^npm install -g", "^pip install --user",
+]
+
+[deny.destructive]
+bash_patterns = ["rm -rf", "^mkfs", "^dd if="]

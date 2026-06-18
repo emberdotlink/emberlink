@@ -1,0 +1,37 @@
+[package]
+name = "core-eventlog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-events = { path = "../core-events" }
+core-trust = { path = "../core-trust" }
+core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
+serde_json = "1"
+
+[dev-dependencies]
+anyhow = "1"
+tempfile = "3"
+# P23-S3: build a device-rooted (ECDSA-P256) root chain to prove verify_chain
+# accepts P256 identities, not just Ed25519.
+p256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+# AUDIT-V030-EVENTLOG-SYNTHETIC-LOAD-SQLITE-DISK-FULL: the SQLite-backed
+# synthetic_load variant and the real disk-full hook test exercise the
+# production `EventStore` write path (which lives in `core-state`). The
+# core-eventlog crate itself still compiles to `wasm32-unknown-unknown`;
+# dev-dependencies are excluded from the WASM build (only `[dependencies]`
+# flow into `wasm-pack build ember-ext`), so adding `core-state` here is
+# safe for the WASM gate.
+core-state = { path = "../core-state" }
+libc = "0.2"
+proptest = "1"
+
+[lints]
+workspace = true

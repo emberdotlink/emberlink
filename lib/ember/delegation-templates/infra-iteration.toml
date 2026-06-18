@@ -1,0 +1,24 @@
+# infra-iteration — short-TTL workflow for kubectl/pulumi/helm changes that
+# touch production-shaped clusters. 1h TTL forces operator re-prompt for
+# longer infra sessions. Excludes pulumi.destroy (single most-destructive
+# verb) and the entire trust surface.
+#
+# Per ADR 158 §Component 1.
+# Anchor: onboarding_delegation_templates_landed.
+
+name = "infra-iteration"
+description = "Cluster infra iteration — kubectl, pulumi, helm (no destroy)"
+ttl = "1h"
+
+scopes = [
+    "registry.ember.systems/ember-systems/ember-git/*@v1",
+    "registry.ember.systems/ember-systems/ember-gh/pr_create@v1",
+    "registry.ember.systems/ember-systems/ember-kubectl/*@v1",
+    "registry.ember.systems/ember-systems/ember-pulumi/*@v1",
+    "registry.ember.systems/ember-systems/ember-helm/*@v1",
+]
+
+excludes = [
+    "registry.ember.systems/ember-systems/ember-trust/*@v1",
+    "registry.ember.systems/ember-systems/ember-pulumi/destroy@v1",
+]

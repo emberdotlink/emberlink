@@ -1,0 +1,641 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-aws per ADR 196.
+# Legacy broker policy fields (`default`, `mode`, biometric flags,
+# and `budget_caps`) are retained during the v0.3.0 carrier
+# migration because the live daemon still consumes them.
+
+schema_version = "2"
+default = "deny"
+
+[meta]
+name = "ember-aws"
+plugin_address = "registry.ember.systems/ember-systems/ember-aws"
+plugin_version = "0.1.0"
+publisher = "did:emberlink"
+provider_kind = "cli"
+summary = "AWS CLI Construct"
+description = "AWS CLI v2 Construct. Mediates `aws` invocations through ember's credential broker: IAM privilege removal (delete-*, detach-*) and KMS key/secret destruction (schedule-key-deletion, decrypt) require biometric approval; S3 destructive ops (rm, delete-object) gate by default and require biometric when targeting a grant's production_buckets; secretsmanager.delete-secret and ec2.terminate-instances require biometric. STS credentials inject via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN; AWS_DEFAULT_REGION may pass through as non-authority context."
+
+[defaults]
+materialization_class = "brokered_credential"
+material_classes = [{ kind = "broker", authority_ref = "aws_sts" }]
+default_runner_classes = ["local_trusted"]
+headless_requirements = []
+
+[runtime.cli]
+wrapped_binary = "aws"
+
+[[actions]]
+key = "aws.s3.cp"
+action_version = "v1"
+summary = "Run aws s3 cp"
+input_schema = { kind = "argv", classifier = "s3 cp *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3.cp"
+semantic_labels = ["aws.s3.cp"]
+
+[[actions]]
+key = "aws.s3.sync"
+action_version = "v1"
+summary = "Run aws s3 sync"
+input_schema = { kind = "argv", classifier = "s3 sync *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3.sync"
+semantic_labels = ["aws.s3.sync"]
+
+[[actions]]
+key = "aws.s3.mv"
+action_version = "v1"
+summary = "Run aws s3 mv"
+input_schema = { kind = "argv", classifier = "s3 mv *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3.mv"
+semantic_labels = ["aws.s3.mv"]
+
+[[actions]]
+key = "aws.s3.rm"
+action_version = "v1"
+summary = "Run aws s3 rm"
+input_schema = { kind = "argv", classifier = "s3 rm *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric_when_production_bucket = true
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3.rm"
+semantic_labels = ["aws.s3.rm"]
+
+[[actions]]
+key = "aws.s3api.put-object"
+action_version = "v1"
+summary = "Run aws s3api put object"
+input_schema = { kind = "argv", classifier = "s3api put-object *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3api.put-object"
+semantic_labels = ["aws.s3api.put-object"]
+
+[[actions]]
+key = "aws.s3api.delete-object"
+action_version = "v1"
+summary = "Run aws s3api delete object"
+input_schema = { kind = "argv", classifier = "s3api delete-object *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric_when_production_bucket = true
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3api.delete-object"
+semantic_labels = ["aws.s3api.delete-object"]
+
+[[actions]]
+key = "aws.s3api.put-bucket-policy"
+action_version = "v1"
+summary = "Run aws s3api put bucket policy"
+input_schema = { kind = "argv", classifier = "s3api put-bucket-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.s3api.put-bucket-policy"
+semantic_labels = ["aws.s3api.put-bucket-policy"]
+
+[[actions]]
+key = "aws.iam.create-user"
+action_version = "v1"
+summary = "Run aws iam create user"
+input_schema = { kind = "argv", classifier = "iam create-user *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.create-user"
+semantic_labels = ["aws.iam.create-user"]
+
+[[actions]]
+key = "aws.iam.create-role"
+action_version = "v1"
+summary = "Run aws iam create role"
+input_schema = { kind = "argv", classifier = "iam create-role *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.create-role"
+semantic_labels = ["aws.iam.create-role"]
+
+[[actions]]
+key = "aws.iam.create-policy"
+action_version = "v1"
+summary = "Run aws iam create policy"
+input_schema = { kind = "argv", classifier = "iam create-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.create-policy"
+semantic_labels = ["aws.iam.create-policy"]
+
+[[actions]]
+key = "aws.iam.create-access-key"
+action_version = "v1"
+summary = "Run aws iam create access key"
+input_schema = { kind = "argv", classifier = "iam create-access-key *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.create-access-key"
+semantic_labels = ["aws.iam.create-access-key"]
+
+[[actions]]
+key = "aws.iam.attach-user-policy"
+action_version = "v1"
+summary = "Run aws iam attach user policy"
+input_schema = { kind = "argv", classifier = "iam attach-user-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.attach-user-policy"
+semantic_labels = ["aws.iam.attach-user-policy"]
+
+[[actions]]
+key = "aws.iam.attach-role-policy"
+action_version = "v1"
+summary = "Run aws iam attach role policy"
+input_schema = { kind = "argv", classifier = "iam attach-role-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.attach-role-policy"
+semantic_labels = ["aws.iam.attach-role-policy"]
+
+[[actions]]
+key = "aws.iam.attach-group-policy"
+action_version = "v1"
+summary = "Run aws iam attach group policy"
+input_schema = { kind = "argv", classifier = "iam attach-group-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.attach-group-policy"
+semantic_labels = ["aws.iam.attach-group-policy"]
+
+[[actions]]
+key = "aws.iam.put-user-policy"
+action_version = "v1"
+summary = "Run aws iam put user policy"
+input_schema = { kind = "argv", classifier = "iam put-user-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.put-user-policy"
+semantic_labels = ["aws.iam.put-user-policy"]
+
+[[actions]]
+key = "aws.iam.put-role-policy"
+action_version = "v1"
+summary = "Run aws iam put role policy"
+input_schema = { kind = "argv", classifier = "iam put-role-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.put-role-policy"
+semantic_labels = ["aws.iam.put-role-policy"]
+
+[[actions]]
+key = "aws.iam.put-group-policy"
+action_version = "v1"
+summary = "Run aws iam put group policy"
+input_schema = { kind = "argv", classifier = "iam put-group-policy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.put-group-policy"
+semantic_labels = ["aws.iam.put-group-policy"]
+
+[[actions]]
+key = "aws.iam.delete-user"
+action_version = "v1"
+summary = "Run aws iam delete user"
+input_schema = { kind = "argv", classifier = "iam delete-user *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.delete-user"
+semantic_labels = ["aws.iam.delete-user"]
+
+[[actions]]
+key = "aws.iam.delete-role"
+action_version = "v1"
+summary = "Run aws iam delete role"
+input_schema = { kind = "argv", classifier = "iam delete-role *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.delete-role"
+semantic_labels = ["aws.iam.delete-role"]
+
+[[actions]]
+key = "aws.iam.delete-policy"
+action_version = "v1"
+summary = "Run aws iam delete policy"
+input_schema = { kind = "argv", classifier = "iam delete-policy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.delete-policy"
+semantic_labels = ["aws.iam.delete-policy"]
+
+[[actions]]
+key = "aws.iam.delete-access-key"
+action_version = "v1"
+summary = "Run aws iam delete access key"
+input_schema = { kind = "argv", classifier = "iam delete-access-key *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.delete-access-key"
+semantic_labels = ["aws.iam.delete-access-key"]
+
+[[actions]]
+key = "aws.iam.detach-user-policy"
+action_version = "v1"
+summary = "Run aws iam detach user policy"
+input_schema = { kind = "argv", classifier = "iam detach-user-policy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.detach-user-policy"
+semantic_labels = ["aws.iam.detach-user-policy"]
+
+[[actions]]
+key = "aws.iam.detach-role-policy"
+action_version = "v1"
+summary = "Run aws iam detach role policy"
+input_schema = { kind = "argv", classifier = "iam detach-role-policy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.detach-role-policy"
+semantic_labels = ["aws.iam.detach-role-policy"]
+
+[[actions]]
+key = "aws.iam.detach-group-policy"
+action_version = "v1"
+summary = "Run aws iam detach group policy"
+input_schema = { kind = "argv", classifier = "iam detach-group-policy *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.iam.detach-group-policy"
+semantic_labels = ["aws.iam.detach-group-policy"]
+
+[[actions]]
+key = "aws.sts.assume-role"
+action_version = "v1"
+summary = "Run aws sts assume role"
+input_schema = { kind = "argv", classifier = "sts assume-role *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.sts.assume-role"
+semantic_labels = ["aws.sts.assume-role"]
+
+[[actions]]
+key = "aws.secretsmanager.create-secret"
+action_version = "v1"
+summary = "Run aws secretsmanager create secret"
+input_schema = { kind = "argv", classifier = "secretsmanager create-secret *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.secretsmanager.create-secret"
+semantic_labels = ["aws.secretsmanager.create-secret"]
+
+[[actions]]
+key = "aws.secretsmanager.update-secret"
+action_version = "v1"
+summary = "Run aws secretsmanager update secret"
+input_schema = { kind = "argv", classifier = "secretsmanager update-secret *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.secretsmanager.update-secret"
+semantic_labels = ["aws.secretsmanager.update-secret"]
+
+[[actions]]
+key = "aws.secretsmanager.put-secret-value"
+action_version = "v1"
+summary = "Run aws secretsmanager put secret value"
+input_schema = { kind = "argv", classifier = "secretsmanager put-secret-value *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.secretsmanager.put-secret-value"
+semantic_labels = ["aws.secretsmanager.put-secret-value"]
+
+[[actions]]
+key = "aws.secretsmanager.delete-secret"
+action_version = "v1"
+summary = "Run aws secretsmanager delete secret"
+input_schema = { kind = "argv", classifier = "secretsmanager delete-secret *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.secretsmanager.delete-secret"
+semantic_labels = ["aws.secretsmanager.delete-secret"]
+
+[[actions]]
+key = "aws.kms.create-key"
+action_version = "v1"
+summary = "Run aws kms create key"
+input_schema = { kind = "argv", classifier = "kms create-key *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.kms.create-key"
+semantic_labels = ["aws.kms.create-key"]
+
+[[actions]]
+key = "aws.kms.encrypt"
+action_version = "v1"
+summary = "Run aws kms encrypt"
+input_schema = { kind = "argv", classifier = "kms encrypt *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.kms.encrypt"
+semantic_labels = ["aws.kms.encrypt"]
+
+[[actions]]
+key = "aws.kms.schedule-key-deletion"
+action_version = "v1"
+summary = "Run aws kms schedule key deletion"
+input_schema = { kind = "argv", classifier = "kms schedule-key-deletion *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.kms.schedule-key-deletion"
+semantic_labels = ["aws.kms.schedule-key-deletion"]
+
+[[actions]]
+key = "aws.kms.decrypt"
+action_version = "v1"
+summary = "Run aws kms decrypt"
+input_schema = { kind = "argv", classifier = "kms decrypt *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.kms.decrypt"
+semantic_labels = ["aws.kms.decrypt"]
+
+[[actions]]
+key = "aws.ec2.delete-volume"
+action_version = "v1"
+summary = "Run aws ec2 delete volume"
+input_schema = { kind = "argv", classifier = "ec2 delete-volume *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.ec2.delete-volume"
+semantic_labels = ["aws.ec2.delete-volume"]
+
+[[actions]]
+key = "aws.ec2.delete-snapshot"
+action_version = "v1"
+summary = "Run aws ec2 delete snapshot"
+input_schema = { kind = "argv", classifier = "ec2 delete-snapshot *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.ec2.delete-snapshot"
+semantic_labels = ["aws.ec2.delete-snapshot"]
+
+[[actions]]
+key = "aws.ec2.modify-instance-attribute"
+action_version = "v1"
+summary = "Run aws ec2 modify instance attribute"
+input_schema = { kind = "argv", classifier = "ec2 modify-instance-attribute *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.ec2.modify-instance-attribute"
+semantic_labels = ["aws.ec2.modify-instance-attribute"]
+
+[[actions]]
+key = "aws.ec2.terminate-instances"
+action_version = "v1"
+summary = "Run aws ec2 terminate instances"
+input_schema = { kind = "argv", classifier = "ec2 terminate-instances *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+biometric = "required"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.ec2.terminate-instances"
+semantic_labels = ["aws.ec2.terminate-instances"]
+
+[[actions]]
+key = "aws.lambda.update-function-code"
+action_version = "v1"
+summary = "Run aws lambda update function code"
+input_schema = { kind = "argv", classifier = "lambda update-function-code *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.lambda.update-function-code"
+semantic_labels = ["aws.lambda.update-function-code"]
+
+[[actions]]
+key = "aws.lambda.delete-function"
+action_version = "v1"
+summary = "Run aws lambda delete function"
+input_schema = { kind = "argv", classifier = "lambda delete-function *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.lambda.delete-function"
+semantic_labels = ["aws.lambda.delete-function"]
+
+[[actions]]
+key = "aws.lambda.invoke"
+action_version = "v1"
+summary = "Run aws lambda invoke"
+input_schema = { kind = "argv", classifier = "lambda invoke *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.lambda.invoke"
+semantic_labels = ["aws.lambda.invoke"]
+
+[[actions]]
+key = "aws.cloudformation.deploy"
+action_version = "v1"
+summary = "Run aws cloudformation deploy"
+input_schema = { kind = "argv", classifier = "cloudformation deploy *" }
+risk_tier = "medium"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.cloudformation.deploy"
+semantic_labels = ["aws.cloudformation.deploy"]
+
+[[actions]]
+key = "aws.cloudformation.delete-stack"
+action_version = "v1"
+summary = "Run aws cloudformation delete stack"
+input_schema = { kind = "argv", classifier = "cloudformation delete-stack *" }
+risk_tier = "high"
+idempotency = "non_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.cloudformation.delete-stack"
+semantic_labels = ["aws.cloudformation.delete-stack"]
+
+[[actions]]
+key = "aws.cloudformation.update-stack"
+action_version = "v1"
+summary = "Run aws cloudformation update stack"
+input_schema = { kind = "argv", classifier = "cloudformation update-stack *" }
+risk_tier = "medium"
+idempotency = "conditionally_idempotent"
+interaction_class = "inline_interactive"
+default = "permit"
+mode = "gate"
+audit_fields = ["action_ref", "authority_ref", "runner_class", "materialization_class", "terminal_outcome"]
+handler_ref = "cli:aws.cloudformation.update-stack"
+semantic_labels = ["aws.cloudformation.update-stack"]

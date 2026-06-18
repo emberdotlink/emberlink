@@ -1,0 +1,154 @@
+{
+  "pages": [
+    {
+      "page": "build/build-a-construct.md",
+      "title": "Construct Authoring Model",
+      "description": "A preview guide to the current Construct model behind Emberlink-mediated tool actions.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "build/choosing-an-integration-surface.md",
+      "title": "Choose an Integration Surface",
+      "description": "How to decide between the launcher path, MCP, and the experimental SDKs.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "build/constructs-and-mediated-tools.md",
+      "title": "Constructs and Mediated Tools",
+      "description": "What Emberlink Constructs are, which mediated tools are in the current public story, and what the daemon actually does for them.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "build/mcp-integration.md",
+      "title": "MCP Integration",
+      "description": "How Emberlink’s MCP server fits into the current daemon-centered product surface.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "concepts/architecture.md",
+      "title": "Architecture Overview",
+      "description": "The current code-backed mechanism map for Emberlink’s local daemon-centered architecture.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "concepts/grant-warden.md",
+      "title": "The Grant Warden Model",
+      "description": "The product model behind Emberlink’s local daemon, grants, and receipts.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "concepts/one-action-end-to-end.md",
+      "title": "One Action End to End",
+      "description": "A current walkthrough of a mediated GitHub action from agent request to daemon decision, materialized authority, and receipt evidence.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "concepts/primitives.md",
+      "title": "Current Primitives",
+      "description": "The current public Emberlink nouns and how they compose into delegated agent authority.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "concepts/receipts-and-audit.md",
+      "title": "Receipts and Audit",
+      "description": "How Emberlink turns delegated actions into signed evidence and local audit history.",
+      "support_level": "Supported"
+    },
+    {
+      "page": "concepts/runtime-flow.md",
+      "title": "Runtime Flow",
+      "description": "How a managed Emberlink session moves from launcher to grant evaluation, materialization, execution, and receipt evidence.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "concepts/security-model.md",
+      "title": "Security Model",
+      "description": "What Emberlink protects, where the trust boundaries are, and what remains outside the current public release posture.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "experimental/sdk-python.md",
+      "title": "Python SDK",
+      "description": "Experimental Python SDK documentation for daemon-mediated agent authorization flows.",
+      "support_level": "Experimental"
+    },
+    {
+      "page": "experimental/sdk-typescript.md",
+      "title": "TypeScript SDK",
+      "description": "Experimental TypeScript SDK documentation for daemon-mediated agent authorization flows.",
+      "support_level": "Experimental"
+    },
+    {
+      "page": "get-started/install-and-first-run.md",
+      "title": "Install and First Run",
+      "description": "Install Ember, run the canonical onboarding flow, and confirm the daemon-backed path is healthy.",
+      "support_level": "Supported"
+    },
+    {
+      "page": "get-started/support-levels-and-release-posture.md",
+      "title": "Support Levels and Release Posture",
+      "description": "What Supported, Preview, and Experimental mean on docs.ember.link, and how that maps to the current v0.3.x release boundary.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "index.md",
+      "title": "Emberlink Docs",
+      "description": "Public documentation for installing Ember, understanding the Grant Warden model, and integrating with Emberlink surfaces.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "reference/cli-reference.md",
+      "title": "CLI Reference",
+      "description": "The current public Ember CLI contract for the pre-release operator surface.",
+      "support_level": "Supported"
+    },
+    {
+      "page": "reference/evidence-reference.md",
+      "title": "Evidence Reference",
+      "description": "The current public receipt and audit command contract.",
+      "support_level": "Supported"
+    },
+    {
+      "page": "reference/grants-and-approvals.md",
+      "title": "Grants and Approvals",
+      "description": "The current public operator contract for delegated authority and approval queues in Emberlink.",
+      "support_level": "Supported"
+    },
+    {
+      "page": "reference/mcp-tools.md",
+      "title": "MCP Tool Reference",
+      "description": "The current public tool contract for emberlink-mcp.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "reference/sandbox-and-isolated-execution.md",
+      "title": "Sandbox and Isolated Execution",
+      "description": "The current public sandbox contract for managed isolated execution in Emberlink.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "reference/trust-and-verification.md",
+      "title": "Trust and Verification",
+      "description": "The current public trust-root and verification-chain surface in Emberlink.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "use/cli-and-troubleshooting.md",
+      "title": "CLI and Troubleshooting",
+      "description": "The public Ember CLI contract for the current pre-release surface and the first repair paths to try.",
+      "support_level": "Supported"
+    },
+    {
+      "page": "use/github-setup-and-auth.md",
+      "title": "GitHub Setup and Auth",
+      "description": "The truthful v0.3.x GitHub setup path for Emberlink’s daemon-backed HTTPS/App lane.",
+      "support_level": "Preview"
+    },
+    {
+      "page": "use/warden-console-prototype.md",
+      "title": "Warden Console Prototype",
+      "description": "A static public mock of the Warden Console direction, with fictional data and no daemon connection.",
+      "support_level": "Experimental"
+    }
+  ]
+}
