@@ -513,7 +513,7 @@ async fn team0_evaluate_grant_scopes_persona_to_trusted_principal() {
 
 #[tokio::test]
 async fn propose_grant_rpc_persists_n_statements() {
-    // implementation-note-254 — N-statement persistence + retrieval.
+    // implementation-note-192 — N-statement persistence + retrieval.
     let store = DaemonStore::open_in_memory().unwrap();
     let vault = test_vault();
     let policy = test_policy();
@@ -1536,6 +1536,12 @@ async fn grant_extend_rpc_landed_socket_force_rejected() {
     .await
     .unwrap();
     let grant_id = grant["id"].as_str().unwrap();
+
+    // `grant.extend` is OperatorPresence-class. Satisfy the outer
+    // chokepoint so this test reaches the handler-local force-on-socket
+    // rejection instead of stopping at the generic presence gate.
+    let _presence_test_guard = crate::trust::presence::test_state_guard();
+    crate::trust::presence::mark_unlocked();
 
     let err = dispatch_method_with_source(
         &store,

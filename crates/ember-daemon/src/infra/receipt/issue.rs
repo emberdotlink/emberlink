@@ -47,7 +47,7 @@ pub enum IssueError {
 }
 
 /// Optional termination metadata injected into the `ClaudeCodeBody` by the
-/// dirty-exit path (implementation-note-55). Pass `None` for
+/// dirty-exit path (implementation-note-36). Pass `None` for
 /// clean-exit / TTL-expiry / explicit-revoke issuance paths where the reason
 /// is not yet known at build time.
 pub struct TerminationMeta {
@@ -229,7 +229,7 @@ fn claim_segment_digests_from_summary(summary: &ClosedScopeSummary) -> Vec<Claim
 /// Steps per design §"Envelope" + design §"Daemon Persona signing":
 /// 1. Build [`ClaudeCodeBody`] from `claim_events` + parsed `audit_gaps.jsonl`
 ///    (lines parsed individually, malformed lines skipped — fail-open shape
-///    matches implementation-note-54's writer). Optional `termination_meta` injects the
+///    matches implementation-note-35's writer). Optional `termination_meta` injects the
 ///    reason/heartbeat/pid fields into the body in the same step.
 /// 2. Compute `permits_merkle_root` over `claim_events[].input_hash` blake3
 ///    leaves (design §"Merkle leaf format" — leaf form simplified for now;
@@ -415,7 +415,7 @@ fn issue_session_receipt_with_body(
 }
 
 /// Parse `~/.ember/sessions/<id>/audit-gaps.jsonl` line-by-line, skipping
-/// malformed lines (matches the fail-open posture of implementation-note-54's writer).
+/// malformed lines (matches the fail-open posture of implementation-note-35's writer).
 fn parse_audit_gaps(path: &Path) -> Result<Vec<AuditGap>, IssueError> {
     let raw = fs::read_to_string(path).map_err(|source| IssueError::AuditGapsRead {
         path: path.display().to_string(),
@@ -705,7 +705,7 @@ mod tests {
 
     /// T1 round-trip — `issue_cohort_a_receipt` now signs in-place.
     /// The returned envelope must verify against the signer's public key.
-    /// Pins implementation-note-291 + implementation-note-292.
+    /// Pins implementation-note-210 + implementation-note-211.
     #[test]
     fn receipt_id_matches_canonical_compute_and_verifies_after_signing() {
         let signer = FixtureSigner::new("issue-rs-roundtrip");

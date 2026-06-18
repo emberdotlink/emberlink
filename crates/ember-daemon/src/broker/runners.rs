@@ -218,15 +218,30 @@ impl RunnerAdapter for LocalTrustedRunner {
 
 static MANAGED_WORKTREE_CACHE: OnceCell<Mutex<HashMap<String, PathBuf>>> = OnceCell::new();
 const MANAGED_WORKTREE_SCAN_MAX_DEPTH: usize = 6;
+const STARTUP_BINARY_MANIFEST_ENV: &str = "EMBER_MANIFEST_PATH";
+
+fn runner_resolution_manifest_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(STARTUP_BINARY_MANIFEST_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+    {
+        return path;
+    }
+
+    let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
+    if bundled.exists() {
+        return bundled;
+    }
+
+    bundled
+}
 
 fn runner_resolution_manifest() -> Option<BinaryManifest> {
     if let Some(manifest) = crate::broker::handler::current_manifest() {
         return Some((*manifest).clone());
     }
-    let manifest_path = dirs_next::home_dir()
-        .map(|home| home.join(".ember/binaries/manifest.toml"))
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| crate::binary_manifest::bundled_install_dir().join("manifest.toml"));
+    let manifest_path = runner_resolution_manifest_path();
     crate::binary_manifest::load_manifest(&manifest_path).ok()
 }
 
@@ -474,6 +489,54 @@ pub(crate) fn resolve_runner_cwd_with_workspace_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runner_resolution_manifest_path_prefers_explicit_existing_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("explicit-manifest.toml");
+        std::fs::write(&manifest_path, b"# manifest").expect("write manifest");
+        let _manifest_guard = EnvGuard::set(STARTUP_BINARY_MANIFEST_ENV, &manifest_path);
+
+        assert_eq!(runner_resolution_manifest_path(), manifest_path);
+    }
+
+    #[test]
+    fn runner_resolution_manifest_path_ignores_home_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_dir = tmp.path().join(".ember/binaries");
+        std::fs::create_dir_all(&manifest_dir).expect("mkdir manifest dir");
+        let home_manifest = manifest_dir.join("manifest.toml");
+        std::fs::write(&home_manifest, b"# legacy manifest").expect("write manifest");
+        let _home_guard = EnvGuard::set("HOME", tmp.path());
+
+        assert_ne!(runner_resolution_manifest_path(), home_manifest);
+    }
 
     #[test]
     fn resolve_workspace_ref_accepts_launcher_relative_worktree_metadata() {

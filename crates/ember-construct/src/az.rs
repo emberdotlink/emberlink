@@ -1129,7 +1129,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::AzureCli)`, and a request that
     // declares `provider = AzureCli` round-trips through issue → revoke
-    // without panicking. Real Azure CLI impl is implementation-note-96
+    // without panicking. Real Azure CLI impl is implementation-note-77
     // (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};

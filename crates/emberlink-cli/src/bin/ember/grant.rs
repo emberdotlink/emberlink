@@ -2,6 +2,13 @@ use super::*;
 
 pub(super) const CLAUDE_CODE_DEFAULT_SCOPE: &str = "claude-code-default-v1";
 pub(super) const CODEX_DEFAULT_SCOPE: &str = "codex-default-v1";
+pub(super) const CURSOR_DEFAULT_SCOPE: &str = "cursor-default-v1";
+pub(super) const GEMINI_DEFAULT_SCOPE: &str = "gemini-default-v1";
+/// Vault credential name for the gemini Code Assist ("Sign in with Google")
+/// OAuth blob (design §2). Unlike codex's account/subject-keyed credential,
+/// the gemini Code Assist lane uses a single fixed name — `ember init --for
+/// gemini` imports `~/.gemini/oauth_creds.json` into exactly this slug.
+pub(super) const GEMINI_CODE_ASSIST_RUNTIME_CREDENTIAL: &str = "google/code-assist-oauth";
 /// Vault credential prefix for Codex's ChatGPT plan/subscription OAuth token
 /// blob (-S2). Concrete credentials are keyed by the ChatGPT account plus
 /// user/token identity derived from the captured token, for example
@@ -213,7 +220,7 @@ pub(super) enum AnthropicRuntimeCredentialAvailability {
     StoredFromEnv(AnthropicRuntimeCredentialRef),
     /// Captured into the vault by driving the provider's own login flow
     /// (`claude setup-token`) during `ember init` — the "no manual `vault add`"
-    /// path (implementation-note-402 model-auth capture).
+    /// path (implementation-note-308 model-auth capture).
     CapturedFromLogin(AnthropicRuntimeCredentialRef),
 }
 
@@ -276,6 +283,20 @@ pub(super) struct ClaudeCodeGrantProvisioning {
 
 #[derive(Debug, Clone)]
 pub(super) struct CodexGrantProvisioning {
+    pub(super) id: String,
+    pub(super) expires_at: Option<String>,
+    pub(super) created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CursorGrantProvisioning {
+    pub(super) id: String,
+    pub(super) expires_at: Option<String>,
+    pub(super) created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GeminiGrantProvisioning {
     pub(super) id: String,
     pub(super) expires_at: Option<String>,
     pub(super) created: bool,
@@ -505,7 +526,7 @@ pub(super) fn grant_supports_runtime_persona_delegation(grant: &serde_json::Valu
 
 /// Create a grant via the daemon's `create_grant` RPC.
 ///
-/// grant_actions_migrated_to_rpc_complete: prior to implementation-note-403
+/// grant_actions_migrated_to_rpc_complete: prior to implementation-note-309
 /// this helper carried an `open_store(config)` local-fallback branch. Under
 /// design's separate-uid posture the daemon owns the SQLite DB and the
 /// operator cannot open it for writing — so the local fallback was
@@ -654,6 +675,47 @@ pub(super) fn build_codex_openai_runtime_statements(
             actions: vec!["llm:generate".to_string()],
             resource: ResourceSelector::Glob {
                 pattern: "openai/*".to_string(),
+            },
+            budget: None,
+            conditions: vec![],
+        },
+    ]
+}
+
+/// Gemini Code Assist gateway statements (design §2), symmetric with
+/// [`build_codex_openai_runtime_statements`]: a `credential:read` on the
+/// `google/code-assist-oauth` OAuth credential, the dev0 GitHub operation
+/// ceiling used by delegated `ember-gh` constructs, plus an `llm:generate`
+/// session statement scoped to the `google/*` glob. The proxy classifies
+/// `cloudcode-pa.googleapis.com` Code Assist calls as `llm:generate` /
+/// `google/v1internal:<method>` (see `core-proxy-forward::match`), which this
+/// glob covers.
+///
+/// NOTE (metering follow-up `implementation-note-310`): the
+/// statements are deliberately UN-budgeted (`budget: None`). The loopback engine
+/// fails budgeted `google/*` grants closed because gemini usage is not yet
+/// token-metered; do not attach a budget here until metering lands.
+pub(super) fn build_gemini_google_runtime_statements(
+    credential_name: &str,
+) -> Vec<StatementProposal> {
+    vec![
+        StatementProposal {
+            resource_type: ResourceType::Credential,
+            credential_name: credential_name.to_string(),
+            actions: vec!["credential:read".to_string()],
+            resource: ResourceSelector::Exact {
+                value: credential_name.to_string(),
+            },
+            budget: None,
+            conditions: vec![],
+        },
+        github_operation_authority_statement(),
+        StatementProposal {
+            resource_type: ResourceType::Session,
+            credential_name: credential_name.to_string(),
+            actions: vec!["llm:generate".to_string()],
+            resource: ResourceSelector::Glob {
+                pattern: "google/*".to_string(),
             },
             budget: None,
             conditions: vec![],
@@ -827,6 +889,57 @@ pub(super) fn grant_status_supports_codex_openai_gateway(
         && grant_status_has_github_operation_ceiling(status)
 }
 
+pub(super) fn grant_status_supports_gemini_google_gateway(
+    status: &serde_json::Value,
+    credential_name: &str,
+) -> bool {
+    if !grant_status_has_live_lease(status) {
+        return false;
+    }
+
+    let Some(statements) = status.get("statements").and_then(|v| v.as_array()) else {
+        return false;
+    };
+
+    let has_matching_credential_statement = statements.iter().any(|stmt| {
+        stmt.get("resource_type").and_then(|v| v.as_str()) == Some("credential")
+            && stmt
+                .get("actions")
+                .and_then(|v| v.as_array())
+                .is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .filter_map(|action| action.as_str())
+                        .any(|action| action == "credential:read")
+                })
+            && stmt.get("resource").is_some_and(|resource| {
+                resource.get("kind").and_then(|v| v.as_str()) == Some("exact")
+                    && resource.get("value").and_then(|v| v.as_str()) == Some(credential_name)
+            })
+    });
+
+    let has_google_session_statement = statements.iter().any(|stmt| {
+        stmt.get("resource_type").and_then(|v| v.as_str()) == Some("session")
+            && stmt
+                .get("actions")
+                .and_then(|v| v.as_array())
+                .is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .filter_map(|action| action.as_str())
+                        .any(|action| action == "llm:generate")
+                })
+            && stmt.get("resource").is_some_and(|resource| {
+                resource.get("kind").and_then(|v| v.as_str()) == Some("glob")
+                    && resource.get("pattern").and_then(|v| v.as_str()) == Some("google/*")
+            })
+    });
+
+    has_matching_credential_statement
+        && has_google_session_statement
+        && grant_status_has_github_operation_ceiling(status)
+}
+
 fn grant_status_has_live_lease(status: &serde_json::Value) -> bool {
     status
         .get("live_lease")
@@ -954,19 +1067,19 @@ pub(super) fn render_claude_init_summary(
     let (title, summary) = match github_posture {
         GitHubOnboardingPosture::AppConfiguredReal => (
             "Claude ready",
-            "Claude is wired through Ember's managed launcher path on this machine.",
+            "Claude is ready to launch through Ember. Run GitHub or Git as usual, then verify the receipt.",
         ),
         GitHubOnboardingPosture::PatConfigured => (
             "Claude ready with caveats",
-            "Claude is wired, but GitHub is still on the degraded PAT fallback lane.",
+            "Claude can launch through Ember, but GitHub is still on the degraded PAT fallback lane.",
         ),
         GitHubOnboardingPosture::AppBroken(_) => (
             "Claude needs one more fix",
-            "Claude is wired, but GitHub still needs repair before brokered actions can succeed.",
+            "Claude can launch through Ember, but brokered GitHub actions need repair first.",
         ),
         GitHubOnboardingPosture::AppConfiguredMock | GitHubOnboardingPosture::AppNotConfigured => (
             "Claude needs one more step",
-            "Claude is wired, but GitHub setup is still needed for brokered actions.",
+            "Claude can launch through Ember, but GitHub setup is needed before brokered GitHub actions.",
         ),
     };
 
@@ -1032,11 +1145,11 @@ pub(super) fn render_claude_init_summary(
                 lines: vec![
                     command_row(
                         format!("{ember_cmd} claude"),
-                        "Launch the canonical Claude path",
+                        "Open the managed Claude session",
                     ),
                     command_row(
-                        format!("{ember_cmd} receipt show"),
-                        "Inspect the signed audit trail",
+                        format!("{ember_cmd} receipt list"),
+                        "Find the receipt after the first brokered action",
                     ),
                 ],
             });
@@ -1055,6 +1168,10 @@ pub(super) fn render_claude_init_summary(
                     command_row(
                         format!("{ember_cmd} claude"),
                         "Launch now if the degraded lane is acceptable",
+                    ),
+                    command_row(
+                        format!("{ember_cmd} receipt list"),
+                        "Find the receipt after the first brokered action",
                     ),
                     command_row("ember explain github setup", "Read the App setup contract"),
                 ],
@@ -1110,7 +1227,7 @@ pub(super) fn render_codex_init_summary(
 
     render_compact_card(
         "Codex ready",
-        "Codex is wired through Ember's managed launcher path on this machine.",
+        "Codex is ready to launch through Ember. Run as usual, then verify the receipt.",
         &[],
         &[
             UiSection {
@@ -1135,7 +1252,7 @@ pub(super) fn render_codex_init_summary(
                 heading: "Next",
                 lines: vec![command_row(
                     format!("{ember_cmd} codex"),
-                    "Launch the canonical Codex path",
+                    "Open the managed Codex session",
                 )],
             },
             UiSection {
@@ -1147,8 +1264,129 @@ pub(super) fn render_codex_init_summary(
                         "Use the headless sign-in lane when browser auth is unavailable",
                     ),
                     command_row(
-                        format!("{ember_cmd} receipt show"),
-                        "Inspect the signed audit trail",
+                        format!("{ember_cmd} receipt list"),
+                        "Find the receipt after the first brokered action",
+                    ),
+                ],
+            },
+        ],
+    )
+}
+
+pub(super) fn render_cursor_init_summary(
+    persona_name: &str,
+    persona_created: bool,
+    template_path: &Path,
+    template_written: bool,
+    grant: &CursorGrantProvisioning,
+    ember_cmd: &str,
+) -> String {
+    let expires = grant.expires_at.as_deref().unwrap_or("never");
+    let grant_line = if grant.created {
+        format!("Grant: created {} (local-only launcher grant)", grant.id)
+    } else {
+        format!("Grant: reused {} until {expires}", grant.id)
+    };
+
+    render_compact_card(
+        "Cursor ready",
+        "Cursor is wired through Ember's managed host launcher path on this machine.",
+        &[],
+        &[
+            UiSection {
+                heading: "Configured",
+                lines: vec![
+                    format!(
+                        "Persona: {} {}",
+                        if persona_created { "created" } else { "reused" },
+                        persona_name
+                    ),
+                    format!(
+                        "Template: {} {}",
+                        if template_written { "wrote" } else { "kept" },
+                        template_path.display()
+                    ),
+                    grant_line,
+                    "Auth: Cursor account/model auth remains Cursor-owned on this baseline lane"
+                        .to_string(),
+                    "Model spend: not brokered by Ember unless a future Cursor mediation mode is designed"
+                        .to_string(),
+                ],
+            },
+            UiSection {
+                heading: "Next",
+                lines: vec![command_row(
+                    format!("{ember_cmd} cursor"),
+                    "Launch the baseline Cursor host path",
+                )],
+            },
+            UiSection {
+                heading: "Also",
+                lines: vec![
+                    command_row(
+                        "curl https://cursor.com/install -fsS | bash",
+                        "Install Cursor CLI if `cursor-agent` or `cursor` is not on PATH",
+                    ),
+                    command_row(
+                        format!("{ember_cmd} explain cursor"),
+                        "Review the Cursor governance boundary",
+                    ),
+                    command_row(
+                        format!("{ember_cmd} receipt list"),
+                        "Find the receipt after the first mediated action",
+                    ),
+                ],
+            },
+        ],
+    )
+}
+
+pub(super) fn render_gemini_init_summary(
+    persona_name: &str,
+    persona_created: bool,
+    credential_summary: &str,
+    grant: &GeminiGrantProvisioning,
+    ember_cmd: &str,
+) -> String {
+    let expires = grant.expires_at.as_deref().unwrap_or("never");
+    let grant_line = if grant.created {
+        format!("Grant: created {} (brokered Code Assist gateway)", grant.id)
+    } else {
+        format!("Grant: reused {} until {expires}", grant.id)
+    };
+
+    render_compact_card(
+        "Gemini ready",
+        "The Gemini CLI is wired through Ember's brokered Google Code Assist lane on this machine.",
+        &[],
+        &[
+            UiSection {
+                heading: "Configured",
+                lines: vec![
+                    format!(
+                        "Persona: {} {}",
+                        if persona_created { "created" } else { "reused" },
+                        persona_name
+                    ),
+                    credential_summary.to_string(),
+                    grant_line,
+                    "Auth: the durable Google refresh token stays daemon-only; the proxy injects a refreshed Bearer server-side"
+                        .to_string(),
+                ],
+            },
+            UiSection {
+                heading: "Next",
+                lines: vec![command_row(
+                    format!("{ember_cmd} gemini"),
+                    "Launch the Gemini CLI on the brokered host path",
+                )],
+            },
+            UiSection {
+                heading: "Also",
+                lines: vec![
+                    command_row(
+                        format!("{ember_cmd} receipt list"),
+                        "Find the receipt after the first brokered action",
                     ),
                 ],
             },
@@ -1205,7 +1443,7 @@ pub(super) fn render_basic_init_summary(
     let (title, summary) = if daemon_socket_live {
         (
             "Ember ready",
-            "Core Ember state is initialized and the managed daemon path is available.",
+            "Core Ember state is ready. Choose an agent lane, launch through Ember, then verify the receipt.",
         )
     } else {
         (
@@ -1234,7 +1472,7 @@ pub(super) fn render_basic_init_summary(
 
     if let Some(receipt) = receipt {
         sections.push(UiSection {
-            heading: "Witness",
+            heading: "First proof",
             lines: vec![
                 format!(
                     "First receipt: {} {}",
@@ -1257,11 +1495,15 @@ pub(super) fn render_basic_init_summary(
             lines: vec![
                 command_row(
                     format!("{ember_cmd} init --for claude"),
-                    "Continue with the Claude path",
+                    "Set up Claude as a managed agent lane",
                 ),
                 command_row(
                     format!("{ember_cmd} init --for codex"),
-                    "Continue with the Codex path",
+                    "Set up Codex as a managed agent lane",
+                ),
+                command_row(
+                    format!("{ember_cmd} init --for cursor"),
+                    "Set up Cursor as a managed agent lane",
                 ),
                 command_row(
                     format!("{ember_cmd} status"),
@@ -1294,7 +1536,7 @@ pub(super) fn render_basic_init_summary(
                         "{ember_cmd} receipt verify {} --pubkey <your-pubkey-hex>",
                         receipt.path.display()
                     ),
-                    "Verify the witness offline",
+                    "Verify the first receipt offline",
                 ),
                 format!(
                     "Witness flow: {}",
@@ -1603,6 +1845,255 @@ pub(super) fn finalize_codex_runtime_grant_response(
     })
 }
 
+fn gemini_code_assist_runtime_missing_message() -> String {
+    format!(
+        "Gemini sessions use Ember's brokered Google Code Assist lane, but the vault has no {GEMINI_CODE_ASSIST_RUNTIME_CREDENTIAL} credential. Sign in with Google in the Gemini CLI on the host (run `gemini` once, choose \"Login with Google\"), then run `ember init --for gemini` to import `~/.gemini/oauth_creds.json`. Local-only {GEMINI_DEFAULT_SCOPE} grants are not valid model-auth grants."
+    )
+}
+
+/// Whether the fixed `google/code-assist-oauth` credential is present in the
+/// vault. Gates the gemini Code Assist composite grant — symmetric with the
+/// codex `openai/plan/chatgpt-oauth/*` presence check, but a single fixed name.
+pub(super) fn gemini_code_assist_runtime_credential_present(config: &DaemonConfig) -> bool {
+    run_vault_list(config, None)
+        .ok()
+        .map(|(_, entries)| {
+            entries.iter().any(|entry| {
+                entry.get("name").and_then(|v| v.as_str())
+                    == Some(GEMINI_CODE_ASSIST_RUNTIME_CREDENTIAL)
+            })
+        })
+        .unwrap_or(false)
+}
+
+pub(super) fn ensure_gemini_runtime_grant(
+    config: &DaemonConfig,
+    persona_id: &str,
+) -> Result<GeminiGrantProvisioning, core_types::ValidationError> {
+    let credential_name = GEMINI_CODE_ASSIST_RUNTIME_CREDENTIAL;
+    if !gemini_code_assist_runtime_credential_present(config) {
+        return Err(core_types::ValidationError::new(
+            gemini_code_assist_runtime_missing_message(),
+        ));
+    }
+
+    let socket_path = config.socket_dir.join("daemon.sock");
+    let grants_value = emberlink_cli::call_daemon_method(
+        &socket_path,
+        "list_grants",
+        &serde_json::json!({"persona_id": persona_id}),
+    )?;
+    let empty_grants: Vec<serde_json::Value> = Vec::new();
+    let grants = grants_value.as_array().unwrap_or(&empty_grants);
+
+    // Prefer reusing the brokered Code Assist gateway grant for this credential —
+    // the lane the proxy injects on; the register-session lane selector picks it
+    // for gemini sessions.
+    for grant in grants.iter().filter(|grant| {
+        grant
+            .get("credential_name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| name == credential_name)
+            && grant_supports_runtime_persona_delegation(grant)
+    }) {
+        let Some(grant_id) = grant.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let status = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "grant_status",
+            &serde_json::json!({"id": grant_id}),
+        )?;
+        if grant_status_supports_gemini_google_gateway(&status, credential_name) {
+            return Ok(GeminiGrantProvisioning {
+                id: grant_id.to_string(),
+                expires_at: grant
+                    .get("expires_at")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                created: false,
+            });
+        }
+    }
+
+    // No reusable grant, but the Code Assist OAuth credential is stored. Mint the
+    // brokered gateway grant (credential:read on `google/code-assist-oauth` +
+    // llm:generate on `google/*`), symmetric with the codex OpenAI lane.
+    let spec = CompositeGrantCreateSpec {
+        persona_id: persona_id.to_string(),
+        credential_name: credential_name.to_string(),
+        scope: GEMINI_DEFAULT_SCOPE.to_string(),
+        ttl_secs: Some(emberlink_cli::onboarding::gemini::DEFAULT_GRANT_TTL_SECS),
+        max_delegation_depth: Some(1),
+        statements: build_gemini_google_runtime_statements(credential_name),
+    };
+    let (_, created) = run_grant_create_composite(config, &spec)?;
+    finalize_gemini_runtime_grant_response(config, created, persona_id)
+}
+
+pub(super) fn finalize_gemini_runtime_grant_response(
+    config: &DaemonConfig,
+    response: serde_json::Value,
+    target_persona_id: &str,
+) -> Result<GeminiGrantProvisioning, core_types::ValidationError> {
+    if response.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+        let approval_id = response
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                core_types::ValidationError::new(
+                    "daemon create_grant returned pending_approval without approval_id",
+                )
+            })?;
+        let caller_persona_id =
+            resolve_claude_code_grant_approver_persona_id(config, target_persona_id)?;
+        let (_, resolved) = run_approval_resolve_with_caller(
+            config,
+            approval_id,
+            &ApprovalOutcome::Approved,
+            Some(&caller_persona_id),
+        )?;
+        let grant_id = resolved.result_grant_id.ok_or_else(|| {
+            core_types::ValidationError::new(
+                "approving gemini init grant did not return result_grant_id",
+            )
+        })?;
+        return Ok(GeminiGrantProvisioning {
+            id: grant_id,
+            expires_at: None,
+            created: true,
+        });
+    }
+
+    let grant_id = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            core_types::ValidationError::new(
+                "daemon create_grant returned success without a grant id",
+            )
+        })?;
+    Ok(GeminiGrantProvisioning {
+        id: grant_id.to_string(),
+        expires_at: response
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        created: true,
+    })
+}
+
+pub(super) fn ensure_cursor_runtime_grant(
+    config: &DaemonConfig,
+    persona_id: &str,
+) -> Result<CursorGrantProvisioning, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    let grants_value = emberlink_cli::call_daemon_method(
+        &socket_path,
+        "list_grants",
+        &serde_json::json!({"persona_id": persona_id}),
+    )?;
+    let empty_grants: Vec<serde_json::Value> = Vec::new();
+    let grants = grants_value.as_array().unwrap_or(&empty_grants);
+
+    for grant in grants.iter().filter(|grant| {
+        grant.get("scope").and_then(|v| v.as_str()) == Some(CURSOR_DEFAULT_SCOPE)
+            && grant.get("status").and_then(|v| v.as_str()) == Some("active")
+            && grant_supports_runtime_persona_delegation(grant)
+    }) {
+        let Some(grant_id) = grant.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let status = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "grant_status",
+            &serde_json::json!({"id": grant_id}),
+        )?;
+        if !grant_status_has_live_lease(&status) {
+            continue;
+        }
+        return Ok(CursorGrantProvisioning {
+            id: grant_id.to_string(),
+            expires_at: grant
+                .get("expires_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            created: false,
+        });
+    }
+
+    let spec = GrantCreateSpec {
+        persona: persona_id.to_string(),
+        credential: CURSOR_DEFAULT_SCOPE.to_string(),
+        scope: CURSOR_DEFAULT_SCOPE.to_string(),
+        ttl_secs: Some(emberlink_cli::onboarding::cursor::DEFAULT_GRANT_TTL_SECS),
+        max_uses_per_hour: None,
+        allowed_hours_start: None,
+        allowed_hours_end: None,
+        allowed_targets: None,
+        max_delegation_depth: Some(1),
+        budget: None,
+        max_children_per_day: None,
+        auto_delegate_scope_template: None,
+    };
+    let (_, created) = run_grant_create(config, &spec)?;
+    finalize_cursor_runtime_grant_response(config, created, persona_id)
+}
+
+pub(super) fn finalize_cursor_runtime_grant_response(
+    config: &DaemonConfig,
+    response: serde_json::Value,
+    target_persona_id: &str,
+) -> Result<CursorGrantProvisioning, core_types::ValidationError> {
+    if response.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+        let approval_id = response
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                core_types::ValidationError::new(
+                    "daemon create_grant returned pending_approval without approval_id",
+                )
+            })?;
+        let caller_persona_id =
+            resolve_claude_code_grant_approver_persona_id(config, target_persona_id)?;
+        let (_, resolved) = run_approval_resolve_with_caller(
+            config,
+            approval_id,
+            &ApprovalOutcome::Approved,
+            Some(&caller_persona_id),
+        )?;
+        let grant_id = resolved.result_grant_id.ok_or_else(|| {
+            core_types::ValidationError::new(
+                "approving cursor init grant did not return result_grant_id",
+            )
+        })?;
+        return Ok(CursorGrantProvisioning {
+            id: grant_id,
+            expires_at: None,
+            created: true,
+        });
+    }
+
+    let grant_id = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            core_types::ValidationError::new(
+                "daemon create_grant returned success without a grant id",
+            )
+        })?;
+    Ok(CursorGrantProvisioning {
+        id: grant_id.to_string(),
+        expires_at: response
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        created: true,
+    })
+}
+
 /// List grants on the current authority surface.
 pub(super) fn run_grant_list(
     config: &DaemonConfig,
@@ -1827,7 +2318,7 @@ pub(super) fn run_grant_evaluate(
 
 /// Delegate a grant via the daemon's `delegate_grant` RPC.
 ///
-/// Local fallback removed per implementation-note-403;
+/// Local fallback removed per implementation-note-309;
 /// see the `grant_actions_migrated_to_rpc_complete` note on
 /// [`run_grant_create`].
 pub(super) fn run_grant_delegate(
@@ -1884,7 +2375,7 @@ pub(super) fn run_grant_expire(
 
 /// Extend a grant via the daemon's `extend_grant` RPC.
 ///
-/// Local fallback removed per implementation-note-403;
+/// Local fallback removed per implementation-note-309;
 /// see the `grant_actions_migrated_to_rpc_complete` note on
 /// [`run_grant_create`].
 pub(super) fn run_grant_extend(

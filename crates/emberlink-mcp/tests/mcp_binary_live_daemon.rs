@@ -1,13 +1,7 @@
 //! Binary-level MCP proof against a live daemon listener.
 //!
-//! The library tests already cover MCP routing internals, but the public
-//! contract is the `emberlink-mcp` binary speaking JSON-RPC 2.0 over stdio.
-//! This test spawns the real binary, drives it over pipes, and proves both:
-//!
-//! - the credential-touching tool path (`request_grant`, `grant_status`,
-//!   `use_credential`) that flows through `AgentRuntime::with_daemon`
-//! - the observability tool path (`list_receipts`) that bypasses the runtime
-//!   and routes directly through `DaemonTransport`
+//! The public contract is the `emberlink-mcp` binary speaking JSON-RPC 2.0 over
+//! stdio and exposing only canonical daemon control/read tools.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -28,7 +22,7 @@ use tokio::sync::watch;
 fn auto_approve_policy() -> PolicyEngine {
     PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: ActionSelector::named("credential.access.*"),
+            action: ActionSelector::named("*"),
             risk: RiskLevel::Low,
             requirement: ApprovalRequirement::Auto,
             tier: None,
@@ -131,28 +125,14 @@ fn extract_text_result(resp: &serde_json::Value) -> String {
     result["content"][0]["text"].as_str().unwrap().to_string()
 }
 
-fn extract_error_text(resp: &serde_json::Value) -> String {
-    assert!(
-        resp.get("error").is_none() || resp.get("error").unwrap().is_null(),
-        "unexpected JSON-RPC error: {resp}"
-    );
-    let result = resp.get("result").expect("missing result");
-    assert_eq!(
-        result["isError"],
-        serde_json::json!(true),
-        "expected tool error"
-    );
-    result["content"][0]["text"].as_str().unwrap().to_string()
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn mcp_binary_round_trips_live_daemon_and_no_daemon_modes() {
+async fn mcp_binary_exposes_canonical_tools_against_live_daemon() {
     let tmp = TempDir::new().unwrap();
     let (socket_path, shutdown_tx) = spawn_listener_thread(&tmp);
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let socket_for_setup = socket_path.clone();
-    let setup = tokio::task::spawn_blocking(move || -> Result<String, String> {
+    let setup = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
         let persona = daemon_call(
             &socket_for_setup,
             "create_persona",
@@ -160,21 +140,25 @@ async fn mcp_binary_round_trips_live_daemon_and_no_daemon_modes() {
         )?;
         let persona_id = persona["id"].as_str().unwrap().to_string();
 
-        daemon_call(
+        let grant = daemon_call(
             &socket_for_setup,
-            "vault_add",
-            serde_json::json!({"name": "github-token", "value": "ghp_secret_value"}),
+            "create_grant",
+            serde_json::json!({
+                "persona_id": persona_id,
+                "credential_name": "github-token",
+                "scope": "repo:read",
+                "ttl_secs": 3600,
+            }),
         )?;
+        let grant_id = grant["id"].as_str().unwrap().to_string();
 
-        Ok(persona_id)
+        Ok((persona_id, grant_id))
     })
     .await
     .unwrap();
-    let persona_id = setup.unwrap();
+    let (persona_id, grant_id) = setup.unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_emberlink-mcp"))
-        .arg("--persona")
-        .arg(&persona_id)
         .arg("--label")
         .arg("test-binary")
         .arg("--daemon-socket")
@@ -216,127 +200,52 @@ async fn mcp_binary_round_trips_live_daemon_and_no_daemon_modes() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert!(tool_names.contains(&"whoami"));
-    assert!(tool_names.contains(&"request_grant"));
-    assert!(tool_names.contains(&"list_receipts"));
+    assert_eq!(
+        tool_names,
+        vec![
+            "session.describe",
+            "catalog.search_actions",
+            "access.request",
+            "grant.list",
+            "status.get",
+            "evidence.query",
+            "evidence.get",
+        ]
+    );
 
-    let whoami = mcp_round_trip(
+    let grants = mcp_round_trip(
         &mut child_stdout,
         &mut child_stdin,
         serde_json::json!({
             "jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"whoami","arguments":{}}
+            "params":{"name":"grant.list","arguments":{"persona_id": persona_id}}
         }),
     );
-    let whoami_json: serde_json::Value =
-        serde_json::from_str(&extract_text_result(&whoami)).unwrap();
-    assert_eq!(whoami_json["persona_id"], serde_json::json!(persona_id));
+    let grants_json: serde_json::Value =
+        serde_json::from_str(&extract_text_result(&grants)).unwrap();
+    let ids: Vec<&str> = grants_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|grant| grant["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![grant_id.as_str()]);
 
-    let request = mcp_round_trip(
+    let old_tool = mcp_round_trip(
         &mut child_stdout,
         &mut child_stdin,
         serde_json::json!({
             "jsonrpc":"2.0","id":4,"method":"tools/call",
-            "params":{"name":"request_grant","arguments":{
-                "scope":"repo:read",
-                "resource_id":"github-token",
-                "duration_secs":3600,
-                "reason":"binary proof"
-            }}
+            "params":{"name":"request_grant","arguments":{}}
         }),
     );
-    let request_json: serde_json::Value =
-        serde_json::from_str(&extract_text_result(&request)).unwrap();
-    let request_id = request_json["request_id"].as_str().unwrap().to_string();
-    assert_eq!(request_json["status"], "approved");
-
-    let status = mcp_round_trip(
-        &mut child_stdout,
-        &mut child_stdin,
-        serde_json::json!({
-            "jsonrpc":"2.0","id":5,"method":"tools/call",
-            "params":{"name":"grant_status","arguments":{"grant_id":request_id}}
-        }),
-    );
-    let status_json: serde_json::Value =
-        serde_json::from_str(&extract_text_result(&status)).unwrap();
-    let grant_id = status_json["grant_id"].as_str().unwrap().to_string();
-    assert_eq!(status_json["status"], "active");
-
-    let use_credential = mcp_round_trip(
-        &mut child_stdout,
-        &mut child_stdin,
-        serde_json::json!({
-            "jsonrpc":"2.0","id":6,"method":"tools/call",
-            "params":{"name":"use_credential","arguments":{
-                "grant_id":grant_id,
-                "credential_id":"github-token"
-            }}
-        }),
-    );
-    let credential_json: serde_json::Value =
-        serde_json::from_str(&extract_text_result(&use_credential)).unwrap();
-    assert_eq!(credential_json["status"], "ok");
-    assert_eq!(credential_json["credential"]["value"], "ghp_secret_value");
-
-    let receipts = mcp_round_trip(
-        &mut child_stdout,
-        &mut child_stdin,
-        serde_json::json!({
-            "jsonrpc":"2.0","id":7,"method":"tools/call",
-            "params":{"name":"list_receipts","arguments":{}}
-        }),
-    );
-    let receipts_json: serde_json::Value =
-        serde_json::from_str(&extract_text_result(&receipts)).unwrap();
-    assert!(
-        receipts_json.is_array(),
-        "list_receipts should return a JSON array"
-    );
+    assert_eq!(old_tool["error"]["code"], -32602);
 
     drop(child_stdin);
     let status = child.wait().unwrap();
     assert!(
         status.success(),
         "emberlink-mcp exited unsuccessfully: {status}"
-    );
-
-    let mut no_daemon_child = Command::new(env!("CARGO_BIN_EXE_emberlink-mcp"))
-        .arg("--persona")
-        .arg("test-no-daemon")
-        .arg("--no-daemon")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut no_daemon_stdin = no_daemon_child.stdin.take().unwrap();
-    let no_daemon_stdout = no_daemon_child.stdout.take().unwrap();
-    let mut no_daemon_stdout = BufReader::new(no_daemon_stdout);
-
-    let denied = mcp_round_trip(
-        &mut no_daemon_stdout,
-        &mut no_daemon_stdin,
-        serde_json::json!({
-            "jsonrpc":"2.0","id":8,"method":"tools/call",
-            "params":{"name":"request_grant","arguments":{
-                "scope":"repo:read",
-                "resource_id":"github-token",
-                "duration_secs":3600
-            }}
-        }),
-    );
-    let denied_text = extract_error_text(&denied);
-    assert!(
-        denied_text.contains("daemon unreachable") || denied_text.contains("access denied"),
-        "unexpected no-daemon error text: {denied_text}"
-    );
-
-    drop(no_daemon_stdin);
-    let status = no_daemon_child.wait().unwrap();
-    assert!(
-        status.success(),
-        "emberlink-mcp --no-daemon exited unsuccessfully: {status}"
     );
 
     shutdown_tx.send(true).unwrap();

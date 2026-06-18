@@ -1,7 +1,7 @@
 use super::*;
 use crate::infra::audit::AuditFilter;
 
-// implementation-note-249 — graceful binding delete (design).
+// implementation-note-187 — graceful binding delete (design).
 #[tokio::test]
 async fn binding_delete_revokes_persona_and_cascades_grants() {
     let store = DaemonStore::open_in_memory().unwrap();
@@ -169,7 +169,7 @@ async fn binding_delete_underscore_alias_dispatches_too() {
     assert_eq!(resp["deleted"], json!(true));
 }
 
-// implementation-note-250 — compromise-response revocation
+// implementation-note-188 — compromise-response revocation
 // (design §"binding.revoke_urgent").
 #[tokio::test]
 async fn binding_revoke_urgent_cascades_grants_and_emits_urgent_audit() {
@@ -337,7 +337,7 @@ async fn binding_revoke_urgent_underscore_alias_dispatches_too() {
     assert_eq!(resp["revoked_urgent"], json!(true));
 }
 
-// implementation-note-251 — mutate binding metadata
+// implementation-note-189 — mutate binding metadata
 // (design §"binding.update").
 #[tokio::test]
 async fn binding_update_mutates_name_and_emits_before_after_audit() {
@@ -595,7 +595,7 @@ async fn binding_update_no_mutation_still_emits_audit() {
     );
 }
 
-// implementation-note-252 — idempotent insert-or-update
+// implementation-note-190 — idempotent insert-or-update
 // (design §"binding.upsert").
 
 #[tokio::test]
@@ -877,7 +877,7 @@ async fn binding_upsert_underscore_alias_dispatches_too() {
     assert_eq!(resp["name"], json!("alias-upsert-worker"));
 }
 
-// --- implementation-note-253 tests --------------------
+// --- implementation-note-191 tests --------------------
 
 #[tokio::test]
 async fn revoke_persona_rejects_non_operator_non_self() {

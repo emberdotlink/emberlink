@@ -69,7 +69,7 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 // Shared native scope (`GcpNativeScope`) re-exported here as `GcpScope` so
 // the broker and the daemon's I7 clamp path (`broker_resolve` →
-// `identity_upper_bound`) speak ONE typed wire shape; implementation-note-16
+// `identity_upper_bound`) speak ONE typed wire shape; implementation-note-13
 // (mirrors the AWS STS `pub use core_broker::project::{AwsStsMode, AwsStsScope};`
 // shape from prior change). The projector and broker can no longer drift.
 pub use core_broker::GcpNativeScope as GcpScope;
@@ -159,7 +159,7 @@ pub struct GcpServiceAccountKey {
 // callsites + tests). The shared definition lets the projector
 // (`core_broker::gcp::GcpProjector::native_upper_bound`) and the broker
 // here speak one typed wire shape — daemon's I7 clamp re-parses the same
-// JSON the broker minted from. implementation-note-16.
+// JSON the broker minted from. implementation-note-13.
 
 /// Minimal HTTP client trait so tests inject a mock without spinning up
 /// a real TLS stack or hitting `oauth2.googleapis.com` /
@@ -1487,7 +1487,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Workload Identity Federation tests — implementation-note-91
+    // Workload Identity Federation tests — implementation-note-72
     // ---------------------------------------------------------------
 
     #[test]

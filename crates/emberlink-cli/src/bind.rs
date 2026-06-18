@@ -1,6 +1,6 @@
 //! `ember bind {register, list, remove, move}` — admin verb for managing
-//! daemon-controlled credential bindings (implementation-note-131
-//! Phase 3 / implementation-note-413).
+//! daemon-controlled credential bindings (implementation-note-111
+//! Phase 3 / implementation-note-320).
 //!
 //! A binding ties `(persona, working_tree, remote_name)` to a remote URL the
 //! broker is authorized to inject credentials for. This verb is the EXPLICIT
@@ -17,7 +17,7 @@
 //!   * `broker.bindings.remove`
 //!   * `broker.bindings.move`
 //!
-//! Marker for `target_state_anchor` (implementation-note-156): `fn cmd_bind` lives in
+//! Marker for `target_state_anchor` (implementation-note-137): `fn cmd_bind` lives in
 //! this file as the top-level dispatch entry.
 
 use std::path::{Path, PathBuf};
@@ -132,7 +132,7 @@ pub struct GlobalOpts {
 /// `Commands::Bind { action }`.
 ///
 /// The literal `fn cmd_bind` is the load-bearing marker for the
-/// implementation-note-156 `target_state_anchor` gate.
+/// implementation-note-137 `target_state_anchor` gate.
 pub fn cmd_bind(cmd: BindCmd, opts: GlobalOpts) -> Result<(), BrokerCliError> {
     match cmd {
         BindCmd::Register {

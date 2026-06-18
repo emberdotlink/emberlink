@@ -41,7 +41,7 @@ fn test_rate_limiter() -> RefCell<RateLimiter> {
     RefCell::new(RateLimiter::default())
 }
 
-// implementation-note-230: mint a
+// implementation-note-185: mint a
 // daemon-identity-signed presence-token for `uid` so tests that
 // construct `RequestContext` directly for OperatorPresence-class
 // methods continue to pass the gate.
@@ -991,6 +991,96 @@ async fn resolve_approval_dispatches_and_returns_resolved_row() {
     assert_eq!(resolved["status"], json!("approved"));
 }
 
+#[tokio::test]
+async fn approval_resolve_alias_accepts_approval_id_and_defaults_approve() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = test_policy();
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "approval-resolve-alias"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+    let req = store
+        .submit_approval(
+            persona_id,
+            "api-key",
+            "read",
+            None,
+            "credential.access",
+            "high",
+        )
+        .unwrap();
+
+    let resolved = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "approval.resolve",
+        &json!({"approval_id": req.id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["id"], json!(req.id));
+    assert_eq!(resolved["status"], json!("approved"));
+}
+
+#[tokio::test]
+async fn approval_narrow_alias_mints_narrowed_grant() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = test_policy();
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "approval-narrow-alias"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+    let req = store
+        .submit_approval(
+            persona_id,
+            "api-key",
+            "*",
+            None,
+            "credential.access",
+            "high",
+        )
+        .unwrap();
+
+    let resolved = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "approval.narrow",
+        &json!({"approval_id": req.id, "new_scope": "read"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved["id"], json!(req.id));
+    assert_eq!(resolved["status"], json!("narrowed"));
+    assert_eq!(resolved["scope"], json!("read"));
+    let grants = store.list_grants().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].scope, "read");
+}
+
 /// approval_socket_arm_operator_presence_required — adversarial-review
 /// 2026-05-19 CRIT-1 regression guard. An agent that submitted an
 /// approval MUST NOT be able to approve its own request via the socket
@@ -1069,6 +1159,70 @@ async fn resolve_approval_socket_refuses_self_approve() {
     assert_eq!(row.status, "pending");
 }
 
+#[tokio::test]
+async fn approval_resolve_alias_socket_refuses_self_approve() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = test_policy();
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "self-approve-alias-attacker"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap().to_string();
+    let req = store
+        .submit_approval(
+            &persona_id,
+            "api-key",
+            "read",
+            None,
+            "credential.access",
+            "high",
+        )
+        .unwrap();
+
+    ensure_test_authority_bridge_env();
+    let _presence_test_guard = crate::trust::presence::test_state_guard();
+    crate::trust::presence::mark_unlocked();
+
+    let ctx = RequestContext::socket_with_principal(
+        Some(PeerCred {
+            uid: 501,
+            pid: Some(std::process::id() as i32),
+        }),
+        persona_id.clone(),
+    )
+    .with_presence_token(Some(test_presence_token(501)));
+    let err = dispatch_method_with_context(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        None,
+        ctx,
+        "approval.resolve",
+        &json!({"approval_id": req.id}),
+    )
+    .await
+    .expect_err("self-approve via approval.resolve must be refused");
+    assert_eq!(err.0, -32003, "expected unauthorized: {err:?}");
+    assert!(
+        err.1.contains("caller cannot approve own request"),
+        "error must name the two-party invariant: {}",
+        err.1
+    );
+
+    let row = store.get_approval(&req.id).unwrap();
+    assert_eq!(row.status, "pending");
+}
+
 /// approval_socket_arm_operator_presence_required — adversarial-review
 /// 2026-05-19 CRIT-1 sibling guard. A different principal CAN resolve
 /// the approval (the dashboard / second-party flow is unaffected).
@@ -1140,6 +1294,28 @@ async fn resolve_approval_socket_allows_second_party_approve() {
     .await
     .unwrap();
     assert_eq!(resolved["status"], json!("approved"));
+}
+
+#[tokio::test]
+async fn status_aggregated_rpc_landed_empty_store_returns_summary_shape() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = test_policy();
+    let rl = test_rate_limiter();
+
+    let status = dispatch_method(&store, &vault, &policy, &rl, "status", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(status["personas"].as_array().unwrap().len(), 0);
+    assert_eq!(status["grants"].as_array().unwrap().len(), 0);
+    assert_eq!(status["grant_live_leases"].as_array().unwrap().len(), 0);
+    assert_eq!(status["sandboxes"].as_array().unwrap().len(), 0);
+    assert_eq!(status["approvals"].as_array().unwrap().len(), 0);
+    assert_eq!(status["recent_activity"].as_array().unwrap().len(), 0);
+    assert_eq!(status["standing_grants"], json!(0));
+    assert_eq!(status["audit_events_total"], json!(0));
+    assert_eq!(status["quarantined"], json!(false));
+    assert_eq!(status["quarantine_authority"], json!(null));
 }
 
 #[tokio::test]
@@ -1769,7 +1945,7 @@ async fn test_delegate_grant_socket_accepts_owner() {
 }
 
 // delegate_grant_socket_principal_not_enrolled — checkpoint for
-// implementation-note-262.
+// implementation-note-203.
 //
 // Original contract (pre-prior change): a Socket-source dispatch
 // with missing `caller_persona_id` returned -32602 (invalid params).
@@ -1939,7 +2115,7 @@ async fn forged_caller_persona_id_in_delegate_params_rejected() {
         llm_proxy_url: None,
         git_proxy_url: None,
         peer_cred_principal: None,
-        // implementation-note-230
+        // implementation-note-185
         // — attach a valid presence_token so the Phase D-4 gate
         // passes; the test asserts a deeper authorization check.
         presence_token: Some(test_presence_token(1000)),
@@ -2091,7 +2267,7 @@ async fn linux_peercred_resolves_persona_via_pid_lookup() {
     // `delegate_grant` from the same PID is bound to that persona
     // without the caller having to assert `caller_persona_id`.
     //
-    // Partial of implementation-note-128 (#4372):
+    // Partial of implementation-note-108 (#4372):
     // `dispatch_method_with_context` enforces a presence-unlocked
     // gate at the entry of every method dispatch (line ~2618).
     // Tests that exercise the dispatch path must hold a
@@ -2127,7 +2303,7 @@ async fn linux_peercred_resolves_persona_via_pid_lookup() {
         llm_proxy_url: None,
         git_proxy_url: None,
         peer_cred_principal: None,
-        // implementation-note-230
+        // implementation-note-185
         // — attach a valid presence_token so the Phase D-4 gate
         // passes; the test exercises the enrollment/peercred
         // resolution path, not the auth gate.
@@ -2199,7 +2375,7 @@ async fn linux_peercred_resolves_persona_via_pid_lookup() {
         llm_proxy_url: None,
         git_proxy_url: None,
         peer_cred_principal: None,
-        // implementation-note-230
+        // implementation-note-185
         // — attach a valid presence_token so the Phase D-4 gate
         // passes; the test asserts the delegation succeeds via the
         // enrolled persona, not the auth gate.
@@ -2273,7 +2449,7 @@ async fn macos_peercred_pid_none_fails_closed() {
         llm_proxy_url: None,
         git_proxy_url: None,
         peer_cred_principal: None,
-        // implementation-note-230
+        // implementation-note-185
         // — attach a valid presence_token so the Phase D-4 gate
         // passes; the test asserts the PrincipalUnavailable path
         // for pid=None, not the auth gate.
@@ -2354,7 +2530,7 @@ fn peercred_principal_returns_not_enrolled_for_unknown_pid() {
 }
 
 // -----------------------------------------------------------------
-// implementation-note-247 Phase 2: sops_unwrap_dek RPC tests
+// implementation-note-180 Phase 2: sops_unwrap_dek RPC tests
 // -----------------------------------------------------------------
 
 /// Build an age-encrypted DEK ciphertext for the given recipient

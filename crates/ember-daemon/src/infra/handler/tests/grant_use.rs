@@ -131,7 +131,7 @@ async fn use_credential_biometric_row_requires_fresh_presence_proof() {
 
 #[tokio::test]
 async fn revoke_statement_blocks_use_credential() {
-    // implementation-note-238: per-statement revoke MVP.
+    // implementation-note-173: per-statement revoke MVP.
     // Revoking the Credential Statement's sid blocks use_credential
     // while the grant is otherwise still active.
     let store = DaemonStore::open_in_memory().unwrap();

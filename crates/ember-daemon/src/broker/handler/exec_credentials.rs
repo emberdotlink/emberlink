@@ -366,7 +366,7 @@ fn apply_credential_to_env(
     }
 }
 
-/// implementation-note-61 Phase 1 (Linux memfd path).
+/// implementation-note-42 Phase 1 (Linux memfd path).
 ///
 /// When `EMBER_BROKER_SEAL_CREDS` is not explicitly set to `0`/`false`
 /// on the daemon's environment, replace credential env entries with
@@ -380,7 +380,7 @@ fn apply_credential_to_env(
 /// child spawn (its `Drop` closes the fds); `env_for_spawn` carries
 /// `<KEY>_FD=<n>` in place of the original `<KEY>=<plaintext>`.
 ///
-/// Default-on (implementation-note-144): the
+/// Default-on (implementation-note-124): the
 /// Phase 2 pre-exec stub in `handle_broker_exec` now rewrites the
 /// child's env back to plaintext immediately before execve, so
 /// existing consumers (`gh`, `aws`, `vault`, etc.) see plaintext
@@ -405,7 +405,7 @@ pub(super) fn maybe_seal_credentials_in_env(
     ),
     crate::broker::exec_env::SealError,
 > {
-    // implementation-note-144: default flipped to
+    // implementation-note-124: default flipped to
     // true now that Phase 2's pre-exec stub (in handle_broker_exec
     // above) rewrites the child env back to plaintext before execve.
     // Setting EMBER_BROKER_SEAL_CREDS=0 remains supported as an
@@ -1092,7 +1092,7 @@ async fn mint_and_inject_for_action_with_registry(
 
     apply_credential_to_env(cred.token.expose_secret(), &policy.injection, env);
 
-    // implementation-note-145 — emit a single operator-visible
+    // implementation-note-125 — emit a single operator-visible
     // line at info level so the demo recording (and post-hoc operators)
     // can see the broker minted a TTL'd credential bound to the caller
     // persona. The wider tracing event above carries the structured
@@ -1556,10 +1556,14 @@ mod tests {
             hosts: &["github.com"],
         };
         apply_credential_to_env("{plaintext}", &injection, &mut env);
+        let expected_key = format!(
+            "url.https://x-access-token:{}@github.com/.insteadOf",
+            "{plaintext}"
+        );
         assert_eq!(env.get("GIT_CONFIG_COUNT").map(|s| s.as_str()), Some("1"));
         assert_eq!(
             env.get("GIT_CONFIG_KEY_0").map(|s| s.as_str()),
-            Some("url.https://x-access-token:{plaintext}@github.com/.insteadOf"),
+            Some(expected_key.as_str()),
         );
         assert_eq!(
             env.get("GIT_CONFIG_VALUE_0").map(|s| s.as_str()),
@@ -2454,7 +2458,7 @@ mod tests {
         let _ = mat_id; // re-revoke handled silently in production wrapper
     }
 
-    // implementation-note-145 — regression test that the
+    // implementation-note-125 — regression test that the
     // operator-visible "[broker] resolved <provider>-token to <persona> — TTL <m>m"
     // line is emitted on a successful credential mint. The demo recording's
     // overlay narrates this line; if it disappears, the storyboard breaks.

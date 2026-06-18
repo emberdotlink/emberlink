@@ -39,12 +39,12 @@
 
 pub mod pty;
 
-/// implementation-note-381: UDS frame protocol consumed by the
+/// implementation-note-286: UDS frame protocol consumed by the
 /// `ember-exec` binary. Subtask B layers content-hash verification on top;
 /// subtask C wires `PtyBridge` for the real spawn.
 pub mod uds;
 
-/// implementation-note-382: privilege-boundary mechanisms.
+/// implementation-note-287: privilege-boundary mechanisms.
 /// [`spawn::verify_content_hash`] is the CRIT-B mitigation gate;
 /// [`spawn::drop_privileges`] locks the real / effective / saved IDs.
 /// Subtask C wires both into the SpawnDirective handler.

@@ -18,9 +18,9 @@
 //! methods just call through to the underlying sync `Vault` API
 //! directly rather than dispatching through `spawn_blocking`.
 //!
-//! # Receipt emission (implementation-note-136)
+//! # Receipt emission
 //!
-//! Per implementation-note-183 security-review Findings 5 and 17 (audit-completeness
+//! Per security-review Findings 5 and 17 (audit-completeness
 //! gap for vault reads), every successful `get` emits a v2
 //! [`ReceiptEnvelope`] with `kind = "vault.read"`. Emission is
 //! best-effort — failures to sign or persist log a warning but do not
@@ -42,9 +42,9 @@ use crate::infra::vault::{VaultError, VaultScope, logical_name_from_storage};
 use super::{CredentialStore, StoreError};
 
 /// v2 kind discriminator for `LocalEncryptedStore::get` success-path
-/// audit. Per implementation-note-136 (Findings 5, 17 — daemon
+/// audit. Per security-review Findings 5, 17 — daemon
 /// vault reads must leave a signed receipt so post-hoc audit can
-/// reconstruct which credentials were read by whom and when).
+/// reconstruct which credentials were read by whom and when.
 pub(crate) const RECEIPT_KIND_VAULT_READ: &str = "vault.read";
 
 enum VaultSource {
@@ -56,7 +56,7 @@ enum VaultSource {
 
 /// `CredentialStore` impl backed by the local sealed-credential vault.
 ///
-/// implementation-note-184: the live vault is resolved from the shared
+/// The live vault is resolved from the shared
 /// store slot at point of use instead of being owned directly here. That lets
 /// explicit lock cut off credential-store reads without needing to tear down
 /// the helper itself.
@@ -283,8 +283,8 @@ fn current_headless_vault(
             "headless enrollment key unavailable for vault key {key}: {err}"
         ))
     })?;
-    // implementation-note-170 (B1) + adversarial CRIT-1 fix
-    // (2026-05-22): construct a implementation-note-185 Vault. Pre-fix this used
+    // Vault-scope MEK split (B1) + adversarial CRIT-1 fix
+    // (2026-05-22): construct a headless-only Vault. Pre-fix this used
     // `Vault::new(mek)` which set BOTH lanes to the headless MEK; any
     // accidental `seal()` / `Vault::add(Interactive, ...)` call on the
     // returned Rc would silently route headless-MEK through the
@@ -322,7 +322,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
             // human-readable rendering of the path-grammar violation.
             StoreError::Other(format!("invalid credential name: {}", name_err))
         }
-        // implementation-note-186 sealed-blob variants. These
+        // Sealed-blob variants. These
         // errors only surface from `export_mek_sealed`/`import_mek_sealed`
         // (the vault-level sealed-export substrate), not from the
         // get/list/add/remove credential paths this mapper serves. Map
@@ -336,7 +336,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         | VaultError::SealedBlobUnknownAead { .. }
         | VaultError::SealedBlobFingerprintMismatch { .. }
         | VaultError::SealedBlobAeadFailure) => StoreError::Other(format!("sealed-blob: {sealed}")),
-        // implementation-note-187 — same shape: surfaces
+        // Same shape: surfaces
         // from the rotation-witness emit path
         // (`emit_identity_rotation_witness`) which the credential
         // store does not call today, but the variant must still be
@@ -344,7 +344,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         emit @ VaultError::WitnessEmit(_) => {
             StoreError::Other(format!("identity-rotation-witness: {emit}"))
         }
-        // implementation-note-170 (B1) + adversarial CRIT-1
+        // Vault-scope MEK split (B1) + adversarial CRIT-1
         // fix: a headless-only Vault refusing an Interactive-lane op
         // surfaces as `HeadlessOnly`. The local credential store only
         // routes Headless-scope operations through `current_headless_vault`
@@ -373,7 +373,7 @@ impl CredentialStore for LocalEncryptedStore {
             .get(scope, &self.store, key)
             .map_err(|e| map_vault_error(e, key))?;
 
-        // implementation-note-136: emit a v2 `vault.read` Receipt
+        // Emit a v2 `vault.read` Receipt
         // on the success path so the audit trail includes every
         // daemon-side credential read. Best-effort — emission failures
         // log a warning but do NOT fail the read.
@@ -421,7 +421,7 @@ impl CredentialStore for LocalEncryptedStore {
 }
 
 // ---------------------------------------------------------------------------
-// Receipt emission (implementation-note-136)
+// Receipt emission
 // ---------------------------------------------------------------------------
 
 /// Best-effort: build, sign, and persist a v2 `vault.read` Receipt for
@@ -959,7 +959,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-136: with the daemon identity
+    /// With the daemon identity
     /// initialised, a successful `get` must leave a signed
     /// `vault.read` row in the audit log carrying the credential
     /// name + the signed envelope JSON.
@@ -1041,7 +1041,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-136: a cache-miss `get` (NotFound)
+    /// A cache-miss `get` (NotFound)
     /// must NOT emit a vault.read audit row — emission is success-path
     /// only so the audit log reflects credentials actually exposed.
     #[test]

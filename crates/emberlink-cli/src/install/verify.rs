@@ -206,7 +206,7 @@ pub struct TrustedPublisher {
 pub const EMBERLINK_RELEASE_PUBLISHER_DID: &str = "did:web:ember.link";
 
 // ember_identity_root_pubkey_provisioned — checkpoint for
-// implementation-note-421. Raw 32-byte Ed25519 public key
+// implementation-note-328. Raw 32-byte Ed25519 public key
 // (extracted from the minisign-framed pubkey by skipping the 2-byte
 // signature algorithm prefix + 8-byte key ID). Round-trips with the
 // production minisign key ID E8CCC724654C2D95.
@@ -915,7 +915,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-422 T1: a fake non-empty sigstore witness
+    /// implementation-note-329 T1: a fake non-empty sigstore witness
     /// must be rejected; the old stub accepted any non-empty bytes.
     #[test]
     fn dual_witness_rejects_fake_sigstore_sig_fixture() {

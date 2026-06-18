@@ -26,5 +26,8 @@ default = []
 anthropic = ["dep:chrono", "dep:ureq"]
 cloudflare = ["dep:chrono", "dep:ureq"]
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

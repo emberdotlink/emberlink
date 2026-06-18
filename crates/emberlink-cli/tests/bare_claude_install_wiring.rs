@@ -1,4 +1,4 @@
-//! implementation-note-419 — T3 integration tests
+//! implementation-note-326 — T3 integration tests
 //! for the bare-`claude` redirector hybrid (operator decision 2026-05-15).
 //!
 //! Validates the shim script that `ember dev install` writes to

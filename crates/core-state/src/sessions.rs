@@ -99,10 +99,10 @@ pub struct SessionWorkspaceBinding {
 /// <base_dir>/
 ///   <session_id>/
 ///     meta.json          # written by `create`, removed by `close`
-///     audit-gaps.jsonl   # placeholder — implementation-note-54 writes this
-///     permits-archive.jsonl  # placeholder — implementation-note-53 sidecar
-///     hook-errors.jsonl  # placeholder — implementation-note-54 panic catch
-///     receipt.json       # placeholder — implementation-note-53 termination receipt
+///     audit-gaps.jsonl   # placeholder — audit-gap sidecar writer
+///     permits-archive.jsonl  # placeholder — permit-archive sidecar
+///     hook-errors.jsonl  # placeholder — hook-error panic-catch sidecar
+///     receipt.json       # placeholder — termination receipt sidecar
 /// ```
 ///
 /// `close` moves `meta.json` to `meta.json.closed` so the session directory
@@ -134,8 +134,8 @@ impl SessionStore {
         fs::write(&tmp_path, &json)?;
         fs::rename(&tmp_path, session_dir.join("meta.json"))?;
 
-        // Touch placeholder sidecar files so downstream tasks (implementation-note-53,
-        // implementation-note-54) can append without creating their own directories.
+        // Touch placeholder sidecar files so downstream sidecar writers can
+        // append without creating their own directories.
         for name in &[
             "audit-gaps.jsonl",
             "permits-archive.jsonl",
@@ -171,8 +171,8 @@ impl SessionStore {
 
     /// Close a session by renaming `meta.json` → `meta.json.closed`.
     ///
-    /// The session directory stays on disk so sidecar writers (implementation-note-53,
-    /// implementation-note-54) can still append to their files after termination.
+    /// The session directory stays on disk so sidecar writers can still
+    /// append to their files after termination.
     /// A no-op (returns `Ok(())`) when the session is already closed or does
     /// not exist.
     pub fn close(&self, id: &str) -> io::Result<()> {

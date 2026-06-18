@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
-
 # CLI Reference
 
 The current public Ember CLI contract is intentionally narrower than the full
@@ -12,10 +7,17 @@ binary surface. The user story is:
 2. `ember status`
 3. `ember claude`
 
+For Codex, the supported advanced path is:
+
+1. `codex login`
+2. `ember init --for codex`
+3. `ember status`
+4. `ember codex`
+
 Everything else should support that journey, not compete with it.
 
 For the core delegated-authority surface beyond that top-level flow, see
-[Grants and approvals](./grants-and-approvals/).
+[Grants and approvals](./grants-and-approvals.md).
 
 ## Start here first
 
@@ -25,14 +27,22 @@ If you are new to Ember, remember these three commands before anything else:
 - `ember status`
 - `ember claude`
 
+If Codex is your agent surface, add:
+
+- `codex login`
+- `ember init --for codex`
+- `ember codex`
+
 ## Primary commands
 
 These commands define the current public-friendly operator surface:
 
 - `ember init`
 - `ember uninstall --for claude`
+- `ember uninstall --for codex`
 - `ember status`
 - `ember claude`
+- `ember codex`
 - `ember vault ...`
 - `ember grant ...`
 - `ember approval ...`
@@ -53,7 +63,7 @@ If the main path is unhealthy, the usual order is:
 
 ```bash
 ember status
-ember status --troubleshoot
+ember doctor
 sudo ember daemon install
 ember github status --json
 ember github setup
@@ -67,6 +77,10 @@ headline journey:
 - `ember persona ...` for advanced persona management
 - `ember config ...` for resolved-config inspection
 - `ember sandbox ...` for managed isolated execution
+
+`ember codex` is listed above as supported, but it remains an advanced path
+because Codex starts from Codex's native login flow before Emberlink imports
+and brokers runtime authority with operator consent.
 
 ## Real but still preview commands
 
@@ -99,11 +113,11 @@ If you are trying to repair a GitHub authority issue, start with:
 ```bash
 ember github status --json
 ember github setup
-ember status --troubleshoot
+ember doctor
 ```
 
 For the read-only trust inspection surface, see
-[Trust and verification](./trust-and-verification/).
+[Trust and verification](./trust-and-verification.md).
 
 For the current sandbox contract and Docker boundary, see
-[Sandbox and isolated execution](./sandbox-and-isolated-execution/).
+[Sandbox and isolated execution](./sandbox-and-isolated-execution.md).

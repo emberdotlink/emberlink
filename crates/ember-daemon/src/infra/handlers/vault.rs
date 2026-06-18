@@ -9,17 +9,19 @@ use serde_json::{Value, json};
 use std::rc::Rc;
 use zeroize::Zeroizing;
 
+use crate::auth::presence_gate::PresencePolicy;
 use crate::infra::{
     handler::{
         DispatchSource, RequestContext, check_user_presence_gate, current_vault,
         enforce_fresh_presence_proof, enforce_fresh_presence_proof_with_audit,
         handler_must_verify_fresh_presence_proof, mint_operator_presence_token,
+        parse_scope_kek_hex,
     },
     receipt::{current_identity, persist_vault_biometric_receipt, sign_vault_receipt},
+    rpc_error::RpcError,
     store::DaemonStore,
     vault::{self, VaultError, VaultReadGate, VaultScope},
 };
-use crate::auth::presence_gate::PresencePolicy;
 use crate::trust::presence::{self, HighRiskOp};
 
 fn value_bytes(params: &Value) -> Result<Vec<u8>, (i32, String)> {
@@ -334,6 +336,571 @@ pub(crate) fn handle_unlock(
             .map_err(|e| (-32000, format!("vault_unlock: encode presence_token: {e}")))?;
     }
     Ok(response)
+}
+
+pub(crate) fn handle_se_provision(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let device_id = params
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams("vault.se_provision: 'device_id' required".to_string())
+        })?;
+    let ecies_key_id = params
+        .get("ecies_key_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams("vault.se_provision: 'ecies_key_id' required".to_string())
+        })?;
+    let wrapped_kek = params
+        .get("wrapped_kek")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams("vault.se_provision: 'wrapped_kek' (hex) required".to_string())
+        })
+        .and_then(|h| {
+            hex::decode(h).map_err(|e| {
+                RpcError::InvalidParams(format!("vault.se_provision: 'wrapped_kek' bad hex: {e}"))
+            })
+        })?;
+    let scope_kek = parse_scope_kek_hex(params, "scope_kek")?;
+
+    // design §4 — resolve BOTH the AC-7 recipient allowlist (§6 finding
+    // M3) and the per-scope binding ("Never one global KEK") from a single
+    // identity-substrate open, fail-closed BEFORE any mutation below.
+    let (allowed_recipients, provision_scope) = match store.data_dir() {
+        Some(data_dir) => match crate::infra::identity_substrate::open_identity_store(data_dir) {
+            Ok(identity_store) => {
+                let st = identity_store.materialized();
+                (
+                    crate::infra::operator_identity::active_kek_recipient_ecies_key_ids_under_operator_root(st),
+                    crate::infra::operator_identity::operator_authority_scope(st),
+                )
+            }
+            Err(e) => {
+                return Err(RpcError::Internal(format!(
+                    "vault.se_provision: open identity store: {e}"
+                ))
+                .into());
+            }
+        },
+        None => (Vec::new(), None),
+    };
+    if !allowed_recipients.iter().any(|k| k == ecies_key_id) {
+        return Err(RpcError::PresenceLocked(format!(
+            "vault.se_provision: ecies_key_id '{ecies_key_id}' is not an \
+                 enrolled presence-Device or recovery recipient under the \
+                 operator root (design §4/§6 AC-7 allowlist = enrolled ∪ \
+                 recovery); refusing to store a scope-KEK wrap to a \
+                 non-enrolled recipient"
+        ))
+        .into());
+    }
+    let (scope_kind, scope_id) = provision_scope.ok_or_else(|| {
+        RpcError::PresenceLocked(
+            "vault.se_provision: no operator-authority scope (no unambiguous \
+         operator root); refusing to store a scope-KEK wrap with no scope \
+         (design §4: never one global KEK)"
+                .to_string(),
+        )
+    })?;
+
+    store
+        .write_presence_scope_kek_wrap(
+            &scope_kind,
+            &scope_id,
+            device_id,
+            ecies_key_id,
+            &wrapped_kek,
+        )
+        .map_err(|e| RpcError::Internal(format!("vault.se_provision: store wrap: {e}")))?;
+
+    store
+        .clear_headless_and_canary_meta()
+        .map_err(|e| RpcError::Internal(format!("vault.se_provision: clean-break meta: {e}")))?;
+    store.clear_bridge_ca_wrap().map_err(|e| {
+        RpcError::Internal(format!("vault.se_provision: clean-break bridge-ca: {e}"))
+    })?;
+    if let Some(dir) = store.data_dir() {
+        for stale in [
+            crate::infra::vault::HEADLESS_MEK_WRAP_FILE,
+            "bridge_ca.wrap",
+            "bridge_ca.sealed",
+        ] {
+            let path = dir.join(stale);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(RpcError::Internal(format!(
+                        "vault.se_provision: clean-break remove {}: {e}",
+                        path.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+    }
+
+    let vault =
+        crate::infra::interactive_unlock::install_presence_scope_kek_vault(store, *scope_kek)
+            .map_err(|e| RpcError::PresenceLocked(format!("vault.se_provision: install: {e}")))?;
+
+    let (canary_nonce, canary) = vault.seal_canary().map_err(|e| {
+        RpcError::PresenceLocked(format!("vault.se_provision: re-seal canary: {e}"))
+    })?;
+    store
+        .write_vault_canary(&canary, &canary_nonce)
+        .map_err(|e| RpcError::Internal(format!("vault.se_provision: write canary: {e}")))?;
+
+    crate::infra::interactive_unlock::arm_non_session_grace_window();
+    Ok(json!({ "status": "provisioned", "device_id": device_id }))
+}
+
+pub(crate) fn handle_se_add_recipient_wrap(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let device_id = params
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams("vault.se_add_recipient_wrap: 'device_id' required".to_string())
+        })?;
+    let ecies_key_id = params
+        .get("ecies_key_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams(
+                "vault.se_add_recipient_wrap: 'ecies_key_id' required".to_string(),
+            )
+        })?;
+    let wrapped_kek = params
+        .get("wrapped_kek")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams(
+                "vault.se_add_recipient_wrap: 'wrapped_kek' (hex) required".to_string(),
+            )
+        })
+        .and_then(|h| {
+            hex::decode(h).map_err(|e| {
+                RpcError::InvalidParams(format!(
+                    "vault.se_add_recipient_wrap: 'wrapped_kek' bad hex: {e}"
+                ))
+            })
+        })?;
+
+    let (allowed_recipients, add_scope) = match store.data_dir() {
+        Some(data_dir) => match crate::infra::identity_substrate::open_identity_store(data_dir) {
+            Ok(identity_store) => {
+                let st = identity_store.materialized();
+                (
+                    crate::infra::operator_identity::active_kek_recipient_ecies_key_ids_under_operator_root(st),
+                    crate::infra::operator_identity::operator_authority_scope(st),
+                )
+            }
+            Err(e) => {
+                return Err(RpcError::Internal(format!(
+                    "vault.se_add_recipient_wrap: open identity store: {e}"
+                ))
+                .into());
+            }
+        },
+        None => (Vec::new(), None),
+    };
+    if !allowed_recipients.iter().any(|k| k == ecies_key_id) {
+        return Err(RpcError::PresenceLocked(format!(
+            "vault.se_add_recipient_wrap: ecies_key_id '{ecies_key_id}' is not an \
+                 enrolled presence-Device or recovery recipient under the operator root \
+                 (design §4/§6 AC-7 allowlist = enrolled ∪ recovery); refusing to store \
+                 a scope-KEK wrap to a non-enrolled recipient"
+        ))
+        .into());
+    }
+    let (scope_kind, scope_id) = add_scope.ok_or_else(|| {
+        RpcError::PresenceLocked(
+            "vault.se_add_recipient_wrap: no operator-authority scope (no unambiguous \
+         operator root); refusing to store a scope-KEK wrap with no scope"
+                .to_string(),
+        )
+    })?;
+    store
+        .write_presence_scope_kek_wrap(
+            &scope_kind,
+            &scope_id,
+            device_id,
+            ecies_key_id,
+            &wrapped_kek,
+        )
+        .map_err(|e| RpcError::Internal(format!("vault.se_add_recipient_wrap: store wrap: {e}")))?;
+    Ok(json!({ "status": "recipient_added", "device_id": device_id }))
+}
+
+pub(crate) fn handle_se_unlock_begin(store: &DaemonStore) -> Result<Value, (i32, String)> {
+    let unlock_scope = match store.data_dir() {
+        Some(data_dir) => match crate::infra::identity_substrate::open_identity_store(data_dir) {
+            Ok(identity_store) => crate::infra::operator_identity::operator_authority_scope(
+                identity_store.materialized(),
+            ),
+            Err(e) => {
+                return Err(RpcError::Internal(format!(
+                    "vault.se_unlock_begin: open identity store: {e}"
+                ))
+                .into());
+            }
+        },
+        None => None,
+    };
+    let wraps = match unlock_scope {
+        Some((scope_kind, scope_id)) => store
+            .list_presence_scope_kek_wraps(&scope_kind, &scope_id)
+            .map_err(|e| RpcError::Internal(format!("vault.se_unlock_begin: list wraps: {e}")))?,
+        None => Vec::new(),
+    };
+    let wraps_json: Vec<serde_json::Value> = wraps
+        .into_iter()
+        .map(|(device_id, ecies_key_id, wrapped)| {
+            json!({
+                "device_id": device_id,
+                "ecies_key_id": ecies_key_id,
+                "wrapped_kek": hex::encode(&wrapped),
+            })
+        })
+        .collect();
+    Ok(json!({ "wraps": wraps_json }))
+}
+
+pub(crate) fn handle_se_unlock_complete(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let scope_kek = parse_scope_kek_hex(params, "scope_kek")?;
+    crate::infra::interactive_unlock::install_presence_scope_kek_vault(store, *scope_kek)
+        .map_err(|e| RpcError::PresenceLocked(format!("vault.se_unlock_complete: install: {e}")))?;
+    crate::infra::interactive_unlock::arm_non_session_grace_window();
+    crate::trust::presence::mark_unlocked();
+    Ok(json!({ "status": "unlocked" }))
+}
+
+pub(crate) fn handle_de_provision_begin(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    use crate::infra::daemon_wrap_key::DwkPurpose;
+    let purpose_str = params
+        .get("purpose")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams("vault.de_provision_begin: 'purpose' required".to_string())
+        })?;
+    let purpose = match purpose_str {
+        "vault_mek" => DwkPurpose::VaultMek,
+        "lease_kek" => DwkPurpose::LeaseKek,
+        other => {
+            return Err(RpcError::InvalidParams(format!(
+                "vault.de_provision_begin: unknown purpose '{other}'"
+            ))
+            .into());
+        }
+    };
+
+    let dwk = store.dwk().ok_or_else(|| {
+        RpcError::Internal("vault.de_provision_begin: DWK not provisioned".to_string())
+    })?;
+
+    let mut raw_key = Zeroizing::new([0u8; 32]);
+    getrandom::fill(raw_key.as_mut()).expect("OS entropy failure");
+
+    let inner_blob = dwk
+        .wrap(&*raw_key, purpose)
+        .map_err(|e| RpcError::Internal(format!("vault.de_provision_begin: DWK wrap: {e}")))?;
+
+    match purpose {
+        DwkPurpose::VaultMek => {
+            let vault = crate::infra::vault::finish_open_with_interactive_key_for_de(
+                *raw_key,
+                store
+                    .data_dir()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            );
+            match vault {
+                Ok(vault) => {
+                    store.set_vault(Rc::new(vault));
+                    tracing::info!("vault.de_provision_begin: MEK provisioned, vault open");
+                }
+                Err(e) => {
+                    return Err(RpcError::Internal(format!(
+                        "vault.de_provision_begin: vault open: {e}"
+                    ))
+                    .into());
+                }
+            }
+        }
+        DwkPurpose::LeaseKek => {
+            let lease_kek = crate::trust::lease::LeaseWrapKey::from_raw(*raw_key);
+            store.set_lease_kek(lease_kek);
+            if let Err(e) = store.rehydrate_persisted_leases(chrono::Utc::now()) {
+                tracing::error!(
+                    error = %e,
+                    "vault.de_provision_begin: lease-KEK installed but \
+                     rehydrating persisted leases failed"
+                );
+            }
+            tracing::info!("vault.de_provision_begin: lease-KEK installed (first boot)");
+        }
+    }
+
+    Ok(json!({
+        "inner_blob": hex::encode(&inner_blob),
+        "purpose": purpose_str,
+    }))
+}
+
+pub(crate) fn handle_de_provision_outer(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let outer_blob = params
+        .get("outer_blob")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams(
+                "vault.de_provision_outer: 'outer_blob' (hex) required".to_string(),
+            )
+        })
+        .and_then(|h| {
+            hex::decode(h).map_err(|e| {
+                RpcError::InvalidParams(format!("vault.de_provision_outer: bad hex: {e}"))
+            })
+        })?;
+    let purpose_str = params
+        .get("purpose")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams("vault.de_provision_outer: 'purpose' required".to_string())
+        })?;
+
+    match purpose_str {
+        "vault_mek" => {
+            if store.vault().is_some()
+                && store.read_double_envelope_outer().ok().flatten().is_some()
+            {
+                return Err(RpcError::Internal(
+                    "vault.de_provision_outer: refusing to overwrite \
+                     existing outer blob while vault is open"
+                        .to_string(),
+                )
+                .into());
+            }
+            store
+                .write_double_envelope_outer(&outer_blob)
+                .map_err(|e| RpcError::Internal(format!("vault.de_provision_outer: store: {e}")))?;
+        }
+        "lease_kek" => {
+            let outer_present = store
+                .read_lease_kek_double_envelope_outer()
+                .ok()
+                .flatten()
+                .is_some();
+            if store.lease_kek().is_some() && outer_present {
+                return Err(RpcError::Internal(
+                    "vault.de_provision_outer: refusing to overwrite \
+                     existing lease-KEK outer blob while lease-KEK is active"
+                        .to_string(),
+                )
+                .into());
+            }
+            store
+                .write_lease_kek_double_envelope_outer(&outer_blob)
+                .map_err(|e| RpcError::Internal(format!("vault.de_provision_outer: store: {e}")))?;
+        }
+        other => {
+            return Err(RpcError::InvalidParams(format!(
+                "vault.de_provision_outer: unknown purpose '{other}'"
+            ))
+            .into());
+        }
+    }
+
+    tracing::info!(
+        purpose = purpose_str,
+        "vault.de_provision_outer: outer blob stored"
+    );
+    Ok(json!({
+        "status": "provisioned",
+        "purpose": purpose_str,
+    }))
+}
+
+pub(crate) fn handle_de_unlock_begin(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let purpose_str = params
+        .get("purpose")
+        .and_then(|v| v.as_str())
+        .unwrap_or("vault_mek");
+
+    let outer_blob = match purpose_str {
+        "vault_mek" => store
+            .read_double_envelope_outer()
+            .map_err(|e| RpcError::Internal(format!("vault.de_unlock_begin: read: {e}")))?,
+        "lease_kek" => store.read_lease_kek_double_envelope_outer().map_err(|e| {
+            RpcError::Internal(format!("vault.de_unlock_begin: read lease_kek: {e}"))
+        })?,
+        other => {
+            return Err(RpcError::InvalidParams(format!(
+                "vault.de_unlock_begin: unknown purpose '{other}'"
+            ))
+            .into());
+        }
+    };
+
+    match outer_blob {
+        Some(blob) => Ok(json!({
+            "outer_blob": hex::encode(&blob),
+            "status": "locked",
+            "purpose": purpose_str,
+        })),
+        None => Ok(json!({
+            "status": "unprovisioned",
+            "purpose": purpose_str,
+        })),
+    }
+}
+
+pub(crate) fn handle_de_unlock_complete(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    use crate::infra::daemon_wrap_key::DwkPurpose;
+    let inner_blob = params
+        .get("inner_blob")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::InvalidParams(
+                "vault.de_unlock_complete: 'inner_blob' (hex) required".to_string(),
+            )
+        })
+        .and_then(|h| {
+            hex::decode(h).map_err(|e| {
+                RpcError::InvalidParams(format!("vault.de_unlock_complete: bad hex: {e}"))
+            })
+        })?;
+
+    let purpose_str = params
+        .get("purpose")
+        .and_then(|v| v.as_str())
+        .unwrap_or("vault_mek");
+
+    let dwk_purpose = match purpose_str {
+        "vault_mek" => DwkPurpose::VaultMek,
+        "lease_kek" => DwkPurpose::LeaseKek,
+        other => {
+            return Err(RpcError::InvalidParams(format!(
+                "vault.de_unlock_complete: unknown purpose '{other}'"
+            ))
+            .into());
+        }
+    };
+
+    let dwk = store.dwk().ok_or_else(|| {
+        RpcError::Internal("vault.de_unlock_complete: DWK not provisioned".to_string())
+    })?;
+
+    let raw_key = dwk.unwrap(&inner_blob, dwk_purpose).map_err(|e| {
+        RpcError::PresenceLocked(format!("vault.de_unlock_complete: DWK unwrap: {e}"))
+    })?;
+    if raw_key.len() != 32 {
+        return Err(RpcError::PresenceLocked(format!(
+            "vault.de_unlock_complete: unwrapped key is {} bytes, expected 32",
+            raw_key.len()
+        ))
+        .into());
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&raw_key);
+
+    match dwk_purpose {
+        DwkPurpose::VaultMek => {
+            let data_dir = store
+                .data_dir()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let vault =
+                crate::infra::vault::finish_open_with_interactive_key_for_de(*key, data_dir)
+                    .map_err(|e| {
+                        RpcError::PresenceLocked(format!(
+                            "vault.de_unlock_complete: vault open: {e}"
+                        ))
+                    })?;
+
+            let vault = Rc::new(vault);
+            vault.verify_canary(store).map_err(|e| {
+                RpcError::PresenceLocked(format!(
+                    "vault.de_unlock_complete: canary verification failed \
+                         (wrong MEK / corrupt double-envelope): {e}"
+                ))
+            })?;
+            store.set_vault(vault);
+            crate::trust::presence::mark_unlocked();
+            tracing::info!("vault.de_unlock_complete: vault unlocked via double-envelope");
+
+            load_bridge_ca_if_ready(store);
+        }
+        DwkPurpose::LeaseKek => {
+            let lease_kek = crate::trust::lease::LeaseWrapKey::from_raw(*key);
+            store.set_lease_kek(lease_kek);
+            if let Err(e) = store.rehydrate_persisted_leases(chrono::Utc::now()) {
+                tracing::error!(
+                    error = %e,
+                    "vault.de_unlock_complete: lease-KEK installed but \
+                     rehydrating persisted leases failed"
+                );
+            }
+            tracing::info!("vault.de_unlock_complete: lease-KEK installed via double-envelope");
+
+            load_bridge_ca_if_ready(store);
+        }
+    }
+
+    Ok(json!({
+        "status": "unlocked",
+        "purpose": purpose_str,
+    }))
+}
+
+fn load_bridge_ca_if_ready(store: &DaemonStore) {
+    if store.bridge_ca().is_some() {
+        return;
+    }
+    if store.lease_kek().is_none() {
+        return;
+    }
+    let Some(vault_ref) = store.vault() else {
+        return;
+    };
+    let data_dir = store
+        .data_dir()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match crate::infra::runtime::load_or_mint_bridge_ca(data_dir, &vault_ref) {
+        Ok(ca) => {
+            store.set_bridge_ca_fingerprint(ca.fingerprint());
+            store.set_bridge_ca(ca);
+            tracing::info!(
+                "vault.de_unlock_complete: bridge CA loaded \
+                 after vault + lease-KEK unlock"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "vault.de_unlock_complete: bridge CA load failed"
+            );
+        }
+    }
 }
 
 pub(crate) fn handle_status(store: &DaemonStore) -> Result<Value, (i32, String)> {

@@ -26,7 +26,7 @@
 //!   fingerprint cache and PEM trust root stay current without opening the
 //!   sealed blob elsewhere.
 //!
-//! ## Bridge CA publish format — dual raw+PEM (implementation-note-355)
+//! ## Bridge CA publish format — dual raw+PEM (implementation-note-255)
 //!
 //! Anchor: `bridge_ca_pem_publish_format_reconciled`.
 //!
@@ -59,7 +59,7 @@
 //! `unseal_from_key`, `verifying_key`, `trust_root_cert_pem`) remain here so
 //! the persistence format and the cert-minting primitives stay co-located.
 //!
-//! ## Sibling server-cert mint (implementation-note-113)
+//! ## Sibling server-cert mint (implementation-note-96)
 //!
 //! Anchor: `ember_rpc_sibling_server_cert_minted_at_startup`.
 //!
@@ -888,7 +888,7 @@ mod tests {
         assert_eq!(key.len(), BRIDGE_CA_MODULE_KEY_LEN);
     }
 
-    // ─── sign_server_cert (implementation-note-113 T2) ───
+    // ─── sign_server_cert (implementation-note-96 T2) ───
 
     /// Pre: minted BridgeCa, valid subject + SANs + TTL.
     /// Post: returned PEMs parse; leaf cert validates against the BridgeCa's
@@ -972,7 +972,7 @@ mod tests {
         assert!(!eku.value.client_auth, "clientAuth NOT set");
     }
 
-    /// implementation-note-227 #2 — a client cert minted WITH a container_id carries both
+    /// implementation-note-183 #2 — a client cert minted WITH a container_id carries both
     /// the persona and container SPIFFE SANs (the container's mTLS identity per
     /// design §2). WITHOUT a container_id only the compat URN is emitted (no
     /// SPIFFE leakage). This pins the identity binding the orchestrator relies

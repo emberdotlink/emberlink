@@ -5,7 +5,7 @@ pub mod device;
 // `headless-runtime` shares it. Re-exported here as `crate::biometric` to keep
 // existing `use crate::biometric::{…}` call sites unchanged.
 pub use ember_presence::biometric;
-// implementation-note-413 — `ember bind …` admin path
+// implementation-note-320 — `ember bind …` admin path
 // for credential bindings. See `bind.rs` doc-comment.
 pub mod bind;
 pub mod broker;
@@ -13,13 +13,13 @@ pub mod catalog;
 pub mod cluster;
 pub mod construct;
 pub mod grants;
-// implementation-note-22 — Phase 1 substrate. The
+// implementation-note-93 — Phase 1 substrate. The
 // `commands.rs` file is a single 300K-line module rather than a
 // `commands/` directory; the `headless` substrate lands as a
 // top-level sibling module per the brief's
 // "(or wherever sibling commands are declared)" clause.
 //
-// implementation-note-23
+// implementation-note-177
 pub mod claude_code_launcher;
 pub mod codex_launcher;
 pub mod delegation_prompt;
@@ -37,6 +37,7 @@ pub mod kms;
 pub mod launcher;
 pub mod onboarding;
 pub mod orchestrator;
+pub mod operator_paths;
 pub mod output;
 pub mod preflight;
 pub mod receipt;
@@ -45,7 +46,7 @@ pub mod session;
 // `ember status` library support — F-code symptom diagnostic appendix
 // invoked by `ember status --troubleshoot` per design §Component 3.
 pub mod status;
-// implementation-note-438 — `ember status --session`
+// implementation-note-342 — `ember status --session`
 // operator attestation that the current shell session IS brokered
 // (design follow-up). Anchor: `dev_prod_parity_attestation_surface_landed`.
 pub mod status_session;
@@ -710,6 +711,22 @@ fn presence_device_se_key() -> Result<SignKeyHandle, DaemonRpcError> {
     })
 }
 
+fn format_touch_id_key_use_error(context: &str, err: impl std::fmt::Display) -> String {
+    let err = err.to_string();
+    let mut message = format!("{context} (Touch ID declined or key unavailable): {err}");
+    if touch_id_biometry_lockout(&err) {
+        message.push_str(
+            ". Touch ID is locked out; unlock this Mac with your account password, then rerun the command.",
+        );
+    }
+    message
+}
+
+fn touch_id_biometry_lockout(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("biometry") && err.contains("locked out")
+}
+
 #[cfg(target_os = "macos")]
 fn acquire_presence_proof(
     socket_path: &std::path::Path,
@@ -746,9 +763,9 @@ fn acquire_presence_proof(
 
     let reason = presence_touch_id_reason(method, params, &params_digest);
     let sig_der = se_sign_with_touch_id_reason(&key, &local_intent, &reason).map_err(|e| {
-        DaemonRpcError::Protocol(format!(
-            "presence-Device signing failed for '{method}' \
-             (Touch ID declined or key unavailable): {e}"
+        DaemonRpcError::Protocol(format_touch_id_key_use_error(
+            &format!("presence-Device signing failed for '{method}'"),
+            e,
         ))
     })?;
     let signature = format!("p256sig:{}", hex::encode(sig_der));
@@ -1039,9 +1056,9 @@ fn acquire_widening_gesture(
         &reason,
     )
     .map_err(|e| {
-        DaemonRpcError::Protocol(format!(
-            "widening gesture for '{method}' failed \
-             (Touch ID declined or key unavailable): {e}"
+        DaemonRpcError::Protocol(format_touch_id_key_use_error(
+            &format!("widening gesture for '{method}' failed"),
+            e,
         ))
     })?;
     if kek.len() != 32 {
@@ -1163,9 +1180,9 @@ fn attempt_se_unlock_window(socket_path: &std::path::Path) -> Result<(), DaemonR
     eprintln!("Touch ID required: unlocking authority custody (design §4)…");
     let ecies_role = se::EciesKeyLabel::from_provisioned(ecies_label);
     let mut kek = se::se_unwrap(&ecies_role, &wrapped).map_err(|e| {
-        DaemonRpcError::Protocol(format!(
-            "design §4 implicit unlock: se_unwrap failed \
-             (Touch ID declined or key unavailable): {e}"
+        DaemonRpcError::Protocol(format_touch_id_key_use_error(
+            "design §4 implicit unlock: se_unwrap failed",
+            e,
         ))
     })?;
     if kek.len() != 32 {
@@ -1248,9 +1265,9 @@ fn attempt_de_unlock_purpose(
                 eprintln!("Touch ID required: unlocking vault (design double-envelope)…");
             }
             let inner = se::se_unwrap(ecies_role, &outer).map_err(|e| {
-                DaemonRpcError::Protocol(format!(
-                    "design double-envelope unlock ({purpose}): SE decrypt failed \
-                     (Touch ID declined or key unavailable): {e}"
+                DaemonRpcError::Protocol(format_touch_id_key_use_error(
+                    &format!("design double-envelope unlock ({purpose}): SE decrypt failed"),
+                    e,
                 ))
             })?;
 

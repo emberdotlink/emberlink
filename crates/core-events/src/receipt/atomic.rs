@@ -42,10 +42,13 @@ pub const RECEIPT_KIND_SNAPSHOT_EMITTED: &str = "snapshot.emitted";
 pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
 pub const RECEIPT_KIND_PAYMENT_EVALUATED: &str = "payment.evaluated";
 pub const RECEIPT_KIND_PAYMENT_SETTLED: &str = "payment.settled";
+/// Signed per-upstream-call receipt for the `proxy_call` observability event.
+/// The forwarding runtime must use the resulting canonical `receipt_id` rather
+/// than deriving a demo-grade hash at the event site.
+pub const RECEIPT_KIND_PROXY_CALL: &str = "proxy.call";
 pub const RECEIPT_KIND_HEADLESS_ENROLLMENT: &str = "headless_enrollment";
 pub const RECEIPT_KIND_HEADLESS_REVOCATION: &str = "headless_revocation";
-/// implementation-note-47 —
-/// co-signed attestation that bridges between identity-key epochs at
+/// Co-signed attestation that bridges between identity-key epochs at
 /// MEK rotation time. Per design Receipt v2 chain-continuity rule +
 /// design catalog discipline. Anchor:
 /// `identity_rotation_witness_body_landed`.
@@ -59,7 +62,7 @@ pub const RECEIPT_KIND_IDENTITY_ROTATION_WITNESS: &str = "identity.rotation_witn
 pub const RECEIPT_KIND_VAULT_MEK_ROTATION: &str = "vault.mek_rotation";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE: &str = "local_state.key_resolve";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION: &str = "local_state.key_rotation";
-/// implementation-note-48 — emberd emits this kind on every
+/// emberd emits this kind on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec`
 /// sidecar. The body shape ([`ExecCompletionBody`]) carries the seven
 /// fields design §"Body shape per kind" pins for the in-container
@@ -97,22 +100,21 @@ pub const RECEIPT_KIND_AUDIT_CHAIN_REPAIR_FINALIZE: &str = "audit.chain_repair_f
 /// `audit.chain_v1_segment_bridge_unattested`. Minted by
 /// `ember audit migrate-chain --acknowledge` when the operator attests the
 /// cordon migration; references the Phase 1 receipt by id. Per design §4 +
-/// design review ESC-8. Consumer: `implementation-note-49`.
+/// design review ESC-8.
 pub const RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_ATTESTED: &str =
     "audit.chain_v1_segment_bridge_attested";
 
 /// receipt_kind_catalog_audit_chain_v2 — operator declined the cordon
 /// migration. Minted by `ember audit migrate-chain --refuse-and-quarantine`.
 /// References the Phase 1 receipt by id and carries the refusal reason +
-/// operator co-signature. Consumer: `implementation-note-49`.
+/// operator co-signature.
 pub const RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_REFUSED: &str =
     "audit.chain_v1_segment_bridge_refused";
 
 /// receipt_kind_catalog_audit_chain_v2 — daemon restored its event store
 /// from an operator-supplied dump (Option E forward-migrate inside restore).
 /// Carries the dump + pre-restore-backup integrity anchors and the cordon
-/// outcome. Per design review restore-from-dump D9. Consumer:
-/// `implementation-note-50`.
+/// outcome. Per design review restore-from-dump D9.
 pub const RECEIPT_KIND_AUDIT_RESTORE_FROM_DUMP: &str = "audit.restore_from_dump";
 
 /// `authority_delegated_hop_receipt_v2` — emitted per delegation hop when a
@@ -461,6 +463,24 @@ pub struct PaymentSettledBody {
     pub reason: Option<String>,
 }
 
+/// Body for `proxy.call` — one upstream request observed by the proxy after
+/// metering. This is a consumption receipt, so it deliberately carries the
+/// metered token split instead of a usage-stripped authority projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyCallBody {
+    pub persona_id: String,
+    pub grant_id: String,
+    pub statement_sid: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_total: u64,
+    pub outcome: String,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeadlessDelegatedMaterial {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -671,8 +691,7 @@ pub struct LocalStateKeyRotationBody {
 /// Body for `exec.completion` — emberd-side Receipt v2 emission on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec` sidecar.
 ///
-/// Per implementation-note-48 and the parent
-/// implementation-note-51 acceptance — emberd (not ember-exec) is
+/// emberd (not ember-exec) is
 /// the receipt signer; the in-container sidecar reports the child's
 /// exit code over the UDS frame protocol, and emberd composes the
 /// signed v2 envelope.
@@ -1065,7 +1084,7 @@ mod tests {
             "audit.chain_repair_finalize"
         );
         // receipt_kind_catalog_audit_chain_v2 — the 3 kinds completing the
-        // implementation-note-52 bundle (the 2 above shipped piecemeal in #4435).
+        // audit chain v2 bundle (the 2 above shipped piecemeal in #4435).
         assert_eq!(
             RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_ATTESTED,
             "audit.chain_v1_segment_bridge_attested"
@@ -1078,6 +1097,7 @@ mod tests {
             RECEIPT_KIND_AUDIT_RESTORE_FROM_DUMP,
             "audit.restore_from_dump"
         );
+        assert_eq!(RECEIPT_KIND_PROXY_CALL, "proxy.call");
         // design Extension 6 / design M4 — bridge cert supersede event
         // (`daemon_bridge_cert_superseded_event_emitted`).
         assert_eq!(
@@ -1885,6 +1905,26 @@ mod tests {
         };
         let json = serde_json::to_string(&body).unwrap();
         let back: PaymentSettledBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn proxy_call_body_round_trips() {
+        let body = ProxyCallBody {
+            persona_id: "persona-worker".into(),
+            grant_id: "grant-123".into(),
+            statement_sid: "S1".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            status: 200,
+            tokens_in: 120,
+            tokens_out: 192,
+            tokens_total: 312,
+            outcome: "complete".into(),
+            observed_at: "2026-06-18T12:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let back: ProxyCallBody = serde_json::from_str(&json).unwrap();
         assert_eq!(back, body);
     }
 }

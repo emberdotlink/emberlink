@@ -272,7 +272,7 @@ pub(super) fn forkpty_exec_and_bridge(
             if rc != 0 {
                 let errno = io_errno();
                 let msg = format!(
-                    "implementation-note-139: setresgid({gid}) failed: errno={errno}\n"
+                    "implementation-note-119: setresgid({gid}) failed: errno={errno}\n"
                 );
                 unsafe {
                     libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const _, msg.len());
@@ -285,7 +285,7 @@ pub(super) fn forkpty_exec_and_bridge(
             if rc != 0 {
                 let errno = io_errno();
                 let msg = format!(
-                    "implementation-note-139: setresuid({uid}) failed: errno={errno}\n"
+                    "implementation-note-119: setresuid({uid}) failed: errno={errno}\n"
                 );
                 unsafe {
                     libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const _, msg.len());

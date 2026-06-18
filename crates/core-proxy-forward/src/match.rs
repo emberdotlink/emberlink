@@ -1,7 +1,7 @@
 //! CLASSIFICATION: PUBLIC
 //!
 //! Pure URL / scope / glob matching primitives extracted from
-//! `ember-daemon/src/infra/proxy.rs` (implementation-note-81).
+//! `ember-daemon/src/infra/proxy.rs` (implementation-note-62).
 //!
 //! These functions have no daemon-state coupling — no `&self`, no DB, no
 //! Vault, no runtime config. They take plain strings (or byte slices) and
@@ -157,6 +157,27 @@ pub fn request_to_action_resource(
             // `openai/*` glob (symmetric with `anthropic/*`). This is the OpenAI
             // branch the comment above anticipated.
             ("llm", "generate", Some("openai"))
+        } else if host_matches_domain(host, "generativelanguage.googleapis.com") {
+            // gemini GATEWAY lane (design slice 2): Google Generative Language
+            // API inference via `generativelanguage.googleapis.com/v1beta/models/
+            // {model}:{generate|streamGenerate|countTokens|embed}Content`. Same
+            // `llm:generate` verb as Anthropic/OpenAI, `google` slug → statements
+            // scope via the `google/*` glob (symmetric with `anthropic/*` /
+            // `openai/*`). The proxy injects `x-goog-api-key` server-side and the
+            // grant carries a `google/gemini-api-key` credential; classifying the
+            // host here is what lets a `google/*` statement clamp the lane (rather
+            // than it falling through to the host-agnostic `generic:write`).
+            ("llm", "generate", Some("google"))
+        } else if host_matches_domain(host, "cloudcode-pa.googleapis.com") {
+            // gemini Code Assist lane (design slice 2): the "Sign in with
+            // Google" free tier is served by the Cloud Code / Code Assist API at
+            // `cloudcode-pa.googleapis.com/v1internal:<method>` (a DIFFERENT host
+            // than the API-key GATEWAY lane above). Same `llm:generate` verb,
+            // same `google` slug → a `google/*` statement glob clamps both
+            // gemini lanes. The proxy injects a daemon-refreshed OAuth Bearer
+            // server-side and the grant carries a `google/`-prefixed OAuth
+            // credential.
+            ("llm", "generate", Some("google"))
         } else {
             (
                 "generic",
@@ -207,7 +228,17 @@ pub fn request_to_action_resource(
 /// provider — breaking `github:*` grant-scope matching. (Sweep 3 finding
 /// S-HOST.) `domain` must NOT start with `.`; the helper adds it.
 pub fn host_matches_domain(host: &str, domain: &str) -> bool {
-    let host = host.to_ascii_lowercase();
+    let host_lower = host.to_ascii_lowercase();
+    // Trim the absolute-FQDN trailing dot (`host.com.`) so the classifier
+    // canonicalizes a host the same way the meter does (`provider_for_host` in
+    // `pricing.rs` already `trim_end_matches('.')`). Without this an
+    // absolute-form host (`generativelanguage.googleapis.com.`, which some
+    // resolver / gRPC stacks emit) under-classifies to the host-agnostic
+    // `generic` lane instead of its provider, diverging from how the same
+    // request meters (adversarial M-1). Strict-suffix matching still rejects
+    // look-alikes (`github.com.evil.com.` → trims to `github.com.evil.com`,
+    // which does not end in `.github.com`).
+    let host = host_lower.trim_end_matches('.');
     let domain = domain.to_ascii_lowercase();
     if host == domain {
         return true;
@@ -663,6 +694,92 @@ mod tests {
                 "openai/backend-api/codex/responses".to_string()
             ))
         );
+
+        // Gemini GATEWAY backend (design slice 2) → llm:generate,
+        // google-slugged resource → covered by a `google/*` statement glob.
+        let uri: http::Uri =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "google/v1beta/models/gemini-3-flash:generateContent".to_string()
+            ))
+        );
+
+        // The streaming method carries a `?alt=sse` query; the resource is
+        // path-only (query excluded), so the same `google/*` glob still clamps it.
+        let uri: http::Uri =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "google/v1beta/models/gemini-3-flash:streamGenerateContent".to_string()
+            ))
+        );
+
+        // Strict domain-suffix matching: a look-alike host must NOT classify as
+        // the google provider (it falls through to `generic:write`).
+        let uri: http::Uri =
+            "https://notgenerativelanguage.googleapis.com.evil.example/v1beta/models/x:generateContent"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "generic:write".to_string(),
+                "/v1beta/models/x:generateContent".to_string()
+            )),
+            "a look-alike host must not be classified as the google llm provider"
+        );
+
+        // Gemini Code Assist ("Sign in with Google") backend → llm:generate,
+        // google-slugged resource → the SAME `google/*` glob covers both gemini
+        // lanes (API-key GATEWAY + OAuth Code Assist), on a different host. Both
+        // GET (operation polls) and POST classify identically (the LLM lane uses
+        // `llm:generate` regardless of method tier).
+        let uri: http::Uri =
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "google/v1internal:streamGenerateContent".to_string()
+            ))
+        );
+        let uri: http::Uri = "https://cloudcode-pa.googleapis.com/v1internal/operations/abc123"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            request_to_action_resource(&http::Method::GET, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "google/v1internal/operations/abc123".to_string()
+            ))
+        );
+
+        // Absolute-FQDN trailing dot still classifies as google (adversarial
+        // M-1): the classifier canonicalizes the host like the meter does, so a
+        // `google/*` grant clamps it rather than it slipping to `generic:write`.
+        let uri: http::Uri =
+            "https://generativelanguage.googleapis.com./v1beta/models/gemini-3-flash:generateContent"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            request_to_action_resource(&post, &uri),
+            Some((
+                "llm:generate".to_string(),
+                "google/v1beta/models/gemini-3-flash:generateContent".to_string()
+            )),
+            "absolute-FQDN trailing dot must still classify as the google provider"
+        );
     }
 
     // ---- is_git_smart_http_path examples ----
@@ -707,10 +824,17 @@ mod tests {
         assert!(!host_matches_domain("evilgithub.com", "github.com"));
         assert!(!host_matches_domain("my-github.com", "github.com"));
 
-        // Unrelated TLD / empty / trailing dot.
+        // Unrelated TLD / empty.
         assert!(!host_matches_domain("github.io", "github.com"));
         assert!(!host_matches_domain("", "github.com"));
-        assert!(!host_matches_domain("github.com.", "github.com"));
+
+        // Absolute-FQDN trailing dot is trimmed (canonicalized), matching how
+        // `provider_for_host` (pricing.rs) normalizes — adversarial M-1.
+        assert!(host_matches_domain("github.com.", "github.com"));
+        assert!(host_matches_domain("api.github.com.", "github.com"));
+        // ...but trimming the dot must NOT open a look-alike bypass.
+        assert!(!host_matches_domain("github.com.evil.com.", "github.com"));
+        assert!(!host_matches_domain("notgithub.com.", "github.com"));
 
         // ASCII-case-insensitive (DNS is case-insensitive; `Uri::host()` does
         // not lowercase) — regression for Sweep 3 finding S-HOST.

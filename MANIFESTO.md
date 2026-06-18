@@ -1,4 +1,3 @@
-
 # The Emberlink Manifesto
 
 ## What we believe
@@ -94,19 +93,6 @@ Grants are bilateral — Alice grants Bob access, Alice's signature is the proof
 
 We get the properties people want from blockchain — immutability, auditability, non-repudiation, censorship resistance — from cryptographic signatures, append-only event logs, and federated relays. Without gas fees, tokens, speculation, or financialization.
 
-## The business model — audit free, compliance paid
-
-**Charge for coordination, compliance, and confidence. Never for the basic act of being safe.**
-
-- **Free / Local.** Warden daemon, local vault, personal grants, audit log, basic connectors, CLI. Forever.
-- **Pro.** Encrypted backup, cross-device sync, managed relay, mobile approval, advanced audit views.
-- **Team.** Shared team policies, grant registry, approval workflows, centralized audit, SIEM export.
-- **Enterprise.** SSO/SAML/OIDC, SCIM, policy-as-code, signed evidence streams, compliance exports, self-hosted control plane.
-
-Grant Receipts at the protocol layer are free and open. Paid tiers monetize coordination across multiple humans, retention beyond local disk, compliance evidence formats enterprise auditors recognize, and the operational expectations of multi-operator environments. The free local daemon is the wedge. It will always exist.
-
-The moment we charge for participation, we have broken the mission.
-
 ## The protocol works without us
 
 The protocol works with zero infrastructure. Non-negotiable.
@@ -115,7 +101,7 @@ The protocol works with zero infrastructure. Non-negotiable.
 
 **Layer 1 — Relay-assisted async.** Relays hold encrypted envelopes for offline recipients. Anyone can run a relay. Relays never see plaintext. If one goes down, pick another. Identity and trust state remain local.
 
-**Layer 2 — Convenience infrastructure.** Cloud backup, managed relays, push notifications, enterprise tooling. Pay for convenience, never for participation.
+**Layer 2 — Convenience infrastructure.** Cloud backup, managed relays, push notifications, and organizational tooling can make the protocol easier to operate, but they are not required for participation.
 
 If every Emberlink server went dark, your identity, your grants, your trust network, and your receipt history still work — they live on your device, and anyone you've delegated to can verify your signature without asking permission.
 
@@ -123,7 +109,7 @@ If every Emberlink server went dark, your identity, your grants, your trust netw
 
 The grant primitive does not stop at AI agents. The same protocol that brokers authority between a human and a coding agent can broker authority between humans, between organizations, between strangers who choose to coordinate without a platform.
 
-That long-arc — *permissionless communities* where creators own their audience graph, where physical locations issue badges, where flash coalitions prove things collectively without revealing individuals — is preserved at the protocol level but is **not the current focus**. The agent economy is the wedge. The general protocol is the foundation that wedge sits on. We will build the consumer expansion when the trust layer for agents is real, deployed, and proven.
+That long-arc — *permissionless communities* where creators own their audience graph, where physical locations issue badges, where flash coalitions prove things collectively without revealing individuals — is preserved at the protocol level but is **not the current focus**. The agent economy is the wedge. The general protocol is the foundation that wedge sits on. We will build the consumer expansion when the Grant Warden path for agents is real, deployed, and proven.
 
 Until then: developer-first, agent-first, daemon-first.
 
@@ -165,4 +151,4 @@ Every credential encrypted. Every access scoped and time-bound. Every action log
 
 Not "trust us." Trust yourself.
 
-Install path and the three-tier integration gradient: [QUICKSTART.md](QUICKSTART.md).
+Install path and integration guide: [QUICKSTART.md](QUICKSTART.md).

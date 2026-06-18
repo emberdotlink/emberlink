@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
-
 # Trust and Verification
 
 Emberlink exposes a **read-only trust inspection surface** today.
@@ -90,6 +85,6 @@ contract.
 
 ## Related pages
 
-- [CLI reference](./cli-reference/)
-- [Receipts and audit](../concepts/receipts-and-audit/)
-- [CLI and troubleshooting](../use/cli-and-troubleshooting/)
+- [CLI reference](./cli-reference.md)
+- [Receipts and audit](../concepts/receipts-and-audit.md)
+- [CLI and troubleshooting](../use/cli-and-troubleshooting.md)

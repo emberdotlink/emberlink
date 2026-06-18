@@ -1,7 +1,6 @@
 //! Binary manifest types — content-hash-pinned binary discovery per design §7.
 //!
-//! The daemon's `~/.ember/binaries/manifest.toml` (per-user) or
-//! `/usr/local/lib/ember/binaries/manifest.toml` (system) binds
+//! The daemon's `/usr/local/lib/ember/binaries/manifest.toml` binds
 //! (tool_name, version) → (absolute_path, blake3 content_hash).
 //! `verify_binary_pin` (in `broker_handler.rs`) consumes this on every
 //! `broker_exec` call and refuses execution on hash mismatch.
@@ -19,10 +18,10 @@
 //! per-publisher mirror) is deferred to v0.4 — see design §7
 //! "Binary distribution channel" amendment.
 //!
-//! Sibling tasks (decomposed under T-CONSTRUCT-PATH-PINNING parent):
-//! - T-CONSTRUCT-PATH-PINNING-CLI: `ember binary install/list/update/remove`
-//! - T-CONSTRUCT-PATH-PINNING-STARTUP-VERIFY: manifest signature gate at daemon startup
-//! - T-CONSTRUCT-BINARY-DISTRIBUTION-CHANNEL: the v0.3.0 channel decision (this file)
+//! Related sub-features:
+//! - the `ember binary install/list/update/remove` CLI surface
+//! - the manifest signature gate at daemon startup
+//! - the v0.3.0 binary distribution channel decision (this file)
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -635,7 +634,7 @@ pub fn parse_trust_roots(raw: &str) -> Result<Vec<VerifyingKey>, VerifyError> {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-124 — peer binary pinning
+// peer binary pinning
 // ---------------------------------------------------------------------------
 
 /// Error variants surfaced by [`verify_peer_binary`]. Distinct from
@@ -858,8 +857,7 @@ mod tests {
     // The parameterized verifier tests (release-only / release+dev /
     // release+N / empty-set) used `tempfile::tempdir` to materialize the
     // signed manifest + sidecar on disk; they were refiled to
-    // `tests/binary_manifest_loader.rs` as T2 integration tests per
-    // implementation-note-125.
+    // `tests/binary_manifest_loader.rs` as T2 integration tests.
     //
     // The `parse_trust_roots` parser tests below are pure-string T1
     // tests that legitimately belong in-tree.
@@ -959,7 +957,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // T-CONSTRUCT-BINARY-DISTRIBUTION-CHANNEL: lookup + channel tests
+    // lookup + channel tests
     // -----------------------------------------------------------------
 
     fn fixture_bundled_entry(tool: &str) -> BinaryManifestEntry {
@@ -976,11 +974,9 @@ mod tests {
 
     #[test]
     fn cohort_a_constructs_covers_v030_friendly_drop_tools() {
-        // Per implementation-note-126 (Cluster A 3d, design review
-        // 20260513-122447): v0.3.0 ships 3 tools (gh/git/kubectl) — the
+        // v0.3.0 ships 3 tools (gh/git/kubectl) — the
         // 3 with daemon-side classifiers. npm/docker/wrangler/pulumi
-        // defer to v0.3.1 (with proper classifiers per
-        // F-S4-V030-CONSOLIDATE-CLASSIFIER) or v0.4. design §8 Touch-1
+        // defer to v0.3.1 (with proper classifiers) or v0.4. design §8 Touch-1
         // prompt names git push only — friendly drop covered.
         assert_eq!(COHORT_A_CONSTRUCTS.len(), 3);
         assert!(is_cohort_a_construct("ember-gh"));
@@ -1066,7 +1062,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-124 — peer binary
+    // Peer binary
     // pinning gate. The broker handlers refuse a request whose peer
     // binary (resolved via /proc/<pid>/exe + blake3) is not in the
     // signed manifest, or whose process is being traced.

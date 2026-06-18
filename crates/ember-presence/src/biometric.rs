@@ -2,7 +2,7 @@
 //! `ember approval approve <id>` from the CLI, and the headless engine's
 //! session-runtime presence acquisition from `headless-runtime`.
 //!
-//! Originally `implementation-note-201` inside `emberlink-cli`; moved here so the
+//! Originally `implementation-note-294` inside `emberlink-cli`; moved here so the
 //! LocalAuthentication FFI lives in one audited place shared by both callers.
 //!
 //! CLASSIFICATION: PUBLIC

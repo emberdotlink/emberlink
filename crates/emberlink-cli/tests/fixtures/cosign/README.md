@@ -1,4 +1,3 @@
-
 Static fixture for `cosign_dual_witness_real_fixture_integration`.
 
 `manifest.cosign-bundle.json` is a no-Rekor negative fixture generated with

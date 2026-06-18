@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use super::*;
+use core_event_types::ActionRef;
 use core_grant_types::{ResourceSelector, ResourceType, StatementProposal};
 use serde::Serialize;
 
-/// implementation-note-242 — Layer 1 pre-flight handler.
+/// implementation-note-178 — Layer 1 pre-flight handler.
 ///
-/// implementation-note-243
+/// implementation-note-179
 ///
 /// Parses the caller-supplied `tasks` + optional `template`, resolves each
 /// task's declared constructs through the bundled cohort-A manifest registry
@@ -147,6 +148,106 @@ pub(super) fn bundled_construct_registry()
         registry.insert(m.name.clone(), m);
     }
     Ok(registry)
+}
+
+pub(super) fn handle_catalog_search_actions(params: &Value) -> Result<Value, (i32, String)> {
+    let query = params
+        .get("query")
+        .or_else(|| params.get("q"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let service_filter = params
+        .get("service")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 100) as usize;
+
+    let mut registry = bundled_construct_registry().map_err(|e| {
+        (
+            -32000,
+            format!("load bundled construct manifest registry: {e}"),
+        )
+    })?;
+    let mut manifests = registry
+        .drain()
+        .map(|(_, manifest)| manifest)
+        .collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut rows = Vec::new();
+    'manifest: for manifest in manifests {
+        if let Some(service_filter) = service_filter.as_deref() {
+            let service_matches = manifest.name.to_ascii_lowercase().contains(service_filter)
+                || manifest
+                    .plugin_address
+                    .as_deref()
+                    .map(|value| value.to_ascii_lowercase().contains(service_filter))
+                    .unwrap_or(false);
+            if !service_matches {
+                continue 'manifest;
+            }
+        }
+
+        for action in manifest.actions {
+            let action_ref = match (&manifest.plugin_address, action.action_version.as_deref()) {
+                (Some(plugin_address), Some(action_version)) => Some(
+                    ActionRef::new(plugin_address.clone(), action.key.clone(), action_version)
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            let authority_refs = if action.authority_refs.is_empty() {
+                manifest.authority_refs.clone()
+            } else {
+                action.authority_refs.clone()
+            };
+            let semantic_labels = action.semantic_labels.join(" ");
+            let need_text = action.need.join(" ");
+            let authority_refs_text = authority_refs.join(" ");
+            let haystack = [
+                manifest.name.as_str(),
+                manifest.plugin_address.as_deref().unwrap_or(""),
+                action.key.as_str(),
+                action_ref.as_deref().unwrap_or(""),
+                semantic_labels.as_str(),
+                need_text.as_str(),
+                authority_refs_text.as_str(),
+            ]
+            .join(" ")
+            .to_ascii_lowercase();
+            if !query.is_empty() && !haystack.contains(&query) {
+                continue;
+            }
+            rows.push(json!({
+                "service": manifest.name,
+                "plugin_address": manifest.plugin_address,
+                "plugin_version": manifest.plugin_version,
+                "description": manifest.description,
+                "action_key": action.key,
+                "action_version": action.action_version,
+                "action_ref": action_ref,
+                "default_policy": action.default_policy,
+                "risk_tier": action.risk_tier,
+                "semantic_labels": action.semantic_labels,
+                "need": action.need,
+                "authority_refs": authority_refs,
+            }));
+            if rows.len() >= limit {
+                return Ok(json!({ "actions": rows }));
+            }
+        }
+    }
+
+    Ok(json!({ "actions": rows }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,6 +1197,51 @@ pub(super) async fn handle_preflight_authority_coverage(
         .collect();
 
     Ok(Value::Array(rows))
+}
+
+#[cfg(test)]
+mod catalog_search_actions_tests {
+    use super::handle_catalog_search_actions;
+    use serde_json::json;
+
+    #[test]
+    fn projects_action_manifest_identity_need_and_policy() {
+        let result =
+            handle_catalog_search_actions(&json!({"service": "ember-gh", "query": "pr_list"}))
+                .expect("catalog search succeeds");
+        let actions = result["actions"].as_array().expect("actions array");
+        let row = actions
+            .iter()
+            .find(|row| row["action_key"] == "pr_list")
+            .expect("pr_list row");
+
+        assert_eq!(row["service"], "ember-gh");
+        assert_eq!(
+            row["action_ref"],
+            "registry.ember.systems/ember-systems/ember-gh/pr_list@v1"
+        );
+        assert_eq!(row["default_policy"], "permit");
+        assert_eq!(row["risk_tier"], "low");
+        assert_eq!(
+            row["need"],
+            json!(["github:metadata:read", "github:pull_request:read"])
+        );
+        assert_eq!(row["authority_refs"], json!(["github"]));
+    }
+
+    #[test]
+    fn applies_limit_and_does_not_project_invocation_tools() {
+        let result = handle_catalog_search_actions(&json!({"query": "github", "limit": 2}))
+            .expect("catalog search succeeds");
+        let actions = result["actions"].as_array().expect("actions array");
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|row| row.get("invoke").is_none() && row.get("tool_name").is_none()),
+            "catalog rows are metadata projections, not dynamic action.invoke shims"
+        );
+    }
 }
 
 #[cfg(test)]

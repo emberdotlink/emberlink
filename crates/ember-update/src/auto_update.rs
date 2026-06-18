@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! Auto-update decision composition (subtask A of `update-policy`).
+//! Auto-update decision composition (subtask A of `implementation note`).
 //!
 //! Anchor: `ember_up_auto_update`.
 //!
@@ -33,7 +33,7 @@
 //!    posture as pointer-invalid — an unsigned or unverifiable revocations
 //!    document cannot be safely treated as "no revocations".
 //! 3. **Signed revocations document is stale (older than 30 min by default,
-//!    per update-policy D5)** → return
+//!    per design note D5)** → return
 //!    [`UpdateDecision::BlockedByStaleRevocations`] so the operator
 //!    sees the staleness, not a misleading "no update available".
 //!    Other revocation trust failures, including future-issued documents,
@@ -81,7 +81,7 @@ pub enum UpdateDecision {
         manifest_uri: String,
     },
     /// `current_digest` is listed in the fresh revocations document.
-    /// Caller routes per `action` (per update-policy
+    /// Caller routes per `action` (per design note
     /// D5 severity-action table) and surfaces `reason` to the operator.
     CurrentRevoked {
         severity: RevocationSeverity,
@@ -284,7 +284,7 @@ mod tests {
         let revs = empty_revocations(&rev_sk, now_ms / 1000);
         let poller = RevocationsPoller::with_trusted_signer(rev_vk);
         let decision = decide_update(current, &p, &vk, &revs, &poller, now_ms).unwrap();
-        // ember_up_auto_update — anchor mirrored in a test body so
+        // ember_up_auto_update — checkpoint mirrored in a test body so
         // grep verification covers production + test paths.
         assert_eq!(decision, UpdateDecision::NoUpdate);
     }

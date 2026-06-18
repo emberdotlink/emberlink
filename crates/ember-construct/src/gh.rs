@@ -573,7 +573,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // V030-FACTORY-RESOLVER-implementation-note-101: GhFactory::resolve_target_from_environment
+    // V030-FACTORY-RESOLVER-implementation-note-82: GhFactory::resolve_target_from_environment
     //
     // AC-1 happy path: real git repo with github origin → synthesizes
     //                  `--repo owner/repo` into argv.

@@ -799,7 +799,7 @@ mod tests {
 
     /// 1. Successful issue path: returns a `SecretRef` + materialization
     ///    id, AND emits a `broker.materialization` row in the audit log.
-    ///    Per implementation-note-19 the response MUST NOT
+    ///    Per implementation-note-16 the response MUST NOT
     ///    contain a raw `token` / `value` field — agent processes hold
     ///    only the opaque ref.
     #[tokio::test]
@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(parsed["mint_stamp_kind"], json!("opaque"));
         assert!(parsed.get("provider_scope_attestable").is_none());
         assert_eq!(parsed["authority_basis"], json!("grant"));
-        // implementation-note-20: fresh_registry registers
+        // implementation-note-17: fresh_registry registers
         // anthropic via the real-broker lane (`register`, not `register_mock`).
         assert_eq!(parsed["mock_broker"], json!(false));
     }
@@ -1235,7 +1235,7 @@ mod tests {
     async fn broker_issue_method_name_marker_present() {
         // The RPC method name is literally "broker_issue" — assert it
         // here so the marker grep stays load-bearing rather than a
-        // soft contract that drifts. See implementation-note-148 marker req.
+        // soft contract that drifts. See implementation-note-128 marker req.
         let probe = "broker_issue";
         assert_eq!(probe, "broker_issue");
         // Also verify provider names line up with `BrokerProvider::as_str`
@@ -1522,7 +1522,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-149 — the registry issue
+    /// implementation-note-129 — the registry issue
     /// path must consume the per-cohort ladder decision instead of leaving
     /// every cohort at the old fail-closed placeholder.
     #[tokio::test]

@@ -32,7 +32,7 @@
 //! with `Error::LegacyUnwrappedFormat` so the operator re-enrolls under
 //! the wrapped scheme rather than silently consuming an insecure entry.
 //!
-//! ## Scope (implementation-note-169)
+//! ## Scope (implementation-note-143)
 //!
 //! - Generate keychain-backed storage for one MEK per persona-enrollment.
 //! - Persist the single active-enrollment metadata slot under the daemon
@@ -150,7 +150,7 @@ impl std::error::Error for Error {}
 /// the operator's real login keychain.
 fn use_mock_keychain() -> bool {
     cfg!(test)
-        || std::env::var("EMBER_VAULT_MOCK").is_ok()
+        || crate::infra::vault::vault_mock_env_enabled()
         || crate::infra::vault::is_cargo_test_binary()
 }
 
@@ -1051,7 +1051,7 @@ mod tests {
     }
 }
 
-// implementation-note-170 anchor: this constant marks
+// implementation-note-144 anchor: this constant marks
 // the crate-level B1+B2 landing for grep-time auditability.
 #[doc(hidden)]
 pub const VAULT_SCOPE_MEK_SPLIT_CRYPTOGRAPHIC_LANDED: &str =

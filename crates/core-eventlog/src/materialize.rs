@@ -337,7 +337,7 @@ pub fn apply_event(
             // Defense-in-depth: both devices must belong to the event's root_id.
             // authorize.rs only checks that the signer holds the root key for body.root_id;
             // without these ownership checks, a root could mark another root's device as
-            // Replaced by a third root's device. See docs/the security review
+            // Replaced by a third root's device. See the security review
             let replacement = state
                 .devices_current
                 .get(&body.replacement_device_id)
@@ -517,7 +517,7 @@ pub fn apply_event(
             // Defense-in-depth: reject duplicate request_id. Without this, a root can
             // replay RecoveryRequested with the same request_id to wipe accumulated
             // guardian approvals, cooldown, and contest state. authorize.rs does not
-            // enforce uniqueness. See docs/the security review
+            // enforce uniqueness. See the security review
             if state
                 .recovery_requests_current
                 .contains_key(&body.request_id)
@@ -973,11 +973,15 @@ mod tests {
     use super::*;
     use core_crypto::FixtureSigner;
     use core_event_types::{
-        DeviceEnrolledEvent, DeviceReplacedEvent, EventBody, RecoveryRequestedEvent,
-        RootCreatedEvent, SignerBinding,
+        DeviceEnrolledEvent, DeviceReplacedEvent, EventBody, EventSubject, KeyRole,
+        RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent,
+        RecoveryRejectedEvent, RecoveryRequestedEvent, RootCreatedEvent, SignerBinding,
+        SubjectKind,
     };
     use core_events::{EventEnvelope, EventRef as CrateEventRef};
-    use core_principals::{KeyAlgorithm, PublicKeyMaterial};
+    use core_principals::{KeyAlgorithm, PublicKeyMaterial, RecoveryScope};
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn make_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
@@ -1169,6 +1173,317 @@ mod tests {
             },
         );
         state
+    }
+
+    // implementation marker
+    #[derive(Clone, Debug)]
+    enum RecoveryOp {
+        Request {
+            slot: u8,
+            target_device_exists: bool,
+        },
+        Approve {
+            slot: u8,
+            guardian: u8,
+        },
+        Contest {
+            slot: u8,
+            guardian: u8,
+            reason: u8,
+            contested_at_epoch: u64,
+        },
+        Reject {
+            slot: u8,
+            reason: u8,
+        },
+        Execute {
+            slot: u8,
+            scope: RecoveryScope,
+        },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ExpectedRecoveryRequest {
+        root_id: String,
+        target_device_id: String,
+        approvals: BTreeSet<String>,
+        contested_by: BTreeSet<String>,
+        status: RecoveryRequestStatus,
+        executed_scope: Option<RecoveryScope>,
+        cooldown_until: Option<u64>,
+        contest_reason: Option<String>,
+        rejection_reason: Option<String>,
+    }
+
+    fn arb_recovery_scope() -> impl Strategy<Value = RecoveryScope> {
+        prop_oneof![
+            Just(RecoveryScope::FreezeDevice),
+            Just(RecoveryScope::RestorePersonaAccess),
+        ]
+    }
+
+    fn arb_recovery_op() -> impl Strategy<Value = RecoveryOp> {
+        prop_oneof![
+            (0u8..4, any::<bool>()).prop_map(|(slot, target_device_exists)| {
+                RecoveryOp::Request {
+                    slot,
+                    target_device_exists,
+                }
+            }),
+            (0u8..4, 0u8..4).prop_map(|(slot, guardian)| RecoveryOp::Approve { slot, guardian }),
+            (0u8..4, 0u8..4, 0u8..4, 0u64..10_000).prop_map(
+                |(slot, guardian, reason, contested_at_epoch)| RecoveryOp::Contest {
+                    slot,
+                    guardian,
+                    reason,
+                    contested_at_epoch,
+                },
+            ),
+            (0u8..4, 0u8..4).prop_map(|(slot, reason)| RecoveryOp::Reject { slot, reason }),
+            (0u8..4, arb_recovery_scope())
+                .prop_map(|(slot, scope)| RecoveryOp::Execute { slot, scope }),
+        ]
+    }
+
+    fn request_id(slot: u8) -> String {
+        format!("req-{slot}")
+    }
+
+    fn guardian_id(guardian: u8) -> String {
+        format!("guardian-{}", guardian + 1)
+    }
+
+    fn reason_text(reason: u8) -> String {
+        format!("reason-{reason}")
+    }
+
+    fn signer_for_guardian(guardian_id: &str) -> SignerBinding {
+        SignerBinding {
+            signer: EventSubject::new(SubjectKind::Guardian, guardian_id),
+            role: KeyRole::Guardian,
+            key_id: format!("key-{guardian_id}"),
+        }
+    }
+
+    fn recovery_event(idx: usize, op: &RecoveryOp) -> EventEnvelope {
+        let event_id = format!("evt-recovery-prop-{idx}");
+        match op {
+            RecoveryOp::Request {
+                slot,
+                target_device_exists,
+            } => make_event(
+                &event_id,
+                EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                    request_id: request_id(*slot),
+                    root_id: "root-a".into(),
+                    target_device_id: if *target_device_exists {
+                        "device-a".into()
+                    } else {
+                        "missing-device".into()
+                    },
+                }),
+                SignerBinding::root("root-a", "key-root-a"),
+            ),
+            RecoveryOp::Approve { slot, guardian } => {
+                let guardian_id = guardian_id(*guardian);
+                make_event(
+                    &event_id,
+                    EventBody::RecoveryApproved(RecoveryApprovedEvent {
+                        request_id: request_id(*slot),
+                        guardian_id: guardian_id.clone(),
+                    }),
+                    signer_for_guardian(&guardian_id),
+                )
+            }
+            RecoveryOp::Contest {
+                slot,
+                guardian,
+                reason,
+                contested_at_epoch,
+            } => {
+                let guardian_id = guardian_id(*guardian);
+                make_event(
+                    &event_id,
+                    EventBody::RecoveryContested(RecoveryContestedEvent {
+                        request_id: request_id(*slot),
+                        guardian_id: guardian_id.clone(),
+                        reason: reason_text(*reason),
+                        contested_at_epoch: *contested_at_epoch,
+                    }),
+                    signer_for_guardian(&guardian_id),
+                )
+            }
+            RecoveryOp::Reject { slot, reason } => make_event(
+                &event_id,
+                EventBody::RecoveryRejected(RecoveryRejectedEvent {
+                    request_id: request_id(*slot),
+                    rejected_by: "root-a".into(),
+                    reason: reason_text(*reason),
+                }),
+                SignerBinding::root("root-a", "key-root-a"),
+            ),
+            RecoveryOp::Execute { slot, scope } => make_event(
+                &event_id,
+                EventBody::RecoveryExecuted(RecoveryExecutedEvent {
+                    request_id: request_id(*slot),
+                    executed_scope: *scope,
+                }),
+                SignerBinding::root("root-a", "key-root-a"),
+            ),
+        }
+    }
+
+    fn apply_expected_recovery_op(
+        expected: &mut BTreeMap<String, ExpectedRecoveryRequest>,
+        op: &RecoveryOp,
+    ) -> Result<(), ()> {
+        match op {
+            RecoveryOp::Request {
+                slot,
+                target_device_exists,
+            } => {
+                let request_id = request_id(*slot);
+                if expected.contains_key(&request_id) || !target_device_exists {
+                    return Err(());
+                }
+                expected.insert(
+                    request_id,
+                    ExpectedRecoveryRequest {
+                        root_id: "root-a".into(),
+                        target_device_id: "device-a".into(),
+                        approvals: BTreeSet::new(),
+                        contested_by: BTreeSet::new(),
+                        status: RecoveryRequestStatus::Requested,
+                        executed_scope: None,
+                        cooldown_until: None,
+                        contest_reason: None,
+                        rejection_reason: None,
+                    },
+                );
+                Ok(())
+            }
+            RecoveryOp::Approve { slot, guardian } => {
+                let request = expected.get_mut(&request_id(*slot)).ok_or(())?;
+                if matches!(
+                    request.status,
+                    RecoveryRequestStatus::Contested
+                        | RecoveryRequestStatus::Rejected
+                        | RecoveryRequestStatus::Executed
+                ) {
+                    return Err(());
+                }
+                request.approvals.insert(guardian_id(*guardian));
+                if request.approvals.len() >= 2 {
+                    request.status = RecoveryRequestStatus::Approved;
+                }
+                Ok(())
+            }
+            RecoveryOp::Contest {
+                slot,
+                guardian,
+                reason,
+                contested_at_epoch,
+            } => {
+                let request = expected.get_mut(&request_id(*slot)).ok_or(())?;
+                if matches!(
+                    request.status,
+                    RecoveryRequestStatus::Rejected | RecoveryRequestStatus::Executed
+                ) {
+                    return Err(());
+                }
+                request.contested_by.insert(guardian_id(*guardian));
+                request.status = RecoveryRequestStatus::Contested;
+                request.cooldown_until = Some(*contested_at_epoch + 3600);
+                request.contest_reason = Some(reason_text(*reason));
+                Ok(())
+            }
+            RecoveryOp::Reject { slot, reason } => {
+                let request = expected.get_mut(&request_id(*slot)).ok_or(())?;
+                if request.status == RecoveryRequestStatus::Executed {
+                    return Err(());
+                }
+                request.status = RecoveryRequestStatus::Rejected;
+                request.cooldown_until = None;
+                request.rejection_reason = Some(reason_text(*reason));
+                Ok(())
+            }
+            RecoveryOp::Execute { slot, scope } => {
+                let request = expected.get_mut(&request_id(*slot)).ok_or(())?;
+                if request.cooldown_until.is_some()
+                    || request.status != RecoveryRequestStatus::Approved
+                {
+                    return Err(());
+                }
+                request.status = RecoveryRequestStatus::Executed;
+                request.executed_scope = Some(*scope);
+                Ok(())
+            }
+        }
+    }
+
+    fn assert_recovery_state_matches_model(
+        state: &MaterializedState,
+        expected: &BTreeMap<String, ExpectedRecoveryRequest>,
+    ) -> Result<(), TestCaseError> {
+        prop_assert_eq!(state.recovery_requests_current.len(), expected.len());
+        for (request_id, expected_request) in expected {
+            let actual = state
+                .recovery_requests_current
+                .get(request_id)
+                .ok_or_else(|| TestCaseError::fail(format!("missing request {request_id}")))?;
+            prop_assert_eq!(&actual.root_id, &expected_request.root_id);
+            prop_assert_eq!(&actual.target_device_id, &expected_request.target_device_id);
+            prop_assert_eq!(&actual.approvals, &expected_request.approvals);
+            prop_assert_eq!(&actual.contested_by, &expected_request.contested_by);
+            prop_assert_eq!(&actual.status, &expected_request.status);
+            prop_assert_eq!(&actual.executed_scope, &expected_request.executed_scope);
+            prop_assert_eq!(&actual.cooldown_until, &expected_request.cooldown_until);
+            prop_assert_eq!(&actual.contest_reason, &expected_request.contest_reason);
+            prop_assert_eq!(&actual.rejection_reason, &expected_request.rejection_reason);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn recovery_lifecycle_sequences_match_expected_state_machine(
+            ops in proptest::collection::vec(arb_recovery_op(), 1..64),
+        ) {
+            let mut state = state_with_recovery_context();
+            let mut expected = BTreeMap::new();
+
+            for (idx, op) in ops.iter().enumerate() {
+                let mut next_expected = expected.clone();
+                let expected_result = apply_expected_recovery_op(&mut next_expected, op);
+                let before_requests = state.recovery_requests_current.clone();
+                let event = recovery_event(idx, op);
+                let actual_result = apply_event(&mut state, &event);
+
+                prop_assert_eq!(
+                    actual_result.is_ok(),
+                    expected_result.is_ok(),
+                    "apply_event/model parity failed for op {}: {:?}; actual={:?}",
+                    idx,
+                    op,
+                    actual_result
+                );
+
+                if actual_result.is_ok() {
+                    expected = next_expected;
+                } else {
+                    prop_assert_eq!(
+                        &state.recovery_requests_current,
+                        &before_requests,
+                        "failed recovery op mutated materialized request state: {:?}",
+                        op
+                    );
+                }
+
+                assert_recovery_state_matches_model(&state, &expected)?;
+            }
+        }
     }
 
     #[test]

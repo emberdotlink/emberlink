@@ -8,17 +8,11 @@ publish = false
 
 [dependencies]
 core-mcp = { path = "../core-mcp" }
-core-state = { path = "../core-state" }
-core-types = { path = "../core-types" }
-emberlink-agent = { path = "../emberlink-agent" }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `rt-multi-thread` + `time` + `net` are required for the in-container
-# mTLS bridge transport (design component 1, implementation-note-485):
-# the bridge transport owns its own multi-thread runtime so sync
-# `DaemonClient` callers (which are themselves called from main's
-# current_thread runtime) can block on tokio I/O without nested-runtime
-# panics.
+# mTLS bridge transport (design component 1, implementation-note-388):
+# the bridge transport owns its own multi-thread runtime so the stdio server's
+# synchronous daemon calls can block on tokio I/O without nested-runtime panics.
 tokio = { version = "1", features = ["io-std", "io-util", "rt", "rt-multi-thread", "macros", "net", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"

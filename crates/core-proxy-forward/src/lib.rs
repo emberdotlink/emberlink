@@ -1,14 +1,15 @@
 //! CLASSIFICATION: PUBLIC
 //! core-proxy-forward — HTTP CONNECT / forward-proxy primitives.
 //!
-//! Skeleton substrate landed in implementation-note-79; the
-//! actual forward-proxy logic migrates in a follow-up slice (implementation-note-80-
+//! Skeleton substrate landed in implementation-note-60; the
+//! actual forward-proxy logic migrates in a follow-up slice (implementation-note-61-
 //! CRATE-RENAME-C-MIGRATE, filed separately when needed).
 
 pub mod policy_backend;
 pub use policy_backend::{
     ChatgptPlanAuth, ColocatedBackend, GrantRecord, PolicyBackend, PolicyError, PreflightDecision,
-    ProxyState, ResolvedAttachmentAuthority, ResolvedGrant, SessionGatewayAuthority,
+    ProxyCallReceiptRequest, ProxyState, ResolvedAttachmentAuthority, ResolvedGrant,
+    SessionGatewayAuthority,
 };
 
 pub mod event_sink;

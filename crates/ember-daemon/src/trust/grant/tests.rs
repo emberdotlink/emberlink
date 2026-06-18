@@ -429,7 +429,7 @@ fn grant_persona_secret_rejects_splice_tamper_and_truncation() {
     expect_resign_refused(&grant_a.id, "truncated blob");
 }
 
-// implementation-note-238 — per-statement revoke unit tests.
+// Per-statement revoke unit tests.
 
 #[test]
 fn revoke_grant_statement_appends_sid() {
@@ -483,7 +483,7 @@ fn revoke_grant_statement_unknown_grant_returns_not_found() {
     assert!(matches!(result, Err(StoreError::NotFound)));
 }
 
-// implementation-note-284 — cascade test. Revoking a
+// Revocation parent-walk cascade test. Revoking a
 // statement on an ancestor persona's grant must surface as a revoked
 // sid when reading the descendant grant's revoked set, so the proxy's
 // per-call check (`get_revoked_sids(&grant.id).contains(&resolved_sid)`)
@@ -532,7 +532,7 @@ fn revocation_cascades_through_parent_chain() {
     );
 }
 
-// implementation-note-284 — middle-of-chain revocation
+// Revocation parent-walk: middle-of-chain revocation
 // also cascades to descendants but NOT to ancestors. Sibling grants
 // owned by the same intermediate persona share the revocation
 // (BTreeSet union over all grants owned by every ancestor).
@@ -1332,7 +1332,7 @@ fn access_grant_from_statements_produces_verifiable_chain() {
 }
 
 /// `access_grant_from_statements_for_persona` returns the same `AccessGrant`
-/// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-356).
+/// as the explicit-root form when both use the same persona.
 #[test]
 fn access_grant_from_statements_for_persona_matches_explicit_root() {
     let store = setup();
@@ -2492,7 +2492,7 @@ fn resume_grant_is_idempotent() {
 
 #[test]
 fn list_active_grants_includes_paused() {
-    // implementation-note-189 — paused grants are reversible; the operator
+    // Paused grants are reversible; the operator
     // who pauses a grant must still see it on the Active list to be
     // able to resume it. Terminal states (revoked / expired /
     // exhausted_by_budget) belong behind the "show terminated"
@@ -3935,7 +3935,7 @@ fn delegate_grant_emits_grant_minted_audit_event() {
     assert_eq!(details["parent_grant_id"], parent.id);
 }
 
-/// implementation-note-109 — end-to-end:
+/// Production spawn-witness emission — end-to-end:
 ///   1. Initialise the daemon identity (required by the emit path).
 ///   2. Create parent + child personas; mint a parent grant with
 ///      delegation depth.
@@ -4214,7 +4214,7 @@ fn test_daemon_grant_store_revoke_cascade_via_adapter() {
 // ---- ADR191_PAYMENT_BUILD_AHEAD: payment reserve/settle lane ----------
 // These tests exercise the preserved design payment substrate
 // (reserve_payment_tool_call → evaluate_payment_tool_call) directly. The
-// implementation-note-255 PreToolUse hook that formerly entered this lane was retired;
+// PreToolUse hook that formerly entered this lane was retired;
 // the payment lane itself is build-ahead and kept proven by these tests.
 
 #[test]
@@ -4728,7 +4728,7 @@ fn tool_call_decision_round_trips_via_serde_json() {
     assert_eq!(back, d);
 }
 
-// --- implementation-note-213: derive_wall_clock_secs unit tests ---
+// --- derive_wall_clock_secs unit tests ---
 
 #[test]
 fn wall_clock_derive_mid_grant() {

@@ -104,7 +104,7 @@ proptest! {
 // ─── prop_client_cert_subject_cn_matches_persona ─────────────────────────────
 
 proptest! {
-    /// Subject CN must be ember-persona-<agent_id> (implementation-note-40).
+    /// Subject CN must be ember-persona-<agent_id> (implementation-note-27).
     #[test]
     fn prop_client_cert_subject_cn_matches_persona(
         agent_id in "[a-z][a-z0-9-]{1,15}",
@@ -187,7 +187,7 @@ fn mint_rejects_invalid_validity_over_limit() {
 
 // ─── prop_client_cert_san_has_spiffe_persona_container ───────────────────────
 //
-// implementation-note-40: when container_id is Some, the cert
+// implementation-note-27: when container_id is Some, the cert
 // MUST carry both SPIFFE URI SANs in addition to the URN compat URI.
 
 proptest! {

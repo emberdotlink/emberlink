@@ -1,4 +1,4 @@
-//! implementation-note-438 — T2 integration tests for
+//! implementation-note-342 — T2 integration tests for
 //! `ember status --session`. The brief asks for a T2 that opens a session
 //! via `ember claude-code`, but the claude-code launcher requires a
 //! provisioned daemon + vault + persona — out of scope for a T2 gate.

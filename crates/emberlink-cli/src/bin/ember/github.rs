@@ -232,6 +232,8 @@ pub(super) fn init_command_with_ember_command(
     match for_target {
         Some(OnboardingTarget::Claude) => format!("{ember_cmd} init --for claude"),
         Some(OnboardingTarget::Codex) => format!("{ember_cmd} init --for codex"),
+        Some(OnboardingTarget::Cursor) => format!("{ember_cmd} init --for cursor"),
+        Some(OnboardingTarget::Gemini) => format!("{ember_cmd} init --for gemini"),
         None => format!("{ember_cmd} init"),
     }
 }

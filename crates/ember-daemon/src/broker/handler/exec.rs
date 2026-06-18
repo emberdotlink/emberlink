@@ -17,15 +17,13 @@ use core_event_types::ActionRef;
 use core_events::construct_toml::TerminalMode;
 use serde_json::Value;
 
-use crate::broker::runners::{
-    RunnerBinarySource, RunnerCwdSource, RunnerDispatchResolution,
-    dispatch_runner_for_exec_with_workspace_path, runner_class_as_str,
-};
+use crate::broker::runners::{RunnerBinarySource, RunnerCwdSource, runner_class_as_str};
 use crate::infra::receipt::current_identity;
 use crate::infra::rpc_error::RpcError;
 use crate::infra::store::DaemonStore;
 use crate::session::lifecycle::DaemonPersonaSigner;
 
+use super::exec_admission::admit_broker_exec_contract;
 use super::exec_credentials::{
     maybe_seal_credentials_in_env, mint_and_inject_for_action, origin_owner_repo_from_cwd,
     resolve_gh_repo_from_argv, revoke_minted_credential,
@@ -36,9 +34,9 @@ use super::exec_policy::{
     APPROVAL_BINDING_PENDING_TTL_SECS, ConstructExecPolicy, NestedExecutionContractRequirement,
     approval_binding_scope, approval_required_response, capture_text_tail,
     daemon_classification_tool_name, execution_contract_digest, extract_remote_name_daemon_side,
-    inherit_execution_contract_from_resolve, inject_ephemeral_git_safe_directory,
-    invocation_plan_digest, lookup_binary_in_manifest, parse_construct_exec_policy,
-    reject_legacy_broker_exec_fields, runner_action_matches_authority_action, sha256_hex_text,
+    inject_ephemeral_git_safe_directory, invocation_plan_digest, lookup_binary_in_manifest,
+    parse_construct_exec_policy, reject_legacy_broker_exec_fields,
+    runner_action_matches_authority_action, sha256_hex_text,
     validate_nested_execution_contract_wire_shape, warn_ignored_execution_contract_mirror_fields,
 };
 #[cfg(unix)]
@@ -344,7 +342,7 @@ fn resolve_broker_exec_uid_lease(
     let pool = uid_alloc::global_pool().ok_or((
         -32021,
         "spawn pool not configured — `ember daemon install` must provision the uid pool \
-         (implementation-note-139)"
+         (implementation-note-119)"
             .to_string(),
     ))?;
 
@@ -364,7 +362,7 @@ fn resolve_broker_exec_uid_lease(
     let lease = pool.checkout(&spawn_id).map_err(|e| match e {
         uid_alloc::UidAllocError::PoolEmpty => (
             -32021,
-            format!("spawn pool unavailable: {e} (implementation-note-139)"),
+            format!("spawn pool unavailable: {e} (implementation-note-119)"),
         ),
         uid_alloc::UidAllocError::PoolExhausted { .. } => RpcError::PoolExhausted {
             retry_after_ms: 100,
@@ -393,7 +391,7 @@ fn resolve_broker_exec_uid_lease(
                     "refusing to spawn child as daemon uid (Finding 14): \
                      pool allocated uid {} but daemon runs as uid {} — \
                      fix `[spawn_pool] uids = [...]` in config.toml \
-                     (implementation-note-139)",
+                     (implementation-note-119)",
                     lease.uid(),
                     daemon_uid
                 ),
@@ -679,10 +677,11 @@ mod host_direct_non_pty_route_tests {
     fn inject_ephemeral_git_safe_directory_appends_after_git_rewrite_entries() {
         let mut env = HashMap::new();
         env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
-        env.insert(
-            "GIT_CONFIG_KEY_0".to_string(),
-            "url.https://x-access-token:{plaintext}@github.com/.insteadOf".to_string(),
+        let existing_rewrite_key = format!(
+            "url.https://x-access-token:{}@github.com/.insteadOf",
+            "{plaintext}"
         );
+        env.insert("GIT_CONFIG_KEY_0".to_string(), existing_rewrite_key);
         env.insert(
             "GIT_CONFIG_VALUE_0".to_string(),
             "https://github.com/".to_string(),
@@ -1064,90 +1063,26 @@ pub async fn handle_broker_exec_with_sessions(
         }
     }
 
-    let request_contract = req
-        .execution_contract
-        .clone()
-        .ok_or((-32602, "broker_exec missing_execution_contract".to_string()))?;
-    let mut execution_contract = if let Some(handle) = pending_spawn_handle.as_ref() {
-        Some(inherit_execution_contract_from_resolve(
-            request_contract,
-            &handle.execution_contract,
-        )?)
-    } else {
-        Some(request_contract)
-    };
-    let contract_id = execution_contract
-        .as_ref()
-        .and_then(|contract| contract.contract_id.clone())
-        .unwrap_or_else(|| format!("contract-{}", uuid::Uuid::new_v4()));
-    if let Some(contract) = execution_contract.as_mut()
-        && contract.contract_id.is_none()
-    {
-        contract.contract_id = Some(contract_id.clone());
-    }
-    let action_ref = execution_contract
-        .as_ref()
-        .map(|contract| contract.action_ref.clone());
-    let workspace_ref = execution_contract
-        .as_ref()
-        .and_then(|contract| contract.workspace_ref.clone());
-    let subject_ref = execution_contract
-        .as_ref()
-        .and_then(|contract| contract.subject_ref.clone());
-    let coordination_ref = execution_contract
-        .as_ref()
-        .and_then(|contract| contract.coordination_ref.clone());
-    let compatibility_cwd = if workspace_ref.is_some() {
-        if let Some(cwd) = req.cwd.as_deref().filter(|value| !value.is_empty()) {
-            tracing::warn!(
-                cwd = %cwd,
-                "broker_exec: deprecated cwd compatibility fallback ignored because nested execution_contract.workspace_ref is present"
-            );
-        }
-        None
-    } else {
-        req.cwd.clone().filter(|value| !value.is_empty())
-    };
-    let caller_ref = execution_contract
-        .as_ref()
-        .and_then(|contract| contract.caller_ref.clone());
-    let mut authority_ref = execution_contract
-        .as_ref()
-        .and_then(|contract| contract.authority_ref.clone());
-    if let Some(contract) = execution_contract.as_ref() {
-        contract
-            .validate()
-            .map_err(|e| (-32602, format!("invalid execution_contract: {e}")))?;
-    }
-    let action_ref = action_ref.ok_or((
-        -32602,
-        "broker_exec requires execution_contract.action_ref".to_string(),
-    ))?;
-
-    let workspace_path_hint = resolved_attachment_authority
-        .as_ref()
-        .and_then(|authority| {
-            let workspace_ref = workspace_ref.as_deref()?;
-            let authority_ref = authority.workspace_ref.as_deref()?;
-            (workspace_ref == authority_ref)
-                .then_some(authority.worktree_path.as_deref())
-                .flatten()
-        });
-    let runner_resolution = dispatch_runner_for_exec_with_workspace_path(
-        execution_contract
-            .as_ref()
-            .expect("execution contract present after action_ref gate"),
-        compatibility_cwd.as_deref(),
-        workspace_path_hint,
-    )
-    .map_err(|e| e.into_rpc_error())?;
-    let RunnerDispatchResolution {
+    let admission = admit_broker_exec_contract(
+        &req,
+        pending_spawn_handle.as_ref(),
+        resolved_attachment_authority.as_ref(),
+    )?;
+    let execution_contract = Some(admission.execution_contract);
+    let contract_id = admission.contract_id;
+    let action_ref = admission.action_ref;
+    let workspace_ref = admission.workspace_ref;
+    let subject_ref = admission.subject_ref;
+    let coordination_ref = admission.coordination_ref;
+    let caller_ref = admission.caller_ref;
+    let mut authority_ref = admission.authority_ref;
+    let crate::broker::runners::RunnerDispatchResolution {
         runner_class,
         binary: construct_binary,
         binary_source: construct_binary_source,
         cwd,
         cwd_source,
-    } = runner_resolution;
+    } = admission.runner_resolution;
     let calling_shim = calling_shim_from_action_ref(&action_ref);
     let mut resolved_binary = construct_binary.clone();
     let mut binary_source = construct_binary_source;
@@ -1920,7 +1855,7 @@ pub async fn handle_broker_exec_with_sessions(
              subuid pool in use. Run the construct in non-PTY mode, \
              or migrate this construct's broker_exec to omit \
              pty_socket_path. Tracked under \
-             implementation-note-143 follow-up."
+             implementation-note-123 follow-up."
                 .to_string(),
         ));
     }

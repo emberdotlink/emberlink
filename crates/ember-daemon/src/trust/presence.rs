@@ -155,7 +155,7 @@ pub enum GateOutcome {
 /// identical `Locked` state that requires a fresh Touch ID prompt to recover.
 ///
 /// Recovery path: callers (CLI, dashboard, headless) invoke `vault_unlock`
-/// over the daemon socket (see `implementation-note-364`
+/// over the daemon socket (see `implementation-note-259`
 /// for the subcommand contract). Background headless that needs to survive
 /// idle windows must call `vault_unlock` explicitly before high-risk ops
 /// rather than relying on an implicit auto-unlock window.
@@ -217,7 +217,7 @@ impl PresenceManager {
 /// check is also a write (last_activity bump).
 static MANAGER: Lazy<Mutex<PresenceManager>> = Lazy::new(|| Mutex::new(PresenceManager::new()));
 
-/// implementation-note-37 C2: register the daemon's `DaemonStore` so
+/// implementation-note-24 C2: register the daemon's `DaemonStore` so
 /// `lock()` can clear the shared live-vault slot on explicit lock. Called
 /// once at daemon startup from `runtime.rs` after the store is opened.
 ///
@@ -242,8 +242,8 @@ pub fn register_store(store: Rc<DaemonStore>) {
 /// parser per call site. The production launchd / systemd units set
 /// none of these, so the bypass is unreachable from a production daemon.
 pub fn dev_mode_enabled() -> bool {
-    matches!(std::env::var("EMBER_VAULT_DEV_MODE").as_deref(), Ok("1"))
-        || std::env::var("EMBER_VAULT_MOCK").is_ok()
+    crate::infra::vault::vault_dev_mode_env_enabled()
+        || crate::infra::vault::vault_mock_env_enabled()
         || crate::infra::vault::is_cargo_test_binary()
 }
 
@@ -303,7 +303,7 @@ pub fn mark_unlocked() {
 /// subcommand; also called from any `lock-on-shutdown` handlers in the
 /// daemon supervisor.
 ///
-/// implementation-note-37 C2 — **hard-lock semantics**:
+/// implementation-note-24 C2 — **hard-lock semantics**:
 ///
 /// - Flips `SessionState` to `Locked`.
 /// - Clears the macOS SE-keyring session cache so the next interactive
@@ -325,7 +325,7 @@ pub fn mark_unlocked() {
 /// observability (an auto-locked daemon still has the vault Rc attached,
 /// useful for diagnostics) rather than a "soft-lock" privilege carve-out
 /// — both paths require a fresh Touch ID prompt to recover, and
-/// `vault_unlock` (see `implementation-note-364`)
+/// `vault_unlock` (see `implementation-note-259`)
 /// is the canonical recovery route for both. Earlier comment drift
 /// claimed idle auto-lock was a "soft-lock" that headless could
 /// survive without a re-prompt; that was never true in code (the SE
@@ -894,7 +894,7 @@ mod tests {
         assert!(idle.is_none());
     }
 
-    /// implementation-note-37 C2: explicit `lock()` is hard-lock —
+    /// implementation-note-24 C2: explicit `lock()` is hard-lock —
     /// the registered `DaemonStore` no longer carries a vault handle
     /// after the call, so the next vault op MUST re-derive the MEK
     /// from the keyring (forces a fresh biometric on macOS).
@@ -924,7 +924,7 @@ mod tests {
         assert!(!unlocked, "explicit lock() must also flip session state");
     }
 
-    /// implementation-note-37 C3: the session-cache value type is
+    /// implementation-note-24 C3: the session-cache value type is
     /// `Zeroizing<String>` so dropping a cache entry overwrites the
     /// passphrase bytes in place. We assert the contract by allocating
     /// a `Zeroizing<String>`, snapshotting the inner pointer, dropping
@@ -962,14 +962,14 @@ mod tests {
         drop(wrapped);
     }
 
-    /// implementation-note-37 C2 partner / `presence_gate_soft_lock_distinction_landed`:
+    /// implementation-note-24 C2 partner / `presence_gate_soft_lock_distinction_landed`:
     /// idle auto-lock retains `Rc<Vault>` for diagnostic observability — the
     /// vault stays Rc'd in `DaemonStore` even though the gate enforces a hard
     /// Touch ID re-prompt requirement. The previous "soft-lock = headless
     /// survives idle without re-prompt" framing was a comment fiction (the
     /// same auto-lock branch already cleared the SE session cache, making
     /// a re-prompt unavoidable). Recovery for either lock path is
-    /// `vault_unlock` per `implementation-note-364`.
+    /// `vault_unlock` per `implementation-note-259`.
     ///
     /// The auto-lock branch runs INSIDE `require_user_presence_at`'s
     /// mutex block, AFTER the `dev_mode_enabled()` short-circuit. Under

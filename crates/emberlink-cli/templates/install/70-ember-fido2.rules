@@ -1,0 +1,110 @@
+# CLASSIFICATION: PUBLIC
+# 70-ember-fido2.rules — udev rules granting non-root access to FIDO2/U2F
+# hardware security keys for ember processes.
+#
+# Install path: /etc/udev/rules.d/70-ember-fido2.rules
+# Reload:       udevadm control --reload-rules && udevadm trigger
+#
+# Two access grants per device:
+#   TAG+="uaccess"           — systemd-logind grants access to the session user
+#                              automatically (modern systems, no group needed)
+#   GROUP="plugdev", MODE="0660" — fallback for older distros / non-logind
+#                              systems; user must be in the plugdev group
+#
+# Vendor IDs covered:
+#   0x1050  Yubico (YubiKey 4/5/Bio and FIDO-only variants)
+#   0x096e  Feitian Technologies (ePass FIDO, BioPass)
+#   0x20a0  Nitrokey (FIDO2, Pro, Start)
+#   0x0483  SoloKeys (Solo 1, Solo 2 — same VID as STMicroelectronics)
+#   HID class fallback — generic U2F/FIDO2 devices presenting as HID with
+#             Usage Page 0xf1d0 (FIDO Alliance defined usage page)
+#
+# References:
+#   https://fidoalliance.org/specs/fido-u2f-v1.2-ps-20170411/fido-u2f-hid-protocol-v1.2-ps-20170411.html
+#   https://support.yubico.com/hc/en-us/articles/360013708900
+
+# ── Yubico (0x1050) ──────────────────────────────────────────────────────────
+# YubiKey FIDO-only (USB-A)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0120", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey 4 OTP+FIDO+CCID
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0406", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey 4 OTP+FIDO+CCID (nano)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0407", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey 5 NFC
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0410", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey 5 Nano
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0402", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey 5C
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0407", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey 5Ci (USB-C + Lightning)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0427", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey Bio (multi-protocol edition)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0428", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# YubiKey — catch-all for all Yubico USB products
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1050", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# ── Feitian Technologies (0x096e) ─────────────────────────────────────────────
+# ePass FIDO NFC
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="096e", ATTRS{idProduct}=="0858", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# BioPass FIDO2
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="096e", ATTRS{idProduct}=="085b", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# K9 security key
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="096e", ATTRS{idProduct}=="0866", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# Feitian — catch-all for all Feitian USB products
+SUBSYSTEM=="usb", ATTRS{idVendor}=="096e", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# ── Nitrokey (0x20a0) ─────────────────────────────────────────────────────────
+# Nitrokey FIDO2
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="4287", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# Nitrokey FIDO U2F
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="4287", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# Nitrokey — catch-all for all Nitrokey USB products
+SUBSYSTEM=="usb", ATTRS{idVendor}=="20a0", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# ── SoloKeys (0x0483) ─────────────────────────────────────────────────────────
+# Solo 1 (shares VID with STMicroelectronics; PID narrows to Solo)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a2ca", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# Solo 2 (USB HID interface)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a2cb", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# SoloKeys — USB catch-all (PID-scoped to known Solo products above are preferred)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a2ca", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a2cb", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# ── HID class fallback — generic FIDO2/U2F devices ───────────────────────────
+# Devices presenting HID with FIDO Alliance usage page (0xf1d0) but not
+# matched by a vendor-specific rule above.  The ENV{HID_NAME} match is
+# advisory; the critical match is the hidraw subsystem + usage-page env var
+# set by the HID core when it parses the HID descriptor.
+SUBSYSTEM=="hidraw", ENV{HID_ID}=="0003:*:*", \
+    ENV{HID_NAME}=="*FIDO*", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="hidraw", ENV{HID_ID}=="0003:*:*", \
+    ENV{HID_NAME}=="*U2F*", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"
+# Usage-page based match: udev sets ATTRS{bInterfaceProtocol}=="00" for HID;
+# the kernel exposes the usage page in /sys — match devices advertising
+# FIDO usage page without a specific name match.
+SUBSYSTEM=="hidraw", ENV{HID_UNIQ}=="*", \
+    ATTRS{bInterfaceClass}=="03", ATTRS{bInterfaceSubClass}=="00", \
+    ATTRS{bInterfaceProtocol}=="00", ENV{HID_NAME}=="*ecurity*Key*", \
+    TAG+="uaccess", GROUP="plugdev", MODE="0660"

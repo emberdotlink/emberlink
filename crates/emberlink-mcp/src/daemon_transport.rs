@@ -18,7 +18,7 @@ use tokio_rustls::TlsConnector;
 /// `crates/ember-rpc/src/listener.rs::build_server_tls_config`.
 ///
 /// `tls_config` is wrapped in `Arc<RwLock<Arc<ClientConfig>>>` so the
-/// implementation-note-486 refresh path can hot-swap the underlying
+/// implementation-note-389 refresh path can hot-swap the underlying
 /// `ClientConfig` (refreshed per-agent cert + key) and have every
 /// `DaemonTransport` clone that shares this `MtlsBridgeConfig` observe the
 /// new config on its next RPC. Anchor: `emberlink_mcp_cert_swap_landed`.
@@ -146,12 +146,12 @@ impl std::fmt::Debug for MtlsBridgeConfig {
 /// Both variants present the same external surface via [`DaemonTransport::
 /// call_tool`]; the variant only changes the wire under the JSON-RPC frame.
 enum Transport {
-    /// Legacy UDS path used by host-mode emberlink-mcp callers. Sync I/O.
+    /// Host UDS path used by host-mode emberlink-mcp callers. Sync I/O.
     UnixSocket(PathBuf),
     /// mTLS+TCP path used by in-container callers (design component 1).
-    /// Owns a dedicated tokio runtime so sync `DaemonClient` trait methods
-    /// can `block_on` the async TLS round-trip even when called from
-    /// within `main.rs`'s `current_thread` runtime.
+    /// Owns a dedicated tokio runtime so synchronous MCP tool calls can
+    /// block on the async TLS round-trip from `main.rs`'s current-thread
+    /// runtime without nested-runtime panics.
     Mtls {
         config: MtlsBridgeConfig,
         runtime: Arc<tokio::runtime::Runtime>,
@@ -166,8 +166,7 @@ pub struct DaemonTransport {
 
 impl DaemonTransport {
     /// Build a transport that talks to the daemon over a Unix domain socket.
-    /// This is the host-mode default and keeps backward compatibility for
-    /// existing callers (tests + sequential dev environments).
+    /// This is the host-mode default.
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
             inner: Transport::UnixSocket(socket_path.as_ref().to_path_buf()),
@@ -184,14 +183,8 @@ impl DaemonTransport {
         }
     }
 
-    /// Returns `Some(path)` for UDS transports, `None` for mTLS.
-    ///
-    /// Kept as an `Option` rather than panicking so the legacy
-    /// `socket_path()` callers in `main.rs` / `lib.rs` (which use it to
-    /// build the receipt-transport socket) can gracefully fall back when
-    /// running in container mode. The mTLS branch in `McpServer::
-    /// with_daemon_socket` is unused in container mode — observability
-    /// tools route through `call_tool` regardless of variant.
+    /// Returns the UDS path for host transports and a stable checkpoint path for
+    /// mTLS transports. Host-only test helpers use this to open raw UDS calls.
     pub fn socket_path(&self) -> &std::path::Path {
         match &self.inner {
             Transport::UnixSocket(p) => p.as_path(),
@@ -213,39 +206,16 @@ impl DaemonTransport {
 
     /// Map MCP tool name to daemon socket method name.
     ///
-    /// Note: `request_grant` is intentionally NOT in this map. It is
-    /// handled by a special-case branch in [`Self::call_tool`] that routes
-    /// it through `request_access` so the policy engine and pre-eval rate
-    /// limiter both run. See design and TODO 69.1.
     fn map_tool_to_method(tool_name: &str) -> Option<&str> {
         match tool_name {
-            // Credential access
-            "use_credential" => Some("use_credential"),
-            "list_grants" => Some("list_grants"),
-            "grant_status" => Some("evaluate_grant"),
-            "revoke_grant" => Some("revoke_grant"),
-            "delegate_grant" => Some("delegate_grant"),
-            "grant_summary" => Some("grant_summary"),
-            // Persona management
-            "whoami" => Some("list_personas"),
-            "create_persona" => Some("create_persona"),
-            // Approval workflow
-            "request_access" => Some("request_access"),
-            "list_approvals" => Some("list_pending_approvals"),
-            "submit_approval" => Some("submit_approval"),
-            // Observability
-            "audit_query" => Some("audit_query"),
-            "detect_anomalies" => Some("detect_anomalies"),
-            // Receipts (Stream D)
-            "list_receipts" => Some("list_receipts"),
-            "get_receipt" => Some("get_receipt"),
-            "daemon_persona" => Some("daemon_persona"),
-            // Budget status (P69K-F1)
-            "grant_budget_status" => Some("grant_budget_status"),
-            // Vault
-            "vault_list" => Some("vault_list"),
-            // Health
-            "ping" => Some("ping"),
+            // Canonical MCP control surface (design aligned).
+            "session.describe" => Some("describe_runtime_attach_target"),
+            "catalog.search_actions" => Some("catalog.search_actions"),
+            "access.request" => Some("request_access"),
+            "grant.list" => Some("list_grants"),
+            "status.get" => Some("status"),
+            "evidence.query" => Some("receipt_query"),
+            "evidence.get" => Some("get_receipt"),
             _ => None,
         }
     }
@@ -278,67 +248,76 @@ impl DaemonTransport {
         Some(host.to_string())
     }
 
-    /// Translate a `request_grant` MCP call into `request_access` daemon
-    /// parameters by synthesizing the `action` field from `credential_name`.
+    /// Translate the canonical MCP `access.request` surface into the daemon's
+    /// `request_access` receiver shape.
     ///
-    /// This ensures agent-initiated credential requests route through the
-    /// policy engine AND the pre-evaluation rate limiter (see TODO 69.1).
-    /// All other fields are forwarded unchanged — no parameter tampering.
-    ///
-    /// Also injects NOTIF-1 banner fields (`tool_name`, `target_host`,
-    /// `target_url`, `agent_framework`) so the approval banner in the
-    /// daemon shows richer context for MCP-originated requests.
-    ///
-    /// Fails closed: returns `Protocol` error if `credential_name` is
-    /// missing rather than silently passing an empty action string.
-    fn translate_request_grant(
+    /// The MCP caller names a package-scoped `action_ref` plus either
+    /// `resource_id` or a typed `target`. The daemon resolves authority need
+    /// from the Action Manifest; this adapter only adds MCP attribution fields.
+    fn translate_access_request(
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, DaemonTransportError> {
-        let credential_name = arguments
-            .get("credential_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                DaemonTransportError::Protocol(
-                    "missing credential_name for request_grant".to_string(),
-                )
-            })?;
+        let mut augmented = arguments.as_object().cloned().ok_or_else(|| {
+            DaemonTransportError::Protocol(
+                "access.request arguments must be a JSON object".to_string(),
+            )
+        })?;
 
-        let action = format!("credential.access.{credential_name}");
-
-        // Clone the caller's arguments and add the synthesized action.
-        // If `action` was already supplied by the caller, the synthesized
-        // value overrides it to prevent callers from bypassing the naming
-        // convention the policy engine expects.
-        let mut augmented = match arguments {
-            serde_json::Value::Object(_) => arguments.clone(),
-            _ => serde_json::Value::Object(serde_json::Map::new()),
-        };
-        if let Some(obj) = augmented.as_object_mut() {
-            obj.insert("action".to_string(), serde_json::Value::String(action));
-
-            // NOTIF-1: inject banner fields for the daemon's approval
-            // notification. These are set only when not already present so
-            // callers that supply richer context aren't overwritten.
-            obj.entry("tool_name")
-                .or_insert_with(|| serde_json::Value::String("mcp/request_grant".to_string()));
-            obj.entry("agent_framework")
-                .or_insert_with(|| serde_json::Value::String("mcp".to_string()));
-
-            // Derive target_host from `resource_id` when present. This field
-            // often carries a URL-like path (e.g. "api.github.com/repos/...").
-            // Fall back to `credential_name` if `resource_id` is absent.
-            let url_candidate = arguments
-                .get("resource_id")
-                .and_then(|v| v.as_str())
-                .or(Some(credential_name));
-            if let Some(host) = url_candidate.and_then(Self::extract_host) {
-                obj.entry("target_host")
-                    .or_insert_with(|| serde_json::Value::String(host.clone()));
-                obj.entry("target_url")
-                    .or_insert_with(|| serde_json::Value::String(host));
-            }
+        if augmented.get("action").is_some() {
+            return Err(DaemonTransportError::Protocol(
+                "access.request no longer accepts action; use action_ref".to_string(),
+            ));
         }
-        Ok(augmented)
+        if augmented.get("scope").is_some() {
+            return Err(DaemonTransportError::Protocol(
+                "access.request no longer accepts scope; use resource_id or typed target"
+                    .to_string(),
+            ));
+        }
+
+        let has_action_ref = augmented
+            .get("action_ref")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+        if !has_action_ref {
+            return Err(DaemonTransportError::Protocol(
+                "missing action_ref for access.request".to_string(),
+            ));
+        }
+        let has_resource_id = augmented
+            .get("resource_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let has_target = augmented.get("target").is_some();
+        if !has_resource_id && !has_target {
+            return Err(DaemonTransportError::Protocol(
+                "access.request requires resource_id or typed target".to_string(),
+            ));
+        }
+
+        augmented
+            .entry("tool_name".to_string())
+            .or_insert_with(|| serde_json::Value::String("mcp/access.request".to_string()));
+        augmented
+            .entry("agent_framework".to_string())
+            .or_insert_with(|| serde_json::Value::String("mcp".to_string()));
+        if let Some(host) = augmented
+            .get("resource_id")
+            .and_then(|v| v.as_str())
+            .and_then(Self::extract_host)
+        {
+            augmented
+                .entry("target_host".to_string())
+                .or_insert_with(|| serde_json::Value::String(host.clone()));
+            augmented
+                .entry("target_url".to_string())
+                .or_insert_with(|| serde_json::Value::String(host));
+        }
+
+        Ok(serde_json::Value::Object(augmented))
     }
 
     /// Execute an MCP tool call by routing through the daemon.
@@ -356,39 +335,33 @@ impl DaemonTransport {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, DaemonTransportError> {
-        if let Transport::Mtls { config, .. } = &self.inner
-            && config.is_refresh_failing()
-        {
-            return Err(DaemonTransportError::RefreshFailing);
+        if let Transport::Mtls { config, .. } = &self.inner {
+            if config.is_refresh_failing() {
+                return Err(DaemonTransportError::RefreshFailing);
+            }
         }
-        // Special case: `request_grant` routes through `request_access` so
-        // policy evaluation AND the pre-eval rate limiter both apply.
-        // TODO 69.1 / design. `translated` owns the augmented params so a
-        // borrow survives the rest of the call.
-        let translated: Option<serde_json::Value> = if tool_name == "request_grant" {
-            Some(Self::translate_request_grant(arguments)?)
-        } else {
-            None
+        let translated: Option<serde_json::Value> = match tool_name {
+            "access.request" => Some(Self::translate_access_request(arguments)?),
+            _ => None,
         };
-        let (method, params_ref): (&str, &serde_json::Value) = if tool_name == "request_grant" {
-            (
+        let (method, params_ref): (&str, &serde_json::Value) = match tool_name {
+            "access.request" => (
                 "request_access",
                 translated.as_ref().expect("translated set above"),
-            )
-        } else {
-            let m = Self::map_tool_to_method(tool_name)
-                .ok_or_else(|| DaemonTransportError::UnknownTool(tool_name.to_string()))?;
-            (m, arguments)
+            ),
+            _ => {
+                let m = Self::map_tool_to_method(tool_name)
+                    .ok_or_else(|| DaemonTransportError::UnknownTool(tool_name.to_string()))?;
+                (m, arguments)
+            }
         };
 
         self.call_raw(method, params_ref)
     }
 
     /// Call a daemon JSON-RPC method by name, bypassing the MCP tool→method
-    /// map. Used by the agent runtime adapter (`DaemonTransportClient` in
-    /// the emberlink-mcp binary's main module) where the tool layer's
-    /// renamings don't apply, and by the
-    /// `bridge.cert_expiring_soon` timer task to post the warning.
+    /// map. Used by bridge maintenance tasks such as
+    /// `bridge.cert_expiring_soon`.
     pub fn call_raw(
         &self,
         method: &str,
@@ -461,9 +434,8 @@ impl DaemonTransport {
     }
 
     /// Synchronous mTLS round-trip. Blocks the caller on the bridge
-    /// transport's dedicated runtime so sync `DaemonClient` trait methods
-    /// (called from `main.rs`'s `current_thread` runtime) don't trigger
-    /// the "blocking on async runtime" panic.
+    /// transport's dedicated runtime so the stdio server can remain on a
+    /// current-thread runtime without nested-runtime panics.
     fn mtls_round_trip(
         config: &MtlsBridgeConfig,
         runtime: &Arc<tokio::runtime::Runtime>,
@@ -756,154 +728,139 @@ mod tests {
     use super::*;
 
     #[test]
-    fn map_tool_to_method_credential_tools() {
-        // `request_grant` is intentionally NOT in the static map. It is
-        // handled by a special-case branch in `call_tool` that routes it
-        // through `request_access` so the policy engine and pre-eval rate
-        // limiter both apply. See TODO 69.1.
-        assert_eq!(DaemonTransport::map_tool_to_method("request_grant"), None);
+    fn map_tool_to_method_canonical_control_surface() {
         assert_eq!(
-            DaemonTransport::map_tool_to_method("use_credential"),
-            Some("use_credential")
+            DaemonTransport::map_tool_to_method("session.describe"),
+            Some("describe_runtime_attach_target")
         );
         assert_eq!(
-            DaemonTransport::map_tool_to_method("list_grants"),
-            Some("list_grants")
+            DaemonTransport::map_tool_to_method("catalog.search_actions"),
+            Some("catalog.search_actions")
         );
         assert_eq!(
-            DaemonTransport::map_tool_to_method("grant_status"),
-            Some("evaluate_grant")
-        );
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("revoke_grant"),
-            Some("revoke_grant")
-        );
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("delegate_grant"),
-            Some("delegate_grant")
-        );
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("grant_summary"),
-            Some("grant_summary")
-        );
-    }
-
-    #[test]
-    fn translate_request_grant_synthesizes_action() {
-        let args = serde_json::json!({
-            "persona_id": "persona-abc",
-            "credential_name": "github-token",
-            "scope": "repo:read",
-            "ttl_secs": 3600
-        });
-        let translated = DaemonTransport::translate_request_grant(&args).unwrap();
-        assert_eq!(translated["action"], "credential.access.github-token");
-        // Other fields must be forwarded unchanged (no parameter tampering).
-        assert_eq!(translated["persona_id"], "persona-abc");
-        assert_eq!(translated["credential_name"], "github-token");
-        assert_eq!(translated["scope"], "repo:read");
-        assert_eq!(translated["ttl_secs"], 3600);
-    }
-
-    #[test]
-    fn translate_request_grant_missing_credential_name_fails_closed() {
-        let args = serde_json::json!({
-            "persona_id": "persona-abc",
-            "scope": "repo:read",
-        });
-        let err = DaemonTransport::translate_request_grant(&args).unwrap_err();
-        match err {
-            DaemonTransportError::Protocol(msg) => {
-                assert!(msg.contains("credential_name"));
-            }
-            other => panic!("expected Protocol error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn translate_request_grant_overrides_caller_supplied_action() {
-        // A caller cannot bypass the policy naming convention by supplying
-        // their own `action` — the synthesized value wins.
-        let args = serde_json::json!({
-            "persona_id": "persona-abc",
-            "credential_name": "github-token",
-            "scope": "repo:read",
-            "action": "credential.access.something-else"
-        });
-        let translated = DaemonTransport::translate_request_grant(&args).unwrap();
-        assert_eq!(translated["action"], "credential.access.github-token");
-    }
-
-    #[test]
-    fn translate_request_grant_non_object_fails_closed() {
-        let args = serde_json::json!("not-an-object");
-        let err = DaemonTransport::translate_request_grant(&args).unwrap_err();
-        match err {
-            DaemonTransportError::Protocol(msg) => {
-                assert!(msg.contains("credential_name"));
-            }
-            other => panic!("expected Protocol error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn map_tool_to_method_persona_tools() {
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("whoami"),
-            Some("list_personas")
-        );
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("create_persona"),
-            Some("create_persona")
-        );
-    }
-
-    #[test]
-    fn map_tool_to_method_approval_tools() {
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("request_access"),
+            DaemonTransport::map_tool_to_method("access.request"),
             Some("request_access")
         );
         assert_eq!(
-            DaemonTransport::map_tool_to_method("list_approvals"),
-            Some("list_pending_approvals")
+            DaemonTransport::map_tool_to_method("grant.list"),
+            Some("list_grants")
         );
         assert_eq!(
-            DaemonTransport::map_tool_to_method("submit_approval"),
-            Some("submit_approval")
+            DaemonTransport::map_tool_to_method("status.get"),
+            Some("status")
+        );
+        assert_eq!(
+            DaemonTransport::map_tool_to_method("evidence.query"),
+            Some("receipt_query")
+        );
+        assert_eq!(
+            DaemonTransport::map_tool_to_method("evidence.get"),
+            Some("get_receipt")
         );
     }
 
     #[test]
-    fn map_tool_to_method_observability_tools() {
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("audit_query"),
-            Some("audit_query")
-        );
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("detect_anomalies"),
-            Some("detect_anomalies")
-        );
+    fn removed_tool_names_do_not_map_to_daemon_methods() {
+        for name in [
+            "request_grant",
+            "use_credential",
+            "list_grants",
+            "grant_status",
+            "revoke_grant",
+            "delegate_grant",
+            "grant_summary",
+            "whoami",
+            "create_persona",
+            "request_access",
+            "list_approvals",
+            "submit_approval",
+            "audit_query",
+            "detect_anomalies",
+            "list_receipts",
+            "get_receipt",
+            "daemon_persona",
+            "grant_budget_status",
+            "vault_list",
+            "ping",
+        ] {
+            assert_eq!(
+                DaemonTransport::map_tool_to_method(name),
+                None,
+                "{name} must not be part of the MCP tool map"
+            );
+        }
     }
 
     #[test]
-    fn map_tool_to_method_vault_and_health_tools() {
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("vault_list"),
-            Some("vault_list")
-        );
-        assert_eq!(DaemonTransport::map_tool_to_method("ping"), Some("ping"));
+    fn translate_access_request_preserves_manifest_shape() {
+        let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "credential_name": "github-token",
+            "resource_id": "api.github.com/repos/octo/repo",
+            "action_ref": "registry.ember.systems/ember-systems/ember-gh/pr_list@v1"
+        });
+        let translated = DaemonTransport::translate_access_request(&args).unwrap();
+        assert!(translated.get("action").is_none());
+        assert_eq!(translated["tool_name"], "mcp/access.request");
+        assert_eq!(translated["agent_framework"], "mcp");
+        assert_eq!(translated["target_host"], "api.github.com");
     }
 
     #[test]
-    fn map_tool_to_method_grant_budget_status_routes_to_daemon() {
-        // `grant_budget_status` is a read-only observability tool that bypasses
-        // the agent runtime and talks directly to the daemon socket — mirrors
-        // the `list_receipts` / `get_receipt` pattern.
-        assert_eq!(
-            DaemonTransport::map_tool_to_method("grant_budget_status"),
-            Some("grant_budget_status")
-        );
+    fn translate_access_request_rejects_removed_action_and_scope() {
+        let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "credential_name": "github-token",
+            "action": "credential.access.github-token",
+            "action_ref": "registry.ember.systems/ember-systems/ember-gh/pr_list@v1",
+            "resource_id": "octo/repo"
+        });
+        let err = DaemonTransport::translate_access_request(&args).unwrap_err();
+        match err {
+            DaemonTransportError::Protocol(msg) => assert!(msg.contains("action")),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+
+        let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "credential_name": "github-token",
+            "scope": "github.repo:octo/repo",
+            "action_ref": "registry.ember.systems/ember-systems/github:gh.pr.list@1"
+        });
+        let err = DaemonTransport::translate_access_request(&args).unwrap_err();
+        match err {
+            DaemonTransportError::Protocol(msg) => assert!(msg.contains("scope")),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_access_request_missing_action_ref_or_target_fails_closed() {
+        let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "credential_name": "github-token",
+            "resource_id": "octo/repo"
+        });
+        let err = DaemonTransport::translate_access_request(&args).unwrap_err();
+        match err {
+            DaemonTransportError::Protocol(msg) => {
+                assert!(msg.contains("action_ref"));
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+
+        let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "credential_name": "github-token",
+            "action_ref": "registry.ember.systems/ember-systems/github:gh.pr.list@1"
+        });
+        let err = DaemonTransport::translate_access_request(&args).unwrap_err();
+        match err {
+            DaemonTransportError::Protocol(msg) => {
+                assert!(msg.contains("resource_id") && msg.contains("target"));
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -943,17 +900,18 @@ mod tests {
     // --- NOTIF-1: MCP approval-request banner fields ---
 
     #[test]
-    fn mcp_approval_request_populates_tool_fields() {
-        // request_grant with a URL-like resource_id should populate
-        // tool_name and target_host in the translated params so the
-        // daemon's approval banner shows richer context.
+    fn mcp_access_request_populates_tool_fields() {
+        // access.request with a URL-like resource_id should populate
+        // tool_name and target_host in the translated params so the daemon's
+        // approval banner shows richer context.
         let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "action_ref": "registry.ember.systems/ember-systems/github:gh.pr.list@1",
             "credential_name": "github-token",
             "resource_id": "api.github.com/repos/emberdotlink/emberlink",
-            "scope": "repo:push",
             "ttl_secs": 3600
         });
-        let translated = DaemonTransport::translate_request_grant(&args).unwrap();
+        let translated = DaemonTransport::translate_access_request(&args).unwrap();
         assert!(
             translated["tool_name"]
                 .as_str()
@@ -975,21 +933,19 @@ mod tests {
     }
 
     #[test]
-    fn mcp_approval_request_no_resource_id_falls_back_to_credential_name() {
-        // When resource_id is absent, the host extraction falls back to
-        // credential_name. A plain name like "github-token" has no dot so
-        // target_host stays None — that's expected and correct.
+    fn mcp_access_request_typed_target_does_not_invent_host() {
         let args = serde_json::json!({
+            "persona_id": "persona-abc",
+            "action_ref": "registry.ember.systems/ember-systems/github:gh.pr.list@1",
             "credential_name": "github-token",
-            "scope": "repo:read"
+            "target": {"kind": "github_repo", "repo": "emberdotlink/emberlink"}
         });
-        let translated = DaemonTransport::translate_request_grant(&args).unwrap();
-        assert_eq!(translated["tool_name"], "mcp/request_grant");
+        let translated = DaemonTransport::translate_access_request(&args).unwrap();
+        assert_eq!(translated["tool_name"], "mcp/access.request");
         assert_eq!(translated["agent_framework"], "mcp");
-        // Plain credential name has no dot → no host extracted.
         assert!(
             translated.get("target_host").is_none() || translated["target_host"].is_null(),
-            "plain credential name should not produce a target_host"
+            "typed targets should not synthesize target_host unless caller supplies it"
         );
     }
 

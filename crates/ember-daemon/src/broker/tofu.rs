@@ -1,6 +1,6 @@
 //! TOFU (Trust-On-First-Use) credential binding confirmation.
 //!
-//! implementation-note-166 — replaces the DCC-3A stub with real
+//! implementation-note-140 — replaces the DCC-3A stub with real
 //! design biometric prompt integration. The flow:
 //!
 //! 1. `submit_approval` writes a pending row into the approvals table
@@ -118,7 +118,7 @@ pub async fn tofu_confirm_binding(
 /// outcome mapping. Lives under `cfg(not(test))` so unit tests bypass
 /// it through the mock-outcome short-circuit above.
 ///
-/// implementation-note-166: biometric_prompt_for_binding checkpoint.
+/// implementation-note-140: biometric_prompt_for_binding checkpoint.
 #[cfg(not(test))]
 async fn biometric_prompt_for_binding(
     store: &DaemonStore,

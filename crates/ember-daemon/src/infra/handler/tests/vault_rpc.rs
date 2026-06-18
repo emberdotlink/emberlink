@@ -790,7 +790,7 @@ async fn team0_vault_scope_token_allows_vault_list_but_not_create_persona() {
 
 #[tokio::test]
 async fn vault_get_round_trip_returns_plaintext_value_and_bytes() {
-    // implementation-note-261: pulumi-render.sh + similar headless
+    // implementation-note-202: pulumi-render.sh + similar headless
     // integrations call `ember vault get` -> daemon RPC `vault_get`.
     // This proves the RPC arm is wired and returns the decrypted
     // value under the canonical {"value": ..., "value_bytes": ...}

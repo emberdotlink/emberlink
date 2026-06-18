@@ -744,7 +744,7 @@ fn audit_help_demotes_internal_chain_copy() {
         "expected audit help to show the verification lane; stdout:\n{stdout}"
     );
     assert!(
-        !stdout.contains("implementation-note-475"),
+        !stdout.contains("implementation-note-378"),
         "expected audit help to hide internal slug copy; stdout:\n{stdout}"
     );
 }
@@ -788,7 +788,7 @@ fn audit_verify_help_stays_short_and_actionable() {
         "expected audit verify help to document accepted --since window shapes; stdout:\n{stdout}"
     );
     assert!(
-        !stdout.contains("implementation-note-475"),
+        !stdout.contains("implementation-note-378"),
         "expected audit verify help to hide internal slug copy; stdout:\n{stdout}"
     );
 }
@@ -1052,7 +1052,7 @@ fn sandbox_help_demotes_raw_container_flags() {
         "expected sandbox help to surface run-scion; stdout:\n{stdout}"
     );
     assert!(
-        !stdout.contains("implementation-note-476"),
+        !stdout.contains("implementation-note-379"),
         "expected sandbox help to avoid internal task ids; stdout:\n{stdout}"
     );
 }
@@ -1067,7 +1067,7 @@ fn sandbox_run_scion_help_uses_generic_task_example() {
         "expected generic task example; stdout:\n{stdout}"
     );
     assert!(
-        !stdout.contains("implementation-note-476"),
+        !stdout.contains("implementation-note-379"),
         "expected run-scion help to avoid internal task ids; stdout:\n{stdout}"
     );
 }
@@ -1078,8 +1078,8 @@ fn demo_help_avoids_internal_task_names() {
     assert_eq!(code, 0, "exit non-zero. stderr: {stderr}");
 
     for leaked in [
-        "implementation-note-477",
-        "implementation-note-416",
+        "implementation-note-380",
+        "implementation-note-323",
         "SCION 2026-05-15 Beat 8",
     ] {
         assert!(

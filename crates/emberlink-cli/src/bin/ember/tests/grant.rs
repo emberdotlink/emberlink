@@ -321,8 +321,11 @@ fn render_claude_init_summary_app_ready_centers_launch() {
     );
     assert!(rendered.contains("Claude ready"));
     assert!(rendered.contains("ember claude"));
+    assert!(rendered.contains("ember receipt list"));
+    assert!(rendered.contains("Find the receipt after the first brokered action"));
     assert!(rendered.contains("GitHub: App lane ready"));
     assert!(!rendered.contains("ember github setup"));
+    assert!(!rendered.contains("ember receipt show"));
 }
 
 #[test]
@@ -368,8 +371,10 @@ fn render_codex_init_summary_centers_launch_and_native_auth() {
     );
     assert!(rendered.contains("Codex ready"));
     assert!(rendered.contains("ember codex"));
+    assert!(rendered.contains("ember receipt list"));
     assert!(rendered.contains("codex login status"));
     assert!(rendered.contains("Auth: remains managed by Codex"));
+    assert!(!rendered.contains("ember receipt show"));
 }
 
 #[test]
@@ -392,9 +397,11 @@ fn render_basic_init_summary_centers_target_selection_and_receipt() {
         "ember",
     );
     assert!(rendered.contains("Ember ready"));
+    assert!(rendered.contains("First proof"));
     assert!(rendered.contains("ember init --for claude"));
     assert!(rendered.contains("ember init --for codex"));
     assert!(rendered.contains("/tmp/data/receipts/first.json"));
+    assert!(rendered.contains("Verify the first receipt offline"));
     assert!(
         rendered.contains(
             emberlink_cli::onboarding::first_grant::INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL
@@ -1975,6 +1982,105 @@ fn ensure_codex_runtime_grant_skips_existing_gateway_without_live_lease() {
         ensure_codex_runtime_grant(&config, "persona-1", Some(TEST_OPENAI_CHATGPT_CREDENTIAL))
             .expect("missing live lease must force fresh Codex grant mint");
     assert_eq!(grant.id, "grant-codex-fresh");
+    assert!(grant.created);
+    server.join().expect("fake daemon thread");
+}
+
+#[test]
+fn ensure_cursor_runtime_grant_skips_existing_grant_without_live_lease() {
+    use std::io::{BufRead, Write as _};
+    use std::os::unix::net::UnixListener;
+
+    let cursor_default_credential = || format!("cursor-{}-v1", "default");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = DaemonConfig::for_test(tmp.path());
+    std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+    let socket_path = config.socket_dir.join("daemon.sock");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    let server = std::thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+            ready_tx.send(()).expect("signal ready");
+
+            for expected_method in ["list_grants", "grant_status", "create_grant"] {
+                let mut stream = accept_with_timeout(&listener, std::time::Duration::from_secs(10));
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!(expected_method));
+
+                let response = match expected_method {
+                    "list_grants" => serde_json::json!({
+                        "id": request["id"],
+                        "result": [{
+                            "id": "grant-cursor-stale",
+                            "persona_id": "persona-1",
+                            "credential_name": cursor_default_credential(),
+                            "scope": cursor_default_credential(),
+                            "expires_at": "2026-05-25T01:01:16.056355+00:00",
+                            "status": "active",
+                            "max_delegation_depth": 1
+                        }]
+                    }),
+                    "grant_status" => serde_json::json!({
+                        "id": request["id"],
+                        "result": {
+                            "kind": "grant",
+                            "id": "grant-cursor-stale",
+                            "live_lease": false,
+                            "statements": []
+                        }
+                    }),
+                    "create_grant" => {
+                        assert_eq!(
+                            request["params"]["persona_id"],
+                            serde_json::json!("persona-1")
+                        );
+                        assert_eq!(
+                            request["params"]["credential_name"],
+                            serde_json::json!(cursor_default_credential())
+                        );
+                        assert_eq!(
+                            request["params"]["scope"],
+                            serde_json::json!(cursor_default_credential())
+                        );
+                        assert_eq!(
+                            request["params"]["max_delegation_depth"],
+                            serde_json::json!(1)
+                        );
+                        serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "id": "grant-cursor-fresh",
+                                "expires_at": "2026-05-25T02:01:16.056355+00:00"
+                            }
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+
+                let mut encoded =
+                    serde_json::to_string(&response).expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        }
+    });
+
+    ready_rx.recv().expect("wait for fake daemon ready");
+    let grant = ensure_cursor_runtime_grant(&config, "persona-1")
+        .expect("missing live lease must force fresh Cursor grant mint");
+    assert_eq!(grant.id, "grant-cursor-fresh");
     assert!(grant.created);
     server.join().expect("fake daemon thread");
 }

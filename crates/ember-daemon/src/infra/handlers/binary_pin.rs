@@ -5,7 +5,8 @@
 use serde_json::{Value, json};
 
 use crate::infra::{
-    handler::{DispatchSource, check_user_presence_gate, current_vault, local_state_vault_name},
+    handler::{DispatchSource, check_user_presence_gate, current_vault},
+    handlers::support::local_state_vault_name,
     receipt::current_identity,
     store::DaemonStore,
 };

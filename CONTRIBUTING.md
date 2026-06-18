@@ -1,6 +1,5 @@
 # Contributing to Emberlink
 
-
 Thanks for your interest. A few things to know before you open a PR:
 
 ## How contributions land here

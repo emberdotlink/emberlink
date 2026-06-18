@@ -918,7 +918,7 @@ async fn list_receipts_persona_filter_narrows_results() {
     assert_eq!(just_a[0]["summary"]["persona_id"].as_str().unwrap(), aid);
 }
 
-/// EMBER-implementation-note-248 integration test: emit synthetic kms_wrap receipts
+/// EMBER-implementation-note-184 integration test: emit synthetic kms_wrap receipts
 /// for two actors, then verify `receipt_query` filters by actor and kind.
 #[tokio::test]
 async fn receipt_query_filters_by_actor_and_kind() {

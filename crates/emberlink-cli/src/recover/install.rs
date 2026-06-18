@@ -70,7 +70,7 @@ pub fn handle(args: RecoverInstallArgs) -> RecoverResult {
 
     println!(
         "ember recover install (mode={mode}, scope={scope}): scaffold only — \
-         per-F-code implementations land as implementation-note-457-* tasks ship. \
+         per-F-code implementations land as implementation-note-360-* tasks ship. \
          See `ember recover --explain F-INSTALL-1` (or 2, 3, 4) for the \
          F-code-anchored runbook."
     );

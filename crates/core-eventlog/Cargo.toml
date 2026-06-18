@@ -22,7 +22,7 @@ tempfile = "3"
 # accepts identities, not just Ed25519.
 p256 = { version = "0.13", features = ["ecdsa"] }
 hex = "0.4"
-# implementation-note-41: the SQLite-backed
+# implementation-note-28: the SQLite-backed
 # synthetic_load variant and the real disk-full hook test exercise the
 # production `EventStore` write path (which lives in `core-state`). The
 # core-eventlog crate itself still compiles to `wasm32-unknown-unknown`;
@@ -31,6 +31,7 @@ hex = "0.4"
 # safe for the WASM gate.
 core-state = { path = "../core-state" }
 libc = "0.2"
+proptest = "1"
 
 [lints]
 workspace = true

@@ -5,6 +5,7 @@ pub enum HarnessKind {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Other,
 }
 
@@ -14,6 +15,7 @@ impl HarnessKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
+            Self::Gemini => "gemini",
             Self::Other => "other",
         }
     }
@@ -34,6 +36,7 @@ mod tests {
         assert_eq!(HarnessKind::Claude.to_string(), "claude");
         assert_eq!(HarnessKind::Codex.to_string(), "codex");
         assert_eq!(HarnessKind::Cursor.to_string(), "cursor");
+        assert_eq!(HarnessKind::Gemini.to_string(), "gemini");
         assert_eq!(HarnessKind::Other.to_string(), "other");
     }
 }

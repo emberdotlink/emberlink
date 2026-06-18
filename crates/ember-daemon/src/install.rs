@@ -24,6 +24,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone, Copy, Debug)]
+struct AtomicFileMetadata {
+    mode: Option<u32>,
+    owner: Option<(libc::uid_t, libc::gid_t)>,
+}
+
 /// Errors raised by [`provision_ember_user`] and [`chown_ember_data_dirs`].
 ///
 /// `Subprocess` is the dominant variant — every shell-out captures stderr
@@ -109,6 +115,189 @@ fn run(program: &str, args: &[&str], tolerate_already_exists: bool) -> Result<()
         stderr,
         exit_code,
     })
+}
+
+/// Atomically replace root-managed install artifacts whose mode/owner is set
+/// immediately after write. Do not use this for mutable operator/config files
+/// unless the caller deliberately preserves existing ownership semantics.
+fn write_root_install_file_atomic(path: &Path, contents: &[u8]) -> Result<(), InstallError> {
+    write_install_file_atomic(
+        path,
+        contents,
+        AtomicFileMetadata {
+            mode: None,
+            owner: None,
+        },
+    )
+}
+
+/// Atomically write a file by creating a same-directory temp file and renaming
+/// it into place. When metadata is supplied, apply it deliberately instead of
+/// inheriting from the installer process.
+fn write_install_file_atomic(
+    path: &Path,
+    contents: &[u8],
+    metadata: AtomicFileMetadata,
+) -> Result<(), InstallError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| InstallError::Subprocess {
+            cmd: format!("write {}", path.display()),
+            stderr: "destination has no parent directory".to_string(),
+            exit_code: None,
+        })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("install-file");
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()));
+
+    let cleanup_tmp = |tmp_path: &Path| {
+        let _ = std::fs::remove_file(tmp_path);
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|e| InstallError::Subprocess {
+            cmd: format!("create temp {}", tmp_path.display()),
+            stderr: format!("open failed: {e}"),
+            exit_code: None,
+        })?;
+    if let Some(mode) = metadata.mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| {
+                cleanup_tmp(&tmp_path);
+                InstallError::Subprocess {
+                    cmd: format!("chmod {:04o} {}", mode, tmp_path.display()),
+                    stderr: format!("set_permissions failed: {e}"),
+                    exit_code: None,
+                }
+            })?;
+    }
+    if let Err(e) = file.write_all(contents) {
+        cleanup_tmp(&tmp_path);
+        return Err(InstallError::Subprocess {
+            cmd: format!("write {}", tmp_path.display()),
+            stderr: format!("write failed: {e}"),
+            exit_code: None,
+        });
+    }
+    if let Err(e) = file.sync_all() {
+        cleanup_tmp(&tmp_path);
+        return Err(InstallError::Subprocess {
+            cmd: format!("sync {}", tmp_path.display()),
+            stderr: format!("sync failed: {e}"),
+            exit_code: None,
+        });
+    }
+    drop(file);
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        cleanup_tmp(&tmp_path);
+        InstallError::Subprocess {
+            cmd: format!("rename {} {}", tmp_path.display(), path.display()),
+            stderr: format!("rename failed: {e}"),
+            exit_code: None,
+        }
+    })?;
+
+    if let Some((uid, gid)) = metadata.owner {
+        let current_uid = unsafe { libc::geteuid() };
+        let current_gid = unsafe { libc::getegid() };
+        if uid != current_uid || gid != current_gid {
+            chown_path(path, uid, gid)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn chown_path(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<(), InstallError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path_c =
+        CString::new(path.as_os_str().as_bytes()).map_err(|e| InstallError::Subprocess {
+            cmd: format!("chown {}", path.display()),
+            stderr: format!("path contains NUL: {e}"),
+            exit_code: None,
+        })?;
+    let rc = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(InstallError::Subprocess {
+            cmd: format!("chown {}:{} {}", uid, gid, path.display()),
+            stderr: format!("chown failed: {err}"),
+            exit_code: Some(rc),
+        });
+    }
+    Ok(())
+}
+
+fn copy_root_credential_file_atomic(src: &Path, dst: &Path) -> Result<(), InstallError> {
+    let contents = std::fs::read(src).map_err(|e| InstallError::Subprocess {
+        cmd: format!("read {}", src.display()),
+        stderr: format!("read failed: {e}"),
+        exit_code: None,
+    })?;
+    write_install_file_atomic(
+        dst,
+        &contents,
+        AtomicFileMetadata {
+            mode: Some(0o440),
+            owner: None,
+        },
+    )
+}
+
+fn existing_regular_config_metadata(
+    path: &Path,
+) -> Result<Option<AtomicFileMetadata>, InstallError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(InstallError::Subprocess {
+                cmd: format!("stat {}", path.display()),
+                stderr: format!("symlink_metadata failed: {e}"),
+                exit_code: None,
+            });
+        }
+    };
+
+    if meta.file_type().is_symlink() {
+        return Err(InstallError::Subprocess {
+            cmd: format!("stat {}", path.display()),
+            stderr: "refusing to use symlinked daemon config path".to_string(),
+            exit_code: None,
+        });
+    }
+    if !meta.is_file() {
+        return Err(InstallError::Subprocess {
+            cmd: format!("stat {}", path.display()),
+            stderr: "refusing to use non-file daemon config path".to_string(),
+            exit_code: None,
+        });
+    }
+
+    Ok(Some(AtomicFileMetadata {
+        mode: Some(meta.permissions().mode() & 0o777),
+        owner: Some((meta.uid(), meta.gid())),
+    }))
 }
 
 /// Returns true if `id <user>` exits 0 (user exists). On spawn failure
@@ -1082,7 +1271,7 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
             range_start,
             slot_count,
         } => format!(
-            "\n[spawn_pool]\n# implementation-note-167 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
+            "\n[spawn_pool]\n# implementation-note-141 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
         ),
         SpawnPoolProvisioning::SystemUsers { uids, gid }
         | SpawnPoolProvisioning::ManualCommands { uids, gid, .. } => {
@@ -1092,7 +1281,7 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "\n[spawn_pool]\n# implementation-note-139 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
+                "\n[spawn_pool]\n# implementation-note-119 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
             )
         }
     }
@@ -1156,6 +1345,7 @@ fn write_spawn_pool_config_inner(
     provisioning: &SpawnPoolProvisioning,
 ) -> Result<(), InstallError> {
     let config_path = paths.config_file();
+    let rewrite_metadata = existing_regular_config_metadata(&config_path)?;
 
     let existing = match std::fs::read_to_string(&config_path) {
         Ok(text) => text,
@@ -1186,11 +1376,14 @@ fn write_spawn_pool_config_inner(
         })?;
     }
 
-    std::fs::write(&config_path, out).map_err(|e| InstallError::Subprocess {
-        cmd: format!("write {}", config_path.display()),
-        stderr: format!("write failed: {e}"),
-        exit_code: None,
-    })?;
+    write_install_file_atomic(
+        &config_path,
+        out.as_bytes(),
+        rewrite_metadata.unwrap_or(AtomicFileMetadata {
+            mode: None,
+            owner: None,
+        }),
+    )?;
 
     Ok(())
 }
@@ -1250,9 +1443,10 @@ account = \"{keyring_account}\"
 /// system config is system-provisioning's job, so the install wizard owns it
 /// (the `ensure-config` step, sequenced *before* `emit-launch-spec`).
 ///
-/// Idempotent and **non-clobbering**: if `config.toml` already exists it is
-/// left untouched — an operator's existing config (hand edits, a prior
-/// install's settings, an upgrade-over-existing host) is authoritative. The
+/// Idempotent and **non-clobbering**: if a regular `config.toml` already
+/// exists it is left untouched — an operator's existing config (hand edits, a
+/// prior install's settings, an upgrade-over-existing host) is authoritative.
+/// Symlink and non-file config paths are refused rather than followed. The
 /// keyring service/account match the daemon-runtime defaults
 /// (`EMBER_KEYRING_SERVICE`/`_ACCOUNT` env override → built-in defaults) so the
 /// CLI and daemon vault paths agree.
@@ -1273,7 +1467,7 @@ fn write_default_config_if_absent_inner(
     paths: &crate::paths::DaemonPaths,
 ) -> Result<(), InstallError> {
     let config_path = paths.config_file();
-    if config_path.exists() {
+    if existing_regular_config_metadata(&config_path)?.is_some() {
         return Ok(());
     }
 
@@ -1290,13 +1484,14 @@ fn write_default_config_if_absent_inner(
     let account = std::env::var("EMBER_KEYRING_ACCOUNT")
         .unwrap_or_else(|_| crate::infra::vault::DEFAULT_KEYRING_ACCOUNT.to_string());
 
-    std::fs::write(&config_path, default_config_toml(&service, &account)).map_err(|e| {
-        InstallError::Subprocess {
-            cmd: format!("write {}", config_path.display()),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        }
-    })?;
+    write_install_file_atomic(
+        &config_path,
+        default_config_toml(&service, &account).as_bytes(),
+        AtomicFileMetadata {
+            mode: None,
+            owner: None,
+        },
+    )?;
 
     Ok(())
 }
@@ -1819,27 +2014,7 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
             continue;
         }
 
-        // Remove destination before copy so that a pre-existing 0440 file
-        // (from a previous install) does not cause Permission denied. The
-        // file is invisible during the tiny window between remove and copy
-        // because the parent dir is root:ember-clients 0750 — no other
-        // process can race in that gap without already having root.
-        if Path::new(dst_path).exists() {
-            std::fs::remove_file(dst_path).map_err(|e| InstallError::Subprocess {
-                cmd: format!("remove {dst_path}"),
-                stderr: format!("remove failed: {e}"),
-                exit_code: None,
-            })?;
-        }
-
-        // Write then chmod then chown — safest ordering against partial-state
-        // windows where the file is visible but not yet locked down.
-        std::fs::copy(&src, dst_path).map_err(|e| InstallError::Subprocess {
-            cmd: format!("copy {} -> {dst_path}", src.display()),
-            stderr: format!("copy failed: {e}"),
-            exit_code: None,
-        })?;
-
+        copy_root_credential_file_atomic(&src, Path::new(dst_path))?;
         run("chmod", &["0440", dst_path], false)?;
         // `root:ember-clients` (formerly `root:ember`) so the daemon — running
         // with `ember-clients` as primary group per the matching plist change
@@ -2369,15 +2544,7 @@ fn bridge_bind_value_is_set(config_toml: &str) -> bool {
 /// Requires elevated privileges (typically invoked under `sudo` from
 /// the installer entry point).
 ///
-pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
-    // design: operator-side `~/.ember/binaries/` (the signed binary
-    // manifest the daemon reads but the operator writes after every
-    // host refresh) still needs its operator-owned repair pass. The
-    // full move to operator-cache is deferred to PR 3e/3f; until then
-    // the legacy operator-home location is the authoritative store and
-    // the CLI's `home` argument still points at it.
-    repair_binary_manifest_dir_ownership(home)?;
-
+pub fn chown_ember_data_dirs(_home: &Path) -> Result<(), InstallError> {
     // Daemon-side state — the post-design system root.
     let paths = crate::paths::DaemonPaths::system();
     chown_ember_data_dirs_inner(&paths.state_root, &mut |path, is_dir| {
@@ -2398,60 +2565,6 @@ pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
             "0640"
         };
         run("chmod", &[mode, &path_str], false)
-    })
-}
-
-/// Keep `~/.ember/binaries` writable by the operator and readable by the
-/// daemon. The daemon reads the signed binary manifest from this directory,
-/// but host refresh writes it from operator space after copying bundled
-/// Construct binaries.
-///
-/// **Deferred move per design.** `~/.ember/binaries/` is operator-data
-/// (CLI binary cache) and is slated to move to the operator-cache path
-/// (`~/Library/Caches/Emberlink/binaries/` on macOS;
-/// `$XDG_CACHE_HOME/emberlink/binaries/` on Linux) in PR 3e/3f of the
-/// design follow-on sequence. PR 3d (this PR) is the daemon-system-
-/// paths move; the operator-cache move is out of scope here. This
-/// function continues to repair `<operator_home>/.ember/binaries/`
-/// in-place until the move lands; CLI callers (`ember.rs`,
-/// `wizard.rs`) still pass the operator home, so the legacy path
-/// stays correct.
-fn repair_binary_manifest_dir_ownership(home: &Path) -> Result<(), InstallError> {
-    // Short-circuit if the binaries dir does not exist before we touch the
-    // operator resolver — keeps the chown_ember_data_dirs test surface
-    // working without an env-pinned operator (tempdir tests have no
-    // `.ember/binaries/` so the resolver is irrelevant).
-    let binaries_dir = home.join(".ember").join("binaries");
-    if !binaries_dir.exists() {
-        return Ok(());
-    }
-    let operator = resolve_operator_user()?;
-    repair_binary_manifest_dir_ownership_inner(home, &operator, &mut |path, is_dir, owner| {
-        let path_str = path.to_string_lossy().into_owned();
-        run("chown", &[owner, &path_str], false)?;
-        run(
-            "chmod",
-            &[if is_dir { "0750" } else { "0640" }, &path_str],
-            false,
-        )
-    })
-}
-
-fn repair_binary_manifest_dir_ownership_inner<F>(
-    home: &Path,
-    operator: &str,
-    apply_ownership: &mut F,
-) -> Result<(), InstallError>
-where
-    F: FnMut(&Path, bool, &str) -> Result<(), InstallError>,
-{
-    let binaries_dir = home.join(".ember").join("binaries");
-    if !binaries_dir.exists() {
-        return Ok(());
-    }
-    let owner = format!("{operator}:ember-clients");
-    chown_chmod_recursive_inner(&binaries_dir, &mut |path, is_dir| {
-        apply_ownership(path, is_dir, &owner)
     })
 }
 
@@ -2811,7 +2924,7 @@ pub(crate) fn render_launchd_plist_body_with_trust_roots(
              <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>\n\
 {trust_roots_env_line}  \
            </dict>\n  \
-           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-309. -->\n  \
+           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-232. -->\n  \
            <key>ProgramArguments</key>\n  \
            <array>\n    \
              <string>/usr/bin/sandbox-exec</string>\n    \
@@ -2904,7 +3017,7 @@ pub(crate) fn render_systemd_unit_body(_operator_home: &Path) -> String {
      StateDirectoryMode=0750\n\
      ConfigurationDirectory=ember\n\
      \n\
-     # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-309.\n\
+     # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-232.\n\
      # Allowlist: systemd-curated baseline + explicit fork/exec/mlock.\n\
      SystemCallFilter=@system-service @ipc @memlock\n\
      SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources\n\
@@ -3285,11 +3398,7 @@ pub fn install_launchd_plist_with_trust_roots(
         || log_paths_repaired
         || stale_runtime_cleared
     {
-        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
-            cmd: format!("write {LAUNCHD_PLIST_PATH}"),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        })?;
+        write_root_install_file_atomic(path, body.as_bytes())?;
 
         run("chmod", &["0644", LAUNCHD_PLIST_PATH], false)?;
 
@@ -3372,11 +3481,7 @@ pub fn install_rpc_plist(operator_home: &Path) -> Result<(), InstallError> {
         return Ok(());
     }
 
-    std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
-        cmd: format!("write {LAUNCHD_RPC_PLIST_PATH}"),
-        stderr: format!("write failed: {e}"),
-        exit_code: None,
-    })?;
+    write_root_install_file_atomic(path, body.as_bytes())?;
     run("chmod", &["0644", LAUNCHD_RPC_PLIST_PATH], false)?;
 
     if should_bootstrap {
@@ -3650,10 +3755,7 @@ fn park_incompatible_launchd_binary_manifest(
     operator_home: &Path,
     install_trust_roots: &str,
 ) -> Result<bool, InstallError> {
-    let manifest_path = operator_home
-        .join(".ember")
-        .join("binaries")
-        .join("manifest.toml");
+    let manifest_path = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
     let trust_roots = launchd_binary_manifest_trust_roots(operator_home, install_trust_roots)?;
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3836,11 +3938,7 @@ fn install_launchd_sandbox_profile_into(
     let rendered = render_launchd_sandbox_profile_body(operator_home);
     let existing = std::fs::read_to_string(dst).ok();
     if existing.as_deref() != Some(rendered.as_str()) {
-        std::fs::write(dst, rendered).map_err(|e| InstallError::Subprocess {
-            cmd: format!("write {}", dst.display()),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        })?;
+        write_root_install_file_atomic(dst, rendered.as_bytes())?;
     }
 
     #[cfg(unix)]
@@ -4210,11 +4308,7 @@ pub fn install_systemd_unit(operator_home: &Path) -> Result<(), InstallError> {
         .unwrap_or(false);
 
     if !already_matches {
-        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
-            cmd: format!("write {SYSTEMD_UNIT_PATH}"),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        })?;
+        write_root_install_file_atomic(path, body.as_bytes())?;
 
         run("chmod", &["0644", SYSTEMD_UNIT_PATH], false)?;
     }
@@ -4277,11 +4371,7 @@ pub fn install_rpc_systemd_unit(operator_home: &Path) -> Result<(), InstallError
         .unwrap_or(false);
 
     if !already_matches {
-        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
-            cmd: format!("write {SYSTEMD_RPC_UNIT_PATH}"),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        })?;
+        write_root_install_file_atomic(path, body.as_bytes())?;
         run("chmod", &["0644", SYSTEMD_RPC_UNIT_PATH], false)?;
     }
 
@@ -4496,11 +4586,7 @@ pub fn install_spawn_helper_unit(
         .unwrap_or(false);
 
     if !already_matches {
-        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
-            cmd: format!("write {SPAWN_HELPER_UNIT_PATH}"),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        })?;
+        write_root_install_file_atomic(path, body.as_bytes())?;
 
         run("chmod", &["0644", SPAWN_HELPER_UNIT_PATH], false)?;
     }
@@ -4679,11 +4765,7 @@ pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<
         .unwrap_or(false);
 
     if !already_matches || !is_spawn_helper_service_loaded() {
-        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
-            cmd: format!("write {SPAWN_HELPER_PLIST_PATH}"),
-            stderr: format!("write failed: {e}"),
-            exit_code: None,
-        })?;
+        write_root_install_file_atomic(path, body.as_bytes())?;
         run("chmod", &["0644", SPAWN_HELPER_PLIST_PATH], false)?;
 
         spawn_helper_bootout_tolerant()?;
@@ -4871,13 +4953,71 @@ mod tests {
         assert!(!already_exists(""));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn write_root_install_file_atomic_replaces_symlink_without_clobbering_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target");
+        let dest = tmp.path().join("launchd.plist");
+        std::fs::write(&target, b"keep-target").expect("write target");
+        symlink(&target, &dest).expect("create symlink");
+
+        write_root_install_file_atomic(&dest, b"new-unit").expect("atomic write");
+
+        assert_eq!(std::fs::read(&target).expect("read target"), b"keep-target");
+        assert_eq!(std::fs::read(&dest).expect("read dest"), b"new-unit");
+        assert!(
+            !std::fs::symlink_metadata(&dest)
+                .expect("dest metadata")
+                .file_type()
+                .is_symlink(),
+            "atomic install write must replace the destination symlink itself"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_root_credential_file_atomic_replaces_symlink_without_clobbering_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("source.pem");
+        let target = tmp.path().join("target");
+        let dest = tmp.path().join("credential.pem");
+        std::fs::write(&src, b"new-secret").expect("write source");
+        std::fs::write(&target, b"keep-target").expect("write target");
+        symlink(&target, &dest).expect("create symlink");
+
+        copy_root_credential_file_atomic(&src, &dest).expect("atomic credential copy");
+
+        assert_eq!(std::fs::read(&target).expect("read target"), b"keep-target");
+        assert_eq!(std::fs::read(&dest).expect("read dest"), b"new-secret");
+        assert!(
+            !std::fs::symlink_metadata(&dest)
+                .expect("dest metadata")
+                .file_type()
+                .is_symlink(),
+            "atomic credential copy must replace the destination symlink itself"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest)
+                .expect("dest metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o440,
+            "credential copy must pre-lock the destination mode"
+        );
+    }
+
     /// T1 unit — the chown traversal is a no-op when the system state
     /// root does not exist yet (fresh host pre-install). The public
     /// `chown_ember_data_dirs` short-circuits on a missing root so
     /// re-running before the installer has populated the system tree is
-    /// safe. We don't assert on `repair_binary_manifest_dir_ownership`
-    /// here — tmpdir has no `.ember/binaries/` so the resolver is never
-    /// called.
+    /// safe. Legacy binary-manifest repair is migration-only and not part
+    /// of this default chown path.
     #[test]
     fn chown_ember_data_dirs_on_empty_system_root_is_ok() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4976,46 +5116,6 @@ mod tests {
         assert!(
             visited.is_empty(),
             "missing state root must NOT invoke the closure; visited={visited:?}"
-        );
-    }
-
-    /// The skipped `binaries/` tree still needs an explicit ownership repair:
-    /// operator-owned for manifest refresh writes, `ember-clients` group-readable
-    /// for daemon startup and broker resolution.
-    #[test]
-    fn repair_binary_manifest_dir_ownership_inner_visits_binaries_as_operator() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let binaries_dir = tmp.path().join(".ember").join("binaries");
-        std::fs::create_dir_all(&binaries_dir).expect("mkdir .ember/binaries");
-        let manifest_path = binaries_dir.join("manifest.toml");
-        std::fs::write(&manifest_path, b"# manifest").expect("write manifest");
-
-        let mut visited: Vec<(std::path::PathBuf, bool, String)> = Vec::new();
-        repair_binary_manifest_dir_ownership_inner(
-            tmp.path(),
-            "alice",
-            &mut |path, is_dir, owner| {
-                visited.push((path.to_path_buf(), is_dir, owner.to_string()));
-                Ok(())
-            },
-        )
-        .expect("repair should visit binaries tree");
-
-        assert!(
-            visited
-                .iter()
-                .any(|(path, is_dir, owner)| path == &binaries_dir
-                    && *is_dir
-                    && owner == "alice:ember-clients"),
-            "binaries dir must be repaired as operator-owned; visited={visited:?}"
-        );
-        assert!(
-            visited
-                .iter()
-                .any(|(path, is_dir, owner)| path == &manifest_path
-                    && !*is_dir
-                    && owner == "alice:ember-clients"),
-            "manifest file must be repaired as operator-owned; visited={visited:?}"
         );
     }
 
@@ -5374,7 +5474,7 @@ mod tests {
             "    <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>",
             "  </dict>",
             // emberd_launchd_sandbox_wired.
-            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-309. -->",
+            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-232. -->",
             "  <key>ProgramArguments</key>",
             "  <array>",
             "    <string>/usr/bin/sandbox-exec</string>",
@@ -5486,7 +5586,7 @@ mod tests {
             "ConfigurationDirectory=ember",
             "",
             // emberd_systemd_seccomp_wired.
-            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-309.",
+            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-232.",
             "# Allowlist: systemd-curated baseline + explicit fork/exec/mlock.",
             "SystemCallFilter=@system-service @ipc @memlock",
             "SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources",
@@ -5793,26 +5893,7 @@ system/sh.emberlink.daemon = {\n\
 
             let dst = dest_dir.join(dst_name);
 
-            // Remove before copy so a pre-existing 0440 file doesn't cause
-            // Permission denied on the write (mirrors install_pem_to_etc).
-            // Removal only needs write on the parent dir — no need to relax
-            // the file's own mode first.
-            if dst.exists() {
-                std::fs::remove_file(&dst).map_err(|e| InstallError::Subprocess {
-                    cmd: format!("remove {}", dst.display()),
-                    stderr: format!("remove failed: {e}"),
-                    exit_code: None,
-                })?;
-            }
-
-            std::fs::copy(&src, &dst).map_err(|e| InstallError::Subprocess {
-                cmd: format!("copy {} -> {}", src.display(), dst.display()),
-                stderr: format!("copy failed: {e}"),
-                exit_code: None,
-            })?;
-
-            // Set mode 0440 on the file.
-            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o440))?;
+            copy_root_credential_file_atomic(&src, &dst)?;
         }
 
         Ok(())
@@ -6941,6 +7022,40 @@ system/sh.emberlink.daemon = {\n\
         assert_eq!(text, existing, "existing config must be left untouched");
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn write_default_config_if_absent_refuses_symlinked_config() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).expect("mkdir config dir");
+        let target = tmp.path().join("attacker-target.toml");
+        symlink(&target, paths.config_file()).expect("create dangling config symlink");
+
+        let err = write_default_config_if_absent_inner(&paths)
+            .expect_err("default config writer must reject symlinked config paths");
+
+        match err {
+            InstallError::Subprocess { stderr, .. } => assert!(
+                stderr.contains("refusing to use symlinked daemon config path"),
+                "unexpected stderr: {stderr}"
+            ),
+            other => panic!("expected subprocess error, got {other:?}"),
+        }
+        assert!(
+            !target.exists(),
+            "default config writer must not create the symlink target"
+        );
+        assert!(
+            std::fs::symlink_metadata(paths.config_file())
+                .expect("config metadata")
+                .file_type()
+                .is_symlink(),
+            "existing symlink must be left untouched"
+        );
+    }
+
     /// T1 — upsert is idempotent and replaces a stale `[spawn_pool]` block
     /// without duplicating it or disturbing other sections.
     #[test]
@@ -6987,6 +7102,66 @@ system/sh.emberlink.daemon = {\n\
         let cfg: toml::Value = toml::from_str(&text).expect("valid toml");
         assert!(cfg.get("spawn_pool").is_some(), "spawn_pool parses");
         assert!(cfg.get("daemon").is_some(), "daemon parses");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_spawn_pool_config_preserves_existing_config_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).expect("mkdir config dir");
+        std::fs::write(paths.config_file(), "[daemon]\nlog_level = \"info\"\n")
+            .expect("seed config");
+        std::fs::set_permissions(paths.config_file(), std::fs::Permissions::from_mode(0o640))
+            .expect("set config mode");
+
+        let prov = SpawnPoolProvisioning::SystemUsers {
+            uids: vec![10010],
+            gid: 10020,
+        };
+        write_spawn_pool_config_inner(&paths, &prov).expect("rewrite config");
+
+        let meta = std::fs::metadata(paths.config_file()).expect("config metadata");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o640,
+            "atomic config rewrite must preserve existing mode"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_spawn_pool_config_refuses_symlinked_config() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::paths::DaemonPaths::for_test(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).expect("mkdir config dir");
+        let target = tmp.path().join("operator-config.toml");
+        std::fs::write(&target, "[daemon]\nlog_level = \"debug\"\n").expect("seed target");
+        symlink(&target, paths.config_file()).expect("symlink config");
+
+        let prov = SpawnPoolProvisioning::SystemUsers {
+            uids: vec![10010],
+            gid: 10020,
+        };
+        let err = write_spawn_pool_config_inner(&paths, &prov)
+            .expect_err("mutable config rewrite must reject symlinks");
+
+        match err {
+            InstallError::Subprocess { stderr, .. } => assert!(
+                stderr.contains("refusing to use symlinked daemon config path"),
+                "unexpected stderr: {stderr}"
+            ),
+            other => panic!("expected subprocess error, got {other:?}"),
+        }
+        let target_text = std::fs::read_to_string(&target).expect("read target");
+        assert_eq!(
+            target_text, "[daemon]\nlog_level = \"debug\"\n",
+            "symlink target must not be mutated"
+        );
     }
 
     /// T1 — `strip_spawn_pool_section` removes the section when it is the last

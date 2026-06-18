@@ -113,22 +113,26 @@ impl From<VaultError> for ProxyError {
 pub struct ProxyState {
     pub store: crate::infra::store::DaemonStore,
     pub sessions_dir: Option<std::path::PathBuf>,
-    /// Per-credential single-flight locks for the codex GPT-plan refresh
-    /// (-S2). ChatGPT refresh tokens ROTATE (single-use), so two concurrent
-    /// requests must NOT both POST a refresh with the same token — the second
-    /// would get `refresh_token_reused` and brick the credential. The first
-    /// caller to find the access token near-expiry holds the per-credential
-    /// lock across the refresh + vault write-back; concurrent callers await it,
-    /// then re-read the freshly-rotated token instead of refreshing again.
-    /// `RefCell<HashMap<..>>` because all proxy work runs on one `LocalSet`
-    /// thread (see `DaemonPolicyBackend`'s `unsafe impl Send`).
-    pub codex_refresh_locks:
+    /// Per-credential single-flight locks for daemon-owned OAuth token refresh,
+    /// shared by the codex GPT-plan lane (`resolve_chatgpt_plan_auth`) and the
+    /// gemini Code Assist lane (`resolve_oauth_bearer`). ChatGPT refresh tokens
+    /// ROTATE (single-use), so two concurrent requests must NOT both POST a
+    /// refresh with the same token — the second would get `refresh_token_reused`
+    /// and brick the credential; Google's don't rotate but the single-flight
+    /// still avoids a thundering herd of refreshes. The first caller to find the
+    /// access token near-expiry holds the per-credential lock across the refresh
+    /// + vault write-back; concurrent callers await it, then re-read the
+    /// freshly-refreshed token instead of refreshing again. Keyed by
+    /// `credential_name`, so the codex (`openai/…`) and gemini (`google/…`) lanes
+    /// never collide. `RefCell<HashMap<..>>` because all proxy work runs on one
+    /// `LocalSet` thread (see `DaemonPolicyBackend`'s `unsafe impl Send`).
+    pub oauth_refresh_locks:
         RefCell<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     pub vault: std::rc::Rc<crate::infra::vault::Vault>,
     /// Audit-log + broadcast sink, installed once during proxy spawn.
     ///
-    /// implementation-note-287: the threshold-debounce set and the
+    /// The threshold-debounce set and the
     /// broadcast channel both moved INTO `DaemonEventSink`. `ProxyState`
     /// now holds a `OnceLock` pointer to the sink so the existing
     /// `state.sink_*` shim methods (and `emit_threshold_crossings` /
@@ -158,7 +162,7 @@ impl ProxyState {
                 .expect("ProxyState::new tests require a live vault attached to the store"),
             store,
             sessions_dir,
-            codex_refresh_locks: RefCell::new(std::collections::HashMap::new()),
+            oauth_refresh_locks: RefCell::new(std::collections::HashMap::new()),
             event_sink: OnceLock::new(),
         }
     }
@@ -245,8 +249,16 @@ impl DaemonPolicyBackend {
         Self { inner: state }
     }
 
-    pub(crate) fn log_codex_loopback_no_kernel_attestation(
+    /// Audit a loopback-TCP connection admitted without kernel peer
+    /// attestation. The `lane` (the projector's name — `codex`,
+    /// `gemini-code-assist`, …) is woven into the event kind so each loopback
+    /// lane logs under its own `<lane>-loopback-no-kernel-attestation` kind
+    /// rather than every lane masquerading as codex (design §2). The codex
+    /// lane therefore still emits `codex-loopback-no-kernel-attestation`,
+    /// byte-for-byte as before.
+    pub(crate) fn log_loopback_no_kernel_attestation(
         &self,
+        lane: &str,
         session_id: &str,
         bound_uid: u32,
         admission_policy: &AdmissionPolicy,
@@ -255,11 +267,11 @@ impl DaemonPolicyBackend {
             .store
             .log_event(
                 None,
-                "codex-loopback-no-kernel-attestation",
+                &format!("{lane}-loopback-no-kernel-attestation"),
                 None,
                 "warn",
                 Some(&format!(
-                    "session={session_id} policy={admission_policy} bound_uid={bound_uid} reason=loopback-tcp-no-kernel-peercred"
+                    "lane={lane} session={session_id} policy={admission_policy} bound_uid={bound_uid} reason=loopback-tcp-no-kernel-peercred"
                 )),
             )
             .map(|_| ())
@@ -348,10 +360,59 @@ impl DaemonPolicyBackend {
             .map(|_| ())
             .map_err(|e| core_proxy_forward::PolicyError::Vault(e.to_string()))
     }
+
+    /// Read + parse the gemini Code Assist `oauth_creds` blob from the vault
+    /// (SYNCHRONOUS — holds the `!Send` `Rc<Vault>` only within this fn, never
+    /// across an await). Sibling of [`read_codex_token_blob`].
+    fn read_gemini_oauth_blob(
+        &self,
+        credential_name: &str,
+    ) -> Result<crate::infra::gemini_oauth::GeminiOAuthBlob, core_proxy_forward::PolicyError> {
+        let vault = self
+            .inner
+            .current_vault()
+            .map_err(|e| core_proxy_forward::PolicyError::Vault(e.to_string()))?;
+        let bytes = match vault.get(VaultScope::Interactive, &self.inner.store, credential_name) {
+            Ok(b) => b,
+            Err(VaultError::NotFound) => {
+                return Err(core_proxy_forward::PolicyError::NotFound(format!(
+                    "credential not found in vault: {credential_name}"
+                )));
+            }
+            Err(e) => return Err(core_proxy_forward::PolicyError::Vault(e.to_string())),
+        };
+        crate::infra::gemini_oauth::parse_oauth_blob(&bytes).map_err(|e| {
+            core_proxy_forward::PolicyError::Vault(format!("gemini oauth blob parse: {e}"))
+        })
+    }
+
+    /// Persist a (refreshed) gemini `oauth_creds` blob back to the vault in-place
+    /// (SYNCHRONOUS — same `!Send`-not-across-await discipline as the read).
+    fn write_gemini_oauth_blob(
+        &self,
+        credential_name: &str,
+        blob: &crate::infra::gemini_oauth::GeminiOAuthBlob,
+    ) -> Result<(), core_proxy_forward::PolicyError> {
+        let vault = self
+            .inner
+            .current_vault()
+            .map_err(|e| core_proxy_forward::PolicyError::Vault(e.to_string()))?;
+        let bytes = crate::infra::gemini_oauth::serialize_oauth_blob(blob);
+        vault
+            .replace(
+                VaultScope::Interactive,
+                &self.inner.store,
+                credential_name,
+                &bytes,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|e| core_proxy_forward::PolicyError::Vault(e.to_string()))
+    }
 }
 
 /// `endpoint_gate_egress_default_composed` — design slice 3 composition hook
-/// for `implementation-note-214`.
+/// for the default agent-egress gating policy.
 ///
 /// The shipped in-process `run_proxy` listener is still the plain host LLM
 /// proxy; the future egress-default/`ember-proxy` mTLS listener is not present
@@ -934,7 +995,7 @@ impl PolicyBackend for DaemonPolicyBackend {
         // 3. Refresh needed → single-flight on a per-credential lock so two
         //    concurrent requests can't both spend the (rotating) refresh token.
         let lock = {
-            let mut locks = self.inner.codex_refresh_locks.borrow_mut();
+            let mut locks = self.inner.oauth_refresh_locks.borrow_mut();
             Arc::clone(
                 locks
                     .entry(credential_name.to_string())
@@ -985,6 +1046,86 @@ impl PolicyBackend for DaemonPolicyBackend {
         tracing::info!(credential_name = %credential_name, "codex GPT-plan: access token refreshed + rotation persisted");
 
         Ok(plan_auth_from_blob(&new_blob))
+    }
+
+    async fn resolve_oauth_bearer(
+        &self,
+        credential_name: &str,
+    ) -> Result<zeroize::Zeroizing<String>, core_proxy_forward::PolicyError> {
+        use crate::infra::gemini_oauth;
+
+        // Structurally mirrors `resolve_chatgpt_plan_auth` (shared single-flight
+        // discipline + the `!Send`-not-across-await rule), but for the gemini
+        // Code Assist OAuth blob; returns ONLY the access token (no account-id).
+
+        // 1. Read + parse the stored token blob (sync — no await held).
+        let blob = self.read_gemini_oauth_blob(credential_name)?;
+
+        // 2. Fast path: token comfortably valid → return as-is, no refresh.
+        if !gemini_oauth::needs_refresh(&blob, chrono::Utc::now()) {
+            return Ok(zeroize::Zeroizing::new(blob.access_token));
+        }
+
+        // 3. Refresh needed → single-flight on the shared per-credential lock so
+        //    concurrent requests don't stampede the token endpoint.
+        let lock = {
+            let mut locks = self.inner.oauth_refresh_locks.borrow_mut();
+            Arc::clone(
+                locks
+                    .entry(credential_name.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().await;
+
+        // 4. Re-read after acquiring the lock — another task may have just
+        //    refreshed while we waited.
+        let blob = self.read_gemini_oauth_blob(credential_name)?;
+        if !gemini_oauth::needs_refresh(&blob, chrono::Utc::now()) {
+            return Ok(zeroize::Zeroizing::new(blob.access_token));
+        }
+
+        let Some(refresh_token) = blob.refresh_token.clone() else {
+            return Err(core_proxy_forward::PolicyError::Forbidden(
+                "no_refresh_token".into(),
+            ));
+        };
+
+        // 5. Refresh against Google's token endpoint (await — NO vault/store held).
+        let outcome = match gemini_oauth::refresh_access_token(&refresh_token).await {
+            Ok(o) => o,
+            Err(gemini_oauth::RefreshError::Config(msg)) => {
+                tracing::warn!(credential_name = %credential_name, error = %msg, "gemini Code Assist: OAuth client configuration missing");
+                return Err(core_proxy_forward::PolicyError::Other(format!(
+                    "Gemini OAuth client configuration missing: {msg}"
+                )));
+            }
+            Err(gemini_oauth::RefreshError::Permanent(reason)) => {
+                tracing::warn!(credential_name = %credential_name, reason = %reason, "gemini Code Assist: refresh token unusable — re-auth required");
+                return Err(core_proxy_forward::PolicyError::Forbidden(format!(
+                    "refresh_{reason}"
+                )));
+            }
+            Err(gemini_oauth::RefreshError::Transient(msg)) => {
+                tracing::warn!(credential_name = %credential_name, error = %msg, "gemini Code Assist: transient refresh failure");
+                // Not hard-expired yet → fall back to the stored token rather
+                // than failing the request on a transient blip.
+                if !gemini_oauth::is_hard_expired(&blob, chrono::Utc::now()) {
+                    return Ok(zeroize::Zeroizing::new(blob.access_token));
+                }
+                return Err(core_proxy_forward::PolicyError::Other(format!(
+                    "refresh failed: {msg}"
+                )));
+            }
+        };
+
+        // 6. Merge refreshed token + persist back to vault (sync — no await).
+        let mut new_blob = blob;
+        gemini_oauth::apply_refresh(&mut new_blob, outcome, chrono::Utc::now());
+        self.write_gemini_oauth_blob(credential_name, &new_blob)?;
+        tracing::info!(credential_name = %credential_name, "gemini Code Assist: access token refreshed + persisted");
+
+        Ok(zeroize::Zeroizing::new(new_blob.access_token))
     }
 
     async fn post_flight(
@@ -1054,7 +1195,7 @@ impl PolicyBackend for DaemonPolicyBackend {
         Ok(())
     }
 
-    // implementation-note-215: post_flight_meter is the trait-level entry
+    // post_flight_meter is the trait-level entry
     // point for credential-grant metering after the upstream call completes.
     // Distinct from `post_flight` at the trait level so Slice C's remote
     // backend can route the two through different metering paths. The
@@ -1066,6 +1207,35 @@ impl PolicyBackend for DaemonPolicyBackend {
         usage: Option<core_grant_types::Usage>,
     ) -> Result<(), core_proxy_forward::PolicyError> {
         self.post_flight(resolved, usage).await
+    }
+
+    async fn issue_proxy_call_receipt(
+        &self,
+        resolved: &core_proxy_forward::ResolvedGrant,
+        call: &core_proxy_forward::ProxyCallReceiptRequest,
+    ) -> Result<Option<String>, core_proxy_forward::PolicyError> {
+        let body = core_events::receipt::ProxyCallBody {
+            persona_id: resolved.persona_id.clone(),
+            grant_id: resolved.grant_id.clone(),
+            statement_sid: resolved.statement_sid.clone(),
+            method: call.method.clone(),
+            path: call.path.clone(),
+            status: call.status,
+            tokens_in: call.tokens_in,
+            tokens_out: call.tokens_out,
+            tokens_total: call.tokens_in.saturating_add(call.tokens_out),
+            outcome: call.outcome.clone(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        // proxy_call_receipt_id_is_signed: the forwarding runtime receives
+        // this canonical ReceiptEnvelope id and never derives a demo hash at
+        // the event emit site.
+        Ok(crate::infra::receipt::emit_proxy_call_receipt_current(
+            &self.inner.store,
+            &resolved.grant_id,
+            &resolved.persona_id,
+            &body,
+        ))
     }
 
     async fn log_event(
@@ -1090,8 +1260,7 @@ impl PolicyBackend for DaemonPolicyBackend {
     }
 }
 
-/// `EventSink` implementation for the ember daemon — landed in
-/// implementation-note-215 and finished in B-2.
+/// `EventSink` implementation for the ember daemon.
 ///
 /// Wraps the daemon's `ProxyState` so the proxy pipeline can route audit
 /// writes + grant-event broadcasts through the trait surface. This is the
@@ -1123,7 +1292,7 @@ pub struct DaemonEventSink {
     /// SDKs). `None` in unit tests that only exercise audit-log emission
     /// and in the git-echo proxy spawn, which does not yet broadcast.
     ///
-    /// Moved here from `ProxyState` in implementation-note-287 so
+    /// Moved here from `ProxyState` so
     /// the broadcast path is fully owned by the sink.
     events_tx: Option<broadcast::Sender<GrantEvent>>,
     /// In-memory debounce set for threshold-crossing emissions. Entries
@@ -1136,7 +1305,7 @@ pub struct DaemonEventSink {
     /// `RefCell` is safe here because proxy connections run on a
     /// `LocalSet` (see `run_proxy`) — the single-threaded runtime gives
     /// non-Sync interior mutability for free without a Mutex. Moved here
-    /// from `ProxyState` in implementation-note-287.
+    /// from `ProxyState`.
     threshold_emitted: RefCell<HashSet<(String, String, &'static str, &'static str)>>,
 }
 
@@ -1273,7 +1442,7 @@ impl EventSink for DaemonEventSink {
 /// `std::io::Error`). Bind success/failure must not depend on whether the
 /// receiver is still listening (silent-ignore on dropped rx).
 ///
-/// implementation-note-196 — added `bind_tx` so the daemon runtime can
+/// Added `bind_tx` so the daemon runtime can
 /// wait for bind, log the actual URL, and write the `proxy.url` sidecar
 /// before entering the main accept loop, matching `run_git_echo_proxy`'s
 /// startup discipline.
@@ -1323,7 +1492,7 @@ pub async fn run_proxy(
 }
 
 // ===== kept from proxy.rs lines 2233-2246 =====
-/// C44-implementation-note-288: short, stable hash of a credential alias for
+/// Short, stable hash of a credential alias for
 /// emission into the audit log's `credential` column.
 ///
 /// Returns `credname-<first 16 hex of sha256>` — enough entropy to avoid
@@ -1350,9 +1519,9 @@ fn hash_credential_name_for_audit(credential_name: &str) -> String {
 /// `upstream_status_is_success` carries the upstream HTTP response's
 /// 2xx-ness through to the meter so the `usage.requests` counter only
 /// increments on upstream-confirmed responses. See
-/// `record_upstream_request` (T-implementation-note-286).
+/// `record_upstream_request`.
 ///
-/// WIP-FOR: T-implementation-note-286 — caller wiring in the
+/// Caller wiring in the
 /// proxy streaming path is in flight; this function is the shared meter
 /// the buffered + SSE-tee paths will both invoke once that task lands.
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -1389,7 +1558,7 @@ fn run_post_flight_meter(
         );
         return;
     };
-    // T-implementation-note-286: fold the upstream-confirmed
+    // Fold the upstream-confirmed
     // request count into the delta. `meter_response` no longer hardcodes
     // `requests: 1`; this is the single decision point that mints the
     // billable request against the grant. A successful upstream that
@@ -1406,7 +1575,7 @@ fn run_post_flight_meter(
     // `statement_usage` is identical for both cases; the audit record is
     // where the distinction lives.
     //
-    // C44-implementation-note-288: the `credential` audit column stores a short
+    // The `credential` audit column stores a short
     // hash of the credential alias, not the raw alias. Raw aliases would
     // let anyone with audit-log read access correlate persona ↔ credential
     // across rows, breaking persona isolation. The raw alias still lives
@@ -1419,7 +1588,7 @@ fn run_post_flight_meter(
     // audit gap. Surface the error to tracing so the operator at least
     // sees it in the daemon log if the store fails.
     let credential_hash = hash_credential_name_for_audit(credential_name);
-    // implementation-note-287: audit-log emission routes through the
+    // Audit-log emission routes through the
     // sink shim. The store write itself is identical; only the
     // ownership of the call boundary moves.
     if let Err(e) = state.sink_log_event(
@@ -1489,7 +1658,7 @@ fn run_post_flight_meter(
 /// status (Anthropic doesn't open an event stream on 5xx), but plumbing
 /// the bit explicitly keeps both paths symmetric and audit-ready.
 ///
-/// WIP-FOR: T-implementation-note-286 — pairs with
+/// Pairs with
 /// `run_post_flight_meter` above; the SSE-tee path will call this once
 /// caller wiring lands.
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -1528,7 +1697,7 @@ fn run_post_flight_meter_from_summary(
         );
         return;
     };
-    // T-implementation-note-286: same fold as the buffered
+    // Same fold as the buffered
     // path. `usage_from_summary` no longer hardcodes `requests: 1`; we
     // mint the billable request here once the upstream's confirmation
     // is known. A partial stream that observed any usage at all still
@@ -1543,7 +1712,7 @@ fn run_post_flight_meter_from_summary(
     // The audit + increment paths below mirror `run_post_flight_meter`
     // verbatim — keep in sync if either evolves.
     let credential_hash = hash_credential_name_for_audit(credential_name);
-    // implementation-note-287: sink shim — see sibling helper.
+    // Sink shim — see sibling helper.
     if let Err(e) = state.sink_log_event(
         Some(persona_id),
         "proxy.meter",
@@ -1616,7 +1785,7 @@ pub(crate) fn emit_threshold_crossings(
     prior: &core_grant_types::Usage,
     current: &core_grant_types::Usage,
 ) {
-    // implementation-note-65: cents axis runs on micro-cents internally
+    // Cents axis runs on micro-cents internally
     // so sub-cent calls accumulate honestly. Both the cap and the
     // before/after counters are scaled to micro-cents; the displayed
     // `used`/`limit` in the emitted audit/push payload are stepped back
@@ -1700,7 +1869,7 @@ fn emit_debounced(
     used: Option<u64>,
     budget: Option<u64>,
 ) {
-    // implementation-note-287: debounce + audit + broadcast now route
+    // Debounce + audit + broadcast now route
     // through the `DaemonEventSink` reachable via `state.sink()`. The
     // sink owns the threshold-debounce set and the broadcast channel; the
     // sync shim methods on `ProxyState` keep this helper's signature
@@ -1944,7 +2113,7 @@ pub struct GitEchoConfig {
 /// Exposed `pub` so a separate test binary or an `#[ignore]`-d integration
 /// test can spawn it without reaching into daemon state.
 ///
-/// `bind_tx` (implementation-note-289): when `Some`, the bound `SocketAddr` is sent
+/// `bind_tx`: when `Some`, the bound `SocketAddr` is sent
 /// exactly once immediately after `TcpListener::bind` succeeds. Bind errors
 /// are sent as `Err` and the function returns. The receiver gets the actual
 /// local addr (so `127.0.0.1:0` callers can read the assigned port). If the
@@ -2136,7 +2305,7 @@ pub async fn handle_git_echo(
                 credential = %credential_name,
                 "git echo: no active grant for persona/credential"
             );
-            // implementation-note-287: route through sink shim.
+            // Route through sink shim.
             if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
@@ -2262,7 +2431,7 @@ pub async fn handle_git_echo(
                 resource = %resource,
                 "git echo: no applicable statement for request — denying"
             );
-            // implementation-note-287: route through sink shim.
+            // Route through sink shim.
             if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
@@ -2351,7 +2520,7 @@ pub async fn handle_git_echo(
                 credential = %credential_name,
                 "git echo: credential not found in vault"
             );
-            // implementation-note-287: route through sink shim.
+            // Route through sink shim.
             if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
@@ -2370,7 +2539,7 @@ pub async fn handle_git_echo(
 
     // P69L.0b--AUDIT: emit `credential.access` so operators can see
     // that a credential substitution occurred and which repo was targeted.
-    // `action` mirrors the shape from C44-implementation-note-288: "github.push.<owner/repo>".
+    // `action` mirrors the credential-correlation shape: "github.push.<owner/repo>".
     tracing::info!(
         event = "credential.access",
         allowed = true,
@@ -2380,7 +2549,7 @@ pub async fn handle_git_echo(
         request_id = %request_id,
         "git echo: credential access"
     );
-    // implementation-note-287: route through sink shim.
+    // Route through sink shim.
     if let Err(e) = config.state.sink_log_event(
         Some(&persona_id),
         "credential.access",

@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-228 — T2 integration coverage
+//! implementation-note-284 — T2 integration coverage
 //! for design CRIT-2: the spawn-enrollment path populates
 //! `client_cert_fingerprint` + `client_cert_not_after` on the persona row.
 //!

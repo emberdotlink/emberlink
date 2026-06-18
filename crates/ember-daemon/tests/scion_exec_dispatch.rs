@@ -1,4 +1,4 @@
-//! implementation-note-110 — T2 round-trip test for the
+//! implementation-note-92 — T2 round-trip test for the
 //! emberd-side `send_spawn_directive` sender.
 //!
 //! Stands up a mock `ember-exec` listener on a tempfile UDS, calls

@@ -1,6 +1,5 @@
 # Python SDK examples
 
-
 ## Prerequisites
 
 Before running any example you need:

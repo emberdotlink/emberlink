@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-366 — M11 of design.
+//! implementation-note-265 — M11 of design.
 //!
 //! T2 integration coverage for the adversarial threat model around the
 //! `refresh_cert` RPC. Sibling of `cert_refresh_happy_path.rs` (M10); this
@@ -28,12 +28,11 @@
 //!   (runtime_authority.rs:1041-1046). M3 chose this mapping rather than a
 //!   separate `auth_failure_persona_revoked` variant.
 //!
-//! - **Rate-limit refusal** → `exhausted_retries` is the enum value M3 locked
-//!   in the `RefreshFailureCause` shape, but the rate-limit *check* itself is
-//!   M3-D (implementation-note-367) and has NOT
-//!   shipped yet. Scenario #4 below verifies the enum value is in place and
-//!   wire-locked; the activation test (60s cooldown enforced) is gated on
-//!   M3-D and #[ignore]'d with a pointer to that task.
+//! - **Rate-limit refusal** → `rate_limited` (runtime_authority.rs:1222-1231).
+//!   M3-D (implementation-note-266) is shipped:
+//!   the first valid refresh for a persona/container chain wins, subsequent
+//!   refreshes inside the 60s cooldown are denied without minting or mutating
+//!   the persona cert row.
 //!
 //! ## Why T2 (in-process dispatch) is the right boundary
 //!
@@ -372,20 +371,15 @@ async fn concurrent_refresh_atomic_no_torn_write() {
     assert_eq!(state.fingerprint_hex, fp_a);
 }
 
-/// Locked at the wire-shape level: when M3-D ships (implementation-note-368-
-/// REFRESH-CERT-implementation-note-369), the second of two within-window
-/// refreshes will return `denied=true` with `failure_cause=exhausted_retries`.
-/// Today the rate-limit check is not enforced; this test is `#[ignore]`'d
-/// pending M3-D ship. The enum-shape lock for `exhausted_retries` is
-/// validated unconditionally by
-/// `refresh_failure_cause_exhausted_retries_serde_locked` below.
-#[ignore = "gated on implementation-note-367"]
+/// M3-D (implementation-note-266): the
+/// second of two within-window refreshes from the same valid successor cert
+/// chain returns `denied=true` with `failure_cause=rate_limited`.
 #[tokio::test]
-async fn concurrent_refresh_within_window_second_returns_exhausted_retries_after_m3_d() {
+async fn concurrent_refresh_within_window_second_returns_rate_limited_after_m3_d() {
     let fx = adv_fixture("ctr-rate-limited");
     let rl = RefCell::new(RateLimiter::default());
 
-    let _first = handle_refresh_cert(
+    let first = handle_refresh_cert(
         None,
         Some(&fx.mtls),
         &fx.store,
@@ -394,10 +388,15 @@ async fn concurrent_refresh_within_window_second_returns_exhausted_retries_after
     )
     .await
     .expect("first refresh succeeds");
+    assert_eq!(first["denied"], json!(false), "first refresh succeeds");
+
+    let mut refreshed_mtls = fx.mtls.clone();
+    refreshed_mtls.cert_fingerprint =
+        hex_to_fingerprint(first["client_cert_fingerprint"].as_str().unwrap());
 
     let second = handle_refresh_cert(
         None,
-        Some(&fx.mtls),
+        Some(&refreshed_mtls),
         &fx.store,
         &rl,
         &json!({"caller_grant_id": fx.parent_grant_id}),
@@ -412,13 +411,13 @@ async fn concurrent_refresh_within_window_second_returns_exhausted_retries_after
     );
     assert_eq!(
         denial_cause(&second),
-        "exhausted_retries",
-        "M3-locked enum value for rate-limit refusal is `exhausted_retries`"
+        "rate_limited",
+        "M3-D rate-limit refusal is `rate_limited`"
     );
 }
 
 // ===========================================================================
-// Scenario 4 — Spam-refresh rate-limit (enum-shape locked; activation pending)
+// Scenario 4 — Spam-refresh rate-limit (activation shipped)
 //
 // Tight-loop refresh calls from the same `(persona_id, container_id)` chain.
 // M3-D is now shipped: the first call succeeds, subsequent calls in the
@@ -426,19 +425,20 @@ async fn concurrent_refresh_within_window_second_returns_exhausted_retries_after
 // ===========================================================================
 
 #[test]
-fn refresh_failure_cause_exhausted_retries_serde_locked() {
+fn refresh_failure_cause_exhausted_retries_serde_remains_locked() {
     let v = serde_json::to_value(RefreshFailureCause::ExhaustedRetries)
         .expect("serialize exhausted_retries");
     assert_eq!(
         v,
         json!("exhausted_retries"),
-        "rate-limit enum value M3 locked is `exhausted_retries` (snake_case wire shape)"
+        "legacy exhausted_retries wire shape remains locked"
     );
 
-    let denied = RefreshDenied::new(RefreshFailureCause::ExhaustedRetries, "60s cooldown active");
+    let denied =
+        RefreshDenied::new(RefreshFailureCause::ExhaustedRetries, "retry budget exhausted");
     let body = serde_json::to_value(&denied).expect("serialize denied");
     assert_eq!(body["failure_cause"], json!("exhausted_retries"));
-    assert_eq!(body["reason"], json!("60s cooldown active"));
+    assert_eq!(body["reason"], json!("retry budget exhausted"));
 
     let round_trip: RefreshDenied = serde_json::from_value(body).expect("RefreshDenied round-trip");
     assert_eq!(
@@ -448,10 +448,10 @@ fn refresh_failure_cause_exhausted_retries_serde_locked() {
 }
 
 #[tokio::test]
-async fn spam_refresh_loop_today_all_succeed_pre_m3_d() {
-    let fx = adv_fixture("ctr-spam-pre-m3d");
+async fn spam_refresh_loop_denies_after_first_refresh_post_m3_d() {
+    let fx = adv_fixture("ctr-spam-post-m3d");
     let rl = RefCell::new(RateLimiter::default());
-    const ITERATIONS: i64 = 10; // small loop — the contract is "all succeed", not stress
+    const ITERATIONS: i64 = 10; // small loop — first succeeds, remaining calls are denied
 
     let mut current_mtls = fx.mtls.clone();
     let mut successful_fingerprint = fx.initial_fingerprint_hex.clone();

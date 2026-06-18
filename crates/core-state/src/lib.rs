@@ -4298,6 +4298,7 @@ mod tests {
     mod persona_activity;
     mod persona_device_access;
     mod presentations;
+    mod proptests;
     mod recovery;
     mod service_bindings;
     mod storage_ledger;

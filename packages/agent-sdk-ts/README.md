@@ -1,6 +1,5 @@
 # @emberlink/agent
 
-
 Experimental TypeScript helper client for the Emberlink agent authorization protocol. It spawns the `emberlink-agent` helper subprocess, which routes daemon-backed methods through the local Ember daemon.
 
 See the [Python counterpart SDK](../agent-sdk-py/README.md) and the [Emberlink project README](../../README.md).

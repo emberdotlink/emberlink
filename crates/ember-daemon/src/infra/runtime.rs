@@ -37,20 +37,25 @@ fn daemon_socket_path(config: &DaemonConfig) -> PathBuf {
     daemon_socket_path_with(config, std::env::var_os("EMBER_DAEMON_SOCKET"))
 }
 
-fn startup_binary_manifest_candidates(home: Option<PathBuf>) -> Vec<PathBuf> {
+const STARTUP_BINARY_MANIFEST_ENV: &str = "EMBER_MANIFEST_PATH";
+
+fn startup_binary_manifest_candidates(explicit_manifest: Option<PathBuf>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
-        candidates.push(home.join(".ember/binaries/manifest.toml"));
+    if let Some(path) = explicit_manifest.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(path);
     }
     candidates.push(crate::binary_manifest::bundled_install_dir().join("manifest.toml"));
     candidates
 }
 
-fn resolve_startup_binary_manifest_path<F>(home: Option<PathBuf>, exists: F) -> Option<PathBuf>
+fn resolve_startup_binary_manifest_path<F>(
+    explicit_manifest: Option<PathBuf>,
+    exists: F,
+) -> Option<PathBuf>
 where
     F: Fn(&Path) -> bool,
 {
-    startup_binary_manifest_candidates(home)
+    startup_binary_manifest_candidates(explicit_manifest)
         .into_iter()
         .find(|path| exists(path))
 }
@@ -452,7 +457,7 @@ pub fn check_sandbox_at_startup() -> Result<SandboxState, SandboxProbeFailure> {
             "daemon is NOT running under a kernel sandbox; ensure systemd \
              SystemCallFilter= (Linux) or LaunchDaemon sandbox-exec (macOS) \
              is wired. Set EMBER_REQUIRE_SANDBOX=1 to refuse-on-detect. \
-             Per implementation-note-309."
+             Per implementation note."
         );
         if std::env::var("EMBER_REQUIRE_SANDBOX").is_ok_and(|v| v == "1") {
             return Err(SandboxProbeFailure::StrictModeUnsandboxed);
@@ -1403,13 +1408,13 @@ impl DaemonRuntime {
                     signer_pubkey = %pubkey,
                     fingerprint = %fingerprint,
                     canonical_version = %crate::infra::receipt::CANONICAL_VERSION,
-                    "daemon-identity-anchor: pass --pubkey to `ember receipt verify` to verify offline"
+                    "daemon-identity-implementation marker --pubkey to `ember receipt verify` to verify offline"
                 );
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "implementation-note-216 (F-S5-013): daemon identity key \
+                    "implementation note (F-S5-013): daemon identity key \
                      unavailable; refusing startup (fail-closed)"
                 );
                 return Err(DaemonError::IdentityInitFailed(e.to_string()));
@@ -1484,7 +1489,7 @@ impl DaemonRuntime {
                 tracing::info!(
                     rows_walked,
                     segments_walked,
-                    "implementation-note-216: audit chain startup sample verify ok"
+                    "implementation note: audit chain startup sample verify ok"
                 );
             }
             Ok(crate::infra::audit::VerifyOutcome::LegacyRowsPresent {
@@ -1501,7 +1506,7 @@ impl DaemonRuntime {
                     legacy_rows = count,
                     max_legacy_id,
                     chain_resumes_at_id,
-                    "implementation-note-216: legacy NULL-hash block present \
+                    "implementation note: legacy NULL-hash block present \
                      in segment 0 (post-cordon expected state); Phase 2 attestation pending"
                 );
             }
@@ -1530,7 +1535,7 @@ impl DaemonRuntime {
                 };
                 tracing::error!(
                     reason = %reason,
-                    "implementation-note-216: audit-chain TAMPER DETECTED at startup; \
+                    "implementation note: audit-chain TAMPER DETECTED at startup; \
                      entering quarantine, binding socket, and refusing non-read-class methods"
                 );
                 crate::infra::handler::enter_quarantine(
@@ -1551,7 +1556,7 @@ impl DaemonRuntime {
                     ?kind,
                     at_row_id,
                     rows_walked_before,
-                    "implementation-note-216: audit-chain TOPOLOGY VIOLATION at startup"
+                    "implementation note: audit-chain TOPOLOGY VIOLATION at startup"
                 );
                 crate::infra::handler::enter_quarantine(
                     crate::infra::handler::QuarantineAuthority::TopologyViolation,
@@ -1565,7 +1570,7 @@ impl DaemonRuntime {
                 );
                 tracing::error!(
                     %receipt_id_orphan,
-                    "implementation-note-216: audit-chain INCOMPLETE REPAIR at startup"
+                    "implementation note: audit-chain INCOMPLETE REPAIR at startup"
                 );
                 crate::infra::handler::enter_quarantine(
                     crate::infra::handler::QuarantineAuthority::IncompleteRepair,
@@ -1581,7 +1586,7 @@ impl DaemonRuntime {
                 );
                 tracing::error!(
                     tombstone_row_id,
-                    "implementation-note-216: audit-chain INCOMPLETE REPAIR RECEIPT at startup"
+                    "implementation note: audit-chain INCOMPLETE REPAIR RECEIPT at startup"
                 );
                 crate::infra::handler::enter_quarantine(
                     crate::infra::handler::QuarantineAuthority::IncompleteRepairReceipt,
@@ -1591,7 +1596,7 @@ impl DaemonRuntime {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "implementation-note-216: audit chain startup verify could not \
+                    "implementation note: audit chain startup verify could not \
                      run (pre-migration DB or SQL failure); skipping (NOT entering quarantine)"
                 );
             }
@@ -1619,10 +1624,12 @@ impl DaemonRuntime {
         // handler can verify the peer binary against it without
         // re-reading the TOML.
         {
-            let manifest_home = std::env::var_os("HOME").map(PathBuf::from);
-            let manifest_candidates = startup_binary_manifest_candidates(manifest_home.clone());
+            let explicit_manifest = std::env::var_os(STARTUP_BINARY_MANIFEST_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            let manifest_candidates = startup_binary_manifest_candidates(explicit_manifest.clone());
             if let Some(manifest_path) =
-                resolve_startup_binary_manifest_path(manifest_home, |path| path.exists())
+                resolve_startup_binary_manifest_path(explicit_manifest, |path| path.exists())
             {
                 // design §Component 1 — trust-root SET verification.
                 //
@@ -2672,7 +2679,7 @@ impl DaemonRuntime {
                     tracing::warn!(
                         "spawn_pool: no [spawn_pool] section in config.toml — \
                          broker_exec will refuse with -32021 until operator runs \
-                         `ember daemon install` (implementation-note-139)"
+                         `ember daemon install` (implementation note)"
                     );
                 }
             }
@@ -3296,42 +3303,44 @@ impl DaemonRuntime {
             }
         }
 
-        // -S2 (design codex) — per-session loopback-TCP responses-API-proxy
-        // for the codex HOST lane. Mirrors the session_proxy registry above but
-        // binds loopback TCP (codex dials `base_url/responses`, can't dial a
-        // UDS) and carries NO peer-attestation gate (a non-root daemon cannot
-        // read a loopback-TCP peer's kernel identity). Credential-safe by
-        // construction: strict `POST /v1/responses`, header strip, server-side
-        // credential injection + `api.openai.com` upstream pin. The launcher
-        // points codex's `config.toml` at the per-session URL.
+        // -S2 (design codex) / design §2 — one per-session loopback-TCP
+        // credential-injection registry shared by the codex GPT-plan responses
+        // lane and the gemini Code Assist OAuth lane. Mirrors the session_proxy
+        // registry above but binds loopback TCP (these harnesses dial a
+        // `base_url`, not a UDS) and carries NO peer-attestation gate (a
+        // non-root daemon cannot read a loopback-TCP peer's kernel identity).
+        // Credential-safe by construction: each lane's projector pins a strict
+        // endpoint gate, header strip, server-side credential injection + an
+        // upstream-host pin. The launcher points the harness's config at the
+        // per-session URL; each `Open` carries its own projector.
         {
-            let codex_proxy_db_path = self.config.data_dir.join("daemon.db");
-            let codex_registry_vault_slot = live_vault_slot.clone();
-            let codex_registry_lease_kek_slot = live_lease_kek_slot.clone();
-            let codex_registry_sessions_dir = sessions_dir.clone();
-            let codex_registry_shutdown = shutdown_tx.subscribe();
-            let (codex_cmd_tx, codex_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<
-                crate::infra::codex_proxy::CodexProxyCommand,
+            let loopback_proxy_db_path = self.config.data_dir.join("daemon.db");
+            let loopback_registry_vault_slot = live_vault_slot.clone();
+            let loopback_registry_lease_kek_slot = live_lease_kek_slot.clone();
+            let loopback_registry_sessions_dir = sessions_dir.clone();
+            let loopback_registry_shutdown = shutdown_tx.subscribe();
+            let (loopback_cmd_tx, loopback_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<
+                crate::infra::loopback_proxy::LoopbackProxyCommand,
             >();
-            if !crate::infra::codex_proxy::install_codex_command_sender(codex_cmd_tx) {
+            if !crate::infra::loopback_proxy::install_loopback_command_sender(loopback_cmd_tx) {
                 tracing::warn!(
-                    "codex_proxy: command sender already installed — second daemon incarnation in-process; per-session codex listeners disabled for this run"
+                    "loopback_proxy: command sender already installed — second daemon incarnation in-process; per-session loopback listeners disabled for this run"
                 );
             } else {
                 local.spawn_local(async move {
-                    let store = match crate::infra::store::DaemonStore::open(&codex_proxy_db_path) {
+                    let store = match crate::infra::store::DaemonStore::open(&loopback_proxy_db_path) {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!(error = %e, "codex_proxy: failed to open store; per-session codex listeners disabled");
+                            tracing::warn!(error = %e, "loopback_proxy: failed to open store; per-session loopback listeners disabled");
                             return;
                         }
                     };
-                    store.replace_vault_slot(codex_registry_vault_slot.clone());
-                    store.replace_lease_kek_slot(codex_registry_lease_kek_slot.clone());
+                    store.replace_vault_slot(loopback_registry_vault_slot.clone());
+                    store.replace_lease_kek_slot(loopback_registry_lease_kek_slot.clone());
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(
                         store,
-                        Some(codex_registry_sessions_dir.clone()),
+                        Some(loopback_registry_sessions_dir.clone()),
                     ));
                     #[allow(clippy::arc_with_non_send_sync)]
                     let event_sink = std::sync::Arc::new(
@@ -3342,10 +3351,46 @@ impl DaemonRuntime {
                     let backend = std::sync::Arc::new(
                         crate::infra::proxy::DaemonPolicyBackend::new(state.clone()),
                     );
-                    crate::infra::codex_proxy::run_codex_proxy_registry(
+                    crate::infra::loopback_proxy::run_loopback_proxy_registry(
                         backend,
-                        codex_cmd_rx,
-                        codex_registry_shutdown,
+                        loopback_cmd_rx,
+                        loopback_registry_shutdown,
+                    )
+                    .await;
+                });
+            }
+        }
+
+        // Cursor HOST lane: per-session loopback HTTPS_PROXY endpoint for
+        // egress allowlisting + audit only. Cursor's model auth remains
+        // Cursor-owned client state; this registry intentionally does not use
+        // the credential-injecting projector engine.
+        {
+            let cursor_egress_db_path = self.config.data_dir.join("daemon.db");
+            let cursor_registry_shutdown = shutdown_tx.subscribe();
+            let (cursor_cmd_tx, cursor_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<
+                crate::infra::cursor_egress_proxy::CursorEgressCommand,
+            >();
+            if !crate::infra::cursor_egress_proxy::install_cursor_egress_command_sender(
+                cursor_cmd_tx,
+            ) {
+                tracing::warn!(
+                    "cursor_egress_proxy: command sender already installed — second daemon incarnation in-process; per-session cursor egress listeners disabled for this run"
+                );
+            } else {
+                local.spawn_local(async move {
+                    let store = match crate::infra::store::DaemonStore::open(&cursor_egress_db_path)
+                    {
+                        Ok(s) => std::rc::Rc::new(s),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "cursor_egress_proxy: failed to open store; per-session cursor egress listeners disabled");
+                            return;
+                        }
+                    };
+                    crate::infra::cursor_egress_proxy::run_cursor_egress_proxy_registry(
+                        store,
+                        cursor_cmd_rx,
+                        cursor_registry_shutdown,
                     )
                     .await;
                 });
@@ -3911,18 +3956,37 @@ pub fn mint_or_rotate_ember_rpc_server_cert(
         match read_cert_not_after(&cert_path) {
             Ok(not_after) => {
                 let now = std::time::SystemTime::now();
-                let needs = match not_after.duration_since(now) {
+                let within_rotation_slack = match not_after.duration_since(now) {
                     Ok(remaining) => remaining < EMBER_RPC_CERT_ROTATION_SLACK,
                     // not_after is in the past — already expired.
                     Err(_) => true,
                 };
-                if needs {
+                if within_rotation_slack {
                     tracing::info!(
                         cert_path = %cert_path.display(),
                         "ember-rpc sibling server cert is within rotation slack — minting fresh"
                     );
+                    true
+                } else {
+                    match server_cert_signed_by_bridge_ca(&cert_path, bridge_ca) {
+                        Ok(true) => false,
+                        Ok(false) => {
+                            tracing::info!(
+                                cert_path = %cert_path.display(),
+                                "ember-rpc sibling server cert was not signed by the current Bridge CA — minting fresh"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                cert_path = %cert_path.display(),
+                                error = %e,
+                                "ember-rpc sibling server cert signature could not be verified — minting fresh"
+                            );
+                            true
+                        }
+                    }
                 }
-                needs
             }
             Err(e) => {
                 tracing::warn!(
@@ -4007,6 +4071,35 @@ fn read_cert_not_after(path: &std::path::Path) -> Result<std::time::SystemTime, 
     }
     let dur = std::time::Duration::from_secs(not_after_secs as u64);
     Ok(std::time::UNIX_EPOCH + dur)
+}
+
+/// Return whether `path` is signed by the currently loaded Bridge CA.
+///
+/// The sibling cert can outlive a Bridge CA rotation. TTL-only reuse would
+/// preserve a still-unexpired cert whose issuer CN matches but whose Ed25519
+/// signature no longer verifies under the daemon's current trust root, causing
+/// isolated mTLS clients to fail with `BadSignature`.
+fn server_cert_signed_by_bridge_ca(
+    path: &std::path::Path,
+    bridge_ca: &BridgeCa,
+) -> Result<bool, std::io::Error> {
+    use ed25519_dalek::Verifier as _;
+    use x509_parser::prelude::FromDer;
+
+    let pem_bytes = std::fs::read(path)?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&pem_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("pem: {e}")))?;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&pem.contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("der: {e}")))?;
+    let signature =
+        ed25519_dalek::Signature::try_from(cert.signature_value.as_ref()).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("signature: {e}"))
+        })?;
+
+    Ok(bridge_ca
+        .verifying_key()
+        .verify(cert.tbs_certificate.as_ref(), &signature)
+        .is_ok())
 }
 
 /// Build the SAN list for the ember-rpc sibling cert from
@@ -4171,6 +4264,40 @@ mod ember_rpc_cert_tests {
         assert_eq!(
             first_contents, second_contents,
             "second mint within the 30d TTL must reuse on-disk cert (no rotation)"
+        );
+    }
+
+    /// Pre: cert minted moments ago under one BridgeCa, then daemon reloads a
+    /// different BridgeCa while the old cert still has >24h TTL.
+    /// Post: second call rotates because TTL-only reuse would break mTLS with
+    /// a server cert signed by the old trust root.
+    #[test]
+    fn second_mint_rotates_when_bridge_ca_changed_even_outside_rotation_slack() {
+        let tmp = TempDir::new().expect("tempdir");
+        let data_dir = tmp.path();
+        let old_ca = BridgeCa::mint();
+        let current_ca = BridgeCa::mint();
+
+        mint_or_rotate_ember_rpc_server_cert(data_dir, None, &old_ca).expect("first mint");
+        let cert = data_dir.join("ember-rpc").join("server.crt");
+        let first_contents = std::fs::read(&cert).expect("read cert");
+        assert!(
+            !server_cert_signed_by_bridge_ca(&cert, &current_ca)
+                .expect("old cert parses for current CA check"),
+            "old cert must not verify under unrelated current CA"
+        );
+
+        mint_or_rotate_ember_rpc_server_cert(data_dir, None, &current_ca).expect("second mint");
+        let second_contents = std::fs::read(&cert).expect("read cert");
+
+        assert_ne!(
+            first_contents, second_contents,
+            "cert must rotate when the Bridge CA changes despite healthy TTL"
+        );
+        assert!(
+            server_cert_signed_by_bridge_ca(&cert, &current_ca)
+                .expect("new cert parses for current CA check"),
+            "rotated cert must verify under current CA"
         );
     }
 
@@ -4478,32 +4605,88 @@ mod tests {
     }
 
     #[test]
-    fn startup_binary_manifest_candidates_try_home_then_bundled_system_manifest() {
-        let home = PathBuf::from("/var/empty");
-        let candidates = startup_binary_manifest_candidates(Some(home));
+    fn startup_binary_manifest_candidates_try_explicit_then_bundled() {
+        let explicit = PathBuf::from("/tmp/dev/manifest.toml");
+        let candidates = startup_binary_manifest_candidates(Some(explicit.clone()));
         let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
 
         assert_eq!(
             candidates.first().map(PathBuf::as_path),
-            Some(std::path::Path::new(
-                "/var/empty/.ember/binaries/manifest.toml"
-            ))
+            Some(explicit.as_path())
         );
         assert_eq!(
-            candidates.last().map(PathBuf::as_path),
+            candidates.get(1).map(PathBuf::as_path),
             Some(bundled.as_path())
+        );
+        assert_eq!(
+            candidates.len(),
+            2,
+            "startup selection must not include operator-home manifest fallback"
         );
     }
 
     #[test]
-    fn startup_binary_manifest_path_falls_back_when_launchd_home_has_no_manifest() {
+    fn startup_binary_manifest_candidates_default_to_bundled_only() {
+        let candidates = startup_binary_manifest_candidates(None);
+        let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
+
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(bundled.as_path())
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "startup selection must not include operator-home manifest fallback"
+        );
+    }
+
+    #[test]
+    fn startup_binary_manifest_path_uses_explicit_manifest_first() {
+        let explicit = PathBuf::from("/tmp/dev/manifest.toml");
+        let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
+        let selected = resolve_startup_binary_manifest_path(Some(explicit.clone()), |path| {
+            path == explicit || path == bundled
+        });
+
+        assert_eq!(selected, Some(explicit));
+    }
+
+    #[test]
+    fn startup_binary_manifest_path_ignores_legacy_home_manifest() {
+        let legacy = PathBuf::from("/var/empty/.ember/binaries/manifest.toml");
         let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
         let selected =
-            resolve_startup_binary_manifest_path(Some(PathBuf::from("/var/empty")), |path| {
-                path == bundled
-            });
+            resolve_startup_binary_manifest_path(None, |path| path == bundled || path == legacy);
 
         assert_eq!(selected, Some(bundled));
+    }
+
+    #[test]
+    fn startup_binary_manifest_path_does_not_fall_back_to_legacy_home() {
+        let legacy = PathBuf::from("/var/empty/.ember/binaries/manifest.toml");
+        let selected = resolve_startup_binary_manifest_path(None, |path| path == legacy);
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn startup_binary_manifest_path_uses_bundled_without_home() {
+        let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
+        let selected = resolve_startup_binary_manifest_path(None, |path| path == bundled);
+
+        assert_eq!(selected, Some(bundled));
+    }
+
+    #[test]
+    fn startup_binary_manifest_candidates_skip_empty_explicit_manifest() {
+        let candidates = startup_binary_manifest_candidates(Some(PathBuf::new()));
+        let bundled = crate::binary_manifest::bundled_install_dir().join("manifest.toml");
+
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(bundled.as_path())
+        );
     }
 
     #[test]

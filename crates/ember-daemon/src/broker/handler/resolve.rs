@@ -737,7 +737,7 @@ pub(crate) async fn resolve_with_registry(
     // rely on the -32001 checkpoint) continue to compile and pass.
     Err((
         -32001,
-        "broker_resolve plaintext path requires `secret_ref` param (implementation-note-151); authoring-path gate is active".to_string(),
+        "broker_resolve plaintext path requires `secret_ref` param (implementation-note-132); authoring-path gate is active".to_string(),
     ))
 }
 /// Handle the `broker_resolve` socket RPC.

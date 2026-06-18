@@ -1,7 +1,7 @@
 //! `ember trust list` — call the daemon's `trust.list` JSON-RPC and
 //! render the operator-visible trust-set snapshot.
 //!
-//! Per design §Component 2 / implementation-note-461. Read-only
+//! Per design §Component 2 / implementation-note-364. Read-only
 //! query (`AuthorityClass::ConnectOnly` on the daemon side); the
 //! returned snapshot was assembled at startup so the CLI sees exactly
 //! the trust set the daemon would verify against if a manifest reached

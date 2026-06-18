@@ -1,7 +1,7 @@
 //! CLASSIFICATION: PUBLIC
 //!
 //! T3 integration test: `ember persona create` + `ember init` against a real
-//! separate-uid daemon process (implementation-note-482).
+//! separate-uid daemon process (implementation-note-385).
 //!
 //! ## What this tests
 //!

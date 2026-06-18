@@ -95,7 +95,7 @@ fn verify_file_with_garbage_json_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// v2 dispatch tests (implementation-note-483)
+// v2 dispatch tests (implementation-note-386)
 // ---------------------------------------------------------------------------
 
 /// Build a signed v2 ReceiptEnvelope using the deterministic FixtureSigner,

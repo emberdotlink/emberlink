@@ -567,12 +567,12 @@ mod tests {
 
     #[test]
     fn owner_repo_from_embedded_token_and_port() {
+        let token_remote = format!(
+            "https://{}@github.com/acme/widgets.git",
+            "x-access-token:example-token"
+        );
         assert_eq!(
-            owner_repo_from_remote_url(&format!(
-                "https://{}@github.com/acme/widgets.git",
-                "x-access-token:example-token"
-            ))
-            .as_deref(),
+            owner_repo_from_remote_url(&token_remote).as_deref(),
             Some("acme/widgets")
         );
         assert_eq!(
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // V030-FACTORY-RESOLVER-implementation-note-101: GitFactory::resolve_target_from_environment
+    // V030-FACTORY-RESOLVER-implementation-note-82: GitFactory::resolve_target_from_environment
     //
     // AC: derive github origin URL from cwd, replace remote-alias positional
     //     (e.g. `origin`) with the derived URL, or append URL on bare push.

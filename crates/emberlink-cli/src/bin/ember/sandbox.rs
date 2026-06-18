@@ -100,7 +100,7 @@ pub(super) fn run_sandbox_stop(
 
 /// Anchor: sandbox_open_store_migration_resolved
 ///
-/// design EXCEPTION (implementation-note-404, Path B):
+/// design EXCEPTION (implementation-note-311, Path B):
 /// Sandbox surface stays on direct `open_store` for the LocalFallback
 /// branch only. Rationale —
 ///
@@ -114,8 +114,8 @@ pub(super) fn run_sandbox_stop(
 ///     daemon-side RPC cannot be reached by definition. Forcing the
 ///     CLI to call a nonexistent RPC there would degrade the
 ///     recovery surface, not improve it.
-/// (c) Per the parent implementation-note-405 digest,
-///     a Path-A migration (file `implementation-note-406`
+/// (c) Per the parent implementation-note-312 digest,
+///     a Path-A migration (file `implementation-note-313`
 ///     + thread sandbox actions through it) is the principled
 ///     long-term fix; it is intentionally out of scope here.
 pub(super) fn run_sandbox_delete(
@@ -135,7 +135,7 @@ pub(super) fn run_sandbox_delete(
     } else {
         // design EXCEPTION: LocalFallback only (daemon socket absent).
         // See doc-comment on `run_sandbox_delete` for the carve-out
-        // rationale and the implementation-note-406 pointer
+        // rationale and the implementation-note-313 pointer
         // that captures the long-term migration path.
         let deleted = run_sandbox_delete_local(&open_store(config), id_or_name)?;
         Ok((SandboxActionDispatch::LocalFallback, deleted))

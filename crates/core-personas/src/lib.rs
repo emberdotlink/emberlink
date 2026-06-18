@@ -24,7 +24,7 @@ pub fn create_persona(
     }
 }
 
-/// implementation-note-74 (design §9 + §6) — factory for
+/// implementation-note-55 (design §9 + §6) — factory for
 /// a workload Persona bound to a SCION agent's container identity.
 ///
 /// Returns the persona alongside the container_id + parent_grant_id
@@ -62,7 +62,7 @@ pub fn create_agent_persona(
     }
 }
 
-/// implementation-note-74 — workload Persona + container
+/// implementation-note-55 — workload Persona + container
 /// binding metadata. Returned by [`create_agent_persona`] so the
 /// daemon can persist the binding atomically with the persona row.
 ///
@@ -99,7 +99,7 @@ pub struct AgentPersona {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtlsPrincipal {
     /// Persona id resolved from the SPIFFE URI SAN of the client cert
-    /// (design component 1 — see `implementation-note-40`).
+    /// (design component 1 — see `implementation-note-27`).
     pub persona_id: String,
     /// Container id resolved from the secondary SAN entry. Cross-checked
     /// against the persona's `agent_personas.container_id` binding to
@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(personas.len(), 1);
     }
 
-    // implementation-note-74 tests.
+    // implementation-note-55 tests.
 
     #[test]
     fn create_agent_persona_carries_container_binding() {

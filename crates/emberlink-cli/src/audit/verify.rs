@@ -97,7 +97,7 @@ pub enum VerifyVerdict {
     },
 }
 
-/// implementation-note-216 (B): `ember audit verify` CLI entry
+/// implementation-note-307 (B): `ember audit verify` CLI entry
 /// point. Walks the daemon's audit chain via the `audit_verify` socket
 /// method. `tail = None` requests a full-chain walk; `Some(n)` requests
 /// the last N rows.

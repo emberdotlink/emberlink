@@ -61,6 +61,7 @@ hex = "0.4"
 inventory = "0.3"
 toml.workspace = true
 clap_complete = "4"
+directories-next = "2"
 dirs-next = "2"
 minijinja = "2"
 ember-update = { path = "../ember-update" }

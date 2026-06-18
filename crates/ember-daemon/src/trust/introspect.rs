@@ -6,8 +6,8 @@
 //! <root-id>` — drill-down lookup by full fingerprint or unique hex
 //! prefix. Phase 3 adds `trust.explain` — chain-walk a signed artifact
 //! back to the trust root that verifies it. The receipt-envelope
-//! artifact-kind branch landed in implementation-note-361; workflow
-//! grant lands in implementation-note-362.
+//! artifact-kind branch landed in implementation-note-256; workflow
+//! grant lands in implementation-note-257.
 //!
 //! Anchor: `trust_introspect_module_landed` (Phase 1) /
 //! `trust_show_landed` (Phase 2) / `trust_explain_landed` (Phase 3
@@ -307,7 +307,7 @@ mod tests {
         assert!(out["trust_root"].is_null());
     }
 
-    // ── implementation-note-361 T1 tests ───────────────────────────────
+    // ── implementation-note-256 T1 tests ───────────────────────────────
 
     #[test]
     fn handle_trust_explain_receipt_rejects_non_empty_sidecar() {
@@ -719,9 +719,9 @@ pub fn render_trust_show_human(fingerprint_hex: &str, source: &str, posture: &st
 ///   artifact bytes are the manifest body.
 /// - `"receipt"` — artifact bytes are the canonical JSON-encoded
 ///   `ReceiptEnvelope`; sidecar bytes MUST be empty (receipts carry
-///   their signature inline). See implementation-note-361.
+///   their signature inline). See implementation-note-256.
 ///
-/// Delegation grant chain walk lands in implementation-note-362.
+/// Delegation grant chain walk lands in implementation-note-257.
 ///
 /// Read-only operation; same posture as `trust.list` / `trust.show`
 /// (`AuthorityClass::ConnectOnly`). Sentinels: `trust_explain_landed`
@@ -770,7 +770,7 @@ pub fn handle_trust_explain_with_store(
         other => Err((
             -32004,
             format!(
-                "unsupported_artifact_kind: {other:?}; supported: binary_manifest, receipt (authority_delegation lands in implementation-note-362)"
+                "unsupported_artifact_kind: {other:?}; supported: binary_manifest, receipt (authority_delegation lands in implementation-note-257)"
             ),
         )),
     }

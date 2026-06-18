@@ -27,7 +27,7 @@
 //! `GET /daemon/identity.json` as hex so external verifiers can compare
 //! against their trust anchor.
 
-// implementation-note-295: Receipt v2 issuance helper for cohort-A
+// Receipt v2 issuance helper for cohort-A
 // `session.claude_code` Receipts. Lives in the `receipt/` sibling
 // directory; this `pub mod` declaration wires it under the existing
 // `receipt` module path so callers see `ember_daemon::receipt::issue`.
@@ -87,7 +87,7 @@ const IDENTITY_KEY_FILENAME: &str = "daemon_persona.key";
 /// receipt tree` from a non-daemon uid under design's separate-uid
 /// posture) read just the Ed25519 pubkey as the trust anchor for
 /// offline-verify without needing read access to the 0600 private
-/// key file. Per implementation-note-294 Option A.
+/// key file. Cross-uid pubkey-sidecar read path, Option A.
 const IDENTITY_PUBKEY_SIDECAR_FILENAME: &str = "daemon_persona.pub";
 
 // ---------------------------------------------------------------------------
@@ -392,7 +392,7 @@ pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-69 — kms receipt canonical-encoding + signing helpers
+// kms receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for kms receipts. Distinct from
@@ -436,7 +436,7 @@ pub fn sign_kms_receipt(receipt: &mut KmsReceipt, identity: &DaemonPersona) {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-296 — broker receipt canonical-encoding + signing helpers
+// broker receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for broker receipts. Distinct from
@@ -480,8 +480,8 @@ pub fn sign_broker_receipt(receipt: &mut BrokerReceipt, identity: &DaemonPersona
 }
 
 // ---------------------------------------------------------------------------
-// v2 broker envelope builders — Phase A substrate for implementation-note-297-
-// implementation-note-298. Per design §Envelope + design §receipt-kind
+// v2 broker envelope builders — Phase A substrate for the broker
+// receipt v2 migration. Per design §Envelope + design §receipt-kind
 // catalog ("broker.materialization", "broker.revocation").
 //
 // Returned envelopes are unsigned: callers wrap a Signer (e.g.
@@ -516,7 +516,7 @@ pub const RECEIPT_KIND_SSH_LEASE_GRANT: &str = "session.ssh_lease_grant";
 /// materialization is unknown to the daemon (matches v1's `Option`
 /// posture in [`crate::broker::handler::emit_revocation_receipt`]).
 ///
-/// `mock_broker` (implementation-note-20 / design §Component 2):
+/// `mock_broker` (dev/prod parity, mock-broker explicit / design §Component 2):
 /// `true` iff the registered broker for the provider revoking the
 /// credential is a `MockBroker` instance. Stamped onto every
 /// `broker.revocation` Receipt body for the same audit-signal reason as
@@ -547,7 +547,7 @@ pub fn build_broker_revocation_envelope(
         "caller_ref": summary.and_then(|s| s.caller_ref.as_deref()),
         "authority_ref": summary.and_then(|s| s.authority_ref.as_deref()),
         "reason": reason,
-        // implementation-note-20 / design §Component 2.
+        // dev/prod parity, mock-broker explicit / design §Component 2.
         "mock_broker": mock_broker,
     });
     ReceiptEnvelope {
@@ -668,7 +668,7 @@ pub fn verify_broker_receipt(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-299 — vault receipt canonical-encoding + signing helpers
+// vault receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for vault receipts. Distinct from
@@ -943,7 +943,7 @@ pub enum ReceiptVerifyError {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-293 — append-only receipts journal
+// append-only receipts journal
 // ---------------------------------------------------------------------------
 
 /// Errors specific to the `receipts.log` journal append path.
@@ -980,7 +980,7 @@ pub enum JournalError {
 ///
 /// `fn append_receipts_journal`
 ///
-/// # FSYNC CONTRACT (implementation-note-300 — fsync_contract_ADR155_C8_P3)
+/// # FSYNC CONTRACT (fsync_contract_ADR155_C8_P3)
 ///
 /// design §Component 8 Prerequisites : **fail-atomic audit emission**.
 /// If the pre-exec `broker.execution_domain` Receipt cannot be persisted,
@@ -1096,7 +1096,7 @@ pub fn trigger_receipt_if_terminal(
 /// Derive a terminal reason from grant status alone.
 ///
 /// For `exhausted_by_budget`, the axis is read from the `budget.exhausted`
-/// audit row (T-implementation-note-301) instead of guessed from which
+/// audit row instead of guessed from which
 /// axes the grant's budget configures. The audit row carries the
 /// authoritative axis that actually tripped the cap.
 fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
@@ -1132,7 +1132,7 @@ fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
 }
 
 /// Read the exhaustion axis from the `budget.exhausted` audit row for this
-/// grant (T-implementation-note-301).
+/// grant.
 ///
 /// `budget.exhausted` rows are emitted by the proxy meter when a Statement
 /// usage tally crosses a budget cap. The row's `details` column carries the
@@ -1223,7 +1223,7 @@ fn build_receipt_body(
     now_epoch_secs: u64,
 ) -> GrantReceipt {
     // 1. Pull the canonical composite chain + envelope-level attestation.
-    //    AUDIT Decision 2 #4 (T-implementation-note-302): the
+    //    AUDIT Decision 2 #4 (attestation passthrough): the
     //    AccessGrant envelope carries the live attestation posture
     //    (sandbox / spiffe / tee status). Capture it here alongside the
     //    chain so step 7 can pass it through into the signed receipt
@@ -1234,7 +1234,7 @@ fn build_receipt_body(
     };
 
     // 2. Per-statement usage tallies from the block-0 statements.
-    // implementation-note-213: derive wall_clock_secs at receipt-build
+    // Derive wall_clock_secs at receipt-build
     // time so signed receipts record actual time used rather than the stored 0.
     let created_at_secs = parse_rfc3339_epoch(&info.created_at);
     let expires_at_secs = info
@@ -1371,7 +1371,7 @@ fn build_receipt_body(
         .first()
         .map(|sb| sb.block.issued_at)
         .unwrap_or_else(|| parse_rfc3339_epoch(&info.created_at));
-    // Per AUDIT Decision 2 #5 (T-implementation-note-303):
+    // Per AUDIT Decision 2 #5 (last-used per statement):
     // last_used_at reflects the most recent moment ANY statement was
     // touched. Aggregate Usage.last_updated was a stand-in that swallowed
     // per-statement granularity in the audit trail. Source of truth is the
@@ -1400,7 +1400,7 @@ fn build_receipt_body(
     };
 
     // 7. Attestation — passes through from the live grant. Per AUDIT
-    //    Decision 2 #4 (T-implementation-note-302): the previous
+    //    Decision 2 #4 (attestation passthrough): the previous
     //    `chain.first().and_then(|_| None).unwrap_or_default()` was a
     //    dead-code default that erased sandbox/spiffe/tee status from the
     //    grant before signing. Source of truth is the AccessGrant
@@ -1500,18 +1500,18 @@ pub struct ReceiptFilter {
     pub since_iso: Option<String>,
     /// Maximum rows to return. Defaults to 100 when `None`.
     pub limit: Option<u64>,
-    /// EMBER-implementation-note-248 — kind discriminator (`grant`, `kms_wrap`,
+    /// `ember audit` — kind discriminator (`grant`, `kms_wrap`,
     /// `kms_unwrap`). Mapped 1:1 to the `kind` column.
     pub kind: Option<String>,
-    /// EMBER-implementation-note-248 — restrict to receipts whose `grant_id` matches.
+    /// `ember audit` — restrict to receipts whose `grant_id` matches.
     pub grant_id: Option<String>,
-    /// EMBER-implementation-note-248 — substring filter on the receipt's `summary.resource`
+    /// `ember audit` — substring filter on the receipt's `summary.resource`
     /// (grant receipts) or top-level `key_name` (kms receipts). Applied
     /// post-fetch so the JSON1 index can still serve exact-match callers.
     pub resource: Option<String>,
 }
 
-/// EMBER-implementation-note-248 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
+/// `ember audit` — flat audit row returned by [`DaemonStore::list_receipt_rows`].
 ///
 /// Joins receipt fields with [`crate::trust::grant::GrantInfo`] when the row is a
 /// grant receipt so callers see `requested_scope` / `granted_scope` without
@@ -1615,10 +1615,9 @@ impl DaemonStore {
             ReceiptKind::KmsWrap => "kms_wrap",
             ReceiptKind::KmsUnwrap => "kms_unwrap",
             // Non-kms variants must never reach this sink — they have
-            // their own (planned) typed-Receipt persistence paths per
-            // RECEIPT-COVERAGE-FIX-implementation-note-66 and
-            // RECEIPT-COVERAGE-FIX-implementation-note-67. Reject explicitly so a
-            // mis-routed call surfaces immediately rather than landing
+            // their own (planned) typed-Receipt persistence paths for
+            // vault-retrieval and broker-typed receipts. Reject explicitly
+            // so a mis-routed call surfaces immediately rather than landing
             // a non-kms row in the kms-shaped storage path.
             ReceiptKind::Grant
             | ReceiptKind::VaultRetrieval
@@ -2037,7 +2036,7 @@ impl DaemonStore {
         raw.ok_or(StoreError::NotFound)
     }
 
-    /// implementation-note-109 — persist a v2 `spawn.witness`
+    /// Persist a v2 `spawn.witness`
     /// [`ReceiptEnvelope`] from the spawn path
     /// (`crate::trust::grant::delegate_grant_full_sql`). Companion to
     /// [`Self::store_broker_receipt_v2`]; rejects envelopes whose `kind` is
@@ -2112,7 +2111,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-304 — persist a
+    /// Persist a
     /// signed v2 `identity.rotation_witness` [`ReceiptEnvelope`] from
     /// the daemon-side emission path (`crate::infra::vault::emit_identity_rotation_witness`).
     /// Companion to [`Self::store_spawn_witness_receipt`]; rejects
@@ -2181,7 +2180,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-109 — load every persisted
+    /// Load every persisted
     /// `spawn.witness` envelope whose `grant_id` (== `body.spawn_grant_id`)
     /// matches one of the supplied parent grant ids. Used by the tree CLI
     /// (`emberlink-cli::receipt::tree::build_tree`) to assemble the
@@ -2237,7 +2236,7 @@ impl DaemonStore {
         Ok(out)
     }
 
-    /// implementation-note-305 — list v2 [`ReceiptEnvelope`]
+    /// List v2 [`ReceiptEnvelope`]
     /// rows from the `receipts` table whose `grant_id` is in `grant_ids`.
     ///
     /// V2 rows are identified by a dotted `kind` discriminator
@@ -2553,7 +2552,7 @@ impl DaemonStore {
         Ok(out)
     }
 
-    /// EMBER-implementation-note-248 — flat audit-row listing for the `ember audit`
+    /// Flat audit-row listing for the `ember audit`
     /// query CLI. Joins the receipts table with `grants` so the row carries
     /// both the receipt fields and the parent grant's scope.
     ///
@@ -3056,6 +3055,27 @@ pub fn emit_payment_settled_receipt_current(
     )
 }
 
+pub fn emit_proxy_call_receipt_current(
+    store: &DaemonStore,
+    grant_id: &str,
+    persona_id: &str,
+    body: &core_events::receipt::ProxyCallBody,
+) -> Option<String> {
+    let terminal_reason = if body.outcome.trim().is_empty() {
+        "complete"
+    } else {
+        body.outcome.as_str()
+    };
+    emit_atomic_receipt_v2_current(
+        store,
+        core_events::receipt::RECEIPT_KIND_PROXY_CALL,
+        grant_id,
+        persona_id,
+        terminal_reason,
+        body,
+    )
+}
+
 pub fn emit_headless_enrollment_receipt_current(
     store: &DaemonStore,
     body: &core_events::receipt::HeadlessEnrollmentBody,
@@ -3227,7 +3247,7 @@ pub fn trigger_receipt_if_terminal_current(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-69 — kms receipt sink wiring
+// kms receipt sink wiring
 // ---------------------------------------------------------------------------
 //
 // `core_kms::ReceiptSink` requires `Send + Sync`, but `DaemonStore` is

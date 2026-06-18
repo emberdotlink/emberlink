@@ -2,7 +2,7 @@
 //!
 //! `ember-exec` — privileged sidecar that verifies, privilege-drops, and execs
 //! a target binary on behalf of an in-container agent. Per design §8 and the
-//! implementation-note-51 decomposition.
+//! implementation-note-288 decomposition.
 //!
 //! This is subtask A (BIN-UDS): bin scaffold + UDS accept loop + the
 //! `SpawnDirective` wire shape. Hash verification (subtask B) and PtyBridge
@@ -34,7 +34,7 @@ use tokio::net::UnixListener;
 /// Field shape: `{"checkpoint":<name>,"agent_id":<id>,"ts":<iso8601>}`
 ///
 /// This is a scaffold stub. The real implementation will route through the
-/// daemon's cross-uid bridge socket (implementation-note-383)
+/// daemon's cross-uid bridge socket (implementation-note-289)
 /// so checkpoints land in the daemon event log with proper attribution.
 fn emit_checkpoint(name: &str, agent_id: &str) {
     use std::io::Write;
@@ -104,7 +104,7 @@ fn sanitize_json_string(s: &str) -> String {
 #[command(
     name = "ember-exec",
     version,
-    about = "Privileged exec sidecar (implementation-note-51)"
+    about = "Privileged exec sidecar (implementation-note-288)"
 )]
 struct Cli {
     /// Path to the Unix-domain socket to bind. Refuses paths under `/tmp/`
@@ -161,7 +161,7 @@ async fn main() -> ExitCode {
                     return;
                 }
             };
-            // implementation-note-384: the handler runs the
+            // implementation-note-290: the handler runs the
             // full verify → drop_priv (if root) → spawn → output → exit
             // flow against the in-flight connection. Wire-shape errors
             // (frame write fail mid-stream) close the connection; spawn

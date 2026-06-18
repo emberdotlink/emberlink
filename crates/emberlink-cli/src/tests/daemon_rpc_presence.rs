@@ -6,6 +6,25 @@ use std::time::SystemTime;
 
 static OPERATOR_PRESENCE_TOKEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn touch_id_key_use_error_names_biometry_lockout_recovery() {
+    let message = format_touch_id_key_use_error(
+        "presence-Device signing failed for 'create_composite_grant'",
+        "SE sign failed: Biometry is locked out.",
+    );
+
+    assert!(message.contains("Biometry is locked out"), "{message}");
+    assert!(message.contains("Touch ID is locked out"), "{message}");
+    assert!(
+        message.contains("unlock this Mac with your account password"),
+        "{message}"
+    );
+    assert!(
+        message.contains("rerun the command"),
+        "hint should tell the operator the command is safe to retry: {message}"
+    );
+}
+
 fn fake_presence_token_value_for_scope(uid: u32, scope: &str) -> serde_json::Value {
     use std::time::Duration;
     #[derive(serde::Serialize)]
@@ -51,7 +70,7 @@ fn accept_with_timeout(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() >= deadline {
                     panic!(
-                        "listener.accept() timed out after {:?} — implementation-note-460 guard fired",
+                        "listener.accept() timed out after {:?} — implementation-note-363 guard fired",
                         timeout
                     );
                 }

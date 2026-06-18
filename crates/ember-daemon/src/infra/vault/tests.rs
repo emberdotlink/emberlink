@@ -10,7 +10,7 @@ fn other_key() -> [u8; 32] {
     [99u8; 32]
 }
 
-/// implementation-note-37 C5: a roundtrip through `add` → `get`
+/// implementation-note-24 C5: a roundtrip through `add` → `get`
 /// succeeds when the row carries per-row AAD bound to the row's
 /// UUID. The shape of the test is intentionally minimal — the
 /// existing `add_list_get_roundtrip` test exercises the happy path
@@ -432,7 +432,7 @@ fn canary_absent_is_ok() {
     vault.verify_canary(&store).unwrap();
 }
 
-/// implementation-note-37 C4: when `vault.params` contains values
+/// implementation-note-24 C4: when `vault.params` contains values
 /// that do not match the compile-time-pinned Argon2 parameters,
 /// `Vault::open_from_config` refuses to proceed with
 /// `VaultError::Crypto("argon2 params mismatch...")`. The file is
@@ -484,7 +484,7 @@ ver = "V0x13"
     }
 }
 
-/// implementation-note-37 C4 partner: a fresh vault (no
+/// implementation-note-24 C4 partner: a fresh vault (no
 /// `vault.params` on disk) lays one down on first open with the
 /// pinned params, and a subsequent open against the same data_dir
 /// succeeds (the params file now exists and matches).
@@ -524,7 +524,7 @@ fn vault_writes_params_file_on_first_open() {
     assert!(contents.contains("V0x13"));
 }
 
-/// implementation-note-37 C1: `Vault` must implement
+/// implementation-note-24 C1: `Vault` must implement
 /// `ZeroizeOnDrop` so the MEK is wiped from memory when the Vault is
 /// dropped (explicit lock, daemon shutdown, or any Rc going to zero
 /// references). Compile-time trait assertion: the function body
@@ -1417,7 +1417,7 @@ fn open_from_config_roundtrip() {
     unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
 }
 
-// implementation-note-170 (B1) anchor: the production
+// implementation-note-144 (B1) anchor: the production
 // `open_from_config` path now generates an independent Headless MEK,
 // AEAD-wraps it under the Interactive MEK, and persists it to
 // `<data_dir>/vault.headless-mek.wrapped`. The two lanes hold
@@ -1476,7 +1476,7 @@ fn vault_open_generates_independent_headless_mek_with_wrap_file() {
     unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
 }
 
-// implementation-note-170 (B1) + adversarial CRIT-1 fix
+// implementation-note-144 (B1) + adversarial CRIT-1 fix
 // checkpoint — `Vault::new_headless_only` refuses Interactive-lane
 // operations at the API boundary. Pre-fix, `current_headless_vault`
 // built `Vault::new(mek)` (single-key, both lanes equal to the
@@ -2029,7 +2029,7 @@ fn salt_file_created_with_0o600_permissions() {
     unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
 }
 
-// --- implementation-note-320: migrate_mek_acl ---
+// --- implementation-note-225: migrate_mek_acl ---
 
 // Serial lock: tests that mutate EMBER_VAULT_TEST_KEYRING_PRESENT must not
 // run concurrently — cargo test threads share the process environment.

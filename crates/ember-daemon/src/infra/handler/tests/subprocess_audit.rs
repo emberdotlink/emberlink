@@ -1,7 +1,7 @@
 use super::*;
 
 // -----------------------------------------------------------------------
-// implementation-note-32 (Tier 1) —
+// implementation-note-181 (Tier 1) —
 // subprocess_audit_log tests. Anchor:
 // subprocess_audit_log_routes_through_chain
 // -----------------------------------------------------------------------

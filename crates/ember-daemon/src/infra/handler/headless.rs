@@ -14,7 +14,7 @@ pub(super) fn data_dir_from_context(
     Ok(data_dir_from_sessions_dir(sessions_dir))
 }
 
-// implementation-note-241 — first real local enrollment cut.
+// implementation-note-176 — first real local enrollment cut.
 //
 // Per design §"Headless: attested device, variable enrollment".
 // This slice makes `headless_enroll` truthful for the local broker
@@ -265,7 +265,7 @@ pub(super) fn handle_enroll(
             format!("headless_enroll: generate headless MEK: {err}"),
         )
     })?;
-    // implementation-note-170 (B1) + adversarial CRIT-1
+    // implementation-note-144 (B1) + adversarial CRIT-1
     // fix (2026-05-22): use `Vault::new_headless_only`. The
     // headless-runtime Vault MUST refuse Interactive-lane ops on
     // an in-memory single-key shape; `new_headless_only` sets
@@ -420,9 +420,9 @@ pub(super) fn handle_status(ctx: &RequestContext) -> Result<Value, (i32, String)
     }
 }
 
-// implementation-note-22 — Phase 1 substrate.
+// implementation-note-93 — Phase 1 substrate.
 //
-// implementation-note-23
+// implementation-note-177
 //
 // Per design §"Pre-flight scope check at enrollment" Layer 2
 // (Historical): the daemon exposes the recent-gaps reader so

@@ -3,7 +3,7 @@ use serde_json::json;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// implementation-note-219: Phase B's
+// implementation-note-182: Phase B's
 // "every method is ConnectOnly" placeholder is gone. Unknown
 // methods now fail-closed to `OperatorPresence` so a newly-
 // added dispatcher arm without a table entry cannot be invoked
@@ -261,6 +261,7 @@ fn all_classified_methods_match_dispatcher_arms() {
         "recover_grant_abandon",
         "recover_persona_abandon",
         "extend_grant",
+        "grant.extend",
         "revoke_statement",
         "evaluate_tool_call",
         "use_credential",
@@ -280,12 +281,15 @@ fn all_classified_methods_match_dispatcher_arms() {
         "submit_approval",
         "propose_grant",
         "resolve_approval",
+        "approval.resolve",
+        "approval_resolve",
+        "approval.narrow",
+        "approval_narrow",
         "grant.expire_stale",
         "expire_grants",
         "create_standing_grant",
         "remove_standing_grant",
         "request_access",
-        "request_access_blocking",
         "broker_issue",
         "broker_revoke",
         "broker_list",
@@ -436,6 +440,8 @@ fn every_classified_method_pins_its_exact_authority_class() {
         ("poll_notifications", CO),
         ("await_approval", CO),
         ("headless_preflight_gaps", CO),
+        ("catalog.search_actions", CO),
+        ("catalog_search_actions", CO),
         ("preflight_authority_coverage", CO),
         ("vault_status", CO),
         ("vault_rotate_plan", CO),
@@ -504,6 +510,7 @@ fn every_classified_method_pins_its_exact_authority_class() {
         ("recover_grant_abandon", OP),
         ("recover_persona_abandon", OP),
         ("extend_grant", OP),
+        ("grant.extend", OP),
         ("revoke_statement", OP),
         ("evaluate_tool_call", OP),
         ("use_credential", OP),
@@ -529,12 +536,15 @@ fn every_classified_method_pins_its_exact_authority_class() {
         ("submit_approval", OP),
         ("propose_grant", OP),
         ("resolve_approval", OP),
+        ("approval.resolve", OP),
+        ("approval_resolve", OP),
+        ("approval.narrow", OP),
+        ("approval_narrow", OP),
         ("grant.expire_stale", OP),
         ("expire_grants", OP),
         ("create_standing_grant", OP),
         ("remove_standing_grant", OP),
         ("request_access", OP),
-        ("request_access_blocking", OP),
         ("broker_issue", OP),
         ("broker_revoke", OP),
         ("broker_list", OP),
@@ -587,7 +597,7 @@ fn every_classified_method_pins_its_exact_authority_class() {
     assert_eq!(before, names.len(), "duplicate method in EXPECTED table");
 }
 
-// implementation-note-219: `RequestContext::
+// implementation-note-182: `RequestContext::
 // satisfies` table.
 //
 // The bridge env var is process-global so we set it before the
@@ -631,7 +641,7 @@ fn satisfies_operator_presence_with_reattest_is_never_satisfied_in_cohort_a() {
     );
 }
 
-// implementation-note-219: dispatch gate
+// implementation-note-182: dispatch gate
 // round-trip. Internal dispatch bypasses the gate — `ping`
 // succeeds even without a synthesized peer or bridge env var,
 // because Internal callers are the pre-existing in-process trust
@@ -662,7 +672,7 @@ async fn dispatch_internal_source_bypasses_authority_gate() {
     );
 }
 
-// implementation-note-219: Socket source
+// implementation-note-182: Socket source
 // without a kernel-attested peer is rejected for ConnectOnly. We
 // construct the context directly (bypassing the test shim's
 // synthetic-peer injection) so we see the production gate.
@@ -705,7 +715,7 @@ async fn dispatch_socket_without_peer_refused_authority_class_not_met() {
     assert_eq!(err.1, "authority_class_not_met");
 }
 
-// implementation-note-219: positive path —
+// implementation-note-182: positive path —
 // Socket source with a peer + bridge env on (set by the test
 // shim) passes the gate for an OperatorPresence-class method.
 // Downstream errors (param validation etc.) are NOT -32001 —
@@ -1152,7 +1162,7 @@ async fn dispatch_operator_presence_unlocked_window_authorizes_with_token() {
     }
 }
 
-// implementation-note-230:
+// implementation-note-185:
 // dispatch_accepts_connect_only_without_token — ConnectOnly-class
 // methods skip the Phase D-4 gate entirely. With peer + no token,
 // dispatch proceeds normally (the response shape depends on the

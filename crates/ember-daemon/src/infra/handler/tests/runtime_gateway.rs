@@ -1,7 +1,7 @@
 use super::*;
 
-// implementation-note-256: daemon-side T2 (updated for
-// implementation-note-229) — register_session
+// implementation-note-196: daemon-side T2 (updated for
+// implementation-note-197) — register_session
 // response must include the real LLM proxy URL from RequestContext.
 #[tokio::test]
 async fn register_session_response_includes_real_proxy_url() {
@@ -67,7 +67,7 @@ async fn register_session_response_includes_real_proxy_url() {
     let mut ctx = RequestContext::internal("test harness");
     ctx.sessions_dir = Some(sessions_dir.clone());
     // Wire the URL via RequestContext — the correct path after
-    // implementation-note-229.
+    // implementation-note-197.
     ctx.llm_proxy_url = Some(expected_proxy_url.to_string());
 
     let reg = dispatch_method_with_context(
@@ -99,7 +99,7 @@ async fn register_session_response_includes_real_proxy_url() {
     );
 }
 
-// implementation-note-229: T2 test —
+// implementation-note-197: T2 test —
 // register_session must read the LLM proxy URL from RequestContext,
 // NOT from std::env::var. The env var may be absent or stale due to
 // Rust 2024 std::env::set_var cross-thread visibility hazard (tokio
@@ -162,7 +162,7 @@ async fn register_session_response_uses_request_context_proxy_url() {
     // SocketListener.with_llm_proxy_url wires in production.
     let mut ctx = RequestContext::internal("test harness");
     ctx.sessions_dir = Some(sessions_dir.clone());
-    // implementation-note-229: this URL must
+    // implementation-note-197: this URL must
     // appear in the response; the env var ("8484") must be ignored.
     ctx.llm_proxy_url = Some("http://127.0.0.1:55555".to_string());
 

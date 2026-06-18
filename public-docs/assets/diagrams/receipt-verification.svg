@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 520" role="img" aria-labelledby="title desc">
+  <title id="title">Receipt verification</title>
+  <desc id="desc">A receipt file and expected signing public key are checked locally. Verification returns pass when the signature and canonical hash match, or break when the artifact was changed or signed by the wrong key.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 32px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 17px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .label { font: 700 20px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .body { font: 15px system-ui, -apple-system, Segoe UI, sans-serif; fill: #334155; }
+      .small { font: 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 18; }
+      .input { fill: #eff6ff; stroke: #2563eb; }
+      .check { fill: #fff7ed; stroke: #ea580c; }
+      .pass { fill: #f0fdf4; stroke: #16a34a; }
+      .break { fill: #fef2f2; stroke: #dc2626; }
+      .line { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1100" height="520"/>
+  <text class="title" x="60" y="56">Receipts verify without a server call</text>
+  <text class="subtitle" x="60" y="88">A receipt is useful after the session because it carries signed evidence about the delegated action.</text>
+
+  <rect class="box input" x="70" y="155" width="210" height="90"/>
+  <text class="label" x="104" y="193">Receipt file</text>
+  <text class="body" x="104" y="221">claim body + signature</text>
+
+  <rect class="box input" x="70" y="295" width="210" height="90"/>
+  <text class="label" x="104" y="333">Trust anchor</text>
+  <text class="body" x="104" y="361">expected public key</text>
+
+  <rect class="box check" x="410" y="195" width="260" height="150"/>
+  <text class="label" x="455" y="234">Local verifier</text>
+  <text class="body" x="455" y="266">canonicalize bytes</text>
+  <text class="body" x="455" y="292">recompute receipt id</text>
+  <text class="body" x="455" y="318">check signature</text>
+
+  <rect class="box pass" x="810" y="155" width="210" height="90"/>
+  <text class="label" x="875" y="193">Pass</text>
+  <text class="body" x="848" y="221">artifact is intact</text>
+
+  <rect class="box break" x="810" y="295" width="210" height="90"/>
+  <text class="label" x="870" y="333">Break</text>
+  <text class="body" x="842" y="361">changed or wrong key</text>
+
+  <path class="line" d="M280 200 C340 200 350 240 410 255"/>
+  <path class="line" d="M280 340 C340 340 350 300 410 285"/>
+  <path class="line" d="M670 245 C725 225 755 205 810 200"/>
+  <path class="line" d="M670 295 C725 315 755 335 810 340"/>
+  <path class="dash" d="M745 112 V430"/>
+  <text class="small" x="770" y="434">No network edge is required for exported receipt verification.</text>
+</svg>

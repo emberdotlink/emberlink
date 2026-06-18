@@ -82,7 +82,7 @@ services:
 {% endif %}
 
 {% if worker_enabled | default(true) %}
-  # hidepid=2 + /proc masking — close published proc-leakage side channels per design §Component 9 (T1+T3 partial). See implementation-note-471.
+  # hidepid=2 + /proc masking — close published proc-leakage side channels per design §Component 9 (T1+T3 partial). See implementation-note-374.
   worker:
     image: "{{ worker_image | default('ember-worker:latest') }}"
     restart: unless-stopped
@@ -115,7 +115,7 @@ services:
     # userns: container UID/GID maps back to host operator's UID/GID per design §Component 9 M1.2. See crates/emberlink-cli/src/up/userns.rs for preflight validation.
     userns_mode: "{{ userns_mode | default('keep-id') }}"
     security_opt:
-      # Seccomp profile — deny unshare/mount/ptrace/bpf class per design §Component 9 (T1). See implementation-note-472.
+      # Seccomp profile — deny unshare/mount/ptrace/bpf class per design §Component 9 (T1). See implementation-note-375.
       - "seccomp={{ worker_seccomp_profile_path | default('infra/seccomp/agent-seccomp.json') }}"
       # AppArmor profile — deny mount/proc-mem-write/sys-security per design §Component 9 M1.3. Installed via 'apparmor_parser -r' on first ember up. See infra/apparmor/ember-agent.profile.
       # AppArmor profile — Linux-only; ignored on macOS Docker Desktop / OrbStack. See ember-agent-apparmor.
@@ -159,7 +159,7 @@ services:
       # idmapped_fallback: worker entrypoint reads EMBER_GIT_SAFE_DIRECTORY and
       # runs `git config --global safe.directory '*'` before any git operations.
       # Ownership is corrected host-side by worker-chown-init before this service
-      # starts (implementation-note-466).
+      # starts (implementation-note-369).
       EMBER_GIT_SAFE_DIRECTORY: "*"
 {% endif %}
     volumes:
@@ -233,7 +233,7 @@ services:
       # are translated at the mount layer — no chown, no safe.directory exemption.
       # When idmapped_supported=false: idmapped_fallback path — plain rw bind-mount
       # with chown-on-mount via the worker-chown-init service and safe.directory
-      # bypass for git (implementation-note-466).
+      # bypass for git (implementation-note-369).
 {% if idmapped_supported | default(false) %}
       - type: bind
         source: "{{ worker_worktree_path }}"
@@ -275,7 +275,7 @@ services:
 {% endif %}
 
 {% if worker_worktree_path is defined and not (idmapped_supported | default(false)) %}
-  # idmapped_fallback init container (implementation-note-466).
+  # idmapped_fallback init container (implementation-note-369).
   #
   # Runs once before the worker service starts. Mounts the worktree read-write
   # as root, then chowns the entire tree to the agent UID:GID (1000:1000) so

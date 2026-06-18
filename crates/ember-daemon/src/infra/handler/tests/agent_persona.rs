@@ -2,7 +2,7 @@ use super::*;
 use crate::infra::audit::AuditFilter;
 
 // ------------------------------------------------------------------
-// implementation-note-74 end-to-end tests.
+// implementation-note-55 end-to-end tests.
 // ------------------------------------------------------------------
 
 /// Helper: mint a parent grant suitable for delegation tests.
@@ -117,7 +117,7 @@ async fn create_agent_persona_atomic_mints_active_persona_and_attenuated_grant()
     assert_eq!(details["agent_id"], json!("scion-agent-aaa"));
 }
 
-/// implementation-note-227 #2 — requesting `bridge_client_bundle: true` is FAIL-SOFT: when the
+/// implementation-note-183 #2 — requesting `bridge_client_bundle: true` is FAIL-SOFT: when the
 /// daemon bridge listener is unconfigured (as in this in-memory test daemon) the
 /// persona + attenuated grant are still minted active and the bundle is simply
 /// omitted, so the spawn never fails on a bridge-mint error. (When a bridge
@@ -171,7 +171,7 @@ async fn create_agent_persona_bridge_bundle_request_is_fail_soft() {
     );
 }
 
-/// implementation-note-227 #2 / design ESC-3 — a bridge RPC carrying an mTLS principal whose
+/// implementation-note-183 #2 / design ESC-3 — a bridge RPC carrying an mTLS principal whose
 /// container SAN does NOT match the persona's `agent_personas.container_id`
 /// binding is refused at dispatch (-32004). This is the cross-check the
 /// `MtlsPrincipal` contract promises; before this change the container SAN was
@@ -624,7 +624,7 @@ async fn create_agent_persona_rejects_duplicate_container_spawn() {
     );
 }
 
-/// implementation-note-74 acceptance criterion:
+/// implementation-note-55 acceptance criterion:
 /// "emberd restart mid-spawn → reconciler refuses to spawn into
 /// enrolling slot."
 ///

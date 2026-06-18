@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-339
+//! implementation-note-242
 //!
 //! This probe is the reproducible answer to design's 2026-06-08
 //! root-cause correction (signed code identity, not login session type,

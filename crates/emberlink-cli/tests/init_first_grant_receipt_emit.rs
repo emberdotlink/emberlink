@@ -1,5 +1,5 @@
 //! CLASSIFICATION: PUBLIC
-//! T2 integration tests for EMBER-INIT-FIRST-implementation-note-444.
+//! T2 integration tests for EMBER-INIT-FIRST-implementation-note-348.
 //!
 //! Verifies that `ember init` emits a real signed Grant Receipt v2 envelope
 //! to `<data_dir>/receipts/first.json`, and that re-running is idempotent

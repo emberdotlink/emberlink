@@ -37,9 +37,9 @@ pub struct BinaryInstallBundleArgs {
 
     /// Destination TOML path for the signed manifest. The companion `.sig`
     /// sidecar is written alongside (`<manifest_path>.with_extension("toml.sig")`).
-    /// Defaults to `<HOME>/.ember/binaries/manifest.toml`, matching the
-    /// daemon's HOME-first lookup in
-    /// `ember_daemon::broker::runners::runner_resolution_manifest`.
+    /// Defaults to the bundled system manifest path
+    /// (`/usr/local/lib/ember/binaries/manifest.toml`). Noncanonical
+    /// manifests require an explicit `--manifest-path`.
     #[arg(long)]
     pub manifest_path: Option<PathBuf>,
 
@@ -73,11 +73,8 @@ pub struct BinaryInstallBundleOutput {
     pub trust_root_hex: String,
 }
 
-fn default_manifest_path(home_dir: &Path) -> PathBuf {
-    home_dir
-        .join(".ember")
-        .join("binaries")
-        .join("manifest.toml")
+fn default_manifest_path(_home_dir: &Path) -> PathBuf {
+    bundled_install_dir().join("manifest.toml")
 }
 
 /// Hash `path`'s bytes with blake3 and return the canonical
@@ -338,12 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn default_manifest_path_lands_in_canonical_dir() {
+    fn default_manifest_path_lands_in_bundled_system_dir() {
         let home = PathBuf::from("/home/test-operator");
         let path = default_manifest_path(&home);
         assert_eq!(
             path,
-            PathBuf::from("/home/test-operator/.ember/binaries/manifest.toml")
+            PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
         );
     }
 }

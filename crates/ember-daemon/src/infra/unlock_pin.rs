@@ -16,7 +16,7 @@
 //! `Instant`s via `release_pin_at` to exercise grace-window semantics
 //! deterministically.
 //!
-//! **Phase 2** (separate task `implementation-note-317`) wires
+//! **Phase 2** (separate task `implementation-note-221`) wires
 //! `acquire_pin` / `release_pin` into the session-open / session-close
 //! dispatch arms in `handler.rs`, adds the idle-zero handler that calls
 //! `Vault::zero_scope(VaultScope::Interactive)` when `should_zero` returns

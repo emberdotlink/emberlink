@@ -44,7 +44,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// implementation-note-37 C5 — AAD domain-separator prefix byte. AEAD
+/// AAD domain-separator prefix byte. AEAD
 /// associated data for every C5+-sealed credential row is the byte
 /// sequence `[AAD_VERSION_BYTE] || uuid_bytes_of_row_id` (17 bytes).
 /// The literal `0x01` future-proofs the format: if we ever rotate the
@@ -130,7 +130,7 @@ pub(crate) fn clear_passphrase_caches() {
     crate::infra::vault_macos::clear_session_cache();
 }
 
-// implementation-note-37 C4 — Argon2id KDF parameter pins. The MEK is
+// Argon2id KDF parameter pins. The MEK is
 // derived by `Vault::from_passphrase` via Argon2id; pinning the cost
 // parameters here (and writing them to `vault.params` next to
 // `vault.salt`) lets `Vault::open_from_config` refuse to unlock a vault
@@ -177,7 +177,7 @@ pub enum VaultError {
     /// Only fired by `vault_add` for NEW entries; existing non-conformant
     /// entries are grandfathered (per design §5.4).
     InvalidName(VaultNameError),
-    /// Sealed-blob (implementation-note-186) parse/structural
+    /// Sealed-blob parse/structural
     /// error: invalid argon2 parameters, malformed length fields, AEAD
     /// key-init failure, etc. `String` carries human-readable detail.
     SealedBlobInvalid(String),
@@ -220,14 +220,14 @@ pub enum VaultError {
     /// message so callers can fingerprint the wrong-passphrase /
     /// tampered-ciphertext case explicitly.
     SealedBlobAeadFailure,
-    /// implementation-note-304 — emission
+    /// Emission
     /// of an `IdentityRotationWitness` Receipt failed. Surfaces signing
     /// failures from `core_events::receipt::sign::sign_receipt_v2`
     /// (canonicalize, serialize, etc.) so callers can distinguish
     /// crypto-layer faults from store-layer faults when persistence
     /// would otherwise mask the underlying signer error.
     WitnessEmit(String),
-    /// implementation-note-170 (B1) + adversarial review
+    /// Scope/MEK split (B1) + adversarial review
     /// CRIT-1 fix (2026-05-22) — a caller invoked an Interactive-lane
     /// operation (`seal`, `open`, or `add`/`get`/`replace`/`list`/
     /// `remove` with `VaultScope::Interactive`) on a Vault that was
@@ -255,7 +255,7 @@ pub enum VaultError {
 
 /// Reasons a credential name fails the design path grammar.
 ///
-/// Grammar (per task brief implementation-note-321):
+/// Grammar:
 ///   - Lowercase ASCII letters `a-z`
 ///   - Digits `0-9`
 ///   - Hyphens `-`
@@ -495,7 +495,7 @@ impl VaultReadGate {
 
 /// Which user-presence policy lane is calling into the vault.
 ///
-/// Phase 2A (`implementation-note-322`) makes the parameter
+/// Phase 2A (scope-split namespace) makes the parameter
 /// load-bearing for storage namespace selection: `Headless` now maps to a
 /// dedicated internal row-name prefix while `Interactive` preserves the
 /// historical flat names. The per-scope MEK split is still follow-up work.
@@ -702,11 +702,11 @@ pub enum VaultKeyStore {
 
 /// MEK holder for the daemon's sealed-credentials store.
 ///
-/// **implementation-note-37 C1**: `Vault` is `ZeroizeOnDrop` so the
+/// **MEK hardening (C1)**: `Vault` is `ZeroizeOnDrop` so the
 /// in-memory MEK is wiped on Drop (explicit lock, daemon shutdown, the
 /// final `Rc<Vault>` / `Arc<Vault>` reference going away).
 ///
-/// implementation-note-323 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// MEK hardening (C1, F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
 /// REMOVED. Prior to this commit `Vault` derived `Clone` so the in-memory
 /// MEK byte-array could be by-value-copied across LocalSet spawn boundaries
 /// (runtime.rs spawned each proxy + dashboard task with a fresh
@@ -724,7 +724,7 @@ pub enum VaultKeyStore {
 /// On-disk filename (under `<data_dir>/`) carrying the AEAD-wrapped
 /// Headless MEK. The blob is `[24-byte nonce || ciphertext-with-tag]`
 /// encrypted under the Interactive MEK with AAD `b"vault.headless-mek.v1"`.
-/// Generated lazily on first vault open per implementation-note-170.
+/// Generated lazily on first vault open per the scope/MEK split.
 pub(crate) const HEADLESS_MEK_WRAP_FILE: &str = "vault.headless-mek.wrapped";
 
 /// AEAD AAD for the disk-wrapped Headless MEK. Version-prefixed so a
@@ -886,7 +886,7 @@ fn unwrap_dek(
 
 /// MEK holder for the daemon's sealed-credentials store.
 ///
-/// **implementation-note-170 (B1, 2026-05-22)** — `Vault`
+/// **Scope/MEK split (B1, 2026-05-22)** — `Vault`
 /// carries TWO 32-byte master keys, one per `VaultScope` lane:
 /// - `interactive_key`: passphrase-derived (Argon2id) via the existing
 ///   keychain → vault.salt → MEK pipeline. Drives Interactive-scope
@@ -904,11 +904,11 @@ fn unwrap_dek(
 /// cryptographic split. Production callers reach `Vault::new_split`
 /// through `load_or_generate_headless_key` indirectly via `finish_open`.
 ///
-/// implementation-note-37 C1: `Vault` is `ZeroizeOnDrop` so both
+/// MEK hardening (C1): `Vault` is `ZeroizeOnDrop` so both
 /// in-memory MEK byte arrays are wiped on Drop (explicit lock, daemon
 /// shutdown, the final `Rc<Vault>` / `Arc<Vault>` reference going away).
 ///
-/// implementation-note-323 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// MEK hardening (C1, F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
 /// REMOVED. Prior to that commit `Vault` derived `Clone`; sharing is
 /// `Rc<Vault>` ONLY, but long-lived helper lanes resolve the live vault
 /// through `DaemonStore`'s shared slot instead of owning private runtime
@@ -1055,7 +1055,7 @@ impl Vault {
     /// Two-key constructor for production callers and tests that DO
     /// model the cryptographic Interactive/Headless split.
     ///
-    /// Per implementation-note-170 (B1): the two keys MUST
+    /// Per the scope/MEK split (B1): the two keys MUST
     /// be cryptographically independent — `interactive_key` is
     /// Argon2id-derived from the operator passphrase; `headless_key` is
     /// fresh OS entropy AEAD-wrapped under `interactive_key` and
@@ -1085,7 +1085,7 @@ impl Vault {
         v
     }
 
-    /// implementation-note-170 (B1) + adversarial review
+    /// Scope/MEK split (B1) + adversarial review
     /// CRIT-1 fix (2026-05-22) — headless-only constructor.
     ///
     /// Sets `interactive_key` to an all-zero checkpoint and
@@ -1118,7 +1118,7 @@ impl Vault {
         v
     }
 
-    /// implementation-note-170 (B1) — true iff this Vault
+    /// Scope/MEK split (B1) — true iff this Vault
     /// was constructed via [`Vault::new_headless_only`] (or any other
     /// path that left `interactive_key` as the all-zero checkpoint).
     ///
@@ -1145,7 +1145,7 @@ impl Vault {
     /// with the compile-time-pinned parameters (`VAULT_ARGON2_*`
     /// constants). Matches `Argon2::default()` in argon2 v0.5 — existing
     /// vaults sealed under the default continue to decrypt without
-    /// rotation (implementation-note-37 C4).
+    /// rotation (MEK hardening C4).
     ///
     /// Returns a single-key Vault (both Interactive and Headless lanes
     /// share the derived bytes). Production callers should instead
@@ -1467,7 +1467,7 @@ fn write_pre_rotation_snapshot(
 }
 
 /// Load the wrapped Headless MEK, or generate a fresh one and persist it.
-/// Per implementation-note-170 (B1, design): the Headless MEK
+/// Per the scope/MEK split (B1, design): the Headless MEK
 /// is cryptographically independent of the Interactive MEK — fresh OS
 /// entropy at first call, AEAD-wrapped under the Interactive MEK so the
 /// daemon can reload it across restarts without re-prompting Touch ID, but
@@ -1631,7 +1631,7 @@ fn open_with_key_store_and_presence(
     key_store: &VaultKeyStore,
     presence: PresenceAfterOpen,
 ) -> Result<Vault, VaultError> {
-    // implementation-note-37 C4: same params gate as
+    // MEK hardening (C4): same params gate as
     // `open_from_config` — runs before any keyring access so a
     // mismatch aborts before a (potentially user-presence-gated)
     // Keychain prompt fires.
@@ -1855,7 +1855,7 @@ impl Vault {
         // authentication when opened in the other.
         let scope = class.scope();
 
-        // implementation-note-170 (B1) + adversarial review
+        // Scope/MEK split (B1) + adversarial review
         // CRIT-1 fix: refuse AuthorityBearing on a headless-only / idle-zeroed
         // vault — there is no §4 key to seal authority under, and the
         // autonomous key may NEVER be a fallback recipient for authority.
@@ -1917,7 +1917,7 @@ impl Vault {
         // fails the AEAD tag even if the two keys happened to be equal.
         let scope = class.scope();
 
-        // implementation-note-170 (B1) + adversarial CRIT-1
+        // Scope/MEK split (B1) + adversarial CRIT-1
         // fix: refuse AuthorityBearing on a headless-only / idle-zeroed vault.
         if scope == VaultScope::Interactive && self.is_headless_only() {
             return Err(VaultError::HeadlessOnly);
@@ -2147,14 +2147,14 @@ impl Vault {
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
         let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-37 C5: mint the row id BEFORE encrypting
+        // MEK hardening (C5): mint the row id BEFORE encrypting
         // so the AEAD AAD can be bound to the row's UUID. AAD format is
         // `[0x01, row_uuid_bytes...]` (17 bytes). Decrypt-side (Vault::get)
         // tries this AAD first, falling back to no-AAD for legacy rows.
         let id = format!("cred-{}", Uuid::new_v4());
         let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
 
-        // implementation-note-170 (B1): encrypt under the
+        // Scope/MEK split (B1): encrypt under the
         // per-scope MEK so an attacker who recovers ONLY the Headless
         // attested-device wrap (per `attested_device.rs`) cannot decrypt
         // Interactive rows.
@@ -2511,12 +2511,12 @@ impl Vault {
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
         let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-37 C5: mint id first, bind AAD to the
+        // MEK hardening (C5): mint id first, bind AAD to the
         // new row's UUID. Same pattern as `Vault::add`.
         let id = format!("cred-{}", Uuid::new_v4());
         let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
 
-        // implementation-note-170 (B1): replace also routes
+        // Scope/MEK split (B1): replace also routes
         // per-scope so the rewritten row stays sealed under the scope's
         // key, not whichever MEK happens to be in `self.interactive_key`.
         //
@@ -2671,7 +2671,7 @@ impl Vault {
 
         // Hold every transient plaintext MEK in `Zeroizing` so the stack copies
         // are scrubbed on scope exit / early `?`-return — the
-        // implementation-note-37 C1 no-residue posture the rest of this file
+        // MEK hardening (C1) no-residue posture the rest of this file
         // keeps (`unwrap_dek`, `unwrap_headless_mek`, etc.). The only un-tracked
         // copy is the momentary by-value arg to `Vault::new_split` below, which
         // moves straight into the new Vault's `ZeroizeOnDrop` cells — the same
@@ -3049,7 +3049,7 @@ impl Vault {
 
 // sealed_mek_blob_format_landed
 //
-// implementation-note-319 — sealed-blob
+// Sealed-blob
 // wire format + argon2id-KEK-wrapped MEK. Daemon-side substrate for
 // vault export/import (the CLI surface lands in a later slice).
 //
@@ -3421,7 +3421,7 @@ pub fn import_mek_sealed(
     Ok(zeroize::Zeroizing::new(plaintext))
 }
 
-// implementation-note-304 —
+// Daemon emit-witness:
 // rotation_witness_emitted_at_mek_rotation
 //
 // At every identity-key rotation point (today: alongside the MEK
@@ -3659,7 +3659,7 @@ pub(crate) fn resolve_passphrase_no_provision(
     }
 
     // 2. Test gate — same three-axis check as `resolve_passphrase`.
-    if cfg!(test) || std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary() {
+    if cfg!(test) || vault_mock_env_enabled() || is_cargo_test_binary() {
         // In test mode, only return a passphrase if the test has explicitly
         // signaled "keyring entry exists" via `EMBER_VAULT_TEST_KEYRING_PRESENT=1`.
         // Otherwise return None so tests can exercise the NoKeyringEntry path.
@@ -3871,8 +3871,8 @@ pub struct MigrateMekAclResult {
 /// Re-store the vault MEK passphrase under the platform-current ACL
 /// (biometric on macOS via `kSecAttrAccessControl`).
 ///
-/// This migrates a pre-existing MEK entry created before
-/// implementation-note-115 shipped so subsequent vault operations
+/// This migrates a pre-existing MEK entry created before the macOS
+/// biometric ACL shipped so subsequent vault operations
 /// use Touch ID instead of the plain keychain password.
 ///
 /// Safety contract:
@@ -4060,16 +4060,15 @@ pub(crate) fn is_separate_uid_posture() -> bool {
     // (see install.rs::render_launchd_plist_body), so any env-var-based
     // home resolution would see the operator's home and miss the
     // /var/empty checkpoint that signals the design separate-uid posture.
-    // Per adversarial review implementation-note-85-(-B).
+    // Per adversarial review (-B).
     //
     // The Ok(None) and Err(e) arms both return false but log distinctly
     // so an operator debugging "why did the daemon land on the keychain
     // branch instead of SE?" can tell apart a provisioning race (uid
     // exists in kernel but passwd entry not yet written) from a real
-    // passwd-database I/O failure. Per self-review 
-    // (implementation-note-324).
+    // passwd-database I/O failure. Per self-review .
     //
-    // implementation-note-325: all three 
+    // All three 
     // findings from the 2026-05-13 self-review are now closed.
     // (this site): Ok(None) / Err distinguished above.
     // : TOCTOU on file-based MEK blob — obviated by the
@@ -4098,6 +4097,26 @@ pub(crate) fn is_separate_uid_posture() -> bool {
     }
 }
 
+#[cfg(not(ember_release))]
+pub fn vault_mock_env_enabled() -> bool {
+    std::env::var("EMBER_VAULT_MOCK").is_ok()
+}
+
+#[cfg(ember_release)]
+pub fn vault_mock_env_enabled() -> bool {
+    false
+}
+
+#[cfg(not(ember_release))]
+pub fn vault_dev_mode_env_enabled() -> bool {
+    matches!(std::env::var("EMBER_VAULT_DEV_MODE").as_deref(), Ok("1"))
+}
+
+#[cfg(ember_release)]
+pub fn vault_dev_mode_env_enabled() -> bool {
+    false
+}
+
 /// True when raw keyring writes must be suppressed: a cargo test binary is
 /// running, or the `EMBER_VAULT_MOCK` opt-out is set. Downstream callers
 /// (e.g., `ember init` in `emberlink-cli`) must consult this before
@@ -4106,7 +4125,7 @@ pub(crate) fn is_separate_uid_posture() -> bool {
 /// raw keyring access, and missing it was the leak that fired real
 /// keychain popups from the emberlink-cli test suite on 2026-04-22.
 pub fn keyring_writes_suppressed() -> bool {
-    std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary()
+    vault_mock_env_enabled() || is_cargo_test_binary()
 }
 
 pub fn verify_keyring_roundtrip(
@@ -4116,7 +4135,7 @@ pub fn verify_keyring_roundtrip(
 ) -> Result<(), VaultError> {
     // Test gate — skip the real-keychain verification step under the same
     // conditions that suppress keyring access in resolve_passphrase above.
-    if cfg!(test) || std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary() {
+    if cfg!(test) || vault_mock_env_enabled() || is_cargo_test_binary() {
         return Ok(());
     }
     let verify_entry = keyring_core::Entry::new(service, account)
@@ -4157,7 +4176,7 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<Zeroizing<String>,
     // Now also detects cargo test binaries by their install path: cargo runs
     // tests from `target/<profile>/deps/<name>-<hash>`, so any process whose
     // current_exe contains `/target/` + `/deps/` is a test binary.
-    if cfg!(test) || std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary() {
+    if cfg!(test) || vault_mock_env_enabled() || is_cargo_test_binary() {
         tracing::debug!(
             service = service,
             account = account,
@@ -4229,7 +4248,7 @@ pub(crate) fn set_vault_passphrase(
     passphrase: &str,
 ) -> Result<(), VaultError> {
     if cfg!(test)
-        || std::env::var("EMBER_VAULT_MOCK").is_ok()
+        || vault_mock_env_enabled()
         || is_cargo_test_binary()
         || keyring_writes_suppressed()
     {
@@ -4330,7 +4349,7 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
     }
 }
 
-/// implementation-note-37 C4: enforce Argon2 parameter pinning via a
+/// MEK hardening (C4): enforce Argon2 parameter pinning via a
 /// `<data_dir>/vault.params` sidecar file.
 ///
 /// - If the file exists, parse it and refuse to proceed if any value

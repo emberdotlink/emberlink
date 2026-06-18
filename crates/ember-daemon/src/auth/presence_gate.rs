@@ -161,10 +161,15 @@ pub fn is_presence_widening(method: &str) -> bool {
         | "create_composite_grant"
         | "delegate_grant"
         | "extend_grant"
+        | "grant.extend"
         | "propose_grant"
         | "create_standing_grant"
         | "save_delegation_template"
         | "resolve_approval"
+        | "approval.resolve"
+        | "approval_resolve"
+        | "approval.narrow"
+        | "approval_narrow"
         // Session launch grant (design Touch-ID-at-launch). Resume/re-attach
         // rides describe_runtime_attach_target (ConnectOnly), NOT this.
         | "register_session"

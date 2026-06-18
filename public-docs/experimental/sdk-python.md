@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Experimental**. Reviewed: 2026-06-17. Status: current.
-
 # Python SDK
 
 The Python package exists, but the broader SDK/headless story is still
@@ -63,7 +58,7 @@ If you want the current most-supported operator path, prefer the daemon-backed
 CLI and launcher story first.
 
 If you are deciding whether the SDK is the right fit, start with
-[Choose an integration surface](../build/choosing-an-integration-surface/).
+[Choose an integration surface](../build/choosing-an-integration-surface.md).
 
 ## Source of truth
 

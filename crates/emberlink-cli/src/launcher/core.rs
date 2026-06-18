@@ -126,12 +126,23 @@ pub struct SessionRegistration {
     pub anthropic_custom_headers: Option<String>,
     /// Git credential-injection proxy URL.
     pub git_proxy_url: Option<String>,
+    /// Cursor-compatible generic HTTP(S) egress proxy URL. This is separate
+    /// from `proxy_url` (LLM credential gateway) and `git_proxy_url` (GitHub
+    /// smart-HTTP projector); the Cursor launcher may set `HTTPS_PROXY` only
+    /// when the daemon returns this explicit field.
+    pub cursor_egress_proxy_url: Option<String>,
     /// Per-session loopback responses-API-proxy base URL for the codex HOST
     /// lane (-S2 / design codex). `http://127.0.0.1:<port>/v1`. When set,
     /// the codex launcher writes a relocated `CODEX_HOME/config.toml` pointing
     /// codex's `model_providers.ember.base_url` here and strips ambient OpenAI
     /// credentials from the child env.
     pub codex_responses_proxy_url: Option<String>,
+    /// Per-session loopback Code Assist proxy base URL for the gemini HOST lane
+    /// (design §2). BARE base `http://127.0.0.1:<port>` (NO `/v1` suffix): the
+    /// gemini-cli builds `${CODE_ASSIST_ENDPOINT}/v1internal:<method>` itself.
+    /// When set, the gemini launcher points `CODE_ASSIST_ENDPOINT` here and
+    /// strips ambient Google API credentials from the child env.
+    pub gemini_proxy_url: Option<String>,
     /// Path to the daemon-managed ssh-agent socket for this session.
     pub ssh_auth_sock: Option<String>,
     /// Optional delegation grant ULID minted at session-open.
@@ -460,7 +471,9 @@ mod tests {
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: None,
+            cursor_egress_proxy_url: None,
             codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
             ssh_auth_sock: None,
             delegation_id: None,
             delegation_template: None,

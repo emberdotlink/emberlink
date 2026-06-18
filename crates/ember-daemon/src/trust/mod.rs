@@ -3,6 +3,7 @@ pub mod approval;
 pub mod attenuation;
 pub mod bridge_ca;
 pub mod grant;
+pub(crate) mod grant_projection;
 pub mod introspect;
 pub mod lease;
 pub mod piv_attestation;

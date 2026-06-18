@@ -13,7 +13,7 @@
 //!   ember-daemon -p ember-construct`).
 //! - Step 2: content-hash diff (SHA-256) — detect which built binaries changed.
 //! - Step 3: copy changed binaries to the dev install root (code-signing is a
-//!   TODO stub; signing pipeline lands in implementation-note-420).
+//!   TODO stub; signing pipeline lands in implementation-note-327).
 //! - Step 4: re-generate and re-sign the dev manifest when synced binaries
 //!   changed.
 //! - Step 5: `launchctl kickstart -k system/sh.emberlink.daemon.dev` (skipped
@@ -268,7 +268,7 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
         let changed = binary_changed(&built, &installed)?;
         if changed {
             // TODO(phase-2): run the dev IdentityRoot sign pipeline here
-            // (implementation-note-420 phase 6) before copying.
+            // (implementation-note-327 phase 6) before copying.
             eprintln!(
                 "[dev sync] {} changed — copying to {}",
                 artifact.binary_name,

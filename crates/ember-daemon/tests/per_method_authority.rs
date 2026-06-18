@@ -81,7 +81,7 @@ async fn dispatch(
     .await
 }
 
-// T2 integration coverage for implementation-note-220:
+// T2 integration coverage for implementation-note-277:
 // per-method authority resolution admits ConnectOnly with peer creds, and binds
 // OperatorPresence tokens to uid + expiry + method scope before dispatching.
 #[tokio::test]

@@ -63,7 +63,7 @@ pub fn print_next_commands_with_ember_command(ember_cmd: &str) {
 
 fn next_commands_text(ember_cmd: &str) -> String {
     format!(
-        "\nNext steps:\n  {ember_cmd} init --for codex    # import Codex auth and refresh the brokered OpenAI grant\n  {ember_cmd} codex               # launch Codex with an Ember-managed session\n  codex login status        # check Codex's native login state if needed\n  codex login --device-auth # headless host sign-in if browser login is unavailable\n  {ember_cmd} receipt show        # inspect the signed audit trail\n\n`{ember_cmd} codex` is the launcher alias over `{ember_cmd} session open codex`.\nCodex login remains native, but `{ember_cmd} init --for codex` imports `~/.codex/auth.json` into `{CODEX_OPENAI_PLAN_CREDENTIAL_PATTERN}` with operator consent so model traffic can use Ember's brokered OpenAI Responses lane.\nIf the host is headless or browser sign-in is blocked, use `codex login --device-auth`; isolated `{ember_cmd} codex` keeps host auth live while routing mutable Codex state through per-session overlays.\n"
+        "\nNext steps:\n  {ember_cmd} init --for codex    # import Codex auth and refresh the brokered OpenAI grant\n  {ember_cmd} codex               # launch Codex with an Ember-managed session\n  codex login status        # check Codex's native login state if needed\n  codex login --device-auth # headless host sign-in if browser login is unavailable\n  {ember_cmd} receipt list        # find the receipt after the first brokered action\n\n`{ember_cmd} codex` is the launcher alias over `{ember_cmd} session open codex`.\nCodex login remains native, but `{ember_cmd} init --for codex` imports `~/.codex/auth.json` into `{CODEX_OPENAI_PLAN_CREDENTIAL_PATTERN}` with operator consent so model traffic can use Ember's brokered OpenAI Responses lane.\nIf the host is headless or browser sign-in is blocked, use `codex login --device-auth`; isolated `{ember_cmd} codex` keeps host auth live while routing mutable Codex state through per-session overlays.\n"
     )
 }
 
@@ -86,7 +86,7 @@ mod tests {
         let text = next_commands_text("/home/operator/emberlink-example/target/debug/ember");
         assert!(text.contains("/home/operator/emberlink-example/target/debug/ember codex"));
         assert!(text.contains("/home/operator/emberlink-example/target/debug/ember init --for codex"));
-        assert!(text.contains("/home/operator/emberlink-example/target/debug/ember receipt show"));
+        assert!(text.contains("/home/operator/emberlink-example/target/debug/ember receipt list"));
         assert!(text.contains(
             "`/home/operator/emberlink-example/target/debug/ember codex` is the launcher alias"
         ));

@@ -1,6 +1,5 @@
 # Code of Conduct
 
-
 Emberlink follows the [Contributor Covenant](https://www.contributor-covenant.org/) version 2.1.
 
 ## Our Pledge

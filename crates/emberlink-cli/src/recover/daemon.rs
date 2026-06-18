@@ -489,7 +489,7 @@ fn handle_with_ops(
         DaemonScope::Pid => {
             println!(
                 "ember recover daemon (mode={}, scope=pid): scaffold only - \
-                 this scope lands under its own implementation-note-456 task. \
+                 this scope lands under its own implementation-note-359 task. \
                  See `ember recover --explain F-DAEMON-1` for the F-code-anchored runbook.",
                 mode.as_str()
             );

@@ -1,6 +1,6 @@
 //! Dev IdentityRoot rotation — grace-window tracker + handlers.
 //!
-//! Per design §Component 3 (implementation-note-221). The CLI side
+//! Per design §Component 3 (implementation-note-260). The CLI side
 //! (`crates/emberlink-cli/src/trust/rotate.rs`) drives the operator-facing
 //! flow: Touch ID gate, new keypair mint, Keychain stash at the `.v2`
 //! label, re-sign of the dev manifest, plist rewrite + `launchctl kickstart`.
@@ -58,7 +58,7 @@ use serde_json::{Value, json};
 
 use crate::binary_manifest::{TrustRootRecord, TrustRootSource, trust_roots_snapshot};
 
-// trust_rotate_dev_ir_landed — checkpoint anchoring this PR (implementation-note-221).
+// trust_rotate_dev_ir_landed — checkpoint anchoring this PR (implementation-note-260).
 
 /// Default grace window for dev IdentityRoot rotation. design §Component 3
 /// specifies 7 days as the canonical default. Operator can shorten via

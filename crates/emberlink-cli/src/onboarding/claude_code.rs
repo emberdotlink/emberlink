@@ -1,5 +1,5 @@
 //! `ember init --for claude` and `ember uninstall --for claude`
-//! orchestration (implementation-note-439).
+//! orchestration (implementation-note-343).
 //!
 //! Per design §2 / §3: a one-command first-run setup that wires Claude Code
 //! to the local ember daemon. This module is the orchestration layer — the
@@ -17,7 +17,7 @@
 //!      `ember vault add --name github-pat`, but init no longer captures
 //!      PATs interactively.
 //!   5. Print the next two commands per design §2:
-//!      `ember claude` and `ember receipt show`.
+//!      `ember claude` and `ember receipt list`.
 //!
 //! The brokered Claude session's `permissions.deny` overlay is authored
 //! per-Construct in each `construct.toml`'s `[settings_overlay]` block
@@ -32,8 +32,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-use crate::binary::install_bundle::{BinaryInstallBundleArgs, BinaryInstallBundleOutput};
 
 /// Default 24-hour grant TTL per design §3.
 pub const DEFAULT_GRANT_TTL_SECS: u64 = 24 * 60 * 60;
@@ -98,7 +96,7 @@ pub fn default_settings_json_path() -> Result<PathBuf, InitError> {
 /// users who relied on per-host persona separation must now set
 /// `EMBER_PERSONA` explicitly or pass `-w <name>` to the launcher.
 ///
-/// implementation-note-436 anchor: routes
+/// implementation-note-340 anchor: routes
 /// through `default_persona_id_for_runtime` so launcher + init agree on
 /// the same persona-id shape.
 pub fn claude_code_persona_name() -> String {
@@ -114,64 +112,6 @@ pub fn claude_code_persona_name() -> String {
 /// `target/...` artifacts.
 pub fn install_managed_prod_shadow_path() -> Result<PathBuf, String> {
     install_managed_prod_shadow_path_inner()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedProdShadowInstall {
-    pub shadow_root: PathBuf,
-    pub operator_manifest_refresh: Option<BinaryInstallBundleOutput>,
-}
-
-pub fn install_managed_prod_shadow_path_with_manifest_repair()
--> Result<ManagedProdShadowInstall, String> {
-    match install_managed_prod_shadow_path_inner() {
-        Ok(shadow_root) => Ok(ManagedProdShadowInstall {
-            shadow_root,
-            operator_manifest_refresh: None,
-        }),
-        Err(first_error) if should_refresh_operator_manifest_after_shadow_error(&first_error) => {
-            let home = home_dir().map_err(|e| e.to_string())?;
-            let args = BinaryInstallBundleArgs {
-                from_dir: ember_daemon::binary_manifest::bundled_install_dir(),
-                manifest_path: None,
-                publisher: "did:emberlink".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                staged_root: None,
-                identity_root_keypath: None,
-            };
-            let refresh =
-                crate::binary::install_bundle::binary_install_bundle(&args, &home).map_err(
-                    |repair_error| {
-                        format!(
-                            "{first_error}; attempted to refresh the operator binary manifest from the installed product bundle, but repair failed: {repair_error}"
-                        )
-                    },
-                )?;
-            let shadow_root = install_managed_prod_shadow_path_inner().map_err(|retry_error| {
-                format!(
-                    "{first_error}; refreshed operator binary manifest at {}, but retry failed: {retry_error}",
-                    refresh.manifest_path.display()
-                )
-            })?;
-            Ok(ManagedProdShadowInstall {
-                shadow_root,
-                operator_manifest_refresh: Some(refresh),
-            })
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn should_refresh_operator_manifest_after_shadow_error(error: &str) -> bool {
-    [
-        "content pin verification failed",
-        "manifest content_pin",
-        "manifest entry lookup failed",
-        "manifest load failed",
-        "manifest signature/trust verification failed",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
 }
 
 fn install_managed_prod_shadow_path_inner() -> Result<PathBuf, String> {
@@ -205,7 +145,7 @@ fn home_dir() -> Result<PathBuf, InitError> {
 
 /// Public surface of [`home_dir`] used by the `cmd_migrate_path_shadow_layout`
 /// CLI handler so the binary doesn't have to depend on `dirs_next` directly.
-/// implementation-note-440.
+/// implementation-note-344.
 pub fn home_dir_for_migrate() -> Result<PathBuf, String> {
     home_dir().map_err(|e| e.to_string())
 }
@@ -291,7 +231,7 @@ fn next_commands_text_with_ember_command(
                 "  {ember_cmd} claude             # launch Claude with this grant (recommended)"
             ));
             lines.push(format!(
-                "  {ember_cmd} receipt show       # see the audit trail of the grant"
+                "  {ember_cmd} receipt list       # find the receipt after the first brokered action"
             ));
         }
         GitHubOnboardingPosture::PatConfigured => {
@@ -302,7 +242,7 @@ fn next_commands_text_with_ember_command(
                 "  {ember_cmd} github setup       # upgrade to the real App lane when ready"
             ));
             lines.push(format!(
-                "  {ember_cmd} receipt show       # see the audit trail of the grant"
+                "  {ember_cmd} receipt list       # find the receipt after the first brokered action"
             ));
         }
         GitHubOnboardingPosture::AppBroken(_) => {
@@ -332,7 +272,7 @@ fn next_commands_text_with_ember_command(
     lines.push("About the launcher".to_string());
     lines.push("------------------".to_string());
     lines.push(format!(
-        "`{ember_cmd} claude` is the canonical v0.3.0 launcher. It opens a fresh session,"
+        "`{ember_cmd} claude` is the managed v0.3.0 launcher. It opens a fresh session,"
     ));
     lines.push(
         "attaches a scoped grant, and keeps audit plus revocation on the supported path."
@@ -449,7 +389,7 @@ pub fn print_github_onboarding_guidance_with_ember_command(
 /// Decide whether the autostart path should install a LaunchAgent / systemd
 /// user unit, or fall back to a raw `--background` daemon spawn.
 ///
-/// implementation-note-441: the LaunchAgent / systemd-user
+/// implementation-note-345: the LaunchAgent / systemd-user
 /// path is correct for the canonical "production user" install (single
 /// always-up daemon per login session) — but it baked an absolute `~/.ember/`
 /// path resolved against the operator's *real* HOME at install time, so an
@@ -489,7 +429,7 @@ pub fn supports_managed_daemon_install(
 
 /// Resolve the autostart liveness-wait timeout in seconds. Honors the
 /// `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` env override; falls back to a
-/// 10s default (raised from 5s in implementation-note-441
+/// 10s default (raised from 5s in implementation-note-345
 /// because first-time provisioning — vault.salt + daemon.db schema — can
 /// exceed 5s on slow disks).
 pub fn autostart_liveness_timeout_secs() -> u64 {
@@ -522,7 +462,7 @@ mod tests {
 
     #[test]
     fn persona_name_uses_2_slot_default_shape() {
-        // implementation-note-436: the default
+        // implementation-note-340: the default
         // persona now follows the locked 2-slot Persona schema
         // (CONTEXT.md "Identity surface" §Persona ID schema) —
         // `claude-code-<context>` where `<context>` is `default` until
@@ -621,27 +561,11 @@ mod tests {
     }
 
     #[test]
-    fn package_upgrade_manifest_errors_trigger_operator_manifest_refresh() {
-        assert!(should_refresh_operator_manifest_after_shadow_error(
-            "manifest trust gate on /Users/operator/.ember/shadow: construct manifest trust gate refused: content pin verification failed for ember-gh"
-        ));
-        assert!(should_refresh_operator_manifest_after_shadow_error(
-            "manifest trust gate on /Users/operator/.ember/shadow: construct manifest trust gate refused: manifest signature/trust verification failed"
-        ));
-        assert!(!should_refresh_operator_manifest_after_shadow_error(
-            "managed product construct bundle is incomplete"
-        ));
-        assert!(!should_refresh_operator_manifest_after_shadow_error(
-            "construct manifest trust gate refused: manifest entry ember-gh path /tmp/escape escapes trusted construct roots"
-        ));
-    }
-
-    #[test]
     fn next_commands_text_stays_truthful_about_launcher_presence() {
         let text = next_commands_text(GitHubOnboardingPosture::AppConfiguredReal);
         assert!(
             text.contains(
-                "`ember claude` is the canonical v0.3.0 launcher. It opens a fresh session,"
+                "`ember claude` is the managed v0.3.0 launcher. It opens a fresh session,"
             ),
             "launcher guidance should still recommend the session-scoped path"
         );
@@ -713,13 +637,13 @@ mod tests {
             "/home/operator/emberlink-example/target/debug/ember",
         );
         assert!(text.contains("/home/operator/emberlink-example/target/debug/ember claude"));
-        assert!(text.contains("/home/operator/emberlink-example/target/debug/ember receipt show"));
+        assert!(text.contains("/home/operator/emberlink-example/target/debug/ember receipt list"));
         assert!(text.contains(
-            "`/home/operator/emberlink-example/target/debug/ember claude` is the canonical v0.3.0 launcher."
+            "`/home/operator/emberlink-example/target/debug/ember claude` is the managed v0.3.0 launcher."
         ));
     }
 
-    // ── implementation-note-442 tests ───────────────────────
+    // ── implementation-note-346 tests ───────────────────────
 
     /// Integration-level: init_for_claude_code_autostarts_daemon_when_not_running
     ///
@@ -741,7 +665,7 @@ mod tests {
         unimplemented!("run manually: ember daemon stop && ember init --for claude")
     }
 
-    // ── implementation-note-441 tests ───────────────────────
+    // ── implementation-note-345 tests ───────────────────────
 
     /// LaunchAgent/systemd path is appropriate for a default user HOME with
     /// no --config override.

@@ -1,4 +1,4 @@
-//! implementation-note-48 — T2 tests for the emberd-side
+//! implementation-note-279 — T2 tests for the emberd-side
 //! `exec.completion` Receipt v2 emission path.
 //!
 //! Two tests:
@@ -45,9 +45,14 @@ use uuid::Uuid;
 
 const TEST_VAULT_KEY: [u8; 32] = [0xACu8; 32];
 
-fn write_runner_manifest(home: &std::path::Path, tool_name: &str, binary_path: &std::path::Path) {
+fn write_runner_manifest(
+    home: &std::path::Path,
+    tool_name: &str,
+    binary_path: &std::path::Path,
+) -> PathBuf {
     let manifest_dir = home.join(".ember/binaries");
     std::fs::create_dir_all(&manifest_dir).expect("mkdir manifest dir");
+    let manifest_path = manifest_dir.join("manifest.toml");
     let manifest_body = format!(
         "\
 [[entries]]
@@ -61,8 +66,8 @@ channel = \"bundled\"
 ",
         binary_path.display()
     );
-    std::fs::write(manifest_dir.join("manifest.toml"), manifest_body)
-        .expect("write runner manifest");
+    std::fs::write(&manifest_path, manifest_body).expect("write runner manifest");
+    manifest_path
 }
 
 fn write_managed_worktree(home: &std::path::Path, runtime_id: &str) -> PathBuf {
@@ -79,26 +84,42 @@ fn write_managed_worktree(home: &std::path::Path, runtime_id: &str) -> PathBuf {
     worktree_path
 }
 
-struct HomeGuard(Option<std::ffi::OsString>);
+struct HomeGuard {
+    previous_home: Option<std::ffi::OsString>,
+    previous_manifest_path: Option<std::ffi::OsString>,
+}
 
 impl HomeGuard {
-    fn set(home: &std::path::Path) -> Self {
-        let previous = std::env::var_os("HOME");
+    fn set(home: &std::path::Path, manifest_path: &std::path::Path) -> Self {
+        let previous_home = std::env::var_os("HOME");
+        let previous_manifest_path = std::env::var_os("EMBER_MANIFEST_PATH");
         unsafe {
             std::env::set_var("HOME", home);
+            std::env::set_var("EMBER_MANIFEST_PATH", manifest_path);
         }
-        Self(previous)
+        Self {
+            previous_home,
+            previous_manifest_path,
+        }
     }
 }
 
 impl Drop for HomeGuard {
     fn drop(&mut self) {
-        match self.0.take() {
+        match self.previous_home.take() {
             Some(home) => unsafe {
                 std::env::set_var("HOME", home);
             },
             None => unsafe {
                 std::env::remove_var("HOME");
+            },
+        }
+        match self.previous_manifest_path.take() {
+            Some(path) => unsafe {
+                std::env::set_var("EMBER_MANIFEST_PATH", path);
+            },
+            None => unsafe {
+                std::env::remove_var("EMBER_MANIFEST_PATH");
             },
         }
     }
@@ -220,13 +241,15 @@ async fn test_handle_exit_frame_emits_receipt() {
     // connection, reads a SpawnDirective, then writes a single
     // `ExecFrame::Exit { code: 0 }` and closes. This is exactly the
     // contract the in-container `ember-exec` receiver presents.
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = tempfile::Builder::new()
+        .prefix("ember-exec-")
+        .tempdir_in("/tmp")
+        .expect("short socket tempdir");
     let socket_path = tmp.path().join("mock-ember-exec.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind UDS");
 
     let store = store_with_vault();
     let runner_home = TempDir::new().expect("runner tempdir");
-    let _home_guard = HomeGuard::set(runner_home.path());
     let fake_gh = runner_home.path().join("bin/ember-gh");
     std::fs::create_dir_all(fake_gh.parent().expect("parent")).expect("mkdir bin dir");
     if std::os::unix::fs::symlink("/usr/bin/true", &fake_gh).is_err() {
@@ -236,7 +259,8 @@ async fn test_handle_exit_frame_emits_receipt() {
         perms.set_mode(0o755);
         std::fs::set_permissions(&fake_gh, perms).expect("chmod fake gh");
     }
-    write_runner_manifest(runner_home.path(), "ember-gh", &fake_gh);
+    let manifest_path = write_runner_manifest(runner_home.path(), "ember-gh", &fake_gh);
+    let _home_guard = HomeGuard::set(runner_home.path(), &manifest_path);
     let runtime_id = format!("rt-{}", Uuid::new_v4().simple());
     write_managed_worktree(runner_home.path(), &runtime_id);
 

@@ -498,7 +498,7 @@ async fn subtarget_contents_no_ref_query_denies() {
 
 // ------------------------------------------------------------------
 // Glob semantics — unit tests now live in
-// `core-proxy-forward::r#match::tests` (implementation-note-81).
+// `core-proxy-forward::r#match::tests` (implementation-note-62).
 // The two end-to-end scope tests below stay here because they exercise
 // `check_scope` against a full `hyper::Uri`, not the matcher alone.
 // ------------------------------------------------------------------

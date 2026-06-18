@@ -7,7 +7,7 @@
 //! listener for pull-side verification, so their right home is a T2 integration
 //! file rather than the source module's T1 unit tests.
 //!
-//! Refiled per `implementation-note-378`. Tests cover:
+//! Refiled per `implementation-note-280`. Tests cover:
 //! - `SnapshotEmitter::emit_snapshot` snapshot-id emission and chain linkage
 //! - `SnapshotEmitter::maybe_emit` first-call and cadence-gated paths
 //! - persisted encrypted snapshot blobs carrying `vault.salt` state

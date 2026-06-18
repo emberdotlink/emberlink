@@ -18,10 +18,10 @@
 //!   operator must be in `plugdev`.  Required on older distros, embedded
 //!   systems, or any system where `uaccess` tagging is absent.
 //!
-//! [`install_ember_fido2_udev_rules`] writes the canonical rules file shipped
-//! in `infra/udev/70-ember-fido2.rules` to `/etc/udev/rules.d/` and reloads
-//! udevd.  The function is compiled only on `target_os = "linux"`.  On all
-//! other operating systems the module exports a stub that returns
+//! [`install_ember_fido2_udev_rules`] writes the canonical rules file embedded
+//! from the crate's `templates/install/` directory to `/etc/udev/rules.d/` and
+//! reloads udevd.  The function is compiled only on `target_os = "linux"`.
+//! On all other operating systems the module exports a stub that returns
 //! [`InstallError::NotLinux`].
 
 #[cfg(target_os = "linux")]
@@ -83,11 +83,11 @@ mod imp {
 
     use super::{Fido2UdevOptions, InstallError};
 
-    /// The canonical rules file content, embedded at compile time from the
-    /// `infra/udev/` directory.  Using `include_str!` ensures the installed
-    /// binary always ships the rules file that was tested alongside it —
-    /// there is no separate distribution artifact to misplace.
-    const RULES_CONTENT: &str = include_str!("../../../../infra/udev/70-ember-fido2.rules");
+    /// The canonical rules file content, embedded at compile time from this
+    /// crate's template directory. Using `include_str!` ensures the installed
+    /// binary always ships the rules file that was tested alongside it - there
+    /// is no separate distribution artifact to misplace.
+    const RULES_CONTENT: &str = include_str!("../../templates/install/70-ember-fido2.rules");
 
     /// Install the ember FIDO2 udev rules file and reload udevd.
     ///

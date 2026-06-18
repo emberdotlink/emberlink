@@ -263,7 +263,7 @@ pub fn render_appendix(snapshot: &HealthSnapshot, ember_cmd: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // Bundled symptom check functions — one per F-code subset shipped in v0.3 per
-// design §Prerequisites ("at least F-DAEMON-1/2 + F-INSTALL-1 + F-implementation-note-453
+// design §Prerequisites ("at least F-DAEMON-1/2 + F-INSTALL-1 + F-implementation-note-356
 // coverage at v0.3"). Each `inventory::submit!` is the registration call; new
 // F-codes add their own `inventory::submit!` in any module without editing this
 // file's runner.
@@ -360,7 +360,7 @@ fn check_f_install_2(snap: &HealthSnapshot) -> CheckResult {
 
 inventory::submit! {
     Symptom {
-        f_code: "F-implementation-note-453",
+        f_code: "F-implementation-note-356",
         summary: "Broker credential authenticates upstream",
         recovery_cmd: "ember recover broker --provider github --scope creds",
         check: check_f_broker_2,
@@ -377,7 +377,7 @@ fn check_f_broker_2(snap: &HealthSnapshot) -> CheckResult {
 
 inventory::submit! {
     Symptom {
-        f_code: "F-implementation-note-459",
+        f_code: "F-implementation-note-362",
         summary: "Mock brokers are NOT trusted on the prod daemon",
         recovery_cmd: "ember recover daemon --prod --scope plist",
         check: check_f_broker_3,
@@ -398,7 +398,7 @@ fn check_f_broker_3(snap: &HealthSnapshot) -> CheckResult {
 
 inventory::submit! {
     Symptom {
-        f_code: "F-implementation-note-174",
+        f_code: "F-implementation-note-145",
         summary: "Audit store usage is below ceiling",
         recovery_cmd: "ember recover audit --scope rotate",
         check: check_f_audit_1,
@@ -530,9 +530,9 @@ mod tests {
             "F-DAEMON-3",
             "F-INSTALL-1",
             "F-INSTALL-2",
-            "F-implementation-note-453",
-            "F-implementation-note-459",
-            "F-implementation-note-174",
+            "F-implementation-note-356",
+            "F-implementation-note-362",
+            "F-implementation-note-145",
         ] {
             assert!(
                 f_codes.contains(&expected),
@@ -570,7 +570,7 @@ mod tests {
         // Symptom 4 — shadow missing → F-INSTALL-1.
         snap.shadow_path_present = Some(false);
         snap.shadow_path = Some(PathBuf::from("/home/op/.ember/shadow"));
-        // Symptom 5 — broker creds invalid → F-implementation-note-453.
+        // Symptom 5 — broker creds invalid → F-implementation-note-356.
         snap.broker_github_credential_invalid = Some(true);
 
         let lines = run_all(&snap);
@@ -585,7 +585,7 @@ mod tests {
             "F-DAEMON-2",
             "F-DAEMON-3",
             "F-INSTALL-1",
-            "F-implementation-note-453",
+            "F-implementation-note-356",
         ] {
             assert!(
                 fails.contains(&expected),

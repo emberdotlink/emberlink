@@ -33,7 +33,7 @@ pub(crate) struct PersonaRootKeyMaterial {
     pub secret_hex: String,
 }
 
-/// implementation-note-225 — RAII wrapper around a heap-allocated
+/// RAII wrapper around a heap-allocated
 /// secret byte buffer that pins its backing pages in physical memory via
 /// `mlock(2)`. The Drop impl calls `munlock(2)` to release the pin.
 ///
@@ -240,14 +240,14 @@ pub struct PersonaInfo {
     pub public_key: String,
     pub created_at: String,
     pub status: String,
-    /// implementation-note-74 — container identity this
+    /// Container identity this
     /// persona was minted for. `None` for personas created via the
     /// legacy `create_persona` path (no container binding); `Some` for
     /// workload personas created via `create_agent_persona`. Used by
     /// the reconciler to refuse a duplicate spawn into the same
     /// container slot when the daemon restarts mid-spawn.
     pub container_id: Option<String>,
-    /// implementation-note-74 — parent grant this persona's
+    /// Parent grant this persona's
     /// attenuated child grant was delegated from. Lets the reconciler
     /// and receipt pipeline correlate "which agent runs under whose
     /// authority" without walking the grant chain.
@@ -307,7 +307,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-74 — phase 1 of the atomic
+    /// Phase 1 of the atomic
     /// `create_agent_persona` two-phase commit. Inserts a workload
     /// persona row with `status = 'enrolling'` and binds it to the
     /// supplied `container_id` + `parent_grant_id`.
@@ -332,7 +332,7 @@ impl DaemonStore {
         container_id: &str,
         parent_grant_id: &str,
     ) -> Result<PersonaInfo, StoreError> {
-        // implementation-note-74 CRIT-4 — refuse a second
+        // CRIT-4 — refuse a second
         // spawn into a container slot that already has an enrolling
         // OR active persona bound to it. The check is racy in the
         // multi-thread sense, but the daemon's single-threaded
@@ -449,7 +449,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-74 — phase 2 of the two-phase
+    /// Phase 2 of the two-phase
     /// commit. Flips a persona row from `enrolling` to `active`. The
     /// transition is gated on the row currently being in `enrolling`
     /// state: a row that has already been activated, revoked, or never
@@ -488,7 +488,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-74 — reconciler entry point. Look
+    /// Reconciler entry point. Look
     /// up an enrolling persona by its bound `container_id`. The
     /// reconciler calls this before spawning into a container slot;
     /// a `Some(_)` return means a previous spawn attempt crashed
@@ -728,7 +728,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-225 — return the persona's raw 32-byte
+    /// Return the persona's raw 32-byte
     /// Ed25519 seed bytes after decrypting via the attached vault.
     ///
     /// Used by [`agent_persona_two_phase_commit`] to wrap the generated
@@ -839,7 +839,7 @@ impl DaemonStore {
         Ok(retired_name)
     }
 
-    /// implementation-note-283 — atomically
+    /// Atomically
     /// increment a persona's `client_cert_refresh_seq` and return the
     /// post-increment value.
     ///
@@ -965,7 +965,7 @@ impl DaemonStore {
         }
     }
 
-    /// implementation-note-228 — atomically write the
+    /// Atomically write the
     /// `client_cert_fingerprint` (blake3-hex of leaf cert DER, per design
     /// §Component 2 / §"Persona table columns") and `client_cert_not_after`
     /// (Unix seconds) on the persona row.
@@ -1006,7 +1006,7 @@ impl DaemonStore {
         }
     }
 
-    /// implementation-note-284 — return the ancestry chain for a
+    /// Return the ancestry chain for a
     /// persona starting with the persona itself, then its parent, then the
     /// parent's parent, up to `MAX_PARENT_PERSONA_CHAIN_HOPS` ancestors total
     /// (per design §Component 6 — practical chains are 3 links).
@@ -1082,19 +1082,18 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-284 — hop cap for `parent_persona_chain`.
+/// Hop cap for `parent_persona_chain`.
 /// design §Component 6 expects practical chains of three links
 /// (root → orchestrator → worker). The cap is also the cycle-safety
 /// fallback — see `parent_persona_chain_handles_cycle_safely`.
 pub const MAX_PARENT_PERSONA_CHAIN_HOPS: usize = 3;
 
-/// implementation-note-225 — atomic enroll → delegate → activate
+/// Atomic enroll → delegate → activate
 /// wrapper that mlocks the new persona's secret-key bytes for the
 /// duration of the commit.
 ///
 /// This is the single transactional entry-point that composes the
-/// already-shipped three-phase primitives from
-/// implementation-note-74:
+/// already-shipped three-phase primitives:
 ///
 /// 1. [`DaemonStore::create_agent_persona_enrolling`] — phase 1 (insert
 ///    enrolling row, bind container slot).
@@ -1129,7 +1128,7 @@ pub const MAX_PARENT_PERSONA_CHAIN_HOPS: usize = 3;
 /// `PersonaInfo`. In practice the daemon attaches one vault for the
 /// entire process lifetime; the explicit arg is for documentation +
 /// future-proofing against per-call vault rotation.
-/// implementation-note-225 — compute a child TTL bounded by the
+/// Compute a child TTL bounded by the
 /// parent's remaining lifetime.
 ///
 /// Returns `Some(seconds)` capped at the parent's remaining lifetime
@@ -1435,7 +1434,7 @@ fn mirror_composite_parent_grant_to_runtime_persona(
     persist
 }
 
-/// implementation-note-161 scaffold — thin wrapper over the
+/// Scaffold — thin wrapper over the
 /// existing two-phase commit + spawn machinery for the `broker.mint_sub_persona`
 /// RPC adapter. Real implementation wires `agent_persona_two_phase_commit`
 /// with a parent-persona lookup and scope attenuation.
@@ -1443,7 +1442,7 @@ fn mirror_composite_parent_grant_to_runtime_persona(
 /// # TODO
 ///
 /// Wire the actual two-phase commit + spawn here once
-/// implementation-note-161 follow-up lands. Until then this
+/// the follow-up lands. Until then this
 /// scaffold must fail closed instead of panicking on the public
 /// `broker.mint_sub_persona` RPC path. The real body:
 ///   1. Resolve `parent_persona_id` to its active grant.
@@ -1460,13 +1459,13 @@ pub async fn mint_sub_persona(
         concat!(
             "broker.mint_sub_persona is fail-closed: ",
             "two-phase commit + spawn wiring is not implemented ",
-            "(implementation-note-161)"
+            "(implementation-note-207)"
         )
         .to_string(),
     ))
 }
 
-/// implementation-note-228 — error returned by
+/// Error returned by
 /// [`pin_persona_client_cert_from_pem`].
 ///
 /// Distinct from [`StoreError`] so the bindings handler can decide its
@@ -1510,7 +1509,7 @@ impl From<StoreError> for PinClientCertError {
     }
 }
 
-/// implementation-note-228 — parse a freshly-minted
+/// Parse a freshly-minted
 /// client cert PEM, compute its blake3-hex fingerprint + Unix `not_after`,
 /// and atomically write both into the persona row via
 /// [`DaemonStore::set_persona_client_cert`].
@@ -1787,7 +1786,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-283 —
     // `increment_refresh_seq` atomic counter on personas.
     // ------------------------------------------------------------------
 
@@ -2135,7 +2133,7 @@ mod tests {
 
     #[test]
     fn separate_store_connections_each_need_vault_attached() {
-        // implementation-note-107 follow-up — regression for the dashboard task
+        // Dashboard biometric follow-up — regression for the dashboard task
         // opening its own DaemonStore connection and never calling
         // set_vault. Two stores against the same on-disk DB are independent
         // RefCell<Option<Rc<Vault>>> handles — each must attach the vault
@@ -2178,7 +2176,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-74 — two-phase commit lifecycle.
+    // two-phase commit lifecycle.
     // ------------------------------------------------------------------
 
     #[test]
@@ -2269,7 +2267,7 @@ mod tests {
 
     #[test]
     fn enrolling_persona_for_container_blocks_reconciler_spawn() {
-        // implementation-note-74 acceptance criterion —
+        // Acceptance criterion —
         // simulate emberd restart mid-spawn: create a persona in
         // `enrolling` state (phase 1 committed) but never activate
         // (phase 3 lost to crash). The reconciler's lookup must
@@ -2319,7 +2317,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-225 — mlock + two-phase commit.
+    // mlock + two-phase commit.
     // ------------------------------------------------------------------
 
     /// Mint a parent grant suitable for delegation by
@@ -2533,7 +2531,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-284 — parent_persona_chain helper.
+    // parent_persona_chain helper.
     // ------------------------------------------------------------------
 
     /// Build a three-generation ancestry: root persona A with grant g_a,

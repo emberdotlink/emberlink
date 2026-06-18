@@ -104,9 +104,9 @@ pub fn gaps_file_path() -> Option<PathBuf> {
     Some(root.join(PERMISSION_GAPS_FILE))
 }
 
-// ─── implementation-note-22 — Phase 1 substrate ───────────────
+// ─── implementation note — Phase 1 substrate ───────────────
 //
-// implementation-note-23
+// implementation note
 //
 // Per design §"Pre-flight scope check at enrollment" Layer 2 (Historical):
 // at headless-enrollment time, the CTA surfaces recent permission-gap
@@ -121,7 +121,7 @@ pub fn gaps_file_path() -> Option<PathBuf> {
 //   `$EMBER_AGENT_ID` (per `permission-gap-report.sh`); the
 //   agent/persona binding is the orchestrator's responsibility. Phase 2
 //   will replace this with a proper persona-id linkage once
-//   implementation-note-24 ships the enrollment surface.
+//   implementation note ships the enrollment surface.
 // - Filters by `ts >= now - since`. `ts` is parsed as RFC3339 UTC; a
 //   malformed `ts` excludes the record (defensive — bad timestamps
 //   should not leak across the time-window filter).
@@ -410,9 +410,9 @@ mod tests {
         assert_eq!(truncate_bytes(s, 100), "aéb"); // well under cap — no truncation
     }
 
-    // ─── implementation-note-22 Phase 1 tests ────────────────
+    // ─── implementation note Phase 1 tests ────────────────
     //
-    // implementation-note-23 — T1 unit tests for
+    // implementation note — T1 unit tests for
     // `recent_gaps_for_persona_at`.
 
     /// Write one gap line to a fixture path. Avoids `set_current_dir`

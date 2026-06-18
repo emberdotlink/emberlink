@@ -1,5 +1,5 @@
 //! Phase A substrate tests for v2 broker envelope builders +
-//! `store_broker_receipt_v2` (implementation-note-290).
+//! `store_broker_receipt_v2` (implementation-note-209).
 
 use super::*;
 use crate::infra::store::DaemonStore;
@@ -85,7 +85,7 @@ fn build_revocation_envelope_has_v2_shape() {
     );
 }
 
-/// implementation-note-20: revocation receipt also
+/// implementation-note-17: revocation receipt also
 /// carries the mock_broker stamp.
 #[test]
 fn build_revocation_envelope_stamps_mock_broker_true() {

@@ -1,6 +1,6 @@
 //! `ember claude` launcher.
 //!
-//! Per design §2 / implementation-note-430 + design §3 (PATH-shadow wiring, sub-B).
+//! Per design §2 + design §3 (PATH-shadow wiring, sub-B).
 //! Real daemon RPC shipped in #2318 (LAUNCHER-SESSION-RPC); see design §2
 //! for the full protocol contract.
 //!
@@ -14,8 +14,7 @@
 //!    proxy_url}`.
 //! 3. Set attachment endpoint coordinates, `EMBER_PROXY_URL`, and
 //!    `EMBER_SESSION_ID` in the child env. `HTTPS_PROXY` is intentionally NOT set — the
-//!    daemon's LLM proxy isn't CONNECT-compatible (see
-//!    implementation-note-431). Claude Code talks
+//!    daemon's LLM proxy isn't CONNECT-compatible. Claude Code talks
 //!    to api.anthropic.com directly with the friendly's own auth.
 //! 4. Prepend `shadow_dir` to the child's `PATH` via `Command::env` so that
 //!    tool invocations like `gh pr create` resolve to the ember Construct
@@ -28,7 +27,6 @@
 //!    a signed Receipt with `termination_reason = clean_exit`.
 //! 7. Exit with the child's status code.
 //!
-//! implementation-note-432
 //!
 //! The launcher uses `std::process::Command::status` (parent-and-child
 //! model) rather than `execve`. Terminal SIGINT/SIGTERM go to the
@@ -483,21 +481,30 @@ pub fn prod_required_constructs_present(specs: &[ConstructSpec]) -> bool {
 }
 
 fn selected_binary_manifest_path() -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os(EMBER_BINARY_MANIFEST_ENV)
-        && !raw.is_empty()
-    {
-        return Some(PathBuf::from(raw));
+    selected_binary_manifest_path_from(
+        std::env::var_os(EMBER_BINARY_MANIFEST_ENV).map(PathBuf::from),
+        PathBuf::from(PROD_MANIFEST_PATH),
+        |path| path.exists(),
+    )
+}
+
+fn selected_binary_manifest_path_from<F>(
+    explicit_manifest: Option<PathBuf>,
+    prod_manifest: PathBuf,
+    exists: F,
+) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    if let Some(path) = explicit_manifest.filter(|path| !path.as_os_str().is_empty()) {
+        return Some(path);
     }
 
-    if let Some(home) = dirs_next::home_dir() {
-        let home_manifest = home.join(".ember/binaries/manifest.toml");
-        if home_manifest.exists() {
-            return Some(home_manifest);
-        }
+    if exists(&prod_manifest) {
+        return Some(prod_manifest);
     }
 
-    let prod_manifest = PathBuf::from(PROD_MANIFEST_PATH);
-    prod_manifest.exists().then_some(prod_manifest)
+    None
 }
 
 fn launcher_manifest_trust_roots() -> Result<Vec<VerifyingKey>, String> {
@@ -1221,7 +1228,9 @@ mod tests {
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: None,
+            cursor_egress_proxy_url: None,
             codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
             ssh_auth_sock: None,
             delegation_id: None,
             delegation_template: None,
@@ -1303,6 +1312,36 @@ mod tests {
             extract_launchd_env_value(plist, EMBER_TRUST_ROOTS_ENV).as_deref(),
             Some("abc123&def456")
         );
+    }
+
+    #[test]
+    fn selected_binary_manifest_path_prefers_explicit_override() {
+        let explicit = PathBuf::from("/tmp/dev/manifest.toml");
+        let prod = PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml");
+        let selected =
+            selected_binary_manifest_path_from(Some(explicit.clone()), prod.clone(), |path| {
+                path == prod
+            });
+
+        assert_eq!(selected, Some(explicit));
+    }
+
+    #[test]
+    fn selected_binary_manifest_path_uses_prod_manifest() {
+        let prod = PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml");
+        let selected = selected_binary_manifest_path_from(None, prod.clone(), |path| path == prod);
+
+        assert_eq!(selected, Some(prod));
+    }
+
+    #[test]
+    fn selected_binary_manifest_path_does_not_use_home_manifest() {
+        let prod = PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml");
+        let selected = selected_binary_manifest_path_from(None, prod, |path| {
+            path == Path::new("/home/test-operator/.ember/binaries/manifest.toml")
+        });
+
+        assert_eq!(selected, None);
     }
 
     #[cfg(unix)]
@@ -1931,7 +1970,7 @@ mod tests {
         );
     }
 
-    // ── persona resolution tests (implementation-note-433) ──
+    // ── persona resolution tests ──
 
     #[test]
     fn persona_defaults_to_cohort_a_when_env_unset() {
@@ -2113,11 +2152,11 @@ mod tests {
         );
     }
 
-    // ── implementation-note-256: launcher env injection tests ──
+    // ── launcher env injection tests ──
 
     #[test]
     fn registration_with_real_proxy_url_is_not_8484() {
-        // implementation-note-256: verify that a registration
+        // Verify that a registration
         // carrying a daemon-provided URL (non-8484) is accepted without
         // falling back. This is the T1 launcher acceptance condition.
         let reg = SessionRegistration {
@@ -2128,7 +2167,9 @@ mod tests {
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: Some("http://127.0.0.1:61170".to_string()),
+            cursor_egress_proxy_url: None,
             codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
             ssh_auth_sock: None,
             delegation_id: None,
             delegation_template: None,
@@ -2158,7 +2199,7 @@ mod tests {
 
     #[test]
     fn run_with_registration_injects_daemon_proxy_url_not_8484() {
-        // implementation-note-256: T2 launcher — assert that the
+        // T2 launcher — assert that the
         // child env receives the daemon-returned proxy URL. We verify this
         // indirectly by confirming run_with_registration succeeds (returns 0)
         // with a registration carrying an ephemeral port. The real child-env
@@ -2171,7 +2212,9 @@ mod tests {
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: None,
+            cursor_egress_proxy_url: None,
             codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
             ssh_auth_sock: None,
             delegation_id: None,
             delegation_template: None,
@@ -2204,7 +2247,7 @@ mod tests {
         );
     }
 
-    // ── host-mode mediation disclaimer tests (implementation-note-434) ──
+    // ── host-mode mediation disclaimer tests ──
 
     #[test]
     fn disclaimer_skipped_when_stderr_not_tty() {

@@ -124,10 +124,8 @@ fn mint_leaf_cert_with_ttl(
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before epoch")
             .as_secs() as i64;
-        params.not_before =
-            OffsetDateTime::from_unix_timestamp(now - 5).expect("not_before");
-        params.not_after =
-            OffsetDateTime::from_unix_timestamp(now + ttl).expect("not_after");
+        params.not_before = OffsetDateTime::from_unix_timestamp(now - 5).expect("not_before");
+        params.not_after = OffsetDateTime::from_unix_timestamp(now + ttl).expect("not_after");
     }
 
     let key_pair = KeyPair::generate().expect("leaf keypair");
@@ -499,6 +497,70 @@ async fn listener_rejects_handshake_with_wrong_ca_signed_client() {
 }
 
 // ---------------------------------------------------------------------------
+// T2 smoke #2b: live listener reloads rotated CA/server materials.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn listener_reloads_tls_materials_between_connections() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a = mint_test_ca("bridge-ca-a");
+    let ca_b = mint_test_ca("bridge-ca-b");
+
+    let server_a = mint_leaf_cert(&ca_a, "server-a", true, vec!["localhost".into()]);
+    let server_b = mint_leaf_cert(&ca_b, "server-b", true, vec!["localhost".into()]);
+    let client_a = mint_leaf_cert(&ca_a, "client-a", false, bridge_client_sans());
+    let client_b = mint_leaf_cert(&ca_b, "client-b", false, bridge_client_sans());
+
+    let (ca_path, server_cert_path, server_key_path) = write_temp_pems(&dir, &ca_a, &server_a);
+
+    let listen_addr = ephemeral_listen_addr().await;
+    let config = ListenerConfig {
+        listen_addr,
+        forward_uds: PathBuf::from("/dev/null-forward-not-used-in-phase-c"),
+        server_cert_path: server_cert_path.clone(),
+        server_key_path: server_key_path.clone(),
+        ca_cert_path: ca_path.clone(),
+    };
+
+    let handle = Listener::spawn(config).await.expect("listener spawn");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client_tls_a = build_client_tls(&ca_a.cert_pem, &client_a.cert_pem, &client_a.key_pem);
+    let response_a = round_trip(
+        listen_addr,
+        client_tls_a,
+        r#"{"jsonrpc":"2.0","method":"vault_unseal","params":{},"id":1}"#,
+    )
+    .await
+    .expect("round-trip before rotation");
+    let parsed_a: serde_json::Value =
+        serde_json::from_str(response_a.trim_end()).expect("response is valid JSON");
+    assert_eq!(parsed_a["error"]["code"].as_i64(), Some(-32601));
+
+    std::fs::write(&ca_path, &ca_b.cert_pem).expect("rotate ca pem");
+    std::fs::write(&server_cert_path, &server_b.cert_pem).expect("rotate server cert");
+    std::fs::write(&server_key_path, &server_b.key_pem).expect("rotate server key");
+
+    let client_tls_b = build_client_tls(&ca_b.cert_pem, &client_b.cert_pem, &client_b.key_pem);
+    let response_b = round_trip(
+        listen_addr,
+        client_tls_b,
+        r#"{"jsonrpc":"2.0","method":"vault_unseal","params":{},"id":2}"#,
+    )
+    .await
+    .expect("round-trip after rotation without listener restart");
+    let parsed_b: serde_json::Value =
+        serde_json::from_str(response_b.trim_end()).expect("response is valid JSON");
+    assert_eq!(
+        parsed_b["error"]["code"].as_i64(),
+        Some(-32601),
+        "listener must reload CA/server cert/key for the next connection; got {parsed_b}"
+    );
+
+    handle.abort();
+}
+
+// ---------------------------------------------------------------------------
 // T2 smoke #3: policy gate denies plaintext-bearing method.
 // ---------------------------------------------------------------------------
 
@@ -567,13 +629,7 @@ async fn listener_force_closes_short_ttl_connection_at_not_after() {
     let ca = mint_test_ca("test-bridge-ca");
     let server = mint_leaf_cert(&ca, "server", true, vec!["localhost".into()]);
     // 3-second client cert TTL — listener must force-close at the deadline.
-    let client = mint_leaf_cert_with_ttl(
-        &ca,
-        "client",
-        false,
-        bridge_client_sans(),
-        Some(3),
-    );
+    let client = mint_leaf_cert_with_ttl(&ca, "client", false, bridge_client_sans(), Some(3));
 
     let (ca_path, server_cert_path, server_key_path) = write_temp_pems(&dir, &ca, &server);
 
@@ -600,9 +656,7 @@ async fn listener_force_closes_short_ttl_connection_at_not_after() {
     // With M12 the deadline wins and the listener writes a typed
     // `connection-expired:` envelope before closing.
     let connector = TlsConnector::from(client_tls);
-    let stream = TcpStream::connect(listen_addr)
-        .await
-        .expect("tcp connect");
+    let stream = TcpStream::connect(listen_addr).await.expect("tcp connect");
     let server_name = ServerName::try_from("localhost").expect("server name");
     let tls_stream = connector
         .connect(server_name, stream)
@@ -612,12 +666,9 @@ async fn listener_force_closes_short_ttl_connection_at_not_after() {
     // Wait up to 8s for the deadline-driven force-close response.
     let mut reader = BufReader::new(tls_stream);
     let mut line = String::new();
-    let read_result = tokio::time::timeout(
-        Duration::from_secs(8),
-        reader.read_line(&mut line),
-    )
-    .await
-    .expect("test must not hang past the deadline");
+    let read_result = tokio::time::timeout(Duration::from_secs(8), reader.read_line(&mut line))
+        .await
+        .expect("test must not hang past the deadline");
     let _bytes = read_result.expect("listener writes ConnectionExpired before EOF");
 
     let parsed: serde_json::Value =
@@ -655,13 +706,7 @@ async fn listener_refusing_client_gets_force_closed_no_further_authentication() 
     let dir = tempfile::tempdir().expect("tempdir");
     let ca = mint_test_ca("test-bridge-ca");
     let server = mint_leaf_cert(&ca, "server", true, vec!["localhost".into()]);
-    let client = mint_leaf_cert_with_ttl(
-        &ca,
-        "client",
-        false,
-        bridge_client_sans(),
-        Some(2),
-    );
+    let client = mint_leaf_cert_with_ttl(&ca, "client", false, bridge_client_sans(), Some(2));
 
     let (ca_path, server_cert_path, server_key_path) = write_temp_pems(&dir, &ca, &server);
 
@@ -680,9 +725,7 @@ async fn listener_refusing_client_gets_force_closed_no_further_authentication() 
     let client_tls = build_client_tls(&ca.cert_pem, &client.cert_pem, &client.key_pem);
 
     let connector = TlsConnector::from(client_tls);
-    let stream = TcpStream::connect(listen_addr)
-        .await
-        .expect("tcp connect");
+    let stream = TcpStream::connect(listen_addr).await.expect("tcp connect");
     let server_name = ServerName::try_from("localhost").expect("server name");
     let mut tls_stream = connector
         .connect(server_name, stream)
@@ -705,12 +748,9 @@ async fn listener_refusing_client_gets_force_closed_no_further_authentication() 
 
     let mut reader = BufReader::new(tls_stream);
     let mut line = String::new();
-    let read_result = tokio::time::timeout(
-        Duration::from_secs(5),
-        reader.read_line(&mut line),
-    )
-    .await
-    .expect("test must not hang");
+    let read_result = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("test must not hang");
 
     match read_result {
         Ok(0) => {

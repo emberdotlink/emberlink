@@ -4,7 +4,7 @@
 //! when present; otherwise default-INTERNAL per the rubric.
 //!
 //! Replaces the dead-code stub that lived in this slot prior to
-//! `implementation-note-16`. The projector matches the AWS STS
+//! `implementation-note-13`. The projector matches the AWS STS
 //! `provider_echo + I7 clamp = matched pair` shape (prior change): a typed
 //! `native_upper_bound` parser that reconstructs the bound identity from the
 //! daemon-computed native payload so [`crate::identity_upper_bound`] can run
@@ -40,7 +40,7 @@
 //! embedded.
 //!
 //! Anchor: `GcpProjector` — pinned in the grounding header for
-//! `implementation-note-16`.
+//! `implementation-note-13`.
 
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +151,7 @@ pub fn identity_ref_from_bound(bound: GcpUpperBound) -> IdentityRef {
 mod tests {
     use super::*;
     use crate::project::ProjectionError;
+    use proptest::prelude::*;
 
     fn valid_native() -> BrokerScope {
         serde_json::json!({
@@ -327,5 +328,100 @@ mod tests {
             checked, 11,
             "T1 property test must cover every row in the fail-closed table"
         );
+    }
+
+    fn non_string_json_value() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            proptest::collection::vec(any::<i64>(), 0..4).prop_map(|items| {
+                serde_json::Value::Array(
+                    items
+                        .into_iter()
+                        .map(|n| serde_json::Value::Number(n.into()))
+                        .collect(),
+                )
+            }),
+            Just(serde_json::json!({"nested": "value"})),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Anchor: core_broker_proptest_projector_clamps_landed
+        #[test]
+        fn native_upper_bound_refuses_non_object_payloads(native in prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            "[a-zA-Z0-9 _.-]{0,32}".prop_map(serde_json::Value::String),
+            proptest::collection::vec(any::<i64>(), 0..4).prop_map(|items| {
+                serde_json::Value::Array(
+                    items
+                        .into_iter()
+                        .map(|n| serde_json::Value::Number(n.into()))
+                        .collect(),
+                )
+            }),
+        ]) {
+            let err = GcpProjector.native_upper_bound(&native).unwrap_err();
+            prop_assert!(
+                matches!(err, ProjectionError::Unparseable(_)),
+                "non-object payload must be unparseable: {err:?}"
+            );
+        }
+
+        #[test]
+        fn native_upper_bound_refuses_non_string_or_blank_targets(
+            target in prop_oneof![
+                non_string_json_value(),
+                "[ \t\n]{0,8}".prop_map(serde_json::Value::String),
+            ],
+            ttl_seconds in any::<u64>(),
+        ) {
+            let native = serde_json::json!({
+                "target_service_account": target,
+                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                "ttl_seconds": ttl_seconds,
+                "delegates": [],
+            });
+
+            let err = GcpProjector.native_upper_bound(&native).unwrap_err();
+
+            prop_assert!(
+                matches!(
+                    err,
+                    ProjectionError::Refused(_) | ProjectionError::Unparseable(_)
+                ),
+                "invalid target must fail closed: {err:?}"
+            );
+        }
+
+        #[test]
+        fn native_upper_bound_extracts_any_nonblank_target(
+            prefix in "[ \t]{0,4}",
+            target in "[a-zA-Z0-9_.@-]{1,64}",
+            suffix in "[ \t]{0,4}",
+            ttl_seconds in any::<u64>(),
+            scopes in proptest::collection::vec("[a-zA-Z0-9:/._-]{0,64}", 0..4),
+            delegates in proptest::collection::vec("[a-zA-Z0-9@._-]{0,64}", 0..4),
+        ) {
+            prop_assume!(!target.trim().is_empty());
+            let padded = format!("{prefix}{target}{suffix}");
+            let native = serde_json::json!({
+                "target_service_account": padded,
+                "scopes": scopes,
+                "ttl_seconds": ttl_seconds,
+                "delegates": delegates,
+            });
+
+            let bound = GcpProjector
+                .native_upper_bound(&native)
+                .expect("nonblank target should parse");
+
+            prop_assert_eq!(bound.target_service_account, target.trim());
+        }
     }
 }

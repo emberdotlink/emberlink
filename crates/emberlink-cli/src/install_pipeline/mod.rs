@@ -1,5 +1,5 @@
 //! Five-stage onboarding pipeline state machine (design §Component 1+2,
-//! implementation-note-426).
+//! implementation-note-333).
 //!
 //! The umbrella that drives Stages 0-4 in order, persists progress to
 //! `~/.config/emberlink/install-state.toml`, and supports `--resume` /
@@ -16,7 +16,7 @@
 //!
 //! # What this module DOES NOT do
 //!
-//! The five stage bodies (implementation-note-427-{0..4}-*) are not fully
+//! The five stage bodies (implementation-note-334-{0..4}-*) are not fully
 //! wired yet. Production `ember dev install` therefore fails closed via
 //! [`stages::PendingStageHandler`] instead of stamping fake completion
 //! into `install-state.toml`. Tests still use [`stages::NoopStageHandler`]
@@ -36,7 +36,7 @@ use state::InstallState;
 
 /// Checkpoint constant required by the headless `target_state_anchor` gate.
 /// Its presence in the compiled binary confirms the umbrella state
-/// machine landed for implementation-note-426.
+/// machine landed for implementation-note-333.
 #[doc(hidden)]
 pub const SENTINEL_ONBOARDING_PIPELINE_STATE_MACHINE_LANDED: &str =
     "onboarding_pipeline_state_machine_landed";
@@ -243,7 +243,7 @@ duration_seconds = 60
         let handler = PendingStageHandler;
         let err = run_install_with(&state, &handler, InstallFlags::default())
             .expect_err("production placeholder must not complete install");
-        assert!(err.contains("implementation-note-426"));
+        assert!(err.contains("implementation-note-333"));
         let record = state.read().unwrap();
         assert!(record.first_run_completed_at.is_none());
         assert!(matches!(

@@ -5,7 +5,7 @@ use crate::infra::store::DaemonStore;
 
 use super::{RequestContext, current_dispatch_deployment_tier};
 
-pub(super) fn handle_list_grants(
+pub(crate) fn handle_list_grants(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -93,7 +93,7 @@ pub(super) fn handle_list_operator_grants(
     Ok(json!(list))
 }
 
-pub(super) fn handle_status(
+pub(crate) fn handle_status(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -122,7 +122,7 @@ pub(super) fn handle_status(
             false,
         )?;
 
-    // implementation-note-240: if the caller is observing a
+    // implementation-note-175: if the caller is observing a
     // grant whose effective (wall-clock-projected) status is terminal
     // but whose stored status is still `active`, flip the row + emit
     // the signed receipt right now. Without this, the runner's
@@ -186,7 +186,7 @@ pub(super) fn handle_status(
                     .collect(),
                 Err(_) => Vec::new(),
             };
-            // implementation-note-238 — surface the
+            // implementation-note-173 — surface the
             // per-Statement revocation list so callers can render
             // strikethrough on individual sids without polling a
             // separate endpoint.
@@ -248,7 +248,7 @@ pub(super) fn handle_status(
     }
 }
 
-pub(super) fn handle_summary(store: &DaemonStore) -> Result<Value, (i32, String)> {
+pub(crate) fn handle_summary(store: &DaemonStore) -> Result<Value, (i32, String)> {
     let summary = store
         .grant_summary()
         .map_err(|e| RpcError::Internal(e.to_string()))?;
@@ -259,14 +259,14 @@ pub(super) fn handle_summary(store: &DaemonStore) -> Result<Value, (i32, String)
     }))
 }
 
-pub(super) fn handle_detect_anomalies(store: &DaemonStore) -> Result<Value, (i32, String)> {
+pub(crate) fn handle_detect_anomalies(store: &DaemonStore) -> Result<Value, (i32, String)> {
     let anomalies = store
         .detect_anomalies()
         .map_err(|e| RpcError::Internal(e.to_string()))?;
     serde_json::to_value(&anomalies).map_err(|e| RpcError::Internal(e.to_string()).into())
 }
 
-pub(super) fn handle_budget_status(
+pub(crate) fn handle_budget_status(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -316,7 +316,7 @@ pub(super) fn handle_budget_status(
         Err(e) => return Err(RpcError::Internal(e.to_string()).into()),
     };
 
-    // Envelope status: load via DaemonGrantStore (implementation-note-237)
+    // Envelope status: load via DaemonGrantStore (implementation-note-172)
     // to get core_grants::Grant with a typed expires_at
     // (Option<DateTime<Utc>>) rather than an RFC3339 string from
     // GrantInfo. GrantStatus::derive is still used for the "Expired"

@@ -119,7 +119,7 @@ async fn grant_status_surfaces_reserved_cents_for_payment_statements() {
     let grant_id = created["id"].as_str().unwrap();
 
     // ADR191_PAYMENT_BUILD_AHEAD: drive the reservation through the preserved
-    // payment lane directly (the implementation-note-255 `evaluate_tool_call` RPC that used
+    // payment lane directly (the implementation-note-193 `evaluate_tool_call` RPC that used
     // to enter it was retired). `grant_status` must still surface the resulting
     // `reserved_cents` projection.
     let decision = store

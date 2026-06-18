@@ -23,7 +23,7 @@ pub struct RequestId(pub String);
 /// currently set on the returned request struct (`tool_name`, `target_host`,
 /// `target_url`, `agent_framework`).
 ///
-/// implementation-note-12: extends the metadata
+/// Extends the metadata
 /// with the five grant-shaping fields (`max_delegation_depth`,
 /// `max_uses_per_hour`, `allowed_hours_start`, `allowed_hours_end`,
 /// `allowed_targets`) that the `create_grant` socket call previously silently
@@ -48,26 +48,26 @@ pub struct SubmitMetadata {
     pub target_url: Option<String>,
     /// Agent framework label (`claude-code`, `aider`, `cursor`, etc.).
     pub agent_framework: Option<String>,
-    /// implementation-note-13 — max depth
+    /// Stamped onto the minted grant row after approval-resolution; sets themax depth
     /// the resulting grant may be re-delegated. `None` means the resolver
     /// defers to the grant default. Stamped on the minted grant row after
     /// approval-resolution so approval-path grants carry the same delegation
     /// cap the auto-approve path would have written via `create_grant`.
     pub max_delegation_depth: Option<u32>,
-    /// implementation-note-13 — rate-limit
+    /// Stamped onto the minted grant row after approval-resolution; sets therate-limit
     /// hint on the resulting grant. `None` leaves the grant unbounded on this
     /// axis. Re-applied to the minted grant row alongside `max_delegation_depth`.
     pub max_uses_per_hour: Option<u64>,
-    /// implementation-note-13 — lower hour
+    /// Stamped onto the minted grant row after approval-resolution; sets thelower hour
     /// bound (UTC, 0..=23) of the allowed-usage window on the resulting grant.
     /// `None` leaves the grant time-unbounded. Companion to
     /// `allowed_hours_end`.
     pub allowed_hours_start: Option<u32>,
-    /// implementation-note-13 — upper hour
+    /// Stamped onto the minted grant row after approval-resolution; sets theupper hour
     /// bound (UTC, 0..=23) of the allowed-usage window on the resulting
     /// grant. `None` mirrors `allowed_hours_start`.
     pub allowed_hours_end: Option<u32>,
-    /// implementation-note-13 — JSON-array
+    /// Stamped onto the minted grant row after approval-resolution; sets theJSON-array
     /// string of allowed-target patterns the broker enforces on each grant
     /// use. `None` means unrestricted targets. Stored as serialised JSON so
     /// the column shape mirrors the auto-approve path's
@@ -128,7 +128,7 @@ pub trait ApprovalLifecycle: Send + Sync {
     /// Decided`, `LifecycleError::ScopeNotNarrowing` (Narrowed-outcome with
     /// a wider scope than requested), `LifecycleError::GrantMintFailed`.
     ///
-    /// implementation-note-14: returns `core_grants::Grant`
+    /// Returns `core_grants::Grant`
     /// (design approval → grant boundary; design phase C).
     async fn decide(
         &self,
@@ -148,7 +148,7 @@ pub trait ApprovalLifecycle: Send + Sync {
     /// Idempotent across identical patterns within the same persona —
     /// re-applying refreshes the TTL rather than minting a new Grant.
     ///
-    /// implementation-note-14: returns `core_grants::Grant`
+    /// Returns `core_grants::Grant`
     /// (design approval → grant boundary; design phase C).
     async fn apply_standing(
         &self,

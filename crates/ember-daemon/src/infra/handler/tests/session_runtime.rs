@@ -1,7 +1,8 @@
 use super::*;
+use crate::infra::handlers::session::handle_session_lookup_or_open;
 
 // -------------------------------------------------------------------------
-// implementation-note-257: register_session + close_session T2
+// implementation-note-198: register_session + close_session T2
 // -------------------------------------------------------------------------
 
 #[tokio::test]
@@ -156,7 +157,7 @@ async fn register_session_and_close_session_emit_clean_exit_receipt() {
         "meta.json.closed must exist after close"
     );
 
-    // implementation-note-258: grant must remain
+    // implementation-note-199: grant must remain
     // Active after CleanExit — the handler no longer calls revoke_grant.
     let grant_after = store.get_grant(grant_id).expect("grant still queryable");
     assert_eq!(
@@ -1022,7 +1023,7 @@ async fn register_session_uses_trusted_principal_when_present() {
     );
 }
 
-/// implementation-note-259 (option b): `register_session`
+/// implementation-note-200 (option b): `register_session`
 /// is the bootstrap enrollment WRITER and must stay open to an attested but
 /// not-yet-enrolled caller. Adding `check_principal_enrollment_strict` here
 /// would deadlock bootstrap (the caller could never become enrolled). This
@@ -1115,7 +1116,7 @@ async fn register_session_stays_open_for_unenrolled_attested_caller_completes_ro
     .await
     .expect(
         "register_session must stay open for an attested but unenrolled caller \
-         (implementation-note-259 option b)",
+         (implementation-note-200 option b)",
     );
 
     assert!(
@@ -2083,7 +2084,7 @@ async fn register_session_ember_forge_lane_rejects_legacy_default_grant_without_
 }
 
 // ---------------------------------------------------------------
-// implementation-note-153 — session.lookup_or_open
+// implementation-note-134 — session.lookup_or_open
 // ---------------------------------------------------------------
 
 /// `session.lookup_or_open` refuses when no kernel-attested
@@ -2092,7 +2093,7 @@ async fn register_session_ember_forge_lane_rejects_legacy_default_grant_without_
 #[tokio::test]
 async fn session_lookup_or_open_refuses_without_principal() {
     let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
-    let res = bindings::handle_session_lookup_or_open(None, &store, &json!({})).await;
+    let res = handle_session_lookup_or_open(None, &store, &json!({})).await;
     let (code, msg) = res.expect_err("must refuse without principal");
     assert_eq!(code, -32401, "expected -32401, got {code}: {msg}");
 }
@@ -2106,7 +2107,7 @@ async fn session_lookup_or_open_refuses_mismatched_parent_pid() {
     let principal =
         PeerCredPrincipal::new(1001, 42_000, std::path::PathBuf::from("/tmp/agent.sock"));
     let params = json!({"parent_pid": 99_999});
-    let res = bindings::handle_session_lookup_or_open(Some(&principal), &store, &params).await;
+    let res = handle_session_lookup_or_open(Some(&principal), &store, &params).await;
     let (code, msg) = res.expect_err("must refuse mismatched parent_pid");
     assert_eq!(code, -32004, "expected -32004, got {code}: {msg}");
     assert!(
@@ -2143,7 +2144,7 @@ async fn session_lookup_or_open_refuses_mismatched_persona() {
     let principal =
         PeerCredPrincipal::new(6666, 42_000, std::path::PathBuf::from("/tmp/agent.sock"));
     let params = json!({"persona": "victim-persona"});
-    let res = bindings::handle_session_lookup_or_open(Some(&principal), &store, &params).await;
+    let res = handle_session_lookup_or_open(Some(&principal), &store, &params).await;
     let (code, _) = res.expect_err("must refuse mismatched persona binding");
     assert_eq!(code, -32004);
 }
@@ -2176,7 +2177,7 @@ async fn session_lookup_or_open_succeeds_on_matched_principal() {
     let principal =
         PeerCredPrincipal::new(7777, 12_345, std::path::PathBuf::from("/tmp/agent.sock"));
     let params = json!({"persona": "matched-persona", "parent_pid": 12_345});
-    let res = bindings::handle_session_lookup_or_open(Some(&principal), &store, &params).await;
+    let res = handle_session_lookup_or_open(Some(&principal), &store, &params).await;
     let value = res.expect("matched principal must succeed");
     assert_eq!(value["parent_pid"].as_i64(), Some(12_345));
     assert_eq!(value["persona_id"].as_str(), Some("matched-persona"));
@@ -2190,7 +2191,7 @@ async fn session_lookup_or_open_succeeds_on_matched_principal() {
     );
 }
 
-/// implementation-note-260 — shape check that
+/// implementation-note-201 — shape check that
 /// the overlay block at the dispatch site overwrites the wire-claimed
 /// `persona` (and the `persona_id` / `id` aliases the various dispatch
 /// arms read) with the kernel-attested or cert-attested identity. The

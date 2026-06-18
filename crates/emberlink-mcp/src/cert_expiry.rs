@@ -1,5 +1,5 @@
 //! In-container bridge-cert refresh client (design §Component 1 + §Component 5,
-//! implementation-note-371 / M6).
+//! implementation-note-268 / M6).
 //!
 //! Replaces the earlier single-shot 90%-TTL warn-only timer with the
 //! 4-band refresh-aware model from design §Component 1:

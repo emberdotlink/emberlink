@@ -10,14 +10,10 @@
 //! Per-provider: `--provider <NAME>` (e.g. `github`, `anthropic`).
 //!
 //! F-code surface:
-//! - `F-implementation-note-452` — GitHub App rate-limited; operator-visible retry with backoff.
-//! - `F-implementation-note-453` — broker creds rotated/invalidated; mint a fresh installation
+//! - `F-implementation-note-355` — GitHub App rate-limited; operator-visible retry with backoff.
+//! - `F-implementation-note-356` — broker creds rotated/invalidated; mint a fresh installation
 //!   token to verify the current key is valid.
 //!
-//! ## Checkpoint for `target_state_anchor`
-//!
-//! `recover_f_broker_1_landed` — F-implementation-note-452 exponential-backoff retry probe.
-//! `recover_f_broker_2_landed` — F-implementation-note-453 GH App credential rotation probe.
 
 use clap::Args;
 
@@ -36,12 +32,12 @@ pub struct RecoverBrokerArgs {
     pub scope: Option<BrokerScope>,
 
     /// Target a specific F-code recovery action directly.
-    /// `F-implementation-note-452` runs the rate-limit retry probe with exponential backoff.
-    /// `F-implementation-note-453` verifies + reports on the current GH App credential validity.
+    /// `F-implementation-note-355` runs the rate-limit retry probe with exponential backoff.
+    /// `F-implementation-note-356` verifies + reports on the current GH App credential validity.
     #[arg(long, value_name = "F_CODE", id = "broker_f_code")]
     pub f_code: Option<String>,
 
-    /// GitHub App installation ID — required for `--f-code F-implementation-note-453`.
+    /// GitHub App installation ID — required for `--f-code F-implementation-note-356`.
     #[arg(long)]
     pub installation_id: Option<String>,
 }
@@ -70,11 +66,11 @@ pub fn handle(args: RecoverBrokerArgs) -> RecoverResult {
     // F-code dispatch takes priority over scope routing.
     if let Some(ref f_code) = args.f_code {
         return match f_code.to_ascii_uppercase().as_str() {
-            "F-implementation-note-452" => handle_f_broker_1(&args),
-            "F-implementation-note-453" => handle_f_broker_2(&args),
+            "F-implementation-note-355" => handle_f_broker_1(&args),
+            "F-implementation-note-356" => handle_f_broker_2(&args),
             other => Err(RecoverError::usage(format!(
                 "unknown F-code `{other}` for `ember recover broker`; \
-                 valid F-codes: F-implementation-note-452, F-implementation-note-453"
+                 valid F-codes: F-implementation-note-355, F-implementation-note-356"
             ))),
         };
     }
@@ -87,21 +83,21 @@ pub fn handle(args: RecoverBrokerArgs) -> RecoverResult {
 
     println!(
         "ember recover broker (provider={provider}, scope={scope}): scaffold only — \
-         per-F-code implementations land as implementation-note-454-* tasks ship. See \
-         `ember recover --explain F-implementation-note-452` (or 2, 3) for the F-code-anchored runbook."
+         per-F-code implementations land as implementation-note-357-* tasks ship. See \
+         `ember recover --explain F-implementation-note-355` (or 2, 3) for the F-code-anchored runbook."
     );
     note_receipt_contract("broker", &scope);
     Ok(RecoverOutcome::ok())
 }
 
 // ---------------------------------------------------------------------------
-// F-implementation-note-452 — Rate-limit auto-retry with exponential backoff
+// F-implementation-note-355 — Rate-limit auto-retry with exponential backoff
 // ---------------------------------------------------------------------------
 //
 // recover_f_broker_1_landed
 //
-// design §F-implementation-note-452: broker captures HTTP 429; operator can run
-// `ember recover broker --f-code F-implementation-note-452` to inspect whether a runaway
+// design §F-implementation-note-355: broker captures HTTP 429; operator can run
+// `ember recover broker --f-code F-implementation-note-355` to inspect whether a runaway
 // pattern triggered the rate-limit and to validate the backoff schedule.
 //
 // Architecture: broker-level rate-limiting is internal to the daemon; the CLI
@@ -123,7 +119,7 @@ fn handle_f_broker_1(args: &RecoverBrokerArgs) -> RecoverResult {
         .unwrap_or("github")
         .to_ascii_lowercase();
 
-    println!("ember recover broker F-implementation-note-452 — rate-limit retry probe (provider={provider})");
+    println!("ember recover broker F-implementation-note-355 — rate-limit retry probe (provider={provider})");
     println!();
     println!("Symptom: broker received HTTP 429 from the upstream provider API.");
     println!(
@@ -160,10 +156,10 @@ fn handle_f_broker_1(args: &RecoverBrokerArgs) -> RecoverResult {
          events with:\n\
          \n  ember audit query --action gh.{provider} --since 1h\n\
          \nA runaway pattern should appear as a spike in that window. If the\n\
-         design §8 inflight cap did not catch it, file a implementation-note-274-* task."
+         design §8 inflight cap did not catch it, file a implementation-note-254-* task."
     );
 
-    note_receipt_contract("broker", "F-implementation-note-452");
+    note_receipt_contract("broker", "F-implementation-note-355");
     Ok(RecoverOutcome::ok())
 }
 
@@ -194,12 +190,12 @@ pub(crate) fn compute_backoff_schedule(
 }
 
 // ---------------------------------------------------------------------------
-// F-implementation-note-453 — GH App credential rotation / verification
+// F-implementation-note-356 — GH App credential rotation / verification
 // ---------------------------------------------------------------------------
 //
 // recover_f_broker_2_landed
 //
-// design §F-implementation-note-453: broker creds rotated upstream / invalidated.
+// design §F-implementation-note-356: broker creds rotated upstream / invalidated.
 // Recovery: verify the current GH App private key can sign a JWT and report
 // whether the credential stored at `~/.config/emberlink/ember-engine-app.pem`
 // (or overridden via EMBER_APP_PEM_PATH) is present and structurally valid.
@@ -224,13 +220,13 @@ fn handle_f_broker_2(args: &RecoverBrokerArgs) -> RecoverResult {
 
     if provider != "github" {
         return Err(RecoverError::usage(format!(
-            "F-implementation-note-453 currently supports provider=github only; got `{provider}`"
+            "F-implementation-note-356 currently supports provider=github only; got `{provider}`"
         )));
     }
 
     let installation_id = args.installation_id.as_deref();
 
-    println!("ember recover broker F-implementation-note-453 — GH App credential rotation probe");
+    println!("ember recover broker F-implementation-note-356 — GH App credential rotation probe");
     println!();
     println!("Symptom: every `gh ...` call returns \"credential rejected\" (HTTP 401).");
     println!("Detection: broker captured a 401 with cred_invalidation_at timestamp.");
@@ -294,7 +290,7 @@ fn handle_f_broker_2(args: &RecoverBrokerArgs) -> RecoverResult {
         }
     }
 
-    note_receipt_contract("broker", "F-implementation-note-453");
+    note_receipt_contract("broker", "F-implementation-note-356");
     Ok(RecoverOutcome::ok())
 }
 
@@ -398,13 +394,13 @@ mod tests {
         let args = RecoverBrokerArgs {
             provider: Some("github".into()),
             scope: None,
-            f_code: Some("F-implementation-note-452".into()),
+            f_code: Some("F-implementation-note-355".into()),
             installation_id: None,
         };
         let result = handle(args);
         assert!(
             result.is_ok(),
-            "F-implementation-note-452 should return Ok; got {result:?}"
+            "F-implementation-note-355 should return Ok; got {result:?}"
         );
     }
 
@@ -419,7 +415,7 @@ mod tests {
         let result = handle(args);
         assert!(
             result.is_ok(),
-            "F-implementation-note-452 case-insensitive dispatch failed: {result:?}"
+            "F-implementation-note-355 case-insensitive dispatch failed: {result:?}"
         );
     }
 
@@ -428,7 +424,7 @@ mod tests {
         let args = RecoverBrokerArgs {
             provider: Some("anthropic".into()),
             scope: None,
-            f_code: Some("F-implementation-note-453".into()),
+            f_code: Some("F-implementation-note-356".into()),
             installation_id: None,
         };
         let result = handle(args);
@@ -444,7 +440,7 @@ mod tests {
         let args = RecoverBrokerArgs {
             provider: None,
             scope: None,
-            f_code: Some("F-implementation-note-455".into()),
+            f_code: Some("F-implementation-note-358".into()),
             installation_id: None,
         };
         let result = handle(args);
@@ -470,7 +466,7 @@ mod tests {
         );
     }
 
-    /// F-implementation-note-453: when credential files are absent (CI / sandbox host without
+    /// F-implementation-note-356: when credential files are absent (CI / sandbox host without
     /// GH App config), the handler returns Ok (Missing verdict is informational,
     /// not an error — operator is guided to configure credentials).
     #[test]
@@ -480,7 +476,7 @@ mod tests {
         let args = RecoverBrokerArgs {
             provider: Some("github".into()),
             scope: None,
-            f_code: Some("F-implementation-note-453".into()),
+            f_code: Some("F-implementation-note-356".into()),
             installation_id: None,
         };
         // This test is environment-dependent: on a host with GH App files it
@@ -488,7 +484,7 @@ mod tests {
         let result = handle(args);
         assert!(
             result.is_ok(),
-            "F-implementation-note-453 should not error on missing or present creds; got {result:?}"
+            "F-implementation-note-356 should not error on missing or present creds; got {result:?}"
         );
     }
 }

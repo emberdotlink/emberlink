@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AssumeRoleWithWebIdentity — implementation-note-87 tests
+    // AssumeRoleWithWebIdentity — implementation-note-68 tests
     // -----------------------------------------------------------------
 
     fn assume_role_with_web_identity_ok_xml() -> String {

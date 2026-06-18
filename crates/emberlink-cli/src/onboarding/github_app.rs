@@ -1,42 +1,35 @@
-//! Public GitHub App manifest helpers (implementation-note-445).
+//! GitHub App manifest helpers.
 //!
-//! The canonical manifest doc lives at `docs/emberlink-github-app-manifest.md`
-//! and is embedded into the binary at compile time so the CLI surface and the
-//! published doc cannot drift. This module is intentionally thin — it exposes
-//! the embedded manifest body and the install URL, and gives callers two small
-//! affordances:
+//! This module exposes the GitHub App install URL, the permission-floor
+//! reference text printed by `ember github app show`, and the manifest body used
+//! by the operator-owned manifest flow.
 //!
 //!   * `print_install_url()` — return the canonical install URL.
-//!   * `show_manifest()`     — print the manifest body to stdout.
+//!   * `show_manifest()`     — print the concise manifest reference to stdout.
 //!
-//! Permission floor (at cohort-A launch) per the doc:
+//! Permission floor:
 //!
 //! | Resource      | Access | Notes |
 //! |---------------|--------|-------|
-//! | contents      | write  | broker mints sub-scoped 1h tokens per grant (design); App is the credential ceiling |
+//! | contents      | write  | broker mints sub-scoped 1h tokens per grant; App is the credential ceiling |
 //! | pull_requests | write  | create / merge / comment |
 //! | issues        | write  | file / comment per agent activity |
 //! | actions       | read   | workflow run status |
 //! | metadata      | read   | mandatory for any GitHub App |
 //!
-//! The App's installation token is the credential ceiling for two consumer
-//! paths in the daemon: (a) agent operations via the broker (shipped, ARCH-
-//! implementation-note-446), and (b) headless-runtime PR-ship announcer (future,
-//! implementation-note-447). Both use `mint_installation_token` to obtain
-//! narrowly-scoped tokens; the App's permissions are the upstream ceiling.
-//!
 //! Workflows, secrets, and administration are explicitly **denied** on the
-//! floor. See `docs/emberlink-github-app-manifest.md` for the full rationale
-//! and the exact JSON manifest body.
+//! floor.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Embedded canonical manifest doc. Matched against `docs/emberlink-github-app-manifest.md`
-/// at compile time so the binary cannot drift from the published reference.
-pub const PUBLIC_MANIFEST_DOC: &str =
-    r#"# Emberlink GitHub App
+/// Concise GitHub App manifest reference printed by `ember github app show`.
+///
+/// Keep this user-facing: the long internal rationale lives in the private docs
+/// tree, while this output gives operators the install URL, permission floor,
+/// denied permissions, and exact JSON body.
+pub const PUBLIC_MANIFEST_DOC: &str = r#"# Emberlink GitHub App
 
 The GitHub App lane lets the local daemon mint short-lived installation tokens
 for approved GitHub actions. Installing the public App alone is not enough for a
@@ -110,17 +103,15 @@ pub fn print_install_url() -> String {
 
 /// Print the embedded manifest body to stdout.
 ///
-/// The body is the full markdown doc — install flow, permission floor, JSON
-/// manifest block, denylist callouts. Callers piping `ember onboarding
-/// github-app show` into a pager get the canonical text the website also
-/// links to.
+/// The body is a concise markdown reference: install URL, permission floor,
+/// denied permissions, and JSON manifest block.
 pub fn show_manifest() {
     print!("{PUBLIC_MANIFEST_DOC}");
 }
 
 /// Build the GitHub App manifest body for the operator-owned manifest flow.
 ///
-/// The permission floor intentionally matches `docs/emberlink-github-app-manifest.md`.
+/// The permission floor intentionally matches `PUBLIC_MANIFEST_DOC`.
 /// `redirect_url` is flow-local and points at the CLI's loopback callback.
 pub fn build_manifest_body(redirect_url: &str) -> Value {
     json!({
@@ -358,9 +349,6 @@ mod tests {
 
     #[test]
     fn embedded_manifest_pulled_in() {
-        // Sanity check: include_str! resolved correctly and the doc is
-        // non-empty. If this fails, the relative path is wrong — fix the
-        // macro path here, not the doc.
         assert!(
             !PUBLIC_MANIFEST_DOC.is_empty(),
             "embedded manifest must be non-empty"
@@ -371,7 +359,7 @@ mod tests {
     fn manifest_documents_floor_permissions() {
         // Any silent expansion or contraction of these permissions should
         // fail this test until the doc is updated explicitly. The set
-        // matches the implementation-note-445 brief and is the credential
+        // matches the implementation-note-349 brief and is the credential
         // ceiling the broker mints sub-scoped tokens against (design).
         for checkpoint in ["contents", "pull_requests", "issues", "actions", "metadata"] {
             assert!(

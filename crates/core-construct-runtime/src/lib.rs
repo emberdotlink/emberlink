@@ -159,7 +159,7 @@ pub trait ConstructConfig: ClassifyArgv {
     /// classify=None bypass) do NOT translate — those branches exit the shim
     /// contract entirely. The fix for emberlink-flag passthrough in those
     /// branches is to eliminate the bypass (e.g. broker.exec default per
-    /// implementation-note-21 step 3), not to add
+    /// implementation-note-18 step 3), not to add
     /// translation here.
     ///
     /// Anchor: `construct_config_translate_argv_hook_landed`.

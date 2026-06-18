@@ -10,8 +10,7 @@
 //! 3. Runs the five [step functions](#step-functions) sequentially under the
 //!    single sudo elevation window — provision user, chown data dirs, emit
 //!    launch spec, add operator to `ember-clients`, verify daemon.
-//! 4. Writes a friendly transcript at `~/.ember/install-wizard.log` — every
-//!    step appends a single ISO-8601 line so the operator (and support) has a
+//! 4. Writes a friendly transcript so the operator and support have a
 //!    breadcrumb of what the wizard tried.
 //! 5. Prints a final relogin banner (Linux only) so `newgrp ember-clients`
 //!    activates the new group membership in the operator's shell.
@@ -20,10 +19,10 @@
 //!
 //! Each step is a `wizard_step_*` function returning [`StepOutcome`]:
 //! - [`wizard_step_provision_user`] — system user + connect group.
-//! - [`wizard_step_chown_data_dirs`] — chown `~/.ember/{vault,grants,…}`.
+//! - [`wizard_step_chown_data_dirs`] — chown daemon system state.
 //! - [`wizard_step_provision_mek`] — vault MEK in System.keychain (macOS) /
 //!   keyring (Linux). Without this the daemon refuses to start.
-//!   implementation-note-423.
+//!   implementation-note-330.
 //! - [`wizard_step_emit_launch_spec`] — launchd plist or systemd unit.
 //! - [`wizard_step_add_user_to_group`] — operator → `ember-clients`.
 //! - [`wizard_step_verify`] — daemon status RPC reachable on the managed socket.
@@ -79,7 +78,9 @@ pub enum WizardError {
     SudoFailed,
     #[error("unsupported platform: {0}; the install wizard supports macOS, Linux, and WSL")]
     UnsupportedPlatform(String),
-    #[error("transcript io error: {0}; check ~/.ember/ permissions and re-run install")]
+    #[error(
+        "transcript io error: {0}; check the operator install-state directory permissions and re-run install"
+    )]
     TranscriptIo(#[from] io::Error),
     #[error(
         "couldn't create ember user: {detail}; \
@@ -124,9 +125,9 @@ pub const WIZARD_STEPS: &[&str] = &[
 
 /// Persistent state recording which wizard steps completed on a prior run.
 ///
-/// Serialized as JSON to `~/.ember/install-wizard.state.json` (one document
-/// per wizard run, overwritten on re-run after rollback). The wizard reads
-/// this on startup via [`load_wizard_state`] to decide whether to offer
+/// Serialized as JSON to the operator-side install wizard state path (one
+/// document per wizard run, overwritten on re-run after rollback). The wizard
+/// reads this on startup via [`load_wizard_state`] to decide whether to offer
 /// resume/rollback or treat the run as a fresh install.
 ///
 /// `last_error` is captured as a String (rather than the `WizardError` enum)
@@ -208,11 +209,12 @@ impl StepOutcome {
 /// Wizard execution context — passed by reference to every step.
 ///
 /// `platform` drives per-OS branches (macOS launchd vs Linux systemd).
-/// `home` is the operator's home dir (`$HOME`); the chown step walks
-/// `home/.ember/{vault,grants,sessions,run,binaries}`.
-/// `invoking_user` is `$USER` at wizard start — captured once so a step that
-/// runs under sudo doesn't pick up `root` from the environment.
-/// `socket_path` is where [`wizard_step_verify`] looks for the daemon UDS.
+/// `home` is the invoking operator's home dir, resolved through passwd data
+/// when possible so `sudo` does not accidentally anchor compatibility work on
+/// root's home. `invoking_user` is captured once so a step that runs under
+/// sudo does not pick up `root` from the environment. `socket_path` is the
+/// canonical production daemon UDS per design, not a path under
+/// `operator_home`.
 #[derive(Debug, Clone)]
 pub struct WizardContext {
     pub platform: Platform,
@@ -224,41 +226,24 @@ pub struct WizardContext {
 impl WizardContext {
     /// Build a `WizardContext` from the live process environment.
     ///
-    /// `$EMBER_OPERATOR` takes precedence: the macOS `.pkg` postinstall runs
-    /// as a pure-root login (no `$SUDO_USER`) and pins the console user there.
-    /// When it is set, `home` is anchored to that operator's passwd entry
-    /// (via `resolve_operator_home`, which also honors `$EMBER_OPERATOR`)
-    /// rather than `dirs_next::home_dir()` — which returns `/var/root` under
-    /// root. When it is unset (every non-pkg path), behavior is unchanged:
-    /// `home` defaults to `dirs_next::home_dir()`, falling back to `.` for the
-    /// stripped-container edge case, and `invoking_user` reads `$USER` with
-    /// `$SUDO_USER` taking precedence so a step run via `sudo ember install`
-    /// still records the unprivileged operator.
+    /// `$EMBER_OPERATOR` takes precedence for the invoking user because the
+    /// macOS `.pkg` postinstall runs as a pure-root login (no `$SUDO_USER`) and
+    /// pins the console user there. For the home directory, prefer
+    /// `resolve_operator_home()` in all modes so normal `sudo ember daemon
+    /// install` resolves `$SUDO_USER` through passwd instead of inheriting
+    /// `/var/root` from sudo's `$HOME`.
     pub fn from_env(platform: Platform) -> Self {
         let operator_override = std::env::var("EMBER_OPERATOR")
             .ok()
             .filter(|u| !u.is_empty() && u != "root");
-        let (home, invoking_user) = match operator_override {
-            Some(operator) => {
-                // `resolve_operator_home` honors `$EMBER_OPERATOR` and resolves
-                // the home via `getpwnam_r`. Fall back to `dirs_next` only if
-                // that lookup fails — defensive; the postinstall sets a real
-                // console user, and the chown step re-resolves and surfaces a
-                // clear error if it cannot.
-                let home = daemon_install::resolve_operator_home().unwrap_or_else(|_| {
-                    dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."))
-                });
-                (home, operator)
-            }
-            None => {
-                let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-                let invoking_user = std::env::var("SUDO_USER")
-                    .or_else(|_| std::env::var("USER"))
-                    .unwrap_or_default();
-                (home, invoking_user)
-            }
-        };
-        let socket_path = home.join(".ember").join("run").join("daemon.sock");
+        let invoking_user = operator_override.unwrap_or_else(|| {
+            std::env::var("SUDO_USER")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_default()
+        });
+        let home = daemon_install::resolve_operator_home()
+            .unwrap_or_else(|_| dirs_next::home_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let socket_path = crate::install_paths::prod_daemon_socket_path();
         Self {
             platform,
             home,
@@ -283,12 +268,11 @@ impl WizardContext {
 pub trait InstallPrimitives {
     fn provision_ember_user(&self) -> Result<(), daemon_install::InstallError>;
     /// Write the default daemon `config.toml` (`[daemon]` + `[keyring]`) into
-    /// the operator's `~/.ember/` if absent. The daemon refuses to boot
+    /// the daemon system config path if absent. The daemon refuses to boot
     /// without it and, on a fresh `.pkg` install, nothing else creates it
-    /// (`ember init` — which historically did — is the identity ceremony, not
-    /// the system-provisioning postinstall). Sequenced before `chown-data-dirs`
-    /// so the freshly-written file is chowned to `ember:ember-clients` with the
-    /// rest of `~/.ember`. Idempotent + non-clobbering. design §Decision 2.
+    /// (`ember init` is the identity ceremony, not the system-provisioning
+    /// postinstall). Idempotent + non-clobbering. design §Decision 2 and
+    /// design.
     fn write_default_config(
         &self,
         operator_home: &Path,
@@ -297,7 +281,7 @@ pub trait InstallPrimitives {
     /// Provision the vault MEK in System.keychain (macOS) / keyring (Linux).
     /// The daemon refuses to start without this. Idempotent — re-running
     /// against an existing MEK item is a no-op (preserves access to existing
-    /// encrypted state). implementation-note-423.
+    /// encrypted state). implementation-note-330.
     fn provision_se_mek(&self, home: &Path) -> Result<(), daemon_install::InstallError>;
     fn install_launch_spec(
         &self,
@@ -810,9 +794,8 @@ fn load_apparmor_profile_impl() -> Result<(), daemon_install::InstallError> {
 /// 1. Prime sudo via `sudo -v`.
 /// 2. Detect the host platform (errors out on `Unsupported`).
 /// 3. Build a [`WizardContext`] from the live environment.
-/// 4. Consult any prior `~/.ember/install-wizard.state.json` via
-///    [`wizard_resume_or_rollback`]; dispatch on the resulting
-///    [`ResumeAction`].
+/// 4. Consult any prior operator install-state resume file via
+///    [`wizard_resume_or_rollback`]; dispatch on the resulting [`ResumeAction`].
 /// 5. On a forward path, run the five steps starting at the appropriate
 ///    index against [`RealPrimitives`].
 /// 6. Print the platform-specific relogin banner.
@@ -1092,11 +1075,10 @@ pub fn wizard_step_provision_user<P: InstallPrimitives>(
 
 /// `ensure-config` — write the default daemon `config.toml` if absent, so the
 /// daemon can boot. Sequenced after `provision-user` (the ember user/group
-/// must exist) and before `chown-data-dirs` (which then chowns the freshly
-/// written file to `ember:ember-clients` along with the rest of `~/.ember`)
-/// and `emit-launch-spec` (which bootstraps the daemon, the point at which it
-/// reads config). Closes the fresh-`.pkg`-install daemon-won't-boot gap;
-/// idempotent + non-clobbering. design §Decision 2.
+/// must exist) and before `emit-launch-spec` (which bootstraps the daemon, the
+/// point at which it reads config). Closes the fresh-`.pkg`-install
+/// daemon-won't-boot gap; idempotent + non-clobbering. design §Decision 2 and
+/// design.
 pub fn wizard_step_ensure_config<P: InstallPrimitives>(
     ctx: &WizardContext,
     primitives: &P,
@@ -1107,19 +1089,18 @@ pub fn wizard_step_ensure_config<P: InstallPrimitives>(
             step: "ensure-config",
             source,
         })?;
+    let config_path = ember_daemon::paths::DaemonPaths::system().config_file();
     Ok(StepOutcome::Completed {
         note: format!(
-            "ensured daemon config at {}/.ember/config.toml (default if absent)",
-            ctx.home.display()
+            "ensured daemon config at {} (default if absent)",
+            config_path.display()
         ),
     })
 }
 
-/// Step 2 — recursively chown daemon-owned `~/.ember` state to
+/// Step 2 — recursively chown daemon-owned system state to
 /// `ember:ember-clients` so the dedicated daemon uid can read its at-rest
-/// state, while keeping `~/.ember/binaries` operator-writable for signed
-/// binary-manifest refreshes. Idempotent and skip-safe (missing subdirs
-/// short-circuit per the daemon-side helper).
+/// state. Idempotent and skip-safe.
 pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
     ctx: &WizardContext,
     primitives: &P,
@@ -1130,10 +1111,11 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
             step: "chown-data-dirs",
             source,
         })?;
+    let state_root = ember_daemon::paths::DaemonPaths::system().state_root;
     Ok(StepOutcome::Completed {
         note: format!(
-            "chowned daemon-owned {}/.ember state to ember:ember-clients; repaired binaries/ for operator manifest writes",
-            ctx.home.display()
+            "chowned daemon system state at {} to ember:ember-clients",
+            state_root.display()
         ),
     })
 }
@@ -1146,7 +1128,7 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
 /// already exists, preserving access to any existing encrypted state from
 /// a prior install. Re-running this step is safe.
 ///
-/// implementation-note-423. The older
+/// implementation-note-330. The older
 /// non-wizard install path (in `crates/emberlink-cli/src/bin/ember.rs`)
 /// called this between the chown step and the launchd-plist step; the
 /// wizard refactor dropped it, causing every fresh install to end with a
@@ -1291,8 +1273,8 @@ pub fn wizard_step_add_user_to_group<P: InstallPrimitives>(
 ///
 /// This is stronger than "socket file exists": the install wizard should only
 /// report success once the managed daemon is actually serving read-class RPCs
-/// on the operator-visible socket seam. If launchd/systemd is still racing
-/// startup we record a Skipped outcome rather than failing the wizard.
+/// on the design system socket. If launchd/systemd is still racing startup we
+/// record a Skipped outcome rather than failing the wizard.
 pub fn wizard_step_verify<P: InstallPrimitives>(
     ctx: &WizardContext,
     primitives: &P,
@@ -1417,11 +1399,12 @@ fn is_wsl(proc_version: &Path) -> bool {
     }
 }
 
-/// Append a single line to `~/.ember/install-wizard.log`.
+/// Append a single line to the operator install wizard transcript.
 ///
-/// Format: `<UTC ISO-8601> | <step> | <outcome>`. Creates `~/.ember/` if it
-/// doesn't exist. Failures bubble up as [`WizardError::TranscriptIo`] —
-/// the wizard cannot continue if it can't write its own audit trail.
+/// Format: `<UTC ISO-8601> | <step> | <outcome>`. Creates the operator
+/// install-state directory if it doesn't exist. Failures bubble up as
+/// [`WizardError::TranscriptIo`] — the wizard cannot continue if it can't
+/// write its own audit trail.
 fn append_transcript(step: &str, outcome: &str) -> Result<(), WizardError> {
     let path = transcript_path();
     if let Some(parent) = path.parent() {
@@ -1438,41 +1421,41 @@ fn append_transcript(step: &str, outcome: &str) -> Result<(), WizardError> {
     Ok(())
 }
 
-/// Resolve `~/.ember/install-wizard.log`.
+/// Resolve the operator install wizard transcript path.
 ///
-/// Falls back to `./.ember/install-wizard.log` when `dirs_next::home_dir()`
-/// returns `None` (extremely unusual — only happens in a stripped container
-/// without `$HOME` set). The fallback keeps the wizard functional in CI
-/// rather than panicking.
-const WIZARD_HOME_OVERRIDE_ENV: &str = "EMBER_INSTALL_WIZARD_HOME";
+/// Falls back to `./.config/emberlink/install/` when OS project dirs cannot be
+/// resolved (extremely unusual — only happens in a stripped container without a
+/// home directory). The fallback keeps the wizard functional in CI rather than
+/// panicking.
+const WIZARD_STATE_DIR_OVERRIDE_ENV: &str = "EMBER_INSTALL_WIZARD_STATE_DIR";
 
 fn transcript_path() -> PathBuf {
-    wizard_home_dir().join(".ember").join("install-wizard.log")
+    wizard_install_state_dir().join("install-wizard.log")
 }
 
-/// Resolve `~/.ember/install-wizard.state.json` — the machine-readable
-/// counterpart to the human transcript at [`transcript_path`]. Same fallback
-/// rule as [`transcript_path`].
+/// Resolve the machine-readable install wizard state file. Same fallback rule
+/// as [`transcript_path`].
 fn state_path() -> PathBuf {
-    wizard_home_dir()
-        .join(".ember")
-        .join("install-wizard.state.json")
+    wizard_install_state_dir().join("install-wizard.state.json")
 }
 
-fn wizard_home_dir() -> PathBuf {
-    std::env::var_os(WIZARD_HOME_OVERRIDE_ENV)
-        .or_else(|| std::env::var_os("HOME"))
+fn wizard_install_state_dir() -> PathBuf {
+    std::env::var_os(WIZARD_STATE_DIR_OVERRIDE_ENV)
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
-        .or_else(dirs_next::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .or_else(crate::operator_paths::install_state_dir)
+        .unwrap_or_else(|| {
+            PathBuf::from(".")
+                .join(".config")
+                .join("emberlink")
+                .join("install")
+        })
 }
 
-/// Persist [`WizardState`] to `~/.ember/install-wizard.state.json` as a
-/// pretty-printed JSON document. Overwrites the prior file. Failures bubble
-/// up as [`WizardError::TranscriptIo`] for the same reason
-/// `append_transcript` does — the wizard cannot continue if it can't
-/// persist its own resume breadcrumb.
+/// Persist [`WizardState`] to the operator install-state dir as a pretty-
+/// printed JSON document. Overwrites the prior file. Failures bubble up as
+/// [`WizardError::TranscriptIo`] for the same reason `append_transcript` does
+/// — the wizard cannot continue if it can't persist its own resume breadcrumb.
 pub fn save_wizard_state(state: &WizardState) -> Result<(), WizardError> {
     save_wizard_state_at(state, &state_path())
 }
@@ -1488,10 +1471,9 @@ pub fn save_wizard_state_at(state: &WizardState, path: &Path) -> Result<(), Wiza
     Ok(())
 }
 
-/// Load [`WizardState`] from `~/.ember/install-wizard.state.json`. Returns
-/// `Ok(None)` when the file does not exist (= fresh install). Returns
-/// `Ok(Some(state))` on a clean parse, or `Err` on IO failure / malformed
-/// JSON.
+/// Load [`WizardState`] from the operator install-state dir. Returns `Ok(None)`
+/// when the file does not exist (= fresh install). Returns `Ok(Some(state))` on
+/// a clean parse, or `Err` on IO failure / malformed JSON.
 pub fn load_wizard_state() -> Result<Option<WizardState>, WizardError> {
     load_wizard_state_at(&state_path())
 }
@@ -1685,7 +1667,7 @@ pub fn run_rollback<P: InstallPrimitives>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// implementation-note-424 — new-machine daemon detection + prompt
+// implementation-note-331 — new-machine daemon detection + prompt
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Three-state result of [`detect_daemon_installed`].
@@ -1825,7 +1807,7 @@ impl std::fmt::Display for DaemonInstallPromptError {
 /// Returns `Ok(())` when the operator consented and the install succeeded.
 /// Returns `Err(DaemonInstallPromptError::Declined)` when the operator said no.
 /// Returns other `Err` variants for non-interactive mode or subprocess failures.
-// implementation-note-424 checkpoint
+// implementation-note-331 checkpoint
 pub fn prompt_install_daemon(non_interactive: bool) -> Result<(), DaemonInstallPromptError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2164,14 +2146,85 @@ mod tests {
             },
             home: PathBuf::from("/home/operator"),
             invoking_user: "operator".to_string(),
-            socket_path: PathBuf::from("/home/operator/.ember/run/daemon.sock"),
+            socket_path: crate::install_paths::prod_daemon_socket_path(),
         }
     }
 
-    /// Sandboxed wrapper around `run_wizard_steps` that points the
-    /// transcript at a tempdir instead of `~/.ember/install-wizard.log`.
-    /// Without this, the test would either fail in CI (no `$HOME`) or
-    /// pollute the test runner's home dir.
+    #[test]
+    fn wizard_context_uses_adr218_prod_socket_path() {
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior_home = std::env::var_os("HOME");
+        let prior_operator = std::env::var_os("EMBER_OPERATOR");
+        unsafe {
+            std::env::set_var("HOME", "/tmp/emberlink-wizard-home-fixture");
+            std::env::remove_var("EMBER_OPERATOR");
+        }
+
+        let ctx = WizardContext::from_env(Platform::Linux {
+            distro: "ubuntu".to_string(),
+        });
+
+        unsafe {
+            match prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_operator {
+                Some(v) => std::env::set_var("EMBER_OPERATOR", v),
+                None => std::env::remove_var("EMBER_OPERATOR"),
+            }
+        }
+
+        let expected = crate::install_paths::prod_daemon_socket_path();
+        assert_eq!(ctx.socket_path, expected);
+        let socket = ctx.socket_path.to_string_lossy();
+        assert!(
+            !socket.contains("/.ember/"),
+            "prod verify socket must not use retired ~/.ember path: {socket}"
+        );
+    }
+
+    #[test]
+    fn wizard_install_state_paths_do_not_use_home_dot_ember() {
+        let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior_state_dir = std::env::var(WIZARD_STATE_DIR_OVERRIDE_ENV).ok();
+        unsafe {
+            std::env::set_var(
+                WIZARD_STATE_DIR_OVERRIDE_ENV,
+                "/tmp/emberlink-install-state-fixture",
+            );
+        }
+
+        let transcript = transcript_path();
+        let state = state_path();
+
+        unsafe {
+            match prior_state_dir {
+                Some(v) => std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, v),
+                None => std::env::remove_var(WIZARD_STATE_DIR_OVERRIDE_ENV),
+            }
+        }
+
+        assert_eq!(
+            transcript,
+            PathBuf::from("/tmp/emberlink-install-state-fixture").join("install-wizard.log")
+        );
+        assert_eq!(
+            state,
+            PathBuf::from("/tmp/emberlink-install-state-fixture").join("install-wizard.state.json")
+        );
+        for path in [transcript, state] {
+            let rendered = path.to_string_lossy();
+            assert!(
+                !rendered.contains("/.ember/"),
+                "wizard install state must not use retired ~/.ember path: {rendered}"
+            );
+        }
+    }
+
+    /// Sandboxed wrapper around `run_wizard_steps` that points the transcript
+    /// at a tempdir. Without this, the test would either fail in CI or pollute
+    /// the test runner's operator data dir.
     fn run_steps_isolated<P: InstallPrimitives>(
         ctx: &WizardContext,
         primitives: &P,
@@ -2182,15 +2235,15 @@ mod tests {
         // process-wide HOME that other tests may mutate concurrently.
         // We still hold HOME_GUARD so wizard tests do not race each other.
         let guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior_home = std::env::var(WIZARD_HOME_OVERRIDE_ENV).ok();
+        let prior_state_dir = std::env::var(WIZARD_STATE_DIR_OVERRIDE_ENV).ok();
         unsafe {
-            std::env::set_var(WIZARD_HOME_OVERRIDE_ENV, tmp.path());
+            std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, tmp.path());
         }
         let result = run_wizard_steps(ctx, primitives);
         unsafe {
-            match prior_home {
-                Some(v) => std::env::set_var(WIZARD_HOME_OVERRIDE_ENV, v),
-                None => std::env::remove_var(WIZARD_HOME_OVERRIDE_ENV),
+            match prior_state_dir {
+                Some(v) => std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, v),
+                None => std::env::remove_var(WIZARD_STATE_DIR_OVERRIDE_ENV),
             }
         }
         drop(guard);
@@ -2501,9 +2554,9 @@ mod tests {
         // serialize them through a shared mutex (see HOME_GUARD).
         let tmp = tempdir().expect("tempdir");
         let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior_home = std::env::var(WIZARD_HOME_OVERRIDE_ENV).ok();
+        let prior_state_dir = std::env::var(WIZARD_STATE_DIR_OVERRIDE_ENV).ok();
         unsafe {
-            std::env::set_var(WIZARD_HOME_OVERRIDE_ENV, tmp.path());
+            std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, tmp.path());
         }
         // Pre-write a state file so we can confirm rollback clears it.
         save_wizard_state(&state).expect("save state");
@@ -2516,9 +2569,9 @@ mod tests {
 
         let exists_after = state_path().exists();
         unsafe {
-            match prior_home {
-                Some(v) => std::env::set_var(WIZARD_HOME_OVERRIDE_ENV, v),
-                None => std::env::remove_var(WIZARD_HOME_OVERRIDE_ENV),
+            match prior_state_dir {
+                Some(v) => std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, v),
+                None => std::env::remove_var(WIZARD_STATE_DIR_OVERRIDE_ENV),
             }
         }
         drop(_guard);
@@ -2571,16 +2624,16 @@ mod tests {
         let ctx = fixture_ctx();
         let tmp = tempdir().expect("tempdir");
         let _guard = HOME_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior_home = std::env::var(WIZARD_HOME_OVERRIDE_ENV).ok();
+        let prior_state_dir = std::env::var(WIZARD_STATE_DIR_OVERRIDE_ENV).ok();
         unsafe {
-            std::env::set_var(WIZARD_HOME_OVERRIDE_ENV, tmp.path());
+            std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, tmp.path());
         }
         save_wizard_state(&state).expect("save state");
         let rollback_result = run_rollback(&ctx, &stub, &state);
         unsafe {
-            match prior_home {
-                Some(v) => std::env::set_var(WIZARD_HOME_OVERRIDE_ENV, v),
-                None => std::env::remove_var(WIZARD_HOME_OVERRIDE_ENV),
+            match prior_state_dir {
+                Some(v) => std::env::set_var(WIZARD_STATE_DIR_OVERRIDE_ENV, v),
+                None => std::env::remove_var(WIZARD_STATE_DIR_OVERRIDE_ENV),
             }
         }
         drop(_guard);
@@ -2715,7 +2768,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // implementation-note-424 — T2 tests
+    // implementation-note-331 — T2 tests
     // ----------------------------------------------------------------
 
     /// detect_daemon_installed: socket present → Running.
@@ -2944,7 +2997,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // implementation-note-419 — prompt tests.
+    // implementation-note-326 — prompt tests.
     // Checkpoint mirrored in test body so a grep over the test corpus
     // also lights up:
     //   dev_prod_parity_bare_claude_install_wiring_landed

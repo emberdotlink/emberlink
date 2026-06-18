@@ -1,20 +1,16 @@
-
-
-> [!NOTE]
-> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
-
 # MCP Tool Reference
 
 `emberlink-mcp` is a stdio JSON-RPC 2.0 server that exposes Emberlink daemon
-surfaces as MCP tools.
+control/read surfaces as MCP tools.
 
 Current truth:
 
 - daemon-backed by default
-- `--no-daemon` is an explicit fail-closed compatibility mode
+- only canonical dot-named tools are exposed
+- credential materialization is not an MCP tool
 - tool failures are returned as MCP tool results with `isError: true`
 
-## Server shape
+## Server Shape
 
 - transport: JSON-RPC 2.0 over stdio
 - MCP protocol version: `2024-11-05`
@@ -24,21 +20,24 @@ Current truth:
 
 | Tool | Purpose | Required arguments |
 |---|---|---|
-| `whoami` | Read the current persona/label identity | none |
-| `list_grants` | List active grants for the caller persona | none |
-| `request_grant` | Request daemon-mediated access to a credential-bearing action | `scope`, `resource_id`, `duration_secs` |
-| `grant_status` | Check status of a pending approval id or active grant id | `grant_id` |
-| `use_credential` | Redeem an active grant | `grant_id`, `credential_id` |
-| `list_receipts` | List emitted Grant Receipts | none |
-| `get_receipt` | Fetch one receipt by id | `id` |
-| `grant_budget_status` | Read lifecycle/budget state for a grant | `grant_id` |
+| `session.describe` | Describe a Runtime Persona attach target | `runtime_persona_id` |
+| `catalog.search_actions` | Search Action Manifest catalog projection | none |
+| `access.request` | Request authority for a manifest action | `persona_id`, `action_ref`, `credential_name`, plus `resource_id` or `target` |
+| `grant.list` | List grants visible to a persona | `persona_id` |
+| `status.get` | Read daemon status | none |
+| `evidence.query` | Query receipt evidence | none |
+| `evidence.get` | Fetch one receipt/evidence item | `id` |
 
-## Important request semantics
+## Important Request Semantics
 
-### `request_grant`
+### `access.request`
 
-`resource_id` is required. The daemon uses it to route the request through the
-correct policy path for the targeted credential-bearing action.
+`access.request` requires a bundled `action_ref`. The daemon resolves the
+action's `need` from the bundled Action Manifest. The caller selects the
+concrete resource with either:
+
+- `resource_id`
+- typed `target`, currently `{"kind":"github_repo","repo":"owner/name"}`
 
 Minimal example:
 
@@ -48,45 +47,29 @@ Minimal example:
   "id": 1,
   "method": "tools/call",
   "params": {
-    "name": "request_grant",
+    "name": "access.request",
     "arguments": {
-      "scope": "repo:read",
-      "resource_id": "github-token",
-      "duration_secs": 3600
+      "persona_id": "persona-123",
+      "action_ref": "registry.ember.systems/ember-systems/ember-gh/pr_list@v1",
+      "credential_name": "github-token",
+      "target": {
+        "kind": "github_repo",
+        "repo": "emberdotlink/emberlink"
+      },
+      "ttl_secs": 3600
     }
   }
 }
 ```
 
-Possible outcomes:
+Removed fields:
 
-- auto-approved immediately
-- queued for approval
-- denied
+- `action`
+- `scope`
 
-### `grant_status`
+Removed MCP tools:
 
-`grant_status` accepts either:
-
-- a pending request/approval id from `request_grant`
-- an active grant id
-
-The returned JSON shape depends on which kind of id the daemon resolved.
-
-### `use_credential`
-
-`use_credential` requires:
-
-- an active `grant_id`
-- the `credential_id` being redeemed
-
-It does not bypass the daemon. The daemon still enforces persona ownership and
-grant validity.
-
-## Fail-closed posture
-
-Without a daemon link, these tools should be expected to fail:
-
+- `whoami`
 - `list_grants`
 - `request_grant`
 - `grant_status`
@@ -95,5 +78,7 @@ Without a daemon link, these tools should be expected to fail:
 - `get_receipt`
 - `grant_budget_status`
 
-That is intentional. MCP is not supposed to invent local authority if the
-daemon is unavailable.
+## Fail-Closed Posture
+
+Without a daemon link, canonical tools fail rather than inventing local
+authority. Removed tool names return JSON-RPC `unknown tool` errors.

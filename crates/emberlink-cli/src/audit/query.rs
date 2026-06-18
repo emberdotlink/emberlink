@@ -61,7 +61,7 @@ pub struct QueryFilter {
     /// `binding.registered`. The validation surface (well-known catalog
     /// check at parse time) lives in the CLI arg parser; this library
     /// layer accepts any non-empty string so future kinds work without
-    /// a library change. Anchors `implementation-note-398-
+    /// a library change. Anchors `implementation-note-303-
     /// KIND-FILTER` (design §C8 M12 dogfood-gate prerequisite).
     pub kind: Option<String>,
     /// Maximum rows. Defaults to 100 when `None`.
@@ -389,7 +389,7 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// This is the read-side primitive consumed by the future
 /// `ember receipt verify --offline` chain-walking path
-/// (implementation-note-399). The
+/// (implementation-note-304). The
 /// CLI's verify dispatch will materialize these envelopes into
 /// [`core_events::receipt::sign::RotationWitnessEntry`] values
 /// (filling in `prior_identity_pub` / `new_identity_pub` from the
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn direct_query_filters_by_kind() {
-        // implementation-note-400:
+        // implementation-note-305:
         // The library path filters on `receipts.kind` so an M12-style
         // dogfood-gate query like
         //   `--kind bridge.cert_refresh_failed --since 7d`
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn direct_query_kind_composes_with_since_and_persona() {
-        // implementation-note-400:
+        // implementation-note-305:
         // Verify the brief's "composes with --since DUR and --persona ID"
         // AND-combine requirement at the library layer.
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -913,7 +913,7 @@ mod tests {
         assert!(s.contains("total: 1"));
     }
 
-    /// implementation-note-399:
+    /// implementation-note-304:
     /// `load_rotation_witness_envelopes` returns an empty vec when no
     /// witnesses are stored. This is the normal case for fresh installs
     /// and must not error.
@@ -938,7 +938,7 @@ mod tests {
         assert!(envelopes.is_empty());
     }
 
-    /// implementation-note-399:
+    /// implementation-note-304:
     /// Multiple witnesses are returned sorted ascending by
     /// `rotated_at_epoch_secs` regardless of insertion order. The chain
     /// walker (`verify_receipt_v2_with_rotation_chain`) requires
@@ -1016,7 +1016,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-399:
+    /// implementation-note-304:
     /// Non-`identity.rotation_witness` kinds are excluded — the chain
     /// walker would reject a non-witness anyway, but filtering at the
     /// loader keeps the chain shape clean.

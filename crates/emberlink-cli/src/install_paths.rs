@@ -7,10 +7,10 @@
 //!
 //! This module is the canonical source-of-truth for those path constants. It
 //! is consumed by:
-//! - `ember dev install` (implementation-note-420) — provisions
+//! - `ember dev install` (implementation-note-327) — provisions
 //!   the dev daemon end-to-end
 //! - `ember daemon install` — provisions the prod daemon
-//! - `dev_install::install_plist` (implementation-note-425) —
+//! - `dev_install::install_plist` (implementation-note-332) —
 //!   renders the dev LaunchDaemon plist with these paths
 //! - `dev-install.sh` developer-loop script (deprecated in this PR; pointer to
 //!   `ember dev install` instead of the old `/usr/local/bin/emberd` symlink)

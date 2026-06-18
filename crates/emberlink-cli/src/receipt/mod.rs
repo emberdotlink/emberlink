@@ -1,6 +1,7 @@
 //! Receipt rendering surface for friendly-dev artifacts.
 //!
-//! Per design §7: `ember receipt show` / `ember receipt export --format md`
+//! Per design §7: `ember receipt list` / `ember receipt show <id>` /
+//! `ember receipt export --format md`
 //! produces a markdown summary that fits in a Slack/iMessage paste.
 //!
 //! [`rollup`] adds the `ember receipt rollup` verb (per

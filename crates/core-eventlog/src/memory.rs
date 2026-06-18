@@ -512,8 +512,17 @@ mod tests {
     };
     use core_events::EventEnvelope;
     use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
+    use proptest::prelude::*;
 
     use super::*;
+
+    const PROPTEST_CASES: u32 = 64;
+
+    #[derive(Clone, Debug)]
+    enum ChainOp {
+        Device(u8),
+        Persona(u8),
+    }
 
     fn test_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
@@ -542,6 +551,62 @@ mod tests {
         let event =
             EventEnvelope::from_body(event_id, body, refs, signer_binding, &signer).unwrap();
         log.append(event, &FixtureVerifier).unwrap();
+    }
+
+    fn root_event() -> EventEnvelope {
+        let signer_binding = SignerBinding::root("root-a", "key-root-a");
+        EventEnvelope::from_body(
+            "evt-root-0",
+            EventBody::RootCreated(RootCreatedEvent {
+                root_id: "root-a".into(),
+                display_name: "Primary".into(),
+                initial_key: test_key("key-root-a"),
+            }),
+            Vec::new(),
+            signer_binding,
+            &FixtureSigner::new("key-root-a"),
+        )
+        .unwrap()
+    }
+
+    fn chain_step_event(
+        idx: usize,
+        op: &ChainOp,
+        prev_event_id: String,
+        seq: u64,
+    ) -> EventEnvelope {
+        let body = match op {
+            ChainOp::Device(label) => EventBody::DeviceAdded(DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: format!("device-{idx}"),
+                label: format!("Device {label}"),
+                initial_key: test_key(&format!("key-device-{idx}")),
+                initial_encryption_key: test_encryption_key(&format!("device-{idx}")),
+            }),
+            ChainOp::Persona(label) => EventBody::PersonaCreated(PersonaCreatedEvent {
+                root_id: "root-a".into(),
+                persona_id: format!("persona-{idx}"),
+                label: format!("Persona {label}"),
+                disclosure_profile: None,
+                survival_mode: SurvivalMode::Strict,
+                initial_key: test_key(&format!("key-persona-{idx}")),
+            }),
+        };
+        EventEnvelope::from_body(
+            format!("evt-step-{idx}"),
+            body,
+            vec![core_events::EventRef::previous(prev_event_id, seq)],
+            SignerBinding::root("root-a", "key-root-a"),
+            &FixtureSigner::new("key-root-a"),
+        )
+        .unwrap()
+    }
+
+    fn arb_chain_op() -> impl Strategy<Value = ChainOp> {
+        prop_oneof![
+            (0u8..32).prop_map(ChainOp::Device),
+            (0u8..32).prop_map(ChainOp::Persona),
+        ]
     }
 
     /// Returns the (prev_event_id, next_seq) for a given root, or None if no head yet.
@@ -601,6 +666,104 @@ mod tests {
             "device-a".to_string(),
             "persona-a".to_string(),
         )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+        // implementation marker
+        #[test]
+        fn generated_append_sequences_preserve_chain_head_and_rebuild_state(
+            ops in proptest::collection::vec(arb_chain_op(), 0..48),
+        ) {
+            let mut log = MemoryEventLog::new();
+            let root = root_event();
+            log.append(root.clone(), &FixtureVerifier).unwrap();
+            let mut expected_ids = vec![root.event_id];
+
+            for (idx, op) in ops.iter().enumerate() {
+                let (prev_event_id, seq) = chain_next(&log, "root-a").unwrap();
+                let event = chain_step_event(idx, op, prev_event_id, seq);
+                log.append(event.clone(), &FixtureVerifier).unwrap();
+                expected_ids.push(event.event_id);
+
+                prop_assert_eq!(log.event_count(), expected_ids.len());
+                let actual_ids = log.event_ids();
+                prop_assert_eq!(actual_ids.as_slice(), expected_ids.as_slice());
+                let (head_event_id, head_seq) = log
+                    .materialized()
+                    .root_chain_heads
+                    .get("root-a")
+                    .cloned()
+                    .unwrap();
+                prop_assert_eq!(head_event_id.as_str(), expected_ids.last().unwrap().as_str());
+                prop_assert_eq!(head_seq, idx as u64 + 1);
+            }
+
+            let materialized_before = log.materialized().clone();
+            let event_ids_before = log.event_ids();
+            log.rebuild().unwrap();
+
+            let event_ids_after = log.event_ids();
+            prop_assert_eq!(event_ids_after.as_slice(), event_ids_before.as_slice());
+            prop_assert_eq!(
+                &log.materialized().root_chain_heads,
+                &materialized_before.root_chain_heads
+            );
+            prop_assert_eq!(
+                &log.materialized().roots_current,
+                &materialized_before.roots_current
+            );
+            prop_assert_eq!(
+                &log.materialized().devices_current,
+                &materialized_before.devices_current
+            );
+            prop_assert_eq!(
+                &log.materialized().personas_current,
+                &materialized_before.personas_current
+            );
+        }
+
+        #[test]
+        fn generated_bad_next_events_are_rejected_without_mutating_log(
+            ops in proptest::collection::vec(arb_chain_op(), 0..32),
+            tamper_signature in any::<bool>(),
+            bad_label in 0u8..32,
+        ) {
+            let mut log = MemoryEventLog::new();
+            log.append(root_event(), &FixtureVerifier).unwrap();
+
+            for (idx, op) in ops.iter().enumerate() {
+                let (prev_event_id, seq) = chain_next(&log, "root-a").unwrap();
+                let event = chain_step_event(idx, op, prev_event_id, seq);
+                log.append(event, &FixtureVerifier).unwrap();
+            }
+
+            let before_ids = log.event_ids();
+            let before_count = log.event_count();
+            let before_head = log.materialized().root_chain_heads.get("root-a").cloned();
+            let (prev_event_id, seq) = chain_next(&log, "root-a").unwrap();
+            let mut event = chain_step_event(
+                ops.len(),
+                &ChainOp::Device(bad_label),
+                prev_event_id,
+                seq,
+            );
+
+            if tamper_signature {
+                event.signature.0.push_str("tampered");
+            } else {
+                event.refs = vec![core_events::EventRef::previous("evt-not-the-head", seq)];
+            }
+
+            prop_assert!(log.append(event, &FixtureVerifier).is_err());
+            prop_assert_eq!(log.event_count(), before_count);
+            prop_assert_eq!(log.event_ids(), before_ids);
+            prop_assert_eq!(
+                log.materialized().root_chain_heads.get("root-a").cloned(),
+                before_head
+            );
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ use core_crypto::{FixtureSigner, FixtureVerifier, Verifier};
 use core_event_types::{EventBody, MessageSentEvent, SignerBinding};
 use core_eventlog::{EventLog, MemoryEventLog};
 use core_events::EventEnvelope;
-// implementation-note-41: `EventStore` is the
+// implementation-note-28: `EventStore` is the
 // production SQLite-backed `EventLog` impl; reaching for it here drives the
 // real write path under load for the `#[ignore]`'d SQLite variant + the
 // disk-full hook. The crate is a dev-dependency only — it is excluded from
@@ -158,7 +158,7 @@ pub fn run_synthetic_load(cfg: SyntheticLoadConfig) -> anyhow::Result<SyntheticL
 // confirm `core-eventlog`'s synthetic_load surface drives the production
 // SQLite write path, not only the WASM-friendly `MemoryEventLog`.
 //
-// implementation-note-41: the SQLite-backed
+// implementation-note-28: the SQLite-backed
 // variant uses `EventStore::open_in_memory()` (in-memory SQLite via
 // `:memory:` — the goal is real write-path code coverage under load, not
 // durable disk; the disk-path coverage is the responsibility of the

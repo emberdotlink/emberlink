@@ -9,7 +9,7 @@ publish = false
 age = { version = "0.11", features = ["armor"] }
 # argon2: passphrase-based KDF for `backup_envelope::seal_backup` /
 # `open_backup` — the encrypted IR backup primitive
-# (implementation-note-34 / design §Component 4). Same crate pinned by
+# (implementation-note-21 / design §Component 4). Same crate pinned by
 # `ember-daemon` for vault MEK derivation; we pin matching `0.5` so a
 # future param-rotation campaign can share the OWASP-recommended cost
 # table across both surfaces.

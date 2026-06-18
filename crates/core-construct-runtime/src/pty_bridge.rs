@@ -193,7 +193,7 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
     // teardown caused `BridgeExit::ShimDisappeared` → SIGTERM cascade
     // on every non-interactive shim invocation (headless scripts run
     // shims with stdin=/dev/null), killing the credential-injected
-    // child mid-flight. See implementation-note-27.
+    // child mid-flight. See implementation-note-19.
     let mut stdin_eof = false;
 
     loop {
@@ -379,7 +379,7 @@ mod tests {
     use std::io::Cursor;
     use std::{collections::VecDeque, io};
 
-    /// Regression for implementation-note-27.
+    /// Regression for implementation-note-19.
     ///
     /// When stdin returns `Ok(0)` (EOF — the steady state for headless
     /// shim invocations whose stdin is `/dev/null`), the previous

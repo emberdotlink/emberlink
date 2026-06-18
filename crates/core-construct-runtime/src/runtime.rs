@@ -11,7 +11,7 @@
 //!   broker_exec RPC → PTY bridge → exit). Takes a [`ConstructConfig`] impl.
 //!   This is the entry point used by production Construct shims (ember-gh etc.).
 //!
-//! ## Resolve → exec two-phase invariant (implementation-note-29)
+//! ## Resolve → exec two-phase invariant
 //!
 //! Per design §9, the construct shim MUST call `broker.resolve` BEFORE
 //! `broker.exec`. Resolve returns a [`SpawnHandle`] binding the four
@@ -60,7 +60,7 @@ const BROKER_EXEC_POOL_EXHAUSTED_BACKOFF_MS: [u64; 3] = [100, 300, 1000];
 // ---------------------------------------------------------------------------
 
 /// Detect whether the parent process attached a TTY to any of the standard
-/// streams. Per T-CONSTRUCT-RUNTIME-NON-TTY-DETECTION, when none of stdin /
+/// streams. When none of stdin /
 /// stdout / stderr have a TTY parent (headless, CI, headless cron, `docker
 /// run` without `-t`), the shim must skip PTY allocation and let the daemon
 /// run the child with `Stdio::piped()` so the bridge thread doesn't die on
@@ -72,8 +72,8 @@ fn parent_has_tty() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Unsessioned subprocess audit log (implementation-note-30-
-// WARNING, Tier 1) — best-effort logging from the passthrough branches.
+// Unsessioned subprocess audit log (Tier 1) — best-effort logging from
+// the passthrough branches.
 // ---------------------------------------------------------------------------
 
 /// Outcome tag for [`log_unsessioned_subprocess`]. Mirrors the daemon's
@@ -639,7 +639,7 @@ fn factory_refusal_disposition(
 }
 
 // ---------------------------------------------------------------------------
-// Two-phase resolve → exec (implementation-note-29)
+// Two-phase resolve → exec
 // ---------------------------------------------------------------------------
 
 /// Opaque spawn handle returned by [`resolve_via_broker`].
@@ -821,10 +821,9 @@ pub trait BrokerTransport {
 /// construct_toml_bytes) and receives a [`SpawnHandle`] binding
 /// (binary, env_allowlist, materialization_id, target_uid). The
 /// `materialization_id` carries the daemon's credential reference;
-/// plaintext is NEVER returned over this RPC (per implementation-note-31-
-/// SECRETREF-CONTRACT — only `handle_broker_resolve`'s legacy
-/// secret-ref → plaintext path returns raw credentials, and that path
-/// is gated to trust-boundary callers).
+/// plaintext is NEVER returned over this RPC — only `handle_broker_resolve`'s
+/// legacy secret-ref → plaintext path returns raw credentials, and that path
+/// is gated to trust-boundary callers.
 pub fn resolve_via_broker<T: BrokerTransport>(
     transport: &T,
     action_ref: &ActionRef,
@@ -1303,7 +1302,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
                 argv = ?argv,
                 "ember-construct: classify=None; passthrough exec (no broker mediation)"
             );
-            // implementation-note-32 (Tier 1): log
+            // Tier 1: log
             // the classify=None passthrough so read-only / safe-write verbs
             // still appear in the chain (verb name from argv[0]).
             log_unsessioned_subprocess(config, argv, UnsessionedOutcome::PassthroughNoClassify);
@@ -1349,7 +1348,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
 
     // 4. Decide whether to allocate a PTY.
     //
-    // T-CONSTRUCT-RUNTIME-NON-TTY-DETECTION: when the parent has NO TTY on
+    // When the parent has NO TTY on
     // any of stdin/stdout/stderr (headless, CI, headless cron, `docker run`
     // without `-t`, non-interactive `nohup`), skip the PTY socket entirely
     // and send `pty_socket_path: None` so the daemon takes its piped-stderr
@@ -1412,8 +1411,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
         None
     };
 
-    // 6. Translate emberlink-shaped argv to wrapped-tool-native argv
-    //    (implementation-note-33 / Q5 grill-pair LOCK):
+    // 6. Translate emberlink-shaped argv to wrapped-tool-native argv:
     //    `ConstructConfig::translate_argv` strips/renames emberlink-specific
     //    flags the upstream binary doesn't understand. Default is identity;
     //    scion strips `--persona`/`--max-depth`/`--brief`, renames
@@ -2023,7 +2021,7 @@ handler_ref = "cli:gh.pr_list"
         }
     }
 
-    /// implementation-note-29 acceptance 1+2:
+    /// Two-phase resolve acceptance 1+2:
     /// run_construct calls resolve_via_broker before exec_via_broker.
     /// The mock transport records the call order and the spawn handle
     /// must bind binary + env + credential + target_uid.
@@ -2093,7 +2091,7 @@ handler_ref = "cli:gh.pr_list"
         );
     }
 
-    /// implementation-note-29 acceptance 3:
+    /// Two-phase resolve acceptance 3:
     /// Receipt emitted only on resolve+exec succeeding as a transaction.
     /// When exec fails after a successful resolve, the audit kind is
     /// `credential_resolve_aborted`, never `credential_provisioned`.
@@ -2152,7 +2150,7 @@ handler_ref = "cli:gh.pr_list"
         assert_eq!(kind.map(|k| k.as_str()), Some("credential_resolve_aborted"));
     }
 
-    /// implementation-note-29 acceptance 2:
+    /// Two-phase resolve acceptance 2:
     /// spawn_handle binds binary + env + credential + target_uid.
     /// Constructs a handle directly and asserts the four fields exist
     /// with the expected types — guards against accidental field drops
@@ -2222,7 +2220,7 @@ handler_ref = "cli:gh.pr_list"
         assert!(pty_socket_path_for_terminal_mode(TerminalMode::Pty).is_some());
     }
 
-    /// implementation-note-29: resolve failure short-
+    /// Resolve failure short-
     /// circuits before exec is reached. No audit kind is emitted
     /// because resolve never produced a credential to begin with.
     #[test]
@@ -2313,7 +2311,7 @@ handler_ref = "cli:gh.pr_list"
     }
 
     // -----------------------------------------------------------------------
-    // Non-TTY detection (T-CONSTRUCT-RUNTIME-NON-TTY-DETECTION)
+    // Non-TTY detection
     // -----------------------------------------------------------------------
 
     /// `build_broker_exec_params` MUST omit `pty_socket_path` when the caller
@@ -3226,7 +3224,7 @@ handler_ref = "cli:gh.pr_list"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-32 (Tier 1) tests for
+    // Tier 1 tests for
     // log_unsessioned_subprocess. The daemon-up happy-path is exercised by
     // ember-daemon's handle_subprocess_audit_log tests; here we pin the
     // best-effort failure modes — vendor=="unknown" short-circuit, and

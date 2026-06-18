@@ -1,5 +1,5 @@
 //! `ember receipt verify --offline` rotation-chain walker (CLI side of
-//! implementation-note-449).
+//! implementation-note-351).
 //!
 //! Slice E3 ships [`core_events::receipt::sign::verify_receipt_v2_with_rotation_chain`]
 //! — the pure walker. This module is the CLI-side adapter:

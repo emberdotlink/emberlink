@@ -654,6 +654,7 @@ mod tests {
     use super::*;
     use core_crypto::FixtureSigner;
     use core_event_types::{EventType, SignerBinding};
+    use proptest::prelude::*;
 
     fn test_attestation(
         attester: &str,
@@ -843,6 +844,212 @@ mod tests {
             domain: "general".to_string(),
             score: 1.0,
             recipient_bound: None,
+        }
+    }
+
+    // Anchor: core_trust_proptest_graph_landed
+    fn chain_edges(hops: usize) -> Vec<TrustAttestation> {
+        let mut edges = Vec::new();
+        let mut previous = "viewer".to_string();
+        for step in 1..=hops {
+            let next = if step == hops {
+                "issuer".to_string()
+            } else {
+                format!("hop_{step}")
+            };
+            edges.push(make_edge(&previous, &next));
+            previous = next;
+        }
+        edges
+    }
+
+    fn node_id(idx: u8) -> String {
+        format!("node_{}", idx % 8)
+    }
+
+    fn indexed_edges(pairs: Vec<(u8, u8)>) -> Vec<TrustAttestation> {
+        pairs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (from, to))| {
+                let attester = node_id(from);
+                let subject = node_id(to);
+                let mut edge = make_edge(&attester, &subject);
+                edge.id = format!("edge:{idx}:{attester}:{subject}");
+                edge
+            })
+            .collect()
+    }
+
+    fn assert_unit_interval(value: f32, field: &str) -> Result<(), TestCaseError> {
+        prop_assert!(value.is_finite(), "{field} must be finite, got {value}");
+        prop_assert!(
+            (0.0..=1.0).contains(&value),
+            "{field} must stay in [0.0, 1.0], got {value}"
+        );
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn badge_weight_chain_distance_respects_max_depth(
+            hops in 0usize..8,
+            max_depth in 0u32..6,
+            issuer_badges_issued in 0u32..500,
+        ) {
+            let edges = chain_edges(hops);
+            let issuer_id = if hops == 0 { "viewer" } else { "issuer" };
+            let weight = compute_badge_weight(&BadgeWeightInput {
+                issuer_id,
+                viewer_id: "viewer",
+                trust_edges: &edges,
+                issuer_badges_issued,
+                max_depth,
+            });
+
+            let effective_depth = max_depth.max(1);
+            if hops == 0 || hops as u32 <= effective_depth {
+                prop_assert_eq!(weight.graph_distance, Some(hops as u32));
+                let expected_distance = if hops <= 1 {
+                    1.0
+                } else {
+                    1.0 / hops as f32
+                };
+                prop_assert!(
+                    (weight.distance_score - expected_distance).abs() < 1e-6,
+                    "distance score drifted for hops={hops}: {:?}",
+                    weight
+                );
+            } else {
+                prop_assert_eq!(weight.graph_distance, None);
+                prop_assert_eq!(weight.total, 0.0);
+            }
+
+            assert_unit_interval(weight.distance_score, "distance_score")?;
+            assert_unit_interval(weight.convergence_score, "convergence_score")?;
+            assert_unit_interval(weight.issuer_score, "issuer_score")?;
+            assert_unit_interval(weight.total, "total")?;
+        }
+
+        #[test]
+        fn badge_weight_scores_are_bounded_for_generated_graphs(
+            pairs in proptest::collection::vec((0u8..8, 0u8..8), 0..32),
+            viewer_idx in 0u8..8,
+            issuer_idx in 0u8..8,
+            issuer_badges_issued in any::<u32>(),
+            max_depth in 0u32..12,
+        ) {
+            let edges = indexed_edges(pairs);
+            let viewer = node_id(viewer_idx);
+            let issuer = node_id(issuer_idx);
+            let weight = compute_badge_weight(&BadgeWeightInput {
+                issuer_id: &issuer,
+                viewer_id: &viewer,
+                trust_edges: &edges,
+                issuer_badges_issued,
+                max_depth,
+            });
+
+            assert_unit_interval(weight.distance_score, "distance_score")?;
+            assert_unit_interval(weight.convergence_score, "convergence_score")?;
+            assert_unit_interval(weight.issuer_score, "issuer_score")?;
+            assert_unit_interval(weight.total, "total")?;
+            if let Some(distance) = weight.graph_distance {
+                prop_assert!(
+                    distance <= max_depth.max(1),
+                    "graph distance {distance} exceeded max depth {max_depth}"
+                );
+            } else {
+                prop_assert_eq!(weight.total, 0.0);
+            }
+        }
+
+        #[test]
+        fn adding_reachable_inbound_trust_edge_does_not_lower_weight(
+            peer_count in 1usize..8,
+            trusted_peer_idx in 0usize..8,
+            extra_peer_idx in 0usize..8,
+            issuer_badges_issued in 0u32..500,
+        ) {
+            let trusted_peer_idx = trusted_peer_idx % peer_count;
+            let extra_peer_idx = extra_peer_idx % peer_count;
+            let mut edges = Vec::new();
+            for idx in 0..peer_count {
+                edges.push(make_edge("viewer", &format!("peer_{idx}")));
+            }
+            edges.push(make_edge(&format!("peer_{trusted_peer_idx}"), "issuer"));
+
+            let before = compute_badge_weight(&BadgeWeightInput {
+                issuer_id: "issuer",
+                viewer_id: "viewer",
+                trust_edges: &edges,
+                issuer_badges_issued,
+                max_depth: DEFAULT_MAX_DEPTH,
+            });
+
+            let mut expanded_edges = edges.clone();
+            expanded_edges.push(make_edge(&format!("peer_{extra_peer_idx}"), "issuer"));
+            let after = compute_badge_weight(&BadgeWeightInput {
+                issuer_id: "issuer",
+                viewer_id: "viewer",
+                trust_edges: &expanded_edges,
+                issuer_badges_issued,
+                max_depth: DEFAULT_MAX_DEPTH,
+            });
+
+            prop_assert_eq!(before.graph_distance, after.graph_distance);
+            prop_assert!(
+                after.convergence_count >= before.convergence_count,
+                "extra inbound edge lowered convergence count: before={before:?} after={after:?}"
+            );
+            prop_assert!(
+                after.total + 1e-6 >= before.total,
+                "extra inbound edge lowered authority total: before={before:?} after={after:?}"
+            );
+        }
+
+        #[test]
+        fn dispute_penalty_is_bounded_and_monotonic_for_direct_extra_dispute(
+            pairs in proptest::collection::vec((0u8..8, 0u8..8), 0..32),
+            dispute_indices in proptest::collection::vec(0u8..8, 0..16),
+            max_depth in 0u32..12,
+        ) {
+            let edges = indexed_edges(pairs);
+            let names: Vec<String> = (0..8).map(node_id).collect();
+            let disputes: Vec<DisputeInput<'_>> = dispute_indices
+                .iter()
+                .map(|idx| DisputeInput {
+                    disputer_id: names[*idx as usize].as_str(),
+                })
+                .collect();
+            let penalty = compute_dispute_penalty("node_0", &disputes, &edges, max_depth);
+            assert_unit_interval(penalty, "penalty")?;
+
+            let mut edges_with_direct = edges.clone();
+            edges_with_direct.push(make_edge("node_0", "direct_extra"));
+            let mut disputes_with_direct: Vec<DisputeInput<'_>> = dispute_indices
+                .iter()
+                .map(|idx| DisputeInput {
+                    disputer_id: names[*idx as usize].as_str(),
+                })
+                .collect();
+            disputes_with_direct.push(DisputeInput {
+                disputer_id: "direct_extra",
+            });
+            let penalty_with_direct = compute_dispute_penalty(
+                "node_0",
+                &disputes_with_direct,
+                &edges_with_direct,
+                max_depth,
+            );
+
+            assert_unit_interval(penalty_with_direct, "penalty_with_direct")?;
+            prop_assert!(
+                penalty_with_direct + 1e-6 >= penalty,
+                "adding a reachable direct dispute lowered penalty: {penalty} -> {penalty_with_direct}"
+            );
         }
     }
 

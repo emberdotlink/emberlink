@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! Typed JSON-RPC error taxonomy for daemon handlers (implementation-note-306).
+//! Typed JSON-RPC error taxonomy for daemon handlers (implementation-note-214).
 //!
 //! Today's `Result<Value, (i32, String)>` shape loses semantic class at the
 //! wire boundary — clients are forced to string-match for retryable vs
@@ -33,7 +33,7 @@
 //! | -32602   | Invalid params                                   | `InvalidParams(String)`              |
 //! | -32603   | JSON-RPC internal error (audit repair tail)      | `JsonRpcInternal(String)`            |
 //!
-//! Composes `implementation-note-307` (per design Component
+//! Composes `implementation-note-215` (per design Component
 //! 10) as the `PoolExhausted` variant carrying the structured
 //! `retry_after_ms` hint that the construct-shim's bounded backoff consumes.
 //!
@@ -82,7 +82,7 @@ pub enum RpcError {
 
     /// -32006 — composite-statement revocation. The grant remains live but
     /// the specific statement authorizing this credential read has been
-    /// revoked (per-statement isolation per implementation-note-238).
+    /// revoked (per-statement isolation per implementation-note-173).
     StatementRevoked,
 
     /// -32007 — caller asked for a credential by name that isn't bound to
@@ -90,7 +90,7 @@ pub enum RpcError {
     CredentialNotBound(String),
 
     /// -32020 — execution-domain pool exhausted (composes
-    /// implementation-note-307 per design Component 10).
+    /// implementation-note-215 per design Component 10).
     /// Carries `retry_after_ms` so the construct-shim's bounded backoff
     /// (3 attempts at 100ms / 300ms / 1s) consumes a structured hint
     /// rather than a guess.
@@ -121,7 +121,7 @@ pub enum RpcError {
     /// (the structural last-presence-device guard, design §5). Split out of
     /// -32030 so the CLI can render the typed "enroll a replacement Device
     /// first via `ember device enroll --backup`" affordance instead of the
-    /// generic presence-locked help (implementation-note-308-
+    /// generic presence-locked help (implementation-note-216-
     /// SUBSPACE, F9.2 LOW on prior change). Other revoke refusals (unknown
     /// device id, already-revoked, signer-not-an-active-presence) stay on
     /// -32030.

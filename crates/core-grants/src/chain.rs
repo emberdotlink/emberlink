@@ -1,4 +1,4 @@
-// implementation-note-70 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
+// implementation-note-51 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
 
 use core_crypto::grant_chain::{self, PubkeyNextKeyPair, RootKeyPair, SignedBlockOutput};
 use core_event_types::PresentationAudienceKind;

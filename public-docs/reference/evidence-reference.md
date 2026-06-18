@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
-
 # Evidence Reference
 
 Emberlink's current evidence surface has two layers:

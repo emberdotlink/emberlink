@@ -1,6 +1,6 @@
 use super::*;
 
-/// implementation-note-219 - set the cohort A
+/// implementation-note-182 - set the cohort A
 /// dev0 bridge env var process-wide for the duration of the test
 /// binary's run, exactly once.
 ///

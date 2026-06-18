@@ -1,16 +1,11 @@
-
-Summary:
-- Role: canonical install and first-run path
-- Decision status: accepted
-- Authority state: current
-- Implementation status: shipped
-- Last reviewed: 2026-06-17
-
 # Quickstart
 
 This is the canonical install and onboarding path for the current product surface.
 
-The source mirror may be public before the first public supported build. Until `v0.3.1`, treat this guide as the **current pre-release / friendly-preview path**, not as a broad GA promise. The release boundary lives in [support levels and release posture](public-docs/get-started/support-levels-and-release-posture.md) and release-notes.
+The source mirror may be public before the first public supported build. Until
+`v0.3.1`, treat this guide as the **current pre-release / friendly-preview
+path**, not as a broad GA promise. The release boundary lives in
+[support levels and release posture](public-docs/get-started/support-levels-and-release-posture.md).
 
 ## Prerequisites
 
@@ -72,12 +67,13 @@ ember claude
 
 `ember init --for claude` creates or reuses the persona/grant surfaces it
 needs and patches the Claude settings the launcher depends on. If the shadow
-shims are missing, raw `gh` / `git` calls bypass the broker.
+shims are missing, raw `gh` / `git` calls do not use broker mediation.
 
 ### Bare `claude` auto-routes through the broker
 
 `ember dev install` (and the prod-equivalent install) writes a
-`~/.ember/shadow/bin/claude` shim that exec's `ember claude-code "$@"`.
+`claude` shim in the operator-side shadow binary directory that exec's
+`ember claude-code "$@"`.
 Any shell with the ember shadow PATH prepended — every shell launched by
 `ember claude-code` — picks up that shim, so typing plain `claude` lands
 inside the brokered launcher rather than invoking the system Claude Code
@@ -116,8 +112,9 @@ claude() {
 - **Permanent:** delete the managed Emberlink region from `~/.zshrc` /
   `~/.bashrc`. Re-running the install wizard re-prompts (it doesn't
   silently re-add the block once removed because the begin/end markers are gone).
-- **Per-host:** the shadow shim lives at
-  `~/.ember/shadow/bin/claude`; delete the file to opt out of the shim
+- **Per-host:** delete the `claude` shim from the operator-side shadow binary
+  directory (`~/Library/Application Support/Emberlink/shadow/bin/` on macOS,
+  `$XDG_DATA_HOME/emberlink/shadow/bin/` on Linux) to opt out of the shim
   (the wizard will reinstall it on the next `ember dev install`).
 
 Background: the hybrid (shadow shim + opt-in shell-init wrap) was chosen on
@@ -174,4 +171,3 @@ The launcher and the MCP server solve different layers: the launcher gives you t
 - [Grant Warden model](public-docs/concepts/grant-warden.md) — terminology and invariants
 - [CLI reference](public-docs/reference/cli-reference.md) — current public operator contract
 - [Support levels and release posture](public-docs/get-started/support-levels-and-release-posture.md) — support labels and release boundary
-- `release-notes` — current scope cuts and bounded issues

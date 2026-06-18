@@ -6,11 +6,11 @@
 //!
 //! - `binary_manifest` (default) — reads sidecar from `<artifact>.sig` or
 //!   the explicit `--sidecar` path.
-//! - `receipt` (implementation-note-361) — Receipt envelope JSON; no
+//! - `receipt` (implementation-note-256) — Receipt envelope JSON; no
 //!   sidecar (the signature is inline). `--sidecar` is ignored on this
 //!   kind, and the wire sidecar bytes are sent empty.
 //!
-//! Delegation grant chain walk lands in implementation-note-362.
+//! Delegation grant chain walk lands in implementation-note-257.
 //!
 //! The CLI reads the artifact + (when applicable) sidecar from disk and
 //! base64-encodes both for the wire. The daemon never touches a
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/release.sig"));
     }
 
-    /// implementation-note-361: receipt + authority_delegation kinds carry
+    /// implementation-note-256: receipt + authority_delegation kinds carry
     /// the signature inline; the run path must NOT compute a default
     /// sidecar path (it would fail trying to read a `.sig` that doesn't
     /// exist) and must pass empty bytes for the wire sidecar.

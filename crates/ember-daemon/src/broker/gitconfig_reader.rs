@@ -1,8 +1,8 @@
 //! CLASSIFICATION: PUBLIC
 //! Bounded INI parser for `.git/config` — resolves a remote's URL by name.
 //!
-//! implementation-note-135 — Phase 2 subtask of
-//! implementation-note-131. Used by DCC-6 (HTTPS dispatch) at
+//! implementation-note-115 — Phase 2 subtask of
+//! implementation-note-111. Used by DCC-6 (HTTPS dispatch) at
 //! credential-injection time to verify the binding's stored URL matches what
 //! the user's `.git/config` actually says for the target remote.
 

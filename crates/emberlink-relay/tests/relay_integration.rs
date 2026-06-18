@@ -361,11 +361,11 @@ fn config_defaults_to_self_signed_tls() {
     assert!(matches!(config.tls_mode, TlsMode::SelfSigned));
 }
 
-/// implementation-note-490 Tier A §A4: when the
+/// Tier A §A4: when the
 /// `insecure-no-tls` cargo feature is OFF (default), `--no-tls` is
 /// rejected by `from_args` rather than silently downgrading to plain
 /// TCP. Production builds compile without the feature; an operator who
-/// types `--no-tls` sees an error referring to the implementation-note-493 ticket.
+/// types `--no-tls` sees an error referring to the relay-TLS ticket.
 #[cfg(not(feature = "insecure-no-tls"))]
 #[test]
 fn config_rejects_no_tls_in_production_build() {
@@ -376,12 +376,12 @@ fn config_rejects_no_tls_in_production_build() {
         "expected production refusal, got: {err}"
     );
     assert!(
-        err.contains("implementation-note-493"),
+        err.contains("implementation-note-394"),
         "expected ticket reference in error, got: {err}"
     );
 }
 
-/// implementation-note-490 Tier A §A4: when the
+/// Tier A §A4: when the
 /// `insecure-no-tls` cargo feature is ON (test loopback rigs only),
 /// `--no-tls` is accepted to keep `core-sim/tests/agent_e2e.rs` workable.
 #[cfg(feature = "insecure-no-tls")]
@@ -1451,7 +1451,7 @@ fn dispatch_rejects_legacy_grant_request_commands_for_release_containment() {
     let state = Arc::new(Mutex::new(RelayState::default()));
     let config = test_offer_config();
 
-    // Use the post-implementation-note-493 wire shapes so the dispatch refusal proves
+    // Use the current sealed-payload wire shapes so the dispatch refusal proves
     // the gate fires AFTER parse (containment, not parse-failure).
     let nonce_hex = hex::encode([0u8; RESPOND_GRANT_REQUEST_NONCE_BYTES]);
     let request_grant = format!(
@@ -1627,7 +1627,7 @@ fn grant_request_deposit_fetch_lifecycle() {
         resp.contains(&format!("\"sealed_payload\":\"{}\"", hex::encode(&sealed))),
         "got: {resp}"
     );
-    // Plaintext fields MUST NOT appear (implementation-note-491).
+    // Plaintext fields MUST NOT appear (sealed off-relay).
     assert!(!resp.contains("\"requester_id\""), "got: {resp}");
     assert!(!resp.contains("\"justification\""), "got: {resp}");
     assert!(!resp.contains("\"scope\""), "got: {resp}");
@@ -1682,7 +1682,7 @@ fn grant_request_respond_approved_with_valid_signature() {
     assert!(resp.contains("\"status\":\"approved\""), "got: {resp}");
 }
 
-/// implementation-note-493 acceptance #2: a captured `RESPOND_GRANT_REQUEST` frame
+/// Signed-response acceptance #2: a captured `RESPOND_GRANT_REQUEST` frame
 /// MUST NOT verify when replayed. The relay tombstones the nonce so the
 /// second frame is refused with `REJECTED nonce replay`.
 #[test]
@@ -1726,7 +1726,7 @@ fn grant_request_respond_rejects_nonce_replay() {
     assert_eq!(read_response(&buf), "REJECTED nonce replay");
 }
 
-/// implementation-note-493 acceptance #2: a tampered nonce flips the signed payload
+/// Signed-response acceptance #2: a tampered nonce flips the signed payload
 /// so the signature stops verifying. Refused with
 /// `REJECTED signature verification failed` and the grant request stays
 /// `Pending`.
@@ -1774,7 +1774,7 @@ fn grant_request_respond_rejects_tampered_nonce() {
     assert!(resp.contains("\"status\":\"pending\""), "got: {resp}");
 }
 
-/// implementation-note-493 acceptance #2: flipping the verdict byte (signed for
+/// Signed-response acceptance #2: flipping the verdict byte (signed for
 /// `denied`, replayed as `approved`) must fail the signature check.
 /// Defends against the canonical "captured deny → reuse as approve"
 /// authority-bearing attack.
@@ -1812,7 +1812,7 @@ fn grant_request_respond_rejects_verdict_flip() {
     );
 }
 
-/// implementation-note-493 acceptance #2: a signature produced by a different key
+/// Signed-response acceptance #2: a signature produced by a different key
 /// (the wrong responder, or a forged claimant) does not verify against
 /// the bound pubkey. The relay refuses without mutating state.
 #[test]

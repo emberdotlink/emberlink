@@ -2,7 +2,7 @@
 //!
 //! H1 invariant (cohort-A test plan): every grant terminates in a signed
 //! Receipt across all four termination paths. Coverage post-M3 follow-up
-//! (implementation-note-340, v2_receipt_coverage_audit_v030_2026_05_09):
+//! (implementation-note-243, v2_receipt_coverage_audit_v030_2026_05_09):
 //!
 //! | Path               | Location                                | TerminationReason |
 //! |--------------------|----------------------------------------|-------------------|

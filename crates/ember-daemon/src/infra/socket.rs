@@ -175,14 +175,14 @@ pub enum SocketError {
     Bind(std::io::Error),
     #[error("socket path already bound")]
     AlreadyBound,
-    /// implementation-note-235 (CRIT-C): an inode already exists at the
+    /// Per-agent UDS socket: an inode already exists at the
     /// per-agent socket path. Returned when the O_EXCL precondition under
     /// the parent-dir `flock()` fails, including the symlink-swap attack
     /// where a privileged container process pre-creates a symlink at the
     /// predictable path before emberd's permission check.
     #[error("per-agent socket path already exists: {0}")]
     AlreadyExists(PathBuf),
-    /// implementation-note-235: the UUID was previously tombstoned and
+    /// Per-agent UDS socket: the UUID was previously tombstoned and
     /// is permanently retired. Tombstoning prevents agent-id recycling so
     /// a freshly-spawned agent cannot inherit a previous agent's grants
     /// or audit trail by replaying its UUID.
@@ -314,13 +314,13 @@ pub struct SocketListener {
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     sessions_dir: Option<PathBuf>,
-    /// implementation-note-229: bound LLM proxy
+    /// Bound LLM proxy
     /// URL populated after the proxy listener binds in runtime.rs, then
     /// plumbed into every connection's RequestContext via handle_connection.
     llm_proxy_url: Option<String>,
-    /// implementation-note-229: bound git proxy URL.
+    /// Bound git proxy URL.
     git_proxy_url: Option<String>,
-    /// implementation-note-231 — integration
+    /// Integration
     /// tests in sibling crates (`emberlink-cli/tests/*.rs`) link against
     /// `ember-daemon` as cfg(not(test)), so the `cfg(test)` synthesis on
     /// `RequestContext::socket` does not fire. When this flag is set,
@@ -368,8 +368,7 @@ impl SocketListener {
     /// `RequestContext::socket_for_test` (mints a synthetic presence_token
     /// bound to the peer-cred uid) instead of `RequestContext::socket` (no
     /// presence_token under cfg(not(test))). Production code MUST NOT call
-    /// this — see the field docstring. implementation-note-311-
-    /// PRE-EXISTING-FAILURES.
+    /// this — see the field docstring.
     pub fn with_test_mode_synthetic_presence_token(mut self, enabled: bool) -> Self {
         self.test_mode_synthetic_presence_token = enabled;
         self
@@ -527,7 +526,7 @@ impl SocketListener {
                             let peer_for_task = Some(peer);
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let peer_for_task: Option<PeerIdentity> = None;
-                            // implementation-note-153: extract
+                            // Peercred principal binding: extract
                             // the (uid, pid, socket_path) triple once per
                             // connection so every dispatch on this stream
                             // gets the same kernel-attested principal.
@@ -781,7 +780,7 @@ pub fn ensure_socket_perms(_path: &Path) -> Result<(), SocketError> {
 /// responsibility. `verify_peer_uid` is the existing wrapper that
 /// re-applies the strict uid-match on top of this function.
 ///
-/// implementation-note-312: Phase A design destination.
+/// Per-method authority Phase A — design destination.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn read_peer_creds(stream: &UnixStream) -> Option<PeerCreds> {
     match stream.peer_cred() {
@@ -842,14 +841,14 @@ fn take_presence_token(
 ///
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 // The happy-path caller `test_verify_peer_uid_accepts_self_connection` lives
-// in `crates/ember-daemon/tests/socket_io.rs` (T2 integration test) per
-// implementation-note-313 — that test exercises the same
+// in `crates/ember-daemon/tests/socket_io.rs` (T2 integration test) —
+// that test exercises the same
 // kernel-attested uid invariant via `read_peer_creds`. This wrapper is kept
 // in-tree as the structural pairing for `verify_peer_uid_with` below; the
 // seam-based negative-path tests in this file still call `verify_peer_uid_with`.
 #[allow(dead_code)]
 fn verify_peer_uid(stream: &UnixStream) -> Option<PeerIdentity> {
-    // bridge_widening_removed (implementation-note-314):
+    // bridge_widening_removed:
     // design bridge widening removed; per-method authority gate from
     // Phase D (WebAuthn presence-token cache) is the replacement.
     verify_peer_uid_with(
@@ -1001,7 +1000,7 @@ async fn handle_connection(
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 let peer_for_ctx: Option<crate::infra::handler::PeerCred> = None;
 
-                // implementation-note-231: when
+                // When
                 // the listener was constructed with
                 // `with_test_mode_synthetic_presence_token(true)`, build via
                 // `socket_for_test` so external integration tests
@@ -1016,13 +1015,13 @@ async fn handle_connection(
                 ctx.sessions_dir = sessions_dir.clone();
                 ctx.llm_proxy_url = llm_proxy_url.clone();
                 ctx.git_proxy_url = git_proxy_url.clone();
-                // implementation-note-153: stamp the
+                // Peercred principal binding: stamp the
                 // kernel-attested principal captured at accept time so
                 // every dispatch on this connection inherits the same
                 // (uid, pid, socket_path) triple.
                 ctx.peer_cred_principal = peer_cred_principal.clone();
 
-                // implementation-note-112 — dispatch_method_panic_recovered.
+                // Panic-recovery async wrap — dispatch_method_panic_recovered.
                 //
                 // prior change shipped `recover_rpc_panic` as a sync
                 // `std::panic::catch_unwind` wrapper, but `catch_unwind` doesn't
@@ -1196,7 +1195,7 @@ async fn write_notification(
     writer.write_all(&bytes).await
 }
 
-// ---- implementation-note-235 ------------------------------------------
+// ---- Per-agent UDS socket ------------------------------------------------
 //
 // CRIT-1: a single shared daemon socket cannot distinguish two agents living
 // in different pid namespaces — `SO_PEERCRED.pid` is pid-namespace-relative,
@@ -1459,8 +1458,7 @@ pub fn tombstone_socket(uuid: Uuid) -> Result<(), SocketError> {
 mod tests {
     // T1 unit tests for `infra/socket.rs`. T2 integration tests that need a
     // real Unix-socket listener / per-agent socket factory I/O were refiled
-    // to `crates/ember-daemon/tests/socket_io.rs` per
-    // `implementation-note-313`. The five families that stay
+    // to `crates/ember-daemon/tests/socket_io.rs`. The five families that stay
     // in-tree are no-I/O: admission counters, `take_presence_token` parser,
     // `verify_peer_uid_with` seam-based negative paths, `daemon_euid` sanity,
     // `compute_next_accept_delay` sequence, `annotate_bind_error` branches,
@@ -1628,12 +1626,11 @@ mod tests {
         assert_eq!(uid, expected);
     }
 
-    // ── read_peer_creds tests (implementation-note-312) ──────
+    // ── read_peer_creds tests ─────────────────────────────────────────────
     //
     // The two `read_peer_creds_*` integration tests and the
     // `test_verify_peer_uid_accepts_self_connection` happy-path test were
-    // refiled to `crates/ember-daemon/tests/socket_io.rs` per
-    // `implementation-note-313` — they need a real
+    // refiled to `crates/ember-daemon/tests/socket_io.rs` — they need a real
     // `UnixListener` / `UnixStream` pair to exercise the kernel
     // `SO_PEERCRED` / `LOCAL_PEERCRED` path. The seam-based negative
     // tests below stay in-tree (no I/O).
@@ -1857,16 +1854,15 @@ mod tests {
         );
     }
 
-    // ---- implementation-note-235 ------------------------------------
+    // ---- Per-agent UDS socket ------------------------------------------
     //
     // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection
     // tests and the per-agent socket happy-path test were refiled to
-    // `crates/ember-daemon/tests/socket_io.rs` per
-    // `implementation-note-313` — they need a real on-disk
+    // `crates/ember-daemon/tests/socket_io.rs` — they need a real on-disk
     // tempdir + a real `UnixListener::bind` to exercise the
     // `create_per_agent_socket_with` O_EXCL + flock contract.
 
-    // ─── implementation-note-112 ────────────────────
+    // ─── Panic-recovery async wrap ───────────────────────────────────
     //
     // The dispatch-site wrapper in this file uses
     // `AssertUnwindSafe(future).catch_unwind().await` from

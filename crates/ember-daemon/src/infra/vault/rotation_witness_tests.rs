@@ -1,7 +1,7 @@
 use super::*;
 
 // ============================================================
-// implementation-note-304 — T2
+// implementation-note-223 — T2
 // round-trip: emit witness → chain-verify via Slice E3's
 // `verify_receipt_v2_with_rotation_chain`.
 //

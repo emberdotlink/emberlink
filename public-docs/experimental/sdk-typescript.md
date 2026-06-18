@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Experimental**. Reviewed: 2026-06-17. Status: current.
-
 # TypeScript SDK
 
 The TypeScript package exists, but the broader SDK/headless story is still
@@ -64,10 +59,11 @@ If you want the most stable public path today, prefer:
 
 - `ember init --for claude`
 - `ember claude`
+- `ember codex` if Codex is your native agent surface
 - `emberlink-mcp`
 
 If you are deciding whether the SDK is the right fit, start with
-[Choose an integration surface](../build/choosing-an-integration-surface/).
+[Choose an integration surface](../build/choosing-an-integration-surface.md).
 
 ## Source of truth
 

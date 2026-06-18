@@ -1,7 +1,7 @@
 //! CLASSIFICATION: PUBLIC
 //!
 //! Shell-init wrap for bare `claude` invocations — the opt-in half of
-//! the implementation-note-419 hybrid (operator
+//! the implementation-note-326 hybrid (operator
 //! decision 2026-05-15, design §Component 6 follow-up).
 //!
 //! The unconditional half is the `~/.ember/shadow/bin/claude` shim
@@ -58,7 +58,7 @@ pub fn render_wrap_block() -> String {
     format!(
         "{begin}\n\
          # Added by `ember install` — see design §Component 6\n\
-         # and implementation-note-419.\n\
+         # and implementation-note-326.\n\
          # Bare `claude` invocations route through `ember claude-code` so the\n\
          # brokered Claude Code launcher always wraps the session.\n\
          # Disable by setting EMBER_NO_CLAUDE_WRAP=1 in your shell before\n\

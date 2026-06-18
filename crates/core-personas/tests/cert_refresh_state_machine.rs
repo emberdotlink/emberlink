@@ -1,5 +1,5 @@
 //! T1 property tests for the bridge cert refresh state machine
-//! (M9 of design — implementation-note-75).
+//! (M9 of design — implementation-note-56).
 //!
 //! Anchor: `daemon_bridge_t1_refresh_property_tests_landed`.
 //!
@@ -60,7 +60,7 @@ use proptest::prelude::*;
 
 /// Persistent persona-row state the refresh protocol mutates. Mirrors
 /// the three SQLite columns introduced by
-/// implementation-note-76 (M1 of design) plus the
+/// implementation-note-57 (M1 of design) plus the
 /// implicit `grant_status` the per-RPC grant-active check reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersonaRow {
@@ -112,7 +112,7 @@ enum StepOutcome {
 }
 
 /// Events the state machine can observe. Models the four transition
-/// shapes called out in the implementation-note-75
+/// shapes called out in the implementation-note-56
 /// brief: `refresh`, `RPC`, `revoke`, `expire`.
 #[derive(Debug, Clone)]
 enum Event {

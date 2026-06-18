@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
-
 # GitHub Setup and Auth
 
 The current GitHub story is **App-first**.
@@ -89,7 +84,7 @@ recovery posture rather than the headline setup story.
 ```bash
 ember github status --json
 ember github setup
-ember status --troubleshoot
+ember doctor
 ```
 
 If GitHub is the only missing part of your install, those commands are the

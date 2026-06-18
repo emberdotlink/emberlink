@@ -1,7 +1,7 @@
 //! CLASSIFICATION: PUBLIC
 //! T2 integration test: `ember persona create` round-trips through daemon RPC.
 //!
-//! implementation-note-481 — under design
+//! implementation-note-384 — under design
 //! separate-uid posture (daemon uid ≠ operator uid) the CLI can no longer
 //! open the daemon's SQLite DB directly. All persona verbs must go through
 //! the JSON-RPC socket. This test exercises the create → list → revoke path

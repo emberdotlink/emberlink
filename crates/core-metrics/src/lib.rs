@@ -4,7 +4,7 @@
 //! label newtypes, forbidden-field gate. The actual Prometheus exporter
 //! wiring lives in a downstream crate (`emberd-metrics` or similar) and
 //! consumes these primitives. Build-ahead with no consumer yet; the
-//! exporter wire-up is tracked as `implementation-note-73`.
+//! exporter wire-up is tracked as `implementation-note-54`.
 //!
 //! This crate is `no_std`-friendly in spirit (no I/O, no `tokio`, no
 //! native deps) so it compiles to `wasm32-unknown-unknown` per

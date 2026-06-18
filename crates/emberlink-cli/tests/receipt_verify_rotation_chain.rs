@@ -1,5 +1,5 @@
 //! Integration tests for `ember receipt verify --file <PATH> --offline` walking
-//! the local rotation-witness chain (implementation-note-449).
+//! the local rotation-witness chain (implementation-note-351).
 //!
 //! Anchor: `ember_receipt_verify_walks_rotation_chain`.
 //!

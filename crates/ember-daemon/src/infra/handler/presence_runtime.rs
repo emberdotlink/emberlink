@@ -4,7 +4,7 @@ use super::*;
 /// the design §4 unlock/provision endpoints, where the operator-session CLI
 /// submits the KEK it just `se_unwrap`ped. The KEK is secret-in-transit (the §4
 /// interactive-honesty clause accepts this at dev0; eviction is load-bearing).
-pub(super) fn parse_scope_kek_hex(
+pub(crate) fn parse_scope_kek_hex(
     params: &Value,
     field: &str,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, (i32, String)> {
@@ -336,7 +336,7 @@ pub(super) fn handle_identity_device_list(
         .and_then(|root_id| root_id.strip_prefix(OPERATOR_ROOT_ID_PREFIX))
         .map(|s| s.to_string());
 
-    // implementation-note-244 (F9.3 LOW): compute
+    // (F9.3 LOW): compute
     // whether the operator-authority set is currently down to exactly ONE
     // Active `presence`-class Device. If so, surface `is_last_authority:
     // true` on that single device so the CLI/dashboard can render a
@@ -409,7 +409,7 @@ pub(super) fn handle_identity_device_list(
                 _ => false,
             };
 
-            // implementation-note-244: a device is
+            // A device is
             // the "only authority" iff it matches the lone Active
             // presence-class pubkey computed above. Non-presence devices
             // and revoked/frozen/replaced presence devices are never the
@@ -475,7 +475,7 @@ pub(super) fn handle_identity_device_list(
     Ok(json!({ "devices": devices }))
 }
 
-/// implementation-note-245 — map an `OperatorIdentityError`
+/// Map an `OperatorIdentityError`
 /// from the device-revoke plan/commit path into the daemon's wire `(code,
 /// message)` pair. The structural last-presence-device guard gets its own
 /// subspace code (-32032 via `RpcError::LastPresenceDeviceGuard`) so the CLI
@@ -530,7 +530,7 @@ fn map_revoke_error(
 /// "prepare succeeds, COMMIT might race" is captured by the lock-protected
 /// re-check inside `commit_device_revoke`.
 ///
-/// implementation-note-246: after the `DeviceRevoked`
+/// After the `DeviceRevoked`
 /// event commits, the COMMIT branch ALWAYS cascade-deletes the revoked
 /// Device's `presence_scope_kek` row (the encryption-side wrap an attacker
 /// holding only the daemon DB + the revoked Device's ECIES private key
@@ -572,7 +572,7 @@ pub(super) async fn handle_identity_device_revoke(
         .and_then(|v| v.as_str())
         .unwrap_or("operator-initiated revoke")
         .to_string();
-    // implementation-note-246 — the opt-in flag that
+    // The opt-in flag that
     // triggers `KEK_s` rotation on COMMIT. Missing field defaults to
     // `false` so a client that hasn't been recompiled against the new
     // schema gets the routine cascade-delete-only path, never an
@@ -601,7 +601,7 @@ pub(super) async fn handle_identity_device_revoke(
                 &target_device_id,
                 &reason,
             )
-            // implementation-note-245: the last-presence
+            // The last-presence
             // -device guard surfaces as -32032 so the CLI can render a typed
             // "enroll a replacement first" affordance; other revoke refusals
             // stay on -32030.
@@ -672,14 +672,14 @@ pub(super) async fn handle_identity_device_revoke(
                 signature,
                 now,
             )
-            // implementation-note-245: same typed-error
+            // Same typed-error
             // mapping the PREPARE path uses, so a COMMIT racing in after a
             // sibling-revoke draining the authority set down to the target
             // also surfaces -32032 (not -32030).
             // Anchor: device_revoke_last_device_distinct_error_code_landed.
             .map_err(|e| map_revoke_error("identity.device.revoke commit", e))?;
 
-            // implementation-note-246 — the cascade-
+            // The cascade-
             // delete + optional rotation MUST run UNDER the same
             // identity-mutation lock that gated the `DeviceRevoked`
             // append above (held by `_guard`), so a concurrent revoke
@@ -1744,6 +1744,10 @@ pub(super) fn widening_transient_kek_applies(method: &str) -> bool {
             | "propose_grant"
             | "save_delegation_template"
             | "resolve_approval"
+            | "approval.resolve"
+            | "approval_resolve"
+            | "approval.narrow"
+            | "approval_narrow"
             | "build_init_first_grant_receipt"
     )
 }
@@ -1819,7 +1823,7 @@ impl Drop for TransientKekEvictionGuard<'_> {
     }
 }
 
-// ── implementation-note-246 T2 integration tests ─────────────
+// ── KEK wrap-rotation T2 integration tests ─────────────
 #[cfg(test)]
 mod kek_wrap_rotation_tests {
     //! T2: in-memory `DaemonStore::open_in_memory()` paired with a

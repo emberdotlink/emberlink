@@ -93,7 +93,7 @@ pub fn run() -> Result<(), String> {
 
     // Phase 7b: install the `claude` shadow shim — bare `claude` inside a
     // launcher-managed agent shell auto-routes through `ember claude-code`
-    // (implementation-note-419). The shim is the
+    // (implementation-note-326). The shim is the
     // unconditional half of the hybrid; the opt-in shell-init wrap is
     // prompted by the interactive install wizard.
     // Anchor: dev_prod_parity_bare_claude_install_wiring_landed.

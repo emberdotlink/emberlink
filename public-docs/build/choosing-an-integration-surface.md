@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
-
 # Choose an Integration Surface
 
 Emberlink exposes more than one user-facing surface, but they are not equal.
@@ -10,8 +5,9 @@ Emberlink exposes more than one user-facing surface, but they are not equal.
 The current public truth is:
 
 1. **Launcher path first**
-2. **MCP second**
-3. **SDKs are experimental**
+2. **Constructs for credential-bearing command execution**
+3. **MCP for MCP-capable tool graphs**
+4. **SDKs are experimental**
 
 ## Use `ember claude` when
 
@@ -25,6 +21,41 @@ This is the best fit when:
 
 The launcher path is the current headline lane because it exercises the real
 daemon, grant, vault, receipt, and tool-brokering story together.
+
+## Use `ember codex` when
+
+Choose the Codex launcher when you already use Codex and are comfortable with
+the advanced path.
+
+This is the best fit when:
+
+- you have already authenticated Codex with `codex login`
+- you want Emberlink session registration and daemon mediation around Codex
+- you understand that Codex starts from Codex's native login path before
+  Emberlink imports and brokers runtime authority with operator consent
+
+`ember codex` is real and supported, but it is not the headline friendly
+onboarding lane. If you are debugging a first run and do not specifically need
+Codex, start with `ember claude`.
+
+## Use a Construct when
+
+Choose a Construct when the integration problem is credential-bearing command
+execution.
+
+This is the best fit when:
+
+- the agent already uses a CLI such as `gh` or `git`
+- the sensitive moment is a tool action that needs delegated authority
+- you need action classification, grant evaluation, materialization, and
+  receipt evidence around that tool action
+
+Constructs are not a general plugin system. They are authority gates for
+actions where credentials and accountability matter.
+
+For `v0.3.0`, the validated public Construct proof surface is `ember-gh` and
+`ember-git`. Additional Constructs such as `ember-aws`, `ember-kubectl`, and
+other provider lanes are experimental or in flight.
 
 ## Use `emberlink-mcp` when
 
@@ -60,6 +91,9 @@ the launcher or MCP lanes.
 | Surface | Current state | Best for |
 |---|---|---|
 | `ember claude` | **Supported** | Friendly operators and the main pre-release user story |
+| `ember codex` | **Supported, advanced** | Codex users who start from native login and want brokered runtime authority inside a managed session |
+| `ember-gh`, `ember-git` | **Supported** | The `v0.3.0` brokered Git/GitHub proof surface |
+| Additional Constructs | **Experimental** | Provider/tool lanes such as `ember-aws` and `ember-kubectl` that are still being validated |
 | `emberlink-mcp` | **Preview** | Tool/server integration in MCP-capable environments |
 | TypeScript / Python SDKs | **Experimental** | Custom programmatic integration against a moving and not-yet-fully-audited contract |
 
@@ -69,14 +103,17 @@ Do not assume these surfaces are interchangeable:
 
 - MCP is not a second trust root
 - the SDKs are not a more-supported replacement for the launcher path
-- the launcher path is not the right answer for every non-Claude environment
+- Constructs are not interchangeable with MCP
+- the launcher path is not the right answer for every custom or headless
+  environment
 
 Pick the surface that matches your environment and your tolerance for churn.
 
 ## Next pages
 
-- [Constructs and mediated tools](./constructs-and-mediated-tools/)
-- [MCP integration](./mcp-integration/)
-- [TypeScript SDK](../experimental/sdk-typescript/)
-- [Python SDK](../experimental/sdk-python/)
-- [Install and first run](../get-started/install-and-first-run/)
+- [Constructs and mediated tools](./constructs-and-mediated-tools.md)
+- [Construct Authoring Model](./build-a-construct.md)
+- [MCP integration](./mcp-integration.md)
+- [TypeScript SDK](../experimental/sdk-typescript.md)
+- [Python SDK](../experimental/sdk-python.md)
+- [Install and first run](../get-started/install-and-first-run.md)

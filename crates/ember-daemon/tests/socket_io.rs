@@ -8,7 +8,7 @@
 //! filesystem path + real Unix-socket listener to exercise the end-to-end
 //! request/response pipeline is a T2 integration file like this one.
 //!
-//! Refiled per `implementation-note-313`. Tests cover:
+//! Refiled per `implementation-note-281`. Tests cover:
 //! - JSON-RPC happy path through `SocketListener::run` (`ping`, `list_personas`,
 //!   `create_persona`) including unknown-method (-32601) + malformed-JSON
 //!   (-32700) error shapes
@@ -327,7 +327,7 @@ async fn test_list_personas_empty() {
 
 // ----- read_peer_creds + same-uid gate tests ------------------------------
 //
-// implementation-note-312. Exercise `read_peer_creds`
+// implementation-note-282. Exercise `read_peer_creds`
 // against a real same-process socket pair where the peer credentials
 // must surface the test process's own uid/gid/pid.
 
@@ -467,7 +467,7 @@ async fn test_verify_peer_uid_accepts_self_connection() {
         .await;
 }
 
-// ----- implementation-note-235 tests -----------------------------------
+// ----- implementation-note-218 tests -----------------------------------
 //
 // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection.
 // Both tests use the `_with` seam so we can drive the would-be-path

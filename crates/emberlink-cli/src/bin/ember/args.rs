@@ -69,7 +69,7 @@ pub(super) enum Commands {
         /// notice and falls back to the passphrase lane.
         #[arg(long, hide = true)]
         touch_id: bool,
-        /// Canonical onboarding for Claude or Codex.
+        /// Canonical onboarding for Claude, Codex, Cursor, or Gemini.
         ///
         /// Canonical value: `claude`. When set, `ember init` completes the
         /// standard first-run setup, creates or reuses the default Claude
@@ -91,6 +91,11 @@ pub(super) enum Commands {
         /// traffic can use Ember's brokered OpenAI Responses lane. `codex
         /// login status` remains the native auth-readiness check and `codex
         /// login --device-auth` remains the headless sign-in escape hatch.
+        ///
+        /// Cursor (target value `cursor`) sets up the baseline host launcher
+        /// persona and local-only runtime grant. Cursor account/model auth
+        /// remains Cursor-owned on this lane; Ember does not broker Cursor
+        /// model spend unless a separate mediation mode is explicitly designed.
         #[arg(long = "for", value_name = "TARGET")]
         for_target: Option<OnboardingTarget>,
         /// Skip all interactive prompts. When set and the daemon is not
@@ -115,7 +120,9 @@ pub(super) enum Commands {
     ///
     /// `--for claude` removes only the lines this onboarding path added to
     /// `~/.claude/settings.json`. `--for codex` removes only the hook block
-    /// this onboarding path added to `~/.codex/hooks.json`.
+    /// this onboarding path added to `~/.codex/hooks.json`. `--for cursor`
+    /// is currently a no-op for Cursor config because baseline Cursor launch
+    /// does not mutate Cursor-owned settings.
     /// Persona, grant, and vault entries are left in place — they may be in
     /// use by other tools.
     Uninstall {
@@ -543,6 +550,77 @@ pub(super) enum Commands {
         #[arg(value_name = "CURSOR_ARGS")]
         args: Vec<String>,
     },
+    /// Launch the Gemini CLI under an Ember-managed session (design §2).
+    ///
+    /// Brokers Google's Gemini CLI on its free "Sign in with Google" (Code
+    /// Assist) OAuth tier: the daemon injects a refreshed Bearer server-side and
+    /// the launcher relocates `GEMINI_CLI_HOME` so the child never holds the
+    /// durable credential. Run `ember init --for gemini` first to import your
+    /// `~/.gemini/oauth_creds.json`.
+    ///
+    /// `--prod` is implicit when neither lane flag is given.
+    /// `--isolated` and `--sandbox sandvault` are accepted for a canonical
+    /// error, but are not wired for the host-only brokered Gemini lane.
+    /// Trailing Gemini args are forwarded on the host path.
+    #[command(name = "gemini", trailing_var_arg = true, allow_hyphen_values = true)]
+    Gemini {
+        /// Use the current worktree's dev daemon flavor.
+        /// Mutually exclusive with --prod.
+        #[arg(long, conflicts_with = "prod")]
+        dev: bool,
+        /// Use the prod daemon flavor (~/.ember/run/daemon.sock). Default when
+        /// neither --dev nor --prod is given.
+        /// Mutually exclusive with --dev.
+        #[arg(long, conflicts_with = "dev")]
+        prod: bool,
+        /// Force the host-resident launcher path.
+        #[arg(long, conflicts_with_all = ["isolated", "sandbox"])]
+        host: bool,
+        /// Reserved for a future container-side mediation lane; currently errors.
+        #[arg(long, conflicts_with_all = ["host", "sandbox"])]
+        isolated: bool,
+        /// Reserved for a future sandbox adapter; currently errors.
+        #[arg(long, value_enum, conflicts_with_all = ["host", "isolated"])]
+        sandbox: Option<SandboxRuntime>,
+        /// Deny out-of-scope authority instead of falling through to JIT approval.
+        #[arg(long)]
+        strict: bool,
+        /// Delegation template to attach at launch.
+        #[arg(long = "delegated", value_name = "TEMPLATE")]
+        delegated: Option<String>,
+        /// Explicitly attach to an already-live runtime persona instead of
+        /// minting a fresh runtime for this launch.
+        #[arg(
+            long = "attach",
+            value_name = "RUNTIME_PERSONA_ID",
+            conflicts_with = "fork_runtime"
+        )]
+        attach_runtime_persona_id: Option<String>,
+        /// Explicitly open a fresh runtime persona. This is the default unless
+        /// `--attach` is supplied; pair with `--delegated` to fork-and-reattest.
+        #[arg(long = "fork")]
+        fork_runtime: bool,
+        /// Advanced isolated-path backend hint (docker, orbstack, podman).
+        /// Requires `--isolated`; reserved for future Gemini isolated support.
+        #[arg(long, value_name = "NAME", conflicts_with = "sandbox")]
+        backend: Option<String>,
+        /// Advanced isolated-path preset/profile hint (dev, headless, demo).
+        /// Requires `--isolated`; reserved for future Gemini isolated support.
+        #[arg(long, value_name = "NAME", conflicts_with = "sandbox")]
+        preset: Option<String>,
+        /// Launch the session from an Ember-managed git worktree.
+        #[arg(long, value_name = "NAME")]
+        worktree: Option<String>,
+        /// Override the branch name created for a new managed worktree.
+        #[arg(long, requires = "worktree")]
+        branch: Option<String>,
+        /// Short operator note recorded in `.agent-session`.
+        #[arg(long, requires = "worktree")]
+        purpose: Option<String>,
+        /// Trailing arguments forwarded verbatim to the Gemini CLI.
+        #[arg(value_name = "GEMINI_ARGS")]
+        args: Vec<String>,
+    },
     /// Demo subcommands — canned flows for friendly-dev onboarding and
     /// the locked composite-grant recording flow.
     ///
@@ -584,11 +662,12 @@ pub(super) enum Commands {
     },
     /// Manage content-hash-pinned binaries.
     ///
-    /// Reads/writes `~/.ember/binaries/manifest.toml`. Verbs:
-    ///   `install <tool>@<version> --from-path <path>`
-    ///   `list`
+    /// Reads/writes `/usr/local/lib/ember/binaries/manifest.toml` by default.
+    /// Pass `--manifest-path` for noncanonical or test manifests. Verbs:
+    ///   `install <tool>@<version> --from-path <path> [--manifest-path <path>]`
+    ///   `list [--manifest-path <path>]`
     ///   `update <tool>`   (stub — not yet implemented)
-    ///   `remove <tool>@<version>`
+    ///   `remove <tool>@<version> [--manifest-path <path>]`
     #[command(hide = true)]
     Binary {
         #[command(subcommand)]
@@ -741,19 +820,18 @@ pub(super) enum Commands {
 /// implementation: persona/grant wiring, `~/.claude/settings.json`
 /// patcher, and the Claude runtime grant.
 ///
-/// `codex` is accepted at the parse level so the help text's
-/// "Canonical onboarding for Claude or Codex" promise is honoured.
-/// The dispatch arm is a stub today — see the
-/// `Some(OnboardingTarget::Codex)` branch in the `Init` handler —
-/// because the Codex hook-wiring path
-/// (`~/.codex/hooks.json` patcher, Codex's native auth lane probe)
-/// is broader work.
+/// `cursor` provisions the baseline host launcher lane only. It deliberately
+/// does not import or broker Cursor account/model credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(super) enum OnboardingTarget {
     #[value(name = "claude")]
     Claude,
     #[value(name = "codex")]
     Codex,
+    #[value(name = "cursor")]
+    Cursor,
+    #[value(name = "gemini")]
+    Gemini,
 }
 
 
@@ -872,7 +950,7 @@ pub(super) struct GithubSetupArgs {
 pub(super) enum GithubAppAction {
     /// Print the canonical public GitHub App install URL
     InstallUrl,
-    /// Print the canonical public GitHub App manifest doc
+    /// Print the GitHub App permission-floor reference
     Show,
     /// Hidden low-level registration surface. Most operators should use `ember github setup`.
     Register(GithubAppRegisterArgs),
@@ -1313,17 +1391,19 @@ pub(super) enum BinaryAction {
         /// Publisher DID (defaults to "did:unknown").
         #[arg(long, default_value = "did:unknown")]
         publisher: String,
+        /// Manifest TOML path. Defaults to `/usr/local/lib/ember/binaries/manifest.toml`.
+        #[arg(long)]
+        manifest_path: Option<std::path::PathBuf>,
     },
     /// Batch-register all Cohort-A Construct binaries from a directory
     /// into a single signed manifest. The manifest is signed with the dev
-    /// IdentityRoot from Keychain and written to the canonical location the
-    /// daemon's broker reads (`~/.ember/binaries/manifest.toml` by default).
-    /// Used by the host refresh script after the binary install loop.
+    /// IdentityRoot from Keychain and written to the bundled system manifest
+    /// path by default. Used by release packaging and host refresh scripts.
     InstallBundle {
         /// Directory holding the bundled Construct binaries.
         #[arg(long)]
         from_dir: Option<std::path::PathBuf>,
-        /// Destination TOML path. Defaults to `<HOME>/.ember/binaries/manifest.toml`.
+        /// Destination TOML path. Defaults to `/usr/local/lib/ember/binaries/manifest.toml`.
         #[arg(long)]
         manifest_path: Option<std::path::PathBuf>,
         /// Publisher DID stamped on every entry.
@@ -1343,7 +1423,11 @@ pub(super) enum BinaryAction {
         identity_root_keypath: Option<std::path::PathBuf>,
     },
     /// Print all registered binaries from the manifest.
-    List,
+    List {
+        /// Manifest TOML path. Defaults to `/usr/local/lib/ember/binaries/manifest.toml`.
+        #[arg(long)]
+        manifest_path: Option<std::path::PathBuf>,
+    },
     /// Stub: not yet implemented. Use install with the new version explicitly.
     Update {
         /// Tool name to update (e.g. `ember-gh`).
@@ -1353,6 +1437,9 @@ pub(super) enum BinaryAction {
     Remove {
         /// Tool name and version: `<name>@<version>` (e.g. `ember-gh@1.0.0`).
         tool_at_version: String,
+        /// Manifest TOML path. Defaults to `/usr/local/lib/ember/binaries/manifest.toml`.
+        #[arg(long)]
+        manifest_path: Option<std::path::PathBuf>,
     },
 }
 

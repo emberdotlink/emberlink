@@ -1,10 +1,10 @@
 //! Subprocess launchers for friendly-dev integrations (`ember claude`,
 //! `ember codex`).
 //!
-//! Per design §2 / implementation-note-430: thin wrappers that register a session with
+//! Per design §2 / implementation-note-338: thin wrappers that register a session with
 //! the daemon, inject the appropriate env vars, and `exec` the upstream
 //! binary. Today the daemon round-trip is stubbed (real RPC lands in
-//! implementation-note-255 / implementation-note-435); the env shape and exit semantics are locked
+//! implementation-note-193 / implementation-note-339); the env shape and exit semantics are locked
 //! here so the rest of the cohort A flow can call this surface from day
 //! one without re-shaping the launcher when the stubs are filled in.
 
@@ -13,6 +13,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod core;
 pub mod cursor;
+pub mod gemini;
 pub mod harness;
 pub mod path_shadow;
 pub mod presence;
@@ -28,7 +29,7 @@ pub mod worktree;
 /// (e.g. via the future `-w` flag), or `None` when no worktree-specific
 /// context applies — yielding the suffix `default`.
 ///
-/// implementation-note-436 checkpoint.
+/// implementation-note-340 checkpoint.
 pub fn default_persona_id_for_runtime(runtime: &str, ctx: Option<&str>) -> String {
     format!("{}-{}", runtime, ctx.unwrap_or("default"))
 }

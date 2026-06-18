@@ -9,7 +9,7 @@
 //!
 //! Also owns the `claude` shadow-shim installer
 //! ([`install_claude_shadow_shim`]) — the unconditional half of the
-//! implementation-note-419 hybrid (operator decision
+//! implementation-note-326 hybrid (operator decision
 //! 2026-05-15). Anchor: `dev_prod_parity_bare_claude_install_wiring_landed`.
 
 use std::fs;
@@ -100,7 +100,7 @@ fn render_claude_shim_body(ember_binary: &Path) -> String {
         "#!/bin/sh\n\
          {checkpoint}\n\
          # Bare `claude` redirector installed by `ember dev install` per\n\
-         # design §Component 6 + implementation-note-419.\n\
+         # design §Component 6 + implementation-note-326.\n\
          # When this shim is on PATH, `claude` routes through `ember claude-code`\n\
          # so the brokered Claude Code launcher always wraps the session.\n\
          # Disable by setting EMBER_NO_CLAUDE_WRAP=1 before launching.\n\
@@ -300,7 +300,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // implementation-note-419 — shadow shim tests.
+    // implementation-note-326 — shadow shim tests.
     // Checkpoint mirrored in test body so a grep covers production + tests:
     //   dev_prod_parity_bare_claude_install_wiring_landed
     // ─────────────────────────────────────────────────────────────────────

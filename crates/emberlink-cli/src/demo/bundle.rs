@@ -1,5 +1,5 @@
 //! `ember demo bundle` — mint the locked May-3 4-statement composite-grant
-//! bundle (implementation-note-416).
+//! bundle (implementation-note-323).
 //!
 //! Submits ONE composite-approval entry with the four locked statements:
 //!   - \[0\] `credential:read` on `anthropic-key`
@@ -7,7 +7,7 @@
 //!   - \[2\] `time:wall_clock` on `*` (90s)
 //!   - \[3\] `credential:read` on `github-token`
 //!
-//! implementation-note-417: tokens cap is sized as defense-in-depth (1M
+//! implementation-note-324: tokens cap is sized as defense-in-depth (1M
 //! is well above any 90-second realistic session). The cents cap (5¢) is the
 //! load-bearing enforcement axis — the voiceover names it. Pre-flight token
 //! estimation in `pricing::estimate_call_tokens` was previously tripping on

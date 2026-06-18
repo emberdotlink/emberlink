@@ -3153,7 +3153,7 @@ mode = "jit_approval""#,
     }
 
     // -----------------------------------------------------------------------
-    // needs_credentials + credential_types tests (implementation-note-45)
+    // needs_credentials + credential_types tests (implementation-note-32)
     // -----------------------------------------------------------------------
 
     #[test]

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use crate::infra::rpc_error::RpcError;
 use crate::infra::store::DaemonStore;
 
-/// implementation-note-32 (Tier 1) — subprocess
+/// implementation-note-181 (Tier 1) — subprocess
 /// observability without a session. A Construct shim that finds
 /// `EMBER_SESSION_ID` unset (or its classifier returning `None`) still
 /// passthrough-execs the wrapped binary, but emits this best-effort RPC

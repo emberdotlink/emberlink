@@ -70,6 +70,18 @@ pub enum PreflightDecision {
     },
 }
 
+/// Per-upstream-call observation used to mint the visible `proxy_call`
+/// receipt and event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyCallReceiptRequest {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub outcome: String,
+}
+
 /// Trait that decouples proxy pipeline logic from its backing store and vault.
 ///
 /// The co-located implementation (`ColocatedBackend`) delegates to the daemon's
@@ -187,6 +199,33 @@ pub trait PolicyBackend: Send + Sync + 'static {
         ))
     }
 
+    /// Resolve a short-window OAuth **Bearer** access token for the gemini Code
+    /// Assist ("Sign in with Google") loopback lane (design slice 2).
+    ///
+    /// Symmetric with [`resolve_chatgpt_plan_auth`], but the Code Assist lane
+    /// needs only a single `Authorization: Bearer <access_token>` (no
+    /// account-id). The vault stores the gemini `oauth_creds.json` blob
+    /// (`{access_token, refresh_token, expiry_date, ...}`); the daemon
+    /// implementation parses it, refreshes the access token against Google's
+    /// OAuth token endpoint (`oauth2.googleapis.com/token`) with the gemini-cli
+    /// public client id/secret + the stored `refresh_token` when it is near
+    /// expiry, and returns ONLY the access token the proxy injects. The
+    /// `refresh_token` deliberately never crosses this boundary (it stays
+    /// daemon-only — the structural-absence root the loopback lane relies on).
+    ///
+    /// Returns [`PolicyError::Forbidden`] with a re-auth signal when the
+    /// `refresh_token` is expired/reused/revoked (the operator must re-run the
+    /// gemini "Sign in with Google" flow). The default errors so non-gemini
+    /// backends need not implement it.
+    async fn resolve_oauth_bearer(
+        &self,
+        _credential_name: &str,
+    ) -> Result<Zeroizing<String>, PolicyError> {
+        Err(PolicyError::Other(
+            "oauth bearer auth not supported by this backend".into(),
+        ))
+    }
+
     /// Meter post-flight usage against the resolved grant/statement.
     ///
     /// `usage` is `None` when the upstream response did not include usage
@@ -203,12 +242,24 @@ pub trait PolicyBackend: Send + Sync + 'static {
     /// Distinct from `post_flight` so the daemon-side implementation can
     /// route the two through different metering paths — Slice B will land
     /// the in-process implementation, Slice C the remote one.
-    /// (implementation-note-78.)
+    /// (implementation-note-59.)
     async fn post_flight_meter(
         &self,
         resolved: &ResolvedGrant,
         usage: Option<core_grant_types::Usage>,
     ) -> Result<(), PolicyError>;
+
+    /// Mint a signed receipt for the human-visible `proxy_call` event.
+    ///
+    /// Backends without a receipt subsystem return `Ok(None)`; the forwarding
+    /// runtime then omits the event rather than emitting an unsigned demo id.
+    async fn issue_proxy_call_receipt(
+        &self,
+        _resolved: &ResolvedGrant,
+        _call: &ProxyCallReceiptRequest,
+    ) -> Result<Option<String>, PolicyError> {
+        Ok(None)
+    }
 
     /// Append an audit event.
     ///

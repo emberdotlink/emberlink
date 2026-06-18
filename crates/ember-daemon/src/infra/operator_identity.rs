@@ -353,7 +353,7 @@ pub enum OperatorIdentityError {
     SelfRootMismatch,
     /// Building or appending a genesis / enrollment event failed.
     Genesis(String),
-    /// implementation-note-245 (F9.2 LOW): the structural
+    /// implementation-note-195 (F9.2 LOW): the structural
     /// last-presence-device guard refused the revoke because the targeted
     /// device is the lone Active `presence`-class Device under the operator
     /// root — revoking it would brick the authority set (no presence key left
@@ -776,7 +776,7 @@ pub struct OobBackupEnrollPlan {
     pub step: OobEnrollStep,
 }
 
-// implementation-note-282 — checkpoint
+// implementation-note-206 — checkpoint
 // `device_revoke_plan_uses_typed_carrier_landed`. The previous
 // `device_revoke_plan` returned [`OobBackupEnrollPlan`] and stuffed a
 // placeholder `DeviceEnrolledEvent` into its `event` field (all empty
@@ -1100,7 +1100,7 @@ pub fn device_revoke_plan(
             target_device_id,
         );
         if remaining < MIN_ACTIVE_PRESENCE_DEVICES_AFTER_REVOKE {
-            // implementation-note-245 (F9.2 LOW): typed
+            // implementation-note-195 (F9.2 LOW): typed
             // refusal so the daemon RPC can map THIS guard to a distinct
             // wire code (-32032) without renumbering the generic -32030
             // presence-locked bucket. Anchor:
@@ -2649,7 +2649,7 @@ mod tests {
             "would-brick",
         )
         .unwrap_err();
-        // implementation-note-245: the last-device guard
+        // implementation-note-195: the last-device guard
         // returns its own typed variant (mapped to -32032 at the RPC boundary),
         // not the generic Genesis(_) bucket the other refusals use.
         // Anchor: device_revoke_last_device_distinct_error_code_landed.
@@ -2752,7 +2752,7 @@ mod tests {
         assert!(msg.contains("not Active"), "got: {msg}");
     }
 
-    /// implementation-note-282 — pins the
+    /// implementation-note-206 — pins the
     /// [`OobRevokePlan`] carrier shape so a future field addition to the
     /// plan forces this test to be updated rather than producing a
     /// silent runtime stub (which is what the placeholder

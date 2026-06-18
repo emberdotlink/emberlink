@@ -27,7 +27,7 @@ fn fake_req(
         composite_statements: None,
         result_grant_id: None,
         skill_ref: None,
-        // implementation-note-13 —
+        // implementation-note-186 —
         // banner-title fixtures don't exercise grant shaping; defaults
         // to None.
         max_delegation_depth: None,
@@ -61,7 +61,7 @@ fn minimal_req() -> ApprovalRequestInfo {
         composite_statements: None,
         result_grant_id: None,
         skill_ref: None,
-        // implementation-note-13 —
+        // implementation-note-186 —
         // minimal fixture: shaping defaults to None.
         max_delegation_depth: None,
         max_uses_per_hour: None,

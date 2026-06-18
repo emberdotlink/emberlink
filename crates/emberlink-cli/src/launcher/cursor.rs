@@ -19,6 +19,16 @@ use crate::launcher::session_rpc::{
 };
 
 const CURSOR_BIN_CANDIDATES: &[&str] = &["cursor-agent", "cursor"];
+const CURSOR_PROXY_ENV: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 pub fn resolve_cursor_bin() -> String {
     resolve_cursor_bin_path()
@@ -173,6 +183,22 @@ fn run_with_registration_with_workspace_ref(
     if let Some(ref git_proxy_url) = registration.git_proxy_url {
         extra_env.push(("EMBER_GIT_PROXY_URL".to_string(), git_proxy_url.clone()));
     }
+    if let Some(ref cursor_egress_proxy_url) = registration.cursor_egress_proxy_url {
+        for key in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            extra_env.push((key.to_string(), cursor_egress_proxy_url.clone()));
+        }
+        extra_env.push((
+            "EMBER_CURSOR_EGRESS_PROXY_URL".to_string(),
+            cursor_egress_proxy_url.clone(),
+        ));
+    }
     if let Some(ref sock) = registration.ssh_auth_sock {
         extra_env.push(("SSH_AUTH_SOCK".to_string(), sock.clone()));
     }
@@ -193,10 +219,9 @@ fn run_with_registration_with_workspace_ref(
         ));
     }
 
-    // Do not derive HTTPS_PROXY from registration.proxy_url here. That field is
-    // the existing model-proxy/session URL, not a Cursor-compatible CONNECT
-    // egress proxy. Cursor egress control needs a daemon-provided per-session
-    // egress URL before the launcher can set HTTPS_PROXY honestly.
+    // Do not derive HTTPS_PROXY from registration.proxy_url or git_proxy_url.
+    // Those are credential projector URLs, not Cursor-compatible generic
+    // CONNECT egress. Cursor gets proxy env only from cursor_egress_proxy_url.
     with_session_close(
         &registration.session_id,
         socket_path,
@@ -211,7 +236,7 @@ fn run_with_registration_with_workspace_ref(
                     socket_path,
                     shadow_bin_dir: shadow_dir,
                     current_dir: Some(&launch_cwd),
-                    stripped_env: &[],
+                    stripped_env: CURSOR_PROXY_ENV,
                 },
                 registration,
                 extra_env,
@@ -354,6 +379,8 @@ pub fn prod_construct_specs_or_error() -> io::Result<Vec<ConstructSpec>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launcher::core::{AuthorityPosture, SessionRegistration};
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -391,14 +418,44 @@ mod tests {
         }
     }
 
+    fn fixture_registration() -> SessionRegistration {
+        SessionRegistration {
+            session_id: "sess_cursor_fixture".to_string(),
+            grant_id: "grant_cursor_fixture".to_string(),
+            proxy_url: "http://127.0.0.1:8484".to_string(),
+            persona_id: None,
+            anthropic_base_url: None,
+            anthropic_custom_headers: None,
+            git_proxy_url: None,
+            cursor_egress_proxy_url: None,
+            codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
+            ssh_auth_sock: None,
+            delegation_id: None,
+            delegation_template: None,
+            authority_posture: AuthorityPosture::from_components(false, None),
+            bridge_client_bundle: None,
+            attachment_id: Some("att_cursor_fixture".to_string()),
+            attachment_endpoint_token: Some("ep_cursor_fixture".to_string()),
+            anthropic_unix_socket: None,
+            leaf_report_nonce: None,
+        }
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+    }
+
     #[test]
     fn resolve_cursor_bin_honors_override() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::set("EMBER_CURSOR_BIN", "/tmp/custom-cursor");
+        let _guard = EnvGuard::set("EMBER_CURSOR_BIN", "/opt/custom-cursor");
 
         assert_eq!(
             resolve_cursor_bin_path().unwrap(),
-            PathBuf::from("/tmp/custom-cursor")
+            PathBuf::from("/opt/custom-cursor")
         );
     }
 
@@ -408,5 +465,85 @@ mod tests {
         let _guard = EnvGuard::remove("EMBER_PERSONA");
 
         assert_eq!(resolve_persona_name(), "cursor-default");
+    }
+
+    #[test]
+    fn cursor_launch_strips_ambient_proxy_env_without_daemon_egress_url() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _https = EnvGuard::set("HTTPS_PROXY", "http://ambient.invalid:1");
+        let _https_lower = EnvGuard::set("https_proxy", "http://ambient.invalid:1");
+        let _http = EnvGuard::set("HTTP_PROXY", "http://ambient.invalid:2");
+        let _http_lower = EnvGuard::set("http_proxy", "http://ambient.invalid:2");
+        let _all = EnvGuard::set("ALL_PROXY", "http://ambient.invalid:3");
+        let _all_lower = EnvGuard::set("all_proxy", "http://ambient.invalid:3");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "cursor.com");
+        let _no_proxy_lower = EnvGuard::set("no_proxy", "cursor.com");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("check-no-proxy-env.sh");
+        write_executable(
+            &script,
+            "#!/bin/sh\n\
+             [ -z \"${HTTPS_PROXY+x}\" ] || exit 61\n\
+             [ -z \"${https_proxy+x}\" ] || exit 62\n\
+             [ -z \"${HTTP_PROXY+x}\" ] || exit 63\n\
+             [ -z \"${http_proxy+x}\" ] || exit 64\n\
+             [ -z \"${ALL_PROXY+x}\" ] || exit 65\n\
+             [ -z \"${all_proxy+x}\" ] || exit 66\n\
+             [ -z \"${NO_PROXY+x}\" ] || exit 67\n\
+             [ -z \"${no_proxy+x}\" ] || exit 68\n\
+             [ -z \"${EMBER_CURSOR_EGRESS_PROXY_URL+x}\" ] || exit 69\n\
+             exit 0\n",
+        );
+
+        let code = run_with_registration(
+            script.to_str().expect("utf8 script path"),
+            &[],
+            "cursor-default",
+            &fixture_registration(),
+            Path::new("/tmp/nonexistent-ember.sock"),
+            tmp.path(),
+        )
+        .expect("run script");
+
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn cursor_launch_injects_daemon_cursor_egress_proxy_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _https = EnvGuard::set("HTTPS_PROXY", "http://ambient.invalid:1");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "cursor.com");
+        let _no_proxy_lower = EnvGuard::set("no_proxy", "cursor.com");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("check-cursor-egress-env.sh");
+        write_executable(
+            &script,
+            "#!/bin/sh\n\
+             expected='http://127.0.0.1:61234'\n\
+             [ \"$HTTPS_PROXY\" = \"$expected\" ] || exit 71\n\
+             [ \"$https_proxy\" = \"$expected\" ] || exit 72\n\
+             [ \"$HTTP_PROXY\" = \"$expected\" ] || exit 73\n\
+             [ \"$http_proxy\" = \"$expected\" ] || exit 74\n\
+             [ \"$ALL_PROXY\" = \"$expected\" ] || exit 75\n\
+             [ \"$all_proxy\" = \"$expected\" ] || exit 76\n\
+             [ \"$EMBER_CURSOR_EGRESS_PROXY_URL\" = \"$expected\" ] || exit 77\n\
+             [ -z \"${NO_PROXY+x}\" ] || exit 78\n\
+             [ -z \"${no_proxy+x}\" ] || exit 79\n\
+             exit 0\n",
+        );
+        let mut registration = fixture_registration();
+        registration.cursor_egress_proxy_url = Some("http://127.0.0.1:61234".to_string());
+
+        let code = run_with_registration(
+            script.to_str().expect("utf8 script path"),
+            &[],
+            "cursor-default",
+            &registration,
+            Path::new("/tmp/nonexistent-ember.sock"),
+            tmp.path(),
+        )
+        .expect("run script");
+
+        assert_eq!(code, 0);
     }
 }

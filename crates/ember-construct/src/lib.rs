@@ -248,7 +248,7 @@ pub static VENDORS: &[VendorManifest] = &[
         binary_env_var: "EMBER_SCION_BINARY",
         classifier: scion::classify_scion_argv_key,
         // Scion overrides the default identity translator per design §4
-        // (implementation-note-102): emberlink-shaped argv
+        // (implementation-note-83): emberlink-shaped argv
         // (`--persona X --max-depth N --template emberlink-worker --brief ...`)
         // becomes scion-native (`--type emberlink-worker --non-interactive`).
         argv_translator: scion::translate_scion_argv,
@@ -606,7 +606,7 @@ mod resolve_binary_tests {
 }
 
 // ---------------------------------------------------------------------------
-// translate_argv hook tests (implementation-note-33)
+// translate_argv hook tests (implementation-note-84)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

@@ -24,7 +24,7 @@
 //!   binary blake3 against the manifest. Mismatch → fail-closed.
 //! - Missing manifest → fail-closed with directive to run generate.
 //!
-//! Path 2 (filed as `implementation-note-177`) replaces the
+//! Path 2 (filed as `implementation-note-146`) replaces the
 //! daemon-self-signing model with Ember Systems IdentityRoot pre-signing
 //! in the release pipeline. Until then, this module's TOFU is the
 //! strongest v0.3-shippable check.

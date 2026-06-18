@@ -1,3 +1,9 @@
+// dispatch_method_revoke_coverage_audited
+//
+// dispatch_revoke_audit_relocated: the detailed revoke-coverage audit record
+// lives outside this dispatcher module. Keep this checkpoint in handler.rs for
+// the bridge-prerequisite proof breadcrumb; do not re-expand the audit table
+// here.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -6,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use core_approval::{ApprovalLifecycle, SubmitMetadata};
 #[cfg(test)]
 use core_personas::MtlsPrincipal;
 
@@ -16,7 +21,6 @@ use crate::infra::receipt::{current_identity, issue::issue_atomic_receipt};
 use crate::infra::rpc_error::RpcError;
 use crate::infra::store::DaemonStore;
 use crate::infra::vault::Vault;
-use crate::trust::approval::DaemonApprovalStoreRef;
 #[cfg(test)]
 use crate::trust::approval::GrantShapeFields;
 use crate::trust::policy::{ApprovalRequirement, PolicyEngine};
@@ -25,15 +29,15 @@ use core_events::receipt::{
     RECEIPT_KIND_RECOVERY_ACTION, RecoveryActionBody, TerminationAuthority,
 };
 
-mod access_requests;
-mod audit_receipts;
+pub(crate) mod access_requests;
+pub(crate) mod audit_receipts;
 mod authority;
 mod banner;
 mod bindings;
 mod context;
-mod grant_lifecycle;
+pub(crate) mod grant_lifecycle;
 mod grant_use;
-mod grants;
+pub(crate) mod grants;
 mod headless;
 mod preflight;
 mod presence_runtime;
@@ -58,9 +62,8 @@ use authority::{
 };
 #[cfg(test)]
 use authority::{PRESENCE_SCOPE_CLASS_VAULT, enter_quarantine_into, is_read_class_method};
-use banner::notify_require_approval;
+pub(crate) use banner::notify_require_approval;
 pub use banner::{Banner, build_banner};
-use context::broker_peercred_principal_for_handler;
 pub(crate) use context::{
     DaemonIdentityPresenceSigner, current_dispatch_deployment_tier, mint_operator_presence_token,
 };
@@ -74,12 +77,14 @@ pub use context::{
     enroll_container_persona, enroll_pid_persona, is_per_agent_socket_path, peercred_principal,
     set_dispatch_deployment_tier,
 };
+pub(crate) use presence_runtime::VerifiedPresenceProof;
+pub(crate) use presence_runtime::parse_scope_kek_hex;
 use presence_runtime::{
-    TransientKekEvictionGuard, VerifiedPresenceProof, enforce_presence_chokepoint_with_audit,
-    enforce_presence_proof, enforce_presence_proof_with_audit, handle_identity_device_enroll,
+    TransientKekEvictionGuard, enforce_presence_chokepoint_with_audit, enforce_presence_proof,
+    enforce_presence_proof_with_audit, handle_identity_device_enroll,
     handle_identity_device_enroll_backup, handle_identity_device_enroll_backup_plan,
     handle_identity_device_enroll_plan, handle_identity_device_revoke,
-    handle_identity_recovery_enroll, handle_presence_request_nonce, parse_scope_kek_hex,
+    handle_identity_recovery_enroll, handle_presence_request_nonce,
     presence_chokepoint_will_enforce, widening_transient_kek_applies,
 };
 #[cfg(test)]
@@ -232,22 +237,6 @@ pub(crate) fn check_user_presence_gate(
     match presence::require_user_presence(op, override_quiet_hours) {
         GateOutcome::Allowed => Ok(()),
         GateOutcome::Locked { reason } => Err(RpcError::PresenceLocked(reason).into()),
-    }
-}
-
-/// Allow-listed caller → vault namespace for the per-caller local-state
-/// content key. Restricts `local_state_key_*` socket methods to the three
-/// known ember binaries; a malicious caller cannot pollute the namespace
-/// with arbitrary keys.
-///
-/// Per KEYCHAIN-CONSOLIDATE-CLI adversarial-review HIGH-1.
-pub(crate) fn local_state_vault_name(caller: &str) -> Result<String, (i32, String)> {
-    match caller {
-        "cli" | "gui" | "native-host" => Ok(format!("local-state/{caller}")),
-        other => Err(RpcError::InvalidParams(format!(
-            "invalid 'caller' {other:?}: expected one of cli, gui, native-host"
-        ))
-        .into()),
     }
 }
 
@@ -1001,7 +990,7 @@ pub async fn dispatch_method_with_context(
     }
 
     match method {
-        "ping" => Ok(json!({"pong": true})),
+        "ping" => crate::infra::handlers::system::handle_ping(),
 
         "presence_token_mint" => Err((
             -32601,
@@ -1016,62 +1005,16 @@ pub async fn dispatch_method_with_context(
         // call that does not carry a payment attempt, so it can only drive the
         // payment lane, never a generic tool-call permit.
         "evaluate_tool_call" => {
-            let persona = params["persona"].as_str().ok_or_else(|| {
-                RpcError::InvalidParams("missing 'persona' parameter".to_string())
-            })?;
-            let tool_name = params["tool_name"].as_str().ok_or_else(|| {
-                RpcError::InvalidParams("missing 'tool_name' parameter".to_string())
-            })?;
-            let session_id = params["session_id"].as_str();
-            let grant_id = params["grant_id"].as_str();
-            let tool_params = &params["params"];
-            let decision = store
-                .reserve_payment_tool_call(persona, tool_name, tool_params, session_id, grant_id)
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            serde_json::to_value(&decision)
-                .map_err(|e| RpcError::Internal(format!("serialize ToolCallDecision: {e}")).into())
+            crate::infra::handlers::personas::handle_evaluate_tool_call(store, params).await
         }
 
         "create_persona" => {
-            let name = params["name"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'name' parameter".to_string()))?;
-            // Launcher onboarding creates an agent persona from an operator CLI
-            // process; ordinary agent-created personas still bind the caller PID.
-            let enroll_peer_pid = params["enroll_peer_pid"].as_bool().unwrap_or(true);
-            let info = store
-                .create_persona(name)
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            // development milestone: enroll the (peer_pid, persona_id) so
-            // subsequent `delegate_grant` calls from this PID resolve
-            // back to the persona that just claimed it.  Only applies to
-            // Socket callers; Internal callers don't have a real peer
-            // identity and shouldn't pollute the registry.
-            if !source.is_internal()
-                && enroll_peer_pid
-                && let Some(peer) = &ctx.peer
-                && let Some(pid) = peer.pid
-            {
-                enroll_pid_persona(pid, &info.id);
-            }
-            Ok(json!({"id": info.id, "name": info.name, "public_key": info.public_key}))
+            crate::infra::handlers::personas::handle_create_persona(store, &ctx, &source, params)
+                .await
         }
 
         "build_init_first_grant_receipt" => {
-            let persona_id = params["persona_id"].as_str().ok_or_else(|| {
-                RpcError::InvalidParams("missing 'persona_id' parameter".to_string())
-            })?;
-            let signer = store
-                .persona_signer(persona_id)
-                .map_err(|e| RpcError::Internal(format!("persona signer: {e}")))?;
-            let file =
-                crate::infra::init_first_grant::build_first_grant_receipt_file(persona_id, &signer)
-                    .map_err(|e| {
-                        RpcError::Internal(format!("build init first-grant receipt: {e}"))
-                    })?;
-            serde_json::to_value(file).map_err(|e| {
-                RpcError::Internal(format!("serialize init first-grant receipt: {e}")).into()
-            })
+            crate::infra::handlers::personas::handle_build_init_first_grant_receipt(store, params)
         }
 
         "persona_signer" => {
@@ -1081,101 +1024,23 @@ pub async fn dispatch_method_with_context(
         }
 
         "list_personas" => {
-            let personas = store
-                .list_personas()
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            let trusted_persona =
-                crate::infra::handlers::principal::team0_connect_only_persona_scope(
-                    &ctx,
-                    "list_personas",
-                )?;
-            let name_prefix = params["name_prefix"].as_str();
-            let list: Vec<Value> = personas
-                .iter()
-                .filter(|p| match trusted_persona.as_deref() {
-                    Some(persona_id) => p.id == persona_id,
-                    None => true,
-                })
-                .filter(|p| match name_prefix {
-                    Some(prefix) => p.name.starts_with(prefix),
-                    None => true,
-                })
-                .map(|p| json!({"id": p.id, "name": p.name, "status": p.status}))
-                .collect();
-            Ok(json!(list))
+            crate::infra::handlers::personas::handle_list_personas(store, &ctx, params).await
         }
 
         "revoke_persona" => {
-            let id = params["id"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'id' parameter".to_string()))?;
-            // revoke_persona_authority_check — Internal callers (admin CLI,
-            // test harness, recovery) bypass; all socket callers must be
-            // the revocation target (self-revoke). Operator-role extension
-            // tracked separately.
-            if !source.is_internal() {
-                let principal =
-                    crate::infra::handlers::support::resolve_caller_principal(&ctx, params).await?;
-                if principal != id {
-                    tracing::warn!(
-                        caller_persona_id = %principal,
-                        target_persona_id = %id,
-                        "rejecting revoke_persona: caller is not the revocation target"
-                    );
-                    return Err(RpcError::PolicyDenied(
-                        "revoke_persona: caller not authorized (must be operator or \
-                         revocation target)"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                // Self-revoke: allowed.
-            }
-            store
-                .revoke_persona(id)
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            Ok(json!({"revoked": true}))
+            crate::infra::handlers::personas::handle_revoke_persona(store, &ctx, &source, params)
+                .await
         }
 
         "retire_persona_for_reenroll" => {
-            let id = params["id"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'id' parameter".to_string()))?;
-            let expected_name = params["expected_name"].as_str().ok_or_else(|| {
-                RpcError::InvalidParams("missing 'expected_name' parameter".to_string())
-            })?;
-            // Same authority posture as revoke_persona: this is a targeted
-            // self-retire used by recovery/onboarding to free a default slot.
-            if !source.is_internal() {
-                let principal =
-                    crate::infra::handlers::support::resolve_caller_principal(&ctx, params).await?;
-                if principal != id {
-                    tracing::warn!(
-                        caller_persona_id = %principal,
-                        target_persona_id = %id,
-                        "rejecting retire_persona_for_reenroll: caller is not the target"
-                    );
-                    return Err(RpcError::PolicyDenied(
-                        "retire_persona_for_reenroll: caller not authorized (must be \
-                         revocation target)"
-                            .to_string(),
-                    )
-                    .into());
-                }
-            }
-            let retired_name = store
-                .retire_persona_for_reenroll(id, expected_name)
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            Ok(json!({
-                "revoked": true,
-                "id": id,
-                "old_name": expected_name,
-                "retired_name": retired_name
-            }))
+            crate::infra::handlers::personas::handle_retire_for_reenroll(
+                store, &ctx, &source, params,
+            )
+            .await
         }
 
         "create_grant" => {
-            grant_lifecycle::handle_create(
+            crate::infra::handlers::grants::handle_create_grant(
                 store,
                 policy,
                 &source,
@@ -1192,16 +1057,17 @@ pub async fn dispatch_method_with_context(
             verified_presence_proof.as_ref(),
         ),
 
-        "delegate_grant" => grant_lifecycle::handle_delegate(store, &ctx, &source, params).await,
+        "delegate_grant" => {
+            crate::infra::handlers::grants::handle_delegate_grant(store, &ctx, &source, params)
+                .await
+        }
 
-        "list_grants" => grants::handle_list_grants(store, &ctx, params),
+        "list_grants" => crate::infra::handlers::grants::handle_list_grants(store, &ctx, params),
 
         "list_operator_grants" => grants::handle_list_operator_grants(store, params),
 
         "list_all_grants" => {
-            // grant_list_all_rpc_landed: daemon RPC projection for the
-            // operator CLI migration; presence-gated because it exposes
-            // cross-persona grant rows.
+            // grant_list_all_rpc_landed
             crate::broker::handler::handle_list_all_grants(store, params)
         }
 
@@ -1218,11 +1084,17 @@ pub async fn dispatch_method_with_context(
 
         "sandbox_run" => sandbox::handle_run(store, policy, &ctx, params),
 
-        "revoke_grant" => grant_lifecycle::handle_revoke(store, &ctx, events_tx, params),
+        "revoke_grant" => {
+            crate::infra::handlers::grants::handle_revoke_grant(store, &ctx, events_tx, params)
+        }
 
-        "revoke_statement" => grant_lifecycle::handle_revoke_statement(store, params),
+        "revoke_statement" => {
+            crate::infra::handlers::grants::handle_revoke_statement(store, params)
+        }
 
-        "evaluate_grant" => grant_lifecycle::handle_evaluate(store, &ctx, params),
+        "evaluate_grant" => {
+            crate::infra::handlers::grants::handle_evaluate_grant(store, &ctx, params)
+        }
 
         "use_credential" => grant_use::handle_use_credential(store, params),
 
@@ -1240,711 +1112,32 @@ pub async fn dispatch_method_with_context(
 
         "vault_unlock" => crate::infra::handlers::vault::handle_unlock(store, &ctx, params),
 
-        // design §4 presence-as-decryption — provisioning + unlock handoff.
-        // The operator-session CLI performs all SE crypto (se_wrap/se_unwrap are
-        // keychain-label ops the separate-uid daemon cannot do); the daemon stores
-        // the opaque wrapped KEK blobs and installs the unwrapped scope KEK into
-        // the live vault slot for the unlock window. The daemon NEVER holds the
-        // unwrapped KEK_s at rest.
         "vault.se_provision" | "vault/se_provision" | "vault_se_provision" => {
-            let device_id = params
-                .get("device_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams("vault.se_provision: 'device_id' required".to_string())
-                })?;
-            let ecies_key_id = params
-                .get("ecies_key_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.se_provision: 'ecies_key_id' required".to_string(),
-                    )
-                })?;
-            let wrapped_kek = params
-                .get("wrapped_kek")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.se_provision: 'wrapped_kek' (hex) required".to_string(),
-                    )
-                })
-                .and_then(|h| {
-                    hex::decode(h).map_err(|e| {
-                        RpcError::InvalidParams(format!(
-                            "vault.se_provision: 'wrapped_kek' bad hex: {e}"
-                        ))
-                    })
-                })?;
-            let scope_kek = parse_scope_kek_hex(params, "scope_kek")?;
-
-            // design §4 — resolve BOTH the AC-7 recipient allowlist (§6 finding
-            // M3) and the per-scope binding ("Never one global KEK") from a single
-            // identity-substrate open, fail-closed BEFORE any mutation below.
-            //  • AC-7: a scope-KEK wrap may be stored ONLY for an enrolled
-            //    presence-Device ECIES recipient under the operator root (plus the
-            //    off-host cold-recovery recipient once that exists), never a
-            //    daemon-supplied arbitrary key — else a compromised daemon could
-            //    persist a wrap to a recipient IT controls and unwrap KEK_s
-            //    autonomously later (standing autonomous decrypt), violating the §4
-            //    "no autonomous-key recipient" invariant (the set is device-rooted,
-            //    never the MEK).
-            //  • Per-scope: the wrap is stored under the operator-authority SCOPE so
-            //    one tap opens exactly one scope, not the whole AuthorityBearing lane
-            //    (F4). Crown-jewel resources earn their own scope in a later slice.
-            // The set + scope live in the identity substrate (`identity-events.db`),
-            // not the main store — reopen on demand (the audit_repair_chain idiom).
-            // No data_dir / no operator root / no enrolled presence Device => refuse
-            // (AC-4: never admit a recipient, never store with no scope).
-            let (allowed_recipients, provision_scope) = match store.data_dir() {
-                Some(data_dir) => {
-                    match crate::infra::identity_substrate::open_identity_store(data_dir) {
-                        Ok(identity_store) => {
-                            let st = identity_store.materialized();
-                            (
-                                // AC-7 allowlist = enrolled ∪ recovery (presence
-                                // Devices AND off-host Recovery recipients), per
-                                // design §4/§6. The union admits a recovery
-                                // recipient's wrap; a non-enrolled key is refused.
-                                crate::infra::operator_identity::active_kek_recipient_ecies_key_ids_under_operator_root(st),
-                                crate::infra::operator_identity::operator_authority_scope(st),
-                            )
-                        }
-                        Err(e) => {
-                            return Err(RpcError::Internal(format!(
-                                "vault.se_provision: open identity store: {e}"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                None => (Vec::new(), None),
-            };
-            if !allowed_recipients.iter().any(|k| k == ecies_key_id) {
-                return Err(RpcError::PresenceLocked(format!(
-                    "vault.se_provision: ecies_key_id '{ecies_key_id}' is not an \
-                         enrolled presence-Device or recovery recipient under the \
-                         operator root (design §4/§6 AC-7 allowlist = enrolled ∪ \
-                         recovery); refusing to store a scope-KEK wrap to a \
-                         non-enrolled recipient"
-                ))
-                .into());
-            }
-            let (scope_kind, scope_id) = provision_scope.ok_or_else(|| {
-                RpcError::PresenceLocked(
-                    "vault.se_provision: no operator-authority scope (no unambiguous \
-                 operator root); refusing to store a scope-KEK wrap with no scope \
-                 (design §4: never one global KEK)"
-                        .to_string(),
-                )
-            })?;
-
-            store
-                .write_presence_scope_kek_wrap(
-                    &scope_kind,
-                    &scope_id,
-                    device_id,
-                    ecies_key_id,
-                    &wrapped_kek,
-                )
-                .map_err(|e| RpcError::Internal(format!("vault.se_provision: store wrap: {e}")))?;
-
-            // design §4 CLEAN-BREAK (DESTRUCTIVE, deliberate): re-sourcing the
-            // interactive vault key from the presence-unwrapped KEK_s makes any
-            // headless blob wrapped under the PRIOR (Argon2id/keychain) MEK
-            // un-unwrappable, and a canary sealed under that prior MEK would
-            // false-alarm. NULL both in `vault_meta` and remove the on-disk
-            // bootstrap sidecar BEFORE installing KEK_s, so the install's vault
-            // open hits first-run headless generation under KEK_s. We do NOT
-            // silently regenerate-on-mismatch anywhere else — a passphrase-lane
-            // wrong-key must stay a loud error; this operator-initiated provision
-            // is the one sanctioned break (operator pre-users; headless unused).
-            store.clear_headless_and_canary_meta().map_err(|e| {
-                RpcError::Internal(format!("vault.se_provision: clean-break meta: {e}"))
-            })?;
-            // bridge-CA is DaemonOperational (design §4): re-classified from the
-            // old interactive MEK to the autonomous headless key (which §4
-            // provisioning also regenerates). Its prior wrap is sealed under the
-            // retired key, so NULL the wrap and remove the on-disk wrap + sealed-CA
-            // files; the next load_or_mint re-mints the bridge CA under the new
-            // headless custody (one-time CA re-issue, operator-accepted pre-users
-            // clean break). NOTE: the DB NULL and file removals are not atomic with
-            // each other or the KEK install; a crash mid-clean-break can leave a
-            // half-removed bridge-CA state that load_or_mint rejects (unopenable
-            // stale wrap). Recovery for this one-time operator-initiated break is to
-            // delete `bridge_ca.*` and re-run `ember vault se-provision`.
-            store.clear_bridge_ca_wrap().map_err(|e| {
-                RpcError::Internal(format!("vault.se_provision: clean-break bridge-ca: {e}"))
-            })?;
-            if let Some(dir) = store.data_dir() {
-                for stale in [
-                    crate::infra::vault::HEADLESS_MEK_WRAP_FILE,
-                    "bridge_ca.wrap",
-                    "bridge_ca.sealed",
-                ] {
-                    let path = dir.join(stale);
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            return Err(RpcError::Internal(format!(
-                                "vault.se_provision: clean-break remove {}: {e}",
-                                path.display()
-                            ))
-                            .into());
-                        }
-                    }
-                }
-            }
-
-            // Install KEK_s for the current window so persona creation can seal
-            // immediately after provisioning (the operator is present — they just
-            // generated + se_wrapped the KEK). The returned vault's interactive
-            // key is the live authority key (KEK_s on the §4 lane).
-            let vault = crate::infra::interactive_unlock::install_presence_scope_kek_vault(
-                store, *scope_kek,
-            )
-            .map_err(|e| RpcError::PresenceLocked(format!("vault.se_provision: install: {e}")))?;
-
-            // Re-seal the key-correctness canary under the now-live interactive
-            // key (KEK_s) so the fail-loud `verify_canary` check returns on the
-            // §4 lane too (it was NULLed by the clean break above). `seal_canary`
-            // seals under `self.interactive_key`, so this is self-consistent with
-            // whatever key the live authority vault is serving.
-            let (canary_nonce, canary) = vault.seal_canary().map_err(|e| {
-                RpcError::PresenceLocked(format!("vault.se_provision: re-seal canary: {e}"))
-            })?;
-            store
-                .write_vault_canary(&canary, &canary_nonce)
-                .map_err(|e| {
-                    RpcError::Internal(format!("vault.se_provision: write canary: {e}"))
-                })?;
-
-            crate::infra::interactive_unlock::arm_non_session_grace_window();
-            Ok(serde_json::json!({ "status": "provisioned", "device_id": device_id }))
+            crate::infra::handlers::vault::handle_se_provision(store, params)
         }
         "vault.se_add_recipient_wrap"
         | "vault/se_add_recipient_wrap"
         | "vault_se_add_recipient_wrap" => {
-            // design §4/§6 — store ONE ADDITIONAL recipient's wrap of the SAME
-            // scope `KEK_s` (multi-recipient: enrolled presence Device set ∪ the
-            // off-host recovery recipient). Unlike `vault.se_provision`, this does
-            // NOT clean-break or (re)install the live key — it only persists the
-            // wrap, AC-7-gated. The wrap is produced in the operator session (the
-            // trusted, present, peer-cred-gated zone): an SE `se_wrap` for a backup
-            // presence Device, or a software `age` wrap to the recovery recipient's
-            // public half. The daemon admits it ONLY if `ecies_key_id` is in the
-            // event-sourced `enrolled ∪ recovery` allowlist — so a compromised
-            // daemon cannot persist a wrap to a recipient it controls (§6 M3).
-            // NOTE (availability-only, threat-model-accepted at dev0): we gate on
-            // `ecies_key_id ∈ allowlist` but do NOT verify the opaque blob was
-            // actually wrapped to that recipient's pubkey. A wrong/garbage blob
-            // only makes recovery FAIL CLOSED (KEK_s cannot leak — unwrap needs the
-            // off-host secret the daemon never holds, AC-4/C3). The wrap is produced
-            // in the peer-cred-gated operator session (trusted zone); a fully
-            // compromised daemon owns the store directly anyway.
-            let device_id = params
-                .get("device_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.se_add_recipient_wrap: 'device_id' required".to_string(),
-                    )
-                })?;
-            let ecies_key_id = params
-                .get("ecies_key_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.se_add_recipient_wrap: 'ecies_key_id' required".to_string(),
-                    )
-                })?;
-            let wrapped_kek = params
-                .get("wrapped_kek")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.se_add_recipient_wrap: 'wrapped_kek' (hex) required".to_string(),
-                    )
-                })
-                .and_then(|h| {
-                    hex::decode(h).map_err(|e| {
-                        RpcError::InvalidParams(format!(
-                            "vault.se_add_recipient_wrap: 'wrapped_kek' bad hex: {e}"
-                        ))
-                    })
-                })?;
-
-            let (allowed_recipients, add_scope) = match store.data_dir() {
-                Some(data_dir) => {
-                    match crate::infra::identity_substrate::open_identity_store(data_dir) {
-                        Ok(identity_store) => {
-                            let st = identity_store.materialized();
-                            (
-                                crate::infra::operator_identity::active_kek_recipient_ecies_key_ids_under_operator_root(st),
-                                crate::infra::operator_identity::operator_authority_scope(st),
-                            )
-                        }
-                        Err(e) => {
-                            return Err(RpcError::Internal(format!(
-                                "vault.se_add_recipient_wrap: open identity store: {e}"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                None => (Vec::new(), None),
-            };
-            if !allowed_recipients.iter().any(|k| k == ecies_key_id) {
-                return Err(RpcError::PresenceLocked(format!(
-                    "vault.se_add_recipient_wrap: ecies_key_id '{ecies_key_id}' is not an \
-                         enrolled presence-Device or recovery recipient under the operator root \
-                         (design §4/§6 AC-7 allowlist = enrolled ∪ recovery); refusing to store \
-                         a scope-KEK wrap to a non-enrolled recipient"
-                ))
-                .into());
-            }
-            let (scope_kind, scope_id) = add_scope.ok_or_else(|| {
-                RpcError::PresenceLocked(
-                    "vault.se_add_recipient_wrap: no operator-authority scope (no unambiguous \
-                 operator root); refusing to store a scope-KEK wrap with no scope"
-                        .to_string(),
-                )
-            })?;
-            store
-                .write_presence_scope_kek_wrap(
-                    &scope_kind,
-                    &scope_id,
-                    device_id,
-                    ecies_key_id,
-                    &wrapped_kek,
-                )
-                .map_err(|e| {
-                    RpcError::Internal(format!("vault.se_add_recipient_wrap: store wrap: {e}"))
-                })?;
-            Ok(serde_json::json!({ "status": "recipient_added", "device_id": device_id }))
+            crate::infra::handlers::vault::handle_se_add_recipient_wrap(store, params)
         }
         "vault.se_unlock_begin" | "vault/se_unlock_begin" | "vault_se_unlock_begin" => {
-            // Pure read: return the opaque per-Device wrapped scope-KEK blobs for
-            // the operator-authority SCOPE (design §4: a tap opens exactly one
-            // scope, never the whole lane). The CLI picks the one for ITS Device
-            // (whose SE key is in its keychain) and performs the `se_unwrap` tap.
-            // The blobs reveal nothing without the presence-gated SE private key.
-            // Scope is daemon-derived from the operator root (identity substrate,
-            // reopened on demand); no operator scope => no wraps (empty), mirroring
-            // the pre-§4 "nothing provisioned" contract the CLI already handles.
-            let unlock_scope = match store.data_dir() {
-                Some(data_dir) => {
-                    match crate::infra::identity_substrate::open_identity_store(data_dir) {
-                        Ok(identity_store) => {
-                            crate::infra::operator_identity::operator_authority_scope(
-                                identity_store.materialized(),
-                            )
-                        }
-                        Err(e) => {
-                            return Err(RpcError::Internal(format!(
-                                "vault.se_unlock_begin: open identity store: {e}"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                None => None,
-            };
-            let wraps = match unlock_scope {
-                Some((scope_kind, scope_id)) => store
-                    .list_presence_scope_kek_wraps(&scope_kind, &scope_id)
-                    .map_err(|e| {
-                        RpcError::Internal(format!("vault.se_unlock_begin: list wraps: {e}"))
-                    })?,
-                None => Vec::new(),
-            };
-            let wraps_json: Vec<serde_json::Value> = wraps
-                .into_iter()
-                .map(|(device_id, ecies_key_id, wrapped)| {
-                    serde_json::json!({
-                        "device_id": device_id,
-                        "ecies_key_id": ecies_key_id,
-                        "wrapped_kek": hex::encode(&wrapped),
-                    })
-                })
-                .collect();
-            Ok(serde_json::json!({ "wraps": wraps_json }))
+            crate::infra::handlers::vault::handle_se_unlock_begin(store)
         }
         "vault.se_unlock_complete" | "vault/se_unlock_complete" | "vault_se_unlock_complete" => {
-            // The CLI submits the scope KEK it just `se_unwrap`ped (the tap). Install
-            // it as the live interactive vault key for the unlock window. A wrong
-            // KEK installs but fails every authority open closed (AEAD).
-            let scope_kek = parse_scope_kek_hex(params, "scope_kek")?;
-            crate::infra::interactive_unlock::install_presence_scope_kek_vault(store, *scope_kek)
-                .map_err(|e| {
-                RpcError::PresenceLocked(format!("vault.se_unlock_complete: install: {e}"))
-            })?;
-            crate::infra::interactive_unlock::arm_non_session_grace_window();
-            // design slice 4 C — the §4 tap IS the operator-presence event. Mark
-            // the interactive presence session UNLOCKED so the OperatorPresence
-            // dispatch gate's fail-closed §4 fall-through (`presence::snapshot()`)
-            // recognizes the open window. Eviction (idle / explicit lock / OS
-            // presence event) re-locks it via the existing window machinery.
-            crate::trust::presence::mark_unlocked();
-            Ok(serde_json::json!({ "status": "unlocked" }))
+            crate::infra::handlers::vault::handle_se_unlock_complete(store, params)
         }
 
-        // ── design — double-envelope SE custody RPCs ─────────────────────
-        //
-        // The double-envelope model: at rest, SE-custodied keys are
-        //   SE_ECIES_encrypt( DWK_encrypt(raw_key) )
-        // The CLI peels the outer SE layer (Aqua/501, Touch ID); the daemon
-        // peels the inner DWK layer (uid=450). Raw key material exists only
-        // in daemon memory. The CLI never holds it.
         "vault.de_provision_begin" | "vault/de_provision_begin" | "vault_de_provision_begin" => {
-            use crate::infra::daemon_wrap_key::DwkPurpose;
-            let purpose_str = params
-                .get("purpose")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.de_provision_begin: 'purpose' required".to_string(),
-                    )
-                })?;
-            let purpose = match purpose_str {
-                "vault_mek" => DwkPurpose::VaultMek,
-                "lease_kek" => DwkPurpose::LeaseKek,
-                other => {
-                    return Err(RpcError::InvalidParams(format!(
-                        "vault.de_provision_begin: unknown purpose '{other}'"
-                    ))
-                    .into());
-                }
-            };
-
-            let dwk = store.dwk().ok_or_else(|| {
-                RpcError::Internal("vault.de_provision_begin: DWK not provisioned".to_string())
-            })?;
-
-            let mut raw_key = zeroize::Zeroizing::new([0u8; 32]);
-            getrandom::fill(raw_key.as_mut()).expect("OS entropy failure");
-
-            let inner_blob = dwk.wrap(&*raw_key, purpose).map_err(|e| {
-                RpcError::Internal(format!("vault.de_provision_begin: DWK wrap: {e}"))
-            })?;
-
-            match purpose {
-                DwkPurpose::VaultMek => {
-                    let vault = crate::infra::vault::finish_open_with_interactive_key_for_de(
-                        *raw_key,
-                        store
-                            .data_dir()
-                            .unwrap_or_else(|| std::path::Path::new(".")),
-                    );
-                    match vault {
-                        Ok(vault) => {
-                            store.set_vault(std::rc::Rc::new(vault));
-                            tracing::info!("vault.de_provision_begin: MEK provisioned, vault open");
-                        }
-                        Err(e) => {
-                            return Err(RpcError::Internal(format!(
-                                "vault.de_provision_begin: vault open: {e}"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                DwkPurpose::LeaseKek => {
-                    let lease_kek = crate::trust::lease::LeaseWrapKey::from_raw(*raw_key);
-                    store.set_lease_kek(lease_kek);
-                    // design §3 — blobs persisted by a prior session become
-                    // live now, not at the next restart's de_unlock_complete.
-                    // Blobs wrapped under a different (lost) KEK fail their
-                    // AEAD open and are skipped per-blob inside rehydrate.
-                    if let Err(e) = store.rehydrate_persisted_leases(chrono::Utc::now()) {
-                        tracing::error!(
-                            error = %e,
-                            "vault.de_provision_begin: lease-KEK installed but \
-                             rehydrating persisted leases failed"
-                        );
-                    }
-                    tracing::info!("vault.de_provision_begin: lease-KEK installed (first boot)");
-                }
-            }
-
-            Ok(serde_json::json!({
-                "inner_blob": hex::encode(&inner_blob),
-                "purpose": purpose_str,
-            }))
+            crate::infra::handlers::vault::handle_de_provision_begin(store, params)
         }
-
         "vault.de_provision_outer" | "vault/de_provision_outer" | "vault_de_provision_outer" => {
-            let outer_blob = params
-                .get("outer_blob")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.de_provision_outer: 'outer_blob' (hex) required".to_string(),
-                    )
-                })
-                .and_then(|h| {
-                    hex::decode(h).map_err(|e| {
-                        RpcError::InvalidParams(format!("vault.de_provision_outer: bad hex: {e}"))
-                    })
-                })?;
-            let purpose_str = params
-                .get("purpose")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.de_provision_outer: 'purpose' required".to_string(),
-                    )
-                })?;
-
-            match purpose_str {
-                "vault_mek" => {
-                    if store.vault().is_some()
-                        && store.read_double_envelope_outer().ok().flatten().is_some()
-                    {
-                        return Err(RpcError::Internal(
-                            "vault.de_provision_outer: refusing to overwrite \
-                             existing outer blob while vault is open"
-                                .to_string(),
-                        )
-                        .into());
-                    }
-                    store
-                        .write_double_envelope_outer(&outer_blob)
-                        .map_err(|e| {
-                            RpcError::Internal(format!("vault.de_provision_outer: store: {e}"))
-                        })?;
-                }
-                "lease_kek" => {
-                    // Symmetric with the `vault_mek` arm above: refuse only when
-                    // BOTH the in-memory key AND the on-disk outer blob are
-                    // already present (i.e. a fully-provisioned, fully-loaded
-                    // state). The prior strict `lease_kek().is_some()` check
-                    // was correct against the pre-#5836 shape, but #5836
-                    // changed `vault.de_provision_begin` to install the
-                    // lease-KEK in memory BEFORE the outer round-trip — so the
-                    // strict guard refused the very first-boot persistence the
-                    // CLI relay is built to drive. Mirroring the conjunctive
-                    // vault_mek shape lets the first-boot outer write land
-                    // while still protecting an already-persisted blob.
-                    let outer_present = store
-                        .read_lease_kek_double_envelope_outer()
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    if store.lease_kek().is_some() && outer_present {
-                        return Err(RpcError::Internal(
-                            "vault.de_provision_outer: refusing to overwrite \
-                             existing lease-KEK outer blob while lease-KEK is active"
-                                .to_string(),
-                        )
-                        .into());
-                    }
-                    store
-                        .write_lease_kek_double_envelope_outer(&outer_blob)
-                        .map_err(|e| {
-                            RpcError::Internal(format!("vault.de_provision_outer: store: {e}"))
-                        })?;
-                }
-                other => {
-                    return Err(RpcError::InvalidParams(format!(
-                        "vault.de_provision_outer: unknown purpose '{other}'"
-                    ))
-                    .into());
-                }
-            }
-
-            tracing::info!(
-                purpose = purpose_str,
-                "vault.de_provision_outer: outer blob stored"
-            );
-            Ok(serde_json::json!({
-                "status": "provisioned",
-                "purpose": purpose_str,
-            }))
+            crate::infra::handlers::vault::handle_de_provision_outer(store, params)
         }
-
         "vault.de_unlock_begin" | "vault/de_unlock_begin" | "vault_de_unlock_begin" => {
-            let purpose_str = params
-                .get("purpose")
-                .and_then(|v| v.as_str())
-                .unwrap_or("vault_mek");
-
-            let outer_blob = match purpose_str {
-                "vault_mek" => store
-                    .read_double_envelope_outer()
-                    .map_err(|e| RpcError::Internal(format!("vault.de_unlock_begin: read: {e}")))?,
-                "lease_kek" => store.read_lease_kek_double_envelope_outer().map_err(|e| {
-                    RpcError::Internal(format!("vault.de_unlock_begin: read lease_kek: {e}"))
-                })?,
-                other => {
-                    return Err(RpcError::InvalidParams(format!(
-                        "vault.de_unlock_begin: unknown purpose '{other}'"
-                    ))
-                    .into());
-                }
-            };
-
-            match outer_blob {
-                Some(blob) => Ok(serde_json::json!({
-                    "outer_blob": hex::encode(&blob),
-                    "status": "locked",
-                    "purpose": purpose_str,
-                })),
-                None => Ok(serde_json::json!({
-                    "status": "unprovisioned",
-                    "purpose": purpose_str,
-                })),
-            }
+            crate::infra::handlers::vault::handle_de_unlock_begin(store, params)
         }
-
         "vault.de_unlock_complete" | "vault/de_unlock_complete" | "vault_de_unlock_complete" => {
-            use crate::infra::daemon_wrap_key::DwkPurpose;
-            let inner_blob = params
-                .get("inner_blob")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    RpcError::InvalidParams(
-                        "vault.de_unlock_complete: 'inner_blob' (hex) required".to_string(),
-                    )
-                })
-                .and_then(|h| {
-                    hex::decode(h).map_err(|e| {
-                        RpcError::InvalidParams(format!("vault.de_unlock_complete: bad hex: {e}"))
-                    })
-                })?;
-
-            let purpose_str = params
-                .get("purpose")
-                .and_then(|v| v.as_str())
-                .unwrap_or("vault_mek");
-
-            let dwk_purpose = match purpose_str {
-                "vault_mek" => DwkPurpose::VaultMek,
-                "lease_kek" => DwkPurpose::LeaseKek,
-                other => {
-                    return Err(RpcError::InvalidParams(format!(
-                        "vault.de_unlock_complete: unknown purpose '{other}'"
-                    ))
-                    .into());
-                }
-            };
-
-            let dwk = store.dwk().ok_or_else(|| {
-                RpcError::Internal("vault.de_unlock_complete: DWK not provisioned".to_string())
-            })?;
-
-            let raw_key = dwk.unwrap(&inner_blob, dwk_purpose).map_err(|e| {
-                RpcError::PresenceLocked(format!("vault.de_unlock_complete: DWK unwrap: {e}"))
-            })?;
-            if raw_key.len() != 32 {
-                return Err(RpcError::PresenceLocked(format!(
-                    "vault.de_unlock_complete: unwrapped key is {} bytes, expected 32",
-                    raw_key.len()
-                ))
-                .into());
-            }
-            let mut key = zeroize::Zeroizing::new([0u8; 32]);
-            key.copy_from_slice(&raw_key);
-
-            match dwk_purpose {
-                DwkPurpose::VaultMek => {
-                    let data_dir = store
-                        .data_dir()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let vault = crate::infra::vault::finish_open_with_interactive_key_for_de(
-                        *key, data_dir,
-                    )
-                    .map_err(|e| {
-                        RpcError::PresenceLocked(format!(
-                            "vault.de_unlock_complete: vault open: {e}"
-                        ))
-                    })?;
-
-                    let vault = std::rc::Rc::new(vault);
-                    vault.verify_canary(store).map_err(|e| {
-                        RpcError::PresenceLocked(format!(
-                            "vault.de_unlock_complete: canary verification failed \
-                                 (wrong MEK / corrupt double-envelope): {e}"
-                        ))
-                    })?;
-                    store.set_vault(vault);
-                    crate::trust::presence::mark_unlocked();
-                    tracing::info!("vault.de_unlock_complete: vault unlocked via double-envelope");
-
-                    // Bridge CA loading: if lease-KEK is also available, load bridge CA.
-                    // Both envelopes must be peeled before sandbox spawn can proceed.
-                    if store.bridge_ca().is_none()
-                        && store.lease_kek().is_some()
-                        && let Some(vault_ref) = store.vault()
-                    {
-                        let data_dir = store
-                            .data_dir()
-                            .unwrap_or_else(|| std::path::Path::new("."));
-                        match crate::infra::runtime::load_or_mint_bridge_ca(data_dir, &vault_ref) {
-                            Ok(ca) => {
-                                store.set_bridge_ca_fingerprint(ca.fingerprint());
-                                store.set_bridge_ca(ca);
-                                tracing::info!(
-                                    "vault.de_unlock_complete: bridge CA loaded \
-                                         after vault + lease-KEK unlock"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "vault.de_unlock_complete: bridge CA load failed"
-                                );
-                            }
-                        }
-                    }
-                }
-                DwkPurpose::LeaseKek => {
-                    let lease_kek = crate::trust::lease::LeaseWrapKey::from_raw(*key);
-                    store.set_lease_kek(lease_kek);
-                    if let Err(e) = store.rehydrate_persisted_leases(chrono::Utc::now()) {
-                        tracing::error!(
-                            error = %e,
-                            "vault.de_unlock_complete: lease-KEK installed but \
-                             rehydrating persisted leases failed"
-                        );
-                    }
-                    tracing::info!(
-                        "vault.de_unlock_complete: lease-KEK installed via double-envelope"
-                    );
-
-                    // Bridge CA loading: if vault is also available, load bridge CA.
-                    // Both envelopes must be peeled before sandbox spawn can proceed.
-                    if store.bridge_ca().is_none()
-                        && let Some(vault_ref) = store.vault()
-                    {
-                        let data_dir = store
-                            .data_dir()
-                            .unwrap_or_else(|| std::path::Path::new("."));
-                        match crate::infra::runtime::load_or_mint_bridge_ca(data_dir, &vault_ref) {
-                            Ok(ca) => {
-                                store.set_bridge_ca_fingerprint(ca.fingerprint());
-                                store.set_bridge_ca(ca);
-                                tracing::info!(
-                                    "vault.de_unlock_complete: bridge CA loaded \
-                                         after vault + lease-KEK unlock"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "vault.de_unlock_complete: bridge CA load failed"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(serde_json::json!({
-                "status": "unlocked",
-                "purpose": purpose_str,
-            }))
+            crate::infra::handlers::vault::handle_de_unlock_complete(store, params)
         }
 
         "recovery_action_receipt" => recovery::emit_recovery_action_receipt(store, params),
@@ -1957,10 +1150,6 @@ pub async fn dispatch_method_with_context(
 
         "vault_status" => crate::infra::handlers::vault::handle_status(store),
 
-        // design D3/D7 — vault MEK rotation (two-phase, daemon-authoritative).
-        // Both arms delegate to the `vault_rotate` module; the OperatorPresence
-        // gate on `vault_rotate_execute` is enforced upstream in
-        // `dispatch_method_with_context` before this arm runs.
         "vault_rotate_plan" => {
             presence::record_activity();
             crate::infra::vault_rotate::handle_vault_rotate_plan(store, params, chrono::Utc::now())
@@ -1980,26 +1169,6 @@ pub async fn dispatch_method_with_context(
 
         "vault_get" => crate::infra::handlers::vault::handle_get(store, params),
 
-        // KEYCHAIN-CONSOLIDATE-CLI-DAEMON-METHODS — per-caller local-state
-        // content-key vending. Per design (separate-uid authorization
-        // substrate) the daemon is the sole keychain client; CLI / GUI /
-        // native-host callers route key acquisition through these three
-        // arms over the SO_PEERCRED + group `ember` ACL-gated socket
-        // instead of touching the OS keychain directly. The per-caller
-        // vault namespace string is `local-state/<caller>` per the daemon-
-        // sole-keychain-client proposal §"Three new daemon socket
-        // methods". Per design, key resolve/rotation events are local
-        // daemon/operator plumbing and emit immutable audit rows, not signed
-        // v2 Receipts. `LocalStateKeyResolveBody` and
-        // `LocalStateKeyRotationBody` are retained only as typed audit-detail
-        // shapes for that lane.
-        //
-        // Key wire format: a `xchacha20-key:<64 hex>` content-key string
-        // produced by `core_crypto::generate_content_key("local-state")`
-        // (the canonical content-key shape consumed by
-        // `core_crypto::encrypt_content` / `decrypt_content`). The vault
-        // entry stores the UTF-8 bytes of that string; calling code reads
-        // them back and treats them as the same content key.
         "local_state_key_get" => {
             crate::infra::handlers::local_state::handle_key_get(store, &ctx, &source, params)
         }
@@ -2018,39 +1187,20 @@ pub async fn dispatch_method_with_context(
             crate::infra::handlers::binary_pin::handle_generate(store, &source, params)
         }
 
-        // Audit-chain verifier wiring: socket method that exposes
-        // the audit-chain verifier primitive shipped in #2998. Walks the
-        // last `tail` rows (or full chain when omitted) and returns a
-        // shape callers (`ember audit verify` CLI) can render directly.
-        "audit_verify" => audit_receipts::handle_verify(store, params),
+        "audit_verify" => crate::infra::handlers::system::handle_audit_verify_rpc(store, params),
 
-        // audit_repair_chain_rpc_landed — design v2 §2 / B4 operator
-        // -co-signed audit-chain repair RPC. Allowed while quarantined
-        // (the ONLY write-class method on `quarantine_allowed_method`).
-        // Wire shape:
-        //   params: {
-        //     "from_row_id": i64,
-        //     "repair_kind": "truncate" | "tombstone_segment",
-        //     "operator_signature_hex": "<128-hex>",
-        //     "operator_pubkey":         "ed25519:<hex>",
-        //     "current_chain_tip_hash":  "<hex>",
-        //     "daemon_identity_root_fingerprint": "<hex>",
-        //   }
-        // returns: { "ok": true, "repair_id", "new_chain_tip_hash",
-        //            "tombstone_row_id", "truncated_row_count" }
+        // audit_repair_chain_rpc_landed
         "audit_repair_chain" => audit_receipts::handle_repair_chain(store, &ctx, params),
 
-        // -S5 follow-up: read-only prepare half for audit repair. Derives
-        // the row hash + daemon fingerprint and returns the canonical bytes the
-        // operator signs off-host; commit still routes through audit_repair_chain.
         "audit_repair_chain_prepare" => {
             audit_receipts::handle_repair_chain_prepare(store, &ctx, params)
         }
 
-        "audit_query" => audit_receipts::handle_audit_query(store, &ctx, params),
+        "audit_query" => {
+            crate::infra::handlers::system::handle_audit_query_rpc(store, &ctx, params)
+        }
 
-        // audit_query_rpc_landed — dotted daemon RPC exposure for the
-        // sanitized audit-log projection; legacy `audit_query` stays above.
+        // audit_query_rpc_landed
         "audit.query" => crate::broker::handler::handle_audit_query(store, &ctx, params),
 
         "audit_log_query" => audit_receipts::handle_audit_log_query(store, params),
@@ -2059,168 +1209,21 @@ pub async fn dispatch_method_with_context(
 
         "receipt_tree" => audit_receipts::handle_receipt_tree(store, params),
 
-        // Unified receipt query — supports the full
-        // `ReceiptFilter` shape (actor/kind/grant_id/since/resource/limit).
-        // The `ember audit query` CLI path calls this via JSON-RPC socket.
-        "receipt_query" => audit_receipts::handle_receipt_query(store, &ctx, params),
+        "receipt_query" => {
+            crate::infra::handlers::system::handle_receipt_query_rpc(store, &ctx, params)
+        }
 
-        // receipt_list_get_rpc_landed — dotted read RPCs return the persisted
-        // receipt JSON envelopes/bodies, preserving each Receipt kind's
-        // on-disk shape for callers that decode per design / design.
+        // receipt_list_get_rpc_landed
         "receipt.list" => crate::broker::handler::handle_receipt_list(store, &ctx, params),
 
         // receipt_list_get_rpc_landed
         "receipt.get" => crate::broker::handler::handle_receipt_get(store, &ctx, params),
 
         "submit_approval" => {
-            let persona_id = params["persona_id"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'persona_id'".to_string()))?;
-            let credential_name = params["credential_name"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'credential_name'".to_string()))?;
-            let scope = params["scope"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'scope'".to_string()))?;
-            let action = params["action"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'action'".to_string()))?;
-            // approval_socket_arm_operator_presence_required — Per
-            // adversarial-review 2026-05-19 CRIT-3. The socket dispatch path
-            // for `submit_approval` previously (a) skipped `policy.evaluate`
-            // entirely, letting an agent submit approval requests for actions
-            // the policy was configured to Deny, and (b) accepted the
-            // caller-supplied `risk_level` verbatim, allowing the audit trail
-            // to lie about how risky the request actually was.
-            //
-            // The fix matches the create_grant arm's pattern (handler.rs:2580+):
-            //   1. Evaluate policy on the action. Denied → -32003 immediately.
-            //   2. Use `eval.risk` for the audit row, ignore caller-supplied.
-            //   3. Apply the per-op presence gate (same posture as create_grant)
-            //      so submit-while-locked surfaces a re-auth prompt rather
-            //      than silently filling the pending-approval queue.
-            // Internal callers (test harness, daemon-internal flows like the
-            // broker's HITL poll loop at broker/handler.rs:1356) bypass.
-            let eval = policy.evaluate(action);
-            if !source.is_internal() {
-                if matches!(eval.requirement, ApprovalRequirement::Denied) {
-                    return Err(RpcError::PolicyDenied(format!(
-                        "submit_approval: policy denies action {action:?} ({})",
-                        eval.matched_rule.unwrap_or_default()
-                    ))
-                    .into());
-                }
-                let override_qh = params["override_quiet_hours"].as_bool().unwrap_or(false);
-                check_user_presence_gate(HighRiskOp::ApprovalSubmit, override_qh)?;
-            }
-            // Risk level is policy-derived, not caller-supplied. This closes
-            // the audit-truthfulness gap in CRIT-3 — an agent can no longer
-            // mark a high-risk submission as "low" to slip past dashboard
-            // filtering or operator-attention heuristics.
-            let risk_level = format!("{:?}", eval.risk).to_lowercase();
-            let ttl_secs = params["ttl_secs"].as_u64();
-            // PHASE-C-1-MIGRATED: trait crossing per design §3
-            let adapter = DaemonApprovalStoreRef::new(store);
-            // Approval flow delegation fields:
-            // submit_approval is a generic tool-invoke approval entry; it
-            // doesn't carry the grant-shaping fields directly. Defaults to
-            // None so the resolver leaves the minted grant unshaped on the
-            // delegation axes (legacy behaviour preserved).
-            let metadata = SubmitMetadata {
-                action: action.to_string(),
-                ttl_secs,
-                risk_level: risk_level.clone(),
-                tool_name: params["tool_name"].as_str().map(str::to_owned),
-                target_host: params["target_host"].as_str().map(str::to_owned),
-                target_url: params["target_url"].as_str().map(str::to_owned),
-                agent_framework: params["agent_framework"].as_str().map(str::to_owned),
-                max_delegation_depth: None,
-                max_uses_per_hour: None,
-                allowed_hours_start: None,
-                allowed_hours_end: None,
-                allowed_targets: None,
-                budget: None,
-                max_children_per_day: None,
-                auto_delegate_scope_template: None,
-            };
-            let scope_obj = core_grant_types::approval::RequestedScope {
-                capability: scope.to_string(),
-                resource_id: None,
-                constraints: vec![],
-            };
-            let request_id = adapter
-                .submit_request(persona_id, credential_name, scope_obj, metadata)
-                .await
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            let req = store
-                .get_approval(&request_id.0)
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            notify_require_approval(store, &req);
-            Ok(json!({"id": request_id.0, "status": req.status}))
+            crate::infra::handlers::approval::handle_submit(store, policy, &source, params).await
         }
 
-        // Composite approval RPC — submit a composite approval that bundles
-        // an N-Statement envelope. On `Approved`, the resolver mints a single
-        // composite grant whose `blocks_json` carries the full statement
-        // chain. Wraps the already-shipped `DaemonStore::propose_grant`.
-        "propose_grant" => {
-            let persona_id = params["persona_id"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'persona_id'".to_string()))?;
-            let credential_name = params["credential_name"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'credential_name'".to_string()))?;
-            let scope = params["scope"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'scope'".to_string()))?;
-            let action = params["action"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'action'".to_string()))?;
-            let risk_level = params["risk_level"]
-                .as_str()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'risk_level'".to_string()))?;
-            let ttl_secs = params["ttl_secs"].as_u64();
-            let stmts_value = params["statements"]
-                .as_array()
-                .ok_or_else(|| RpcError::InvalidParams("missing 'statements' array".to_string()))?;
-            let mut statements: Vec<core_grant_types::Statement> =
-                Vec::with_capacity(stmts_value.len());
-            for v in stmts_value {
-                let s: core_grant_types::Statement = serde_json::from_value(v.clone())
-                    .map_err(|e| RpcError::InvalidParams(format!("invalid statement: {e}")))?;
-                statements.push(s);
-            }
-            if statements.is_empty() {
-                return Err(
-                    RpcError::InvalidParams("statements must not be empty".to_string()).into(),
-                );
-            }
-            // approval_notify_fields_persisted — use the with_notify variant so
-            // tool_name / target_host / target_url / agent_framework land in the DB
-            // (not just in the returned struct) for subsequent get_approval calls.
-            let req = store
-                .propose_grant_with_notify(
-                    persona_id,
-                    credential_name,
-                    scope,
-                    ttl_secs,
-                    action,
-                    risk_level,
-                    statements,
-                    params["tool_name"].as_str().map(str::to_owned),
-                    params["target_host"].as_str().map(str::to_owned),
-                    params["target_url"].as_str().map(str::to_owned),
-                    params["agent_framework"].as_str().map(str::to_owned),
-                )
-                .map_err(|e| RpcError::Internal(e.to_string()))?;
-            notify_require_approval(store, &req);
-            Ok(json!({
-                "approval_id": req.id,
-                "id": req.id,
-                "status": req.status,
-                "statement_count": req.composite_statements.as_ref().map(|v| v.len()).unwrap_or(0),
-            }))
-        }
+        "propose_grant" => crate::infra::handlers::approval::handle_propose_grant(store, params),
 
         "list_pending_approvals" => {
             crate::infra::handlers::approval::handle_list_pending(store, &ctx)
@@ -2230,310 +1233,89 @@ pub async fn dispatch_method_with_context(
             crate::infra::handlers::approval::handle_resolve(store, &ctx, &source, params).await
         }
 
-        "status" => {
-            let persona_scope =
-                crate::infra::handlers::principal::team0_connect_only_persona_scope(
-                    &ctx, "status",
-                )?;
-            let personas = store.list_personas().map_err(|e| (-32000, e.to_string()))?;
-            let grants = store
-                .list_active_grants()
-                .map_err(|e| (-32000, e.to_string()))?;
-            let sandboxes = store
-                .list_sandboxes()
-                .map_err(|e| (-32000, e.to_string()))?;
-            let approvals = store
-                .list_pending_approvals()
-                .map_err(|e| (-32000, e.to_string()))?;
-            let recent_activity_filter = crate::infra::audit::AuditFilter {
-                persona_id: persona_scope.clone(),
-                limit: Some(5),
-                ..Default::default()
-            };
-            let recent_activity = store
-                .query_audit(&recent_activity_filter)
-                .map_err(|e| (-32000, e.to_string()))?;
-            let standing_grants = store
-                .list_standing_grants()
-                .map_err(|e| (-32000, e.to_string()))?
-                .into_iter()
-                .filter(|grant| match persona_scope.as_deref() {
-                    Some(persona_id) => grant.persona_id == persona_id,
-                    None => true,
-                })
-                .count();
-            let audit_events_total = if let Some(persona_id) = persona_scope.as_deref() {
-                store
-                    .query_audit(&crate::infra::audit::AuditFilter {
-                        persona_id: Some(persona_id.to_string()),
-                        ..Default::default()
-                    })
-                    .map_err(|e| (-32000, e.to_string()))?
-                    .len() as u64
-            } else {
-                store.audit_count().map_err(|e| (-32000, e.to_string()))?
-            };
-            let grants = grants
-                .into_iter()
-                .filter(|grant| match persona_scope.as_deref() {
-                    Some(persona_id) => grant.persona_id == persona_id,
-                    None => true,
-                })
-                .collect::<Vec<_>>();
-            let grant_live_leases = grants
-                .iter()
-                .filter(|grant| store.leases().has_live_lease(&grant.id, chrono::Utc::now()))
-                .map(|grant| grant.id.clone())
-                .collect();
-
-            serde_json::to_value(crate::infra::status::StatusSummary {
-                personas: personas
-                    .into_iter()
-                    .filter(|persona| match persona_scope.as_deref() {
-                        Some(persona_id) => persona.id == persona_id,
-                        None => true,
-                    })
-                    .collect(),
-                grants,
-                grant_live_leases,
-                sandboxes: sandboxes
-                    .into_iter()
-                    .filter(|sandbox| match persona_scope.as_deref() {
-                        Some(persona_id) => {
-                            sandbox.persona_id == persona_id
-                                || sandbox.owner_persona_id.as_deref() == Some(persona_id)
-                        }
-                        None => true,
-                    })
-                    .collect(),
-                approvals: approvals
-                    .into_iter()
-                    .filter(|approval| match persona_scope.as_deref() {
-                        Some(persona_id) => approval.persona_id == persona_id,
-                        None => true,
-                    })
-                    .collect(),
-                recent_activity,
-                standing_grants,
-                audit_events_total,
-                quarantined: is_quarantined(),
-                quarantine_authority: quarantine_authority()
-                    .map(|authority| authority.as_str().to_string()),
-            })
-            .map_err(|e| (-32000, format!("serialize status summary: {e}")))
+        // approval_resolve_rpc_landed
+        "approval.resolve" | "approval_resolve" => {
+            crate::broker::handler::handle_approval_resolve(store, &ctx, &source, params).await
+        }
+        "approval.narrow" | "approval_narrow" => {
+            crate::broker::handler::handle_approval_narrow(store, &ctx, &source, params).await
         }
 
-        "grant_status" => grants::handle_status(store, &ctx, params),
+        // status_aggregated_rpc_landed
+        "status" => crate::broker::handler::handle_status(store, &ctx),
 
-        // grant_extend_rpc_landed: dotted namespaced spelling for the
-        // daemon-owned grant extend. Authority gates mirror `create_grant`
-        // (force-from-socket rejection, per-op presence gate under
-        // `HighRiskOp::GrantCreate`, policy evaluation on
-        // `credential.access`). `extend_grant` remains as the legacy
-        // compatibility spelling used by current CLI releases.
+        "grant_status" => crate::infra::handlers::grants::handle_grant_status(store, &ctx, params),
+
+        // grant_extend_rpc_landed
         "grant.extend" | "extend_grant" => {
-            grant_lifecycle::handle_extend(store, policy, &source, params)
+            crate::infra::handlers::grants::handle_extend_grant(store, policy, &source, params)
         }
 
         "request_access" => {
-            access_requests::handle_request(store, policy, rate_limiter, params).await
-        }
-
-        "await_approval" => access_requests::handle_await_approval(store, &ctx, params).await,
-
-        "request_access_blocking" => {
-            access_requests::handle_request_blocking(store, policy, params).await
-        }
-
-        // grant_expire_stale_rpc_landed: namespaced spelling for the
-        // daemon-owned grant expiry sweep. Keep `expire_grants` as the legacy
-        // compatibility spelling used by current CLI releases.
-        "grant.expire_stale" | "expire_grants" => grant_lifecycle::handle_expire_stale(store),
-
-        "grant_summary" => grants::handle_summary(store),
-
-        "detect_anomalies" => grants::handle_detect_anomalies(store),
-
-        "create_standing_grant" => {
-            use core_event_types::ActionSelector;
-
-            let persona_id = params["persona_id"]
-                .as_str()
-                .ok_or((-32602, "missing 'persona_id'".to_string()))?;
-            let action_selector: ActionSelector = serde_json::from_value(
-                params
-                    .get("action_selector")
-                    .cloned()
-                    .ok_or((-32602, "missing 'action_selector'".to_string()))?,
-            )
-            .map_err(|e| (-32602, format!("invalid 'action_selector': {e}")))?;
-            let scope = params["scope"].as_str().unwrap_or("*");
-            let expires_at = params["expires_at"].as_str();
-            store
-                .create_standing_grant(persona_id, &action_selector, scope, expires_at)
-                .map_err(|e| (-32000, e.to_string()))?;
-            Ok(json!({"created": true, "action_selector": action_selector}))
-        }
-
-        "list_standing_grants" => {
-            let persona_scope =
-                crate::infra::handlers::principal::team0_connect_only_persona_scope(
-                    &ctx,
-                    "list_standing_grants",
-                )?;
-            let grants = store
-                .list_standing_grants()
-                .map_err(|e| (-32000, e.to_string()))?;
-            let list: Vec<Value> = grants
-                .iter()
-                .filter(|g| match persona_scope.as_deref() {
-                    Some(persona_id) => g.persona_id == persona_id,
-                    None => true,
-                })
-                .map(|g| {
-                    json!({"id": g.id, "persona_id": g.persona_id, "action_selector": g.action_selector, "scope": g.scope, "expires_at": g.expires_at})
-                })
-                .collect();
-            Ok(Value::Array(list))
-        }
-
-        "remove_standing_grant" => {
-            let id = params["id"]
-                .as_str()
-                .ok_or((-32602, "missing 'id'".to_string()))?;
-            store
-                .remove_standing_grant(id)
-                .map_err(|e| (-32000, e.to_string()))?;
-            Ok(json!({"removed": true}))
-        }
-
-        "poll_notifications" => {
-            let persona_id =
-                crate::infra::handlers::principal::persona_scoped_param_for_connect_only(
-                    &ctx,
-                    params,
-                    "poll_notifications",
-                    "persona_id",
-                    true,
-                )?
-                .ok_or((-32602, "missing 'persona_id'".to_string()))?;
-            let notifications = store
-                .poll_notifications(&persona_id)
-                .map_err(|e| (-32000, e.to_string()))?;
-            Ok(Value::Array(notifications))
-        }
-
-        "list_receipts" => audit_receipts::handle_list_receipts(store, &ctx, params),
-
-        "get_receipt" => audit_receipts::handle_get_receipt(store, &ctx, params),
-
-        "daemon_persona" => {
-            // Expose the current Daemon Persona pubkey over the socket for
-            // offline verification tools. Returns `null` when the Daemon
-            // Persona was not initialised.
-            match crate::infra::receipt::current_identity() {
-                Some(id) => Ok(json!({
-                    "pubkey": id.pubkey_hex(),
-                    "canonical_version": crate::infra::receipt::CANONICAL_VERSION,
-                })),
-                None => Ok(Value::Null),
-            }
-        }
-
-        "grant_budget_status" => grants::handle_budget_status(store, &ctx, params),
-
-        // Broker daemon RPC (design Phase 2): broker socket RPC arms.
-        //
-        // These are intentionally additive — the registry, materialization
-        // tracking, Receipt-event emission, and provider-routing logic live
-        // in `crate::broker_handler`. Adding them here is the minimum
-        // dispatch surface so concurrent worktrees touching unrelated
-        // arms don't conflict on a structural refactor of this fn.
-        //
-        // Marker: RPC method name "BrokerIssue" lives
-        // alongside its sibling routes as the literal `broker_issue`. See
-        // `broker_handler.rs` for handler bodies + tests.
-        //
-        // Broker peercred principal binding: per-agent UDS callers
-        // continue to thread a kernel-attested `PeerCredPrincipal` into
-        // broker handlers. Bridge-authenticated callers instead ride the
-        // `mtls_principal` lane stamped by ember-rpc, so the local sibling
-        // peercred must be suppressed before entering the shared-socket
-        // broker gates.
-        "broker_issue" => {
-            crate::broker::handler::handle_broker_issue(
-                broker_peercred_principal_for_handler(&ctx),
+            crate::infra::handlers::approval::handle_request_access(
                 store,
-                params,
-            )
-            .await
-        }
-        "broker_revoke" => {
-            crate::broker::handler::handle_broker_revoke(
-                broker_peercred_principal_for_handler(&ctx),
-                store,
-                params,
-            )
-            .await
-        }
-        "broker_list" => {
-            crate::broker::handler::handle_broker_list(
-                broker_peercred_principal_for_handler(&ctx),
-                store,
-                params,
-            )
-            .await
-        }
-        // Broker SecretRef contract: agent processes hold an
-        // opaque `SecretRef`; the trust boundary (ember-proxy /
-        // ember-tools) calls `broker_resolve` to materialise the
-        // plaintext credential. Stub today; full impl in a
-        // follow-up.
-        "broker_resolve" => {
-            crate::broker::handler::handle_broker_resolve(
-                broker_peercred_principal_for_handler(&ctx),
-                store,
-                ctx.sessions_dir.as_deref(),
-                params,
-            )
-            .await
-        }
-        // Bridge refresh-cert RPC: refresh_cert dispatch.
-        // The handler consumes the mTLS principal stamped by the bridge
-        // listener and performs design M3 identity proof + mint/update.
-        // Anchor: refresh_cert_dispatch_landed
-        "refresh_cert" => {
-            crate::broker::handler::handle_refresh_cert(
-                broker_peercred_principal_for_handler(&ctx),
-                ctx.mtls_principal(),
-                store,
+                policy,
                 rate_limiter,
                 params,
             )
             .await
         }
-        // design §"daemon-as-process-supervisor": spawn a Construct binary
-        // as the daemon's child, capture exit code, emit
-        // session.construct_invocation receipt. argv re-classifier deferred.
-        "broker_exec" => {
-            crate::broker::handler::handle_broker_exec_with_sessions(
-                broker_peercred_principal_for_handler(&ctx),
-                store,
-                ctx.sessions_dir.as_deref(),
-                params,
-            )
-            .await
+
+        "await_approval" => {
+            crate::infra::handlers::approval::handle_await_approval(store, &ctx, params).await
         }
-        // Claude Code gradient warning (Tier 1) —
-        // unsessioned subprocess audit observability. Fires from a
-        // Construct shim's passthrough-exec branch BEFORE the shim
-        // execs the wrapped binary, so the daemon's tamper-evident
-        // chain records the invocation even though no broker mediation
-        // occurred. ConnectOnly authority (peer-cred is sufficient);
-        // schema validation in the handler prevents abuse. See
-        // `handle_subprocess_audit_log` for the wire contract.
+
+        // grant_expire_stale_rpc_landed
+        "grant.expire_stale" | "expire_grants" => {
+            crate::infra::handlers::system::handle_expire_grants(store)
+        }
+
+        "grant_summary" => crate::infra::handlers::grants::handle_grant_summary(store),
+
+        "detect_anomalies" => crate::infra::handlers::system::handle_detect_anomalies(store),
+
+        "create_standing_grant" => {
+            crate::infra::handlers::grants::handle_create_standing_grant(store, params)
+        }
+
+        "list_standing_grants" => {
+            crate::infra::handlers::grants::handle_list_standing_grants(store, &ctx)
+        }
+
+        "remove_standing_grant" => {
+            crate::infra::handlers::grants::handle_remove_standing_grant(store, params)
+        }
+
+        "poll_notifications" => {
+            crate::infra::handlers::system::handle_poll_notifications(store, &ctx, params)
+        }
+
+        "list_receipts" => {
+            crate::infra::handlers::system::handle_list_receipts(store, &ctx, params)
+        }
+
+        "get_receipt" => crate::infra::handlers::system::handle_get_receipt(store, &ctx, params),
+
+        "daemon_persona" => crate::infra::handlers::system::handle_daemon_persona(),
+
+        "grant_budget_status" => {
+            crate::infra::handlers::grants::handle_grant_budget_status(store, &ctx, params)
+        }
+
+        // Broker-facing RPC routing lives in handlers::broker.
+        "broker_issue" => crate::infra::handlers::broker::handle_issue(store, &ctx, params).await,
+        "broker_revoke" => crate::infra::handlers::broker::handle_revoke(store, &ctx, params).await,
+        "broker_list" => crate::infra::handlers::broker::handle_list(store, &ctx, params).await,
+        "broker_resolve" => {
+            crate::infra::handlers::broker::handle_resolve(store, &ctx, params).await
+        }
+        "refresh_cert" => {
+            crate::infra::handlers::broker::handle_refresh_cert(store, rate_limiter, &ctx, params)
+                .await
+        }
+        "broker_exec" => crate::infra::handlers::broker::handle_exec(store, &ctx, params).await,
         "subprocess_audit_log" => {
-            handle_subprocess_audit_log(store, params, ctx.peer_cred_principal.as_ref())
+            crate::infra::handlers::broker::handle_subprocess_audit_log(store, &ctx, params)
         }
         // Broker peercred principal binding: session.lookup_or_open
         // RPC — look up an existing session for the caller's persona or
@@ -2548,92 +1330,44 @@ pub async fn dispatch_method_with_context(
         // `params.persona` does not match the kernel-attested uid
         // binding, OR -32401 when no principal is available.
         "session.lookup_or_open" | "session_lookup_or_open" => {
-            bindings::handle_session_lookup_or_open(ctx.peer_cred_principal.as_ref(), store, params)
-                .await
-        }
-        // Broker GitHub App local key: mint a 1-hour GitHub App installation
-        // token using a local-held RSA private key (design credential broker).
-        // Credentials loaded from GH_APP_* env vars (placeholder until vault
-        // path provisioning lands).
-        "broker.mint_gh_token" => {
-            crate::broker::handler::handle_broker_mint_gh_token(store, params).await
-        }
-        // Mint sub-persona RPC: mint a child sub-persona scoped
-        // under an existing parent persona. Params: { parent_persona_id, child_label,
-        // scope }. Response: { persona_id }. Real two-phase commit + spawn wiring
-        // is still a scaffold, but otherwise-valid calls fail closed instead of
-        // panicking the daemon.
-        "broker.mint_sub_persona" => {
-            crate::broker::handler::handle_broker_mint_sub_persona(store, params).await
-        }
-        // Broker issue --inject: register a child shell PID for
-        // auto-revoke when the shell exits. Spawns a background poll task that
-        // watches /proc/<pid> (Linux) or kill(pid, 0) (other Unix) and calls
-        // broker_revoke on all listed materialization IDs on exit.
-        "broker_register_pid_watcher" => {
-            crate::broker::handler::handle_broker_register_pid_watcher(store, params).await
-        }
-
-        // design slice 4 C: the forgeable WebAuthn-assertion → `DaemonSignedHandle`
-        // presence-proof bridge (`issue_presence_proof` + `TabChannel` +
-        // `AssertionVerifier` + `issue_daemon_signed_handle`) was deleted. The
-        // dispatch arm is retained so the wire surface stays discoverable, but
-        // `handle_request_presence_proof` now returns a clean `-32601
-        // not_implemented`. Operator presence is sourced from the §4
-        // presence-as-decryption unlock; widening verifies a real enrolled-device
-        // signature via `presence_gate::verify_presence_signature`.
-        "presence/request_proof" | "presence_request_proof" => {
-            crate::broker::handler::handle_request_presence_proof(
+            crate::infra::handlers::session::handle_session_lookup_or_open(
                 ctx.peer_cred_principal.as_ref(),
                 store,
                 params,
             )
             .await
         }
+        "broker.mint_gh_token" => {
+            crate::infra::handlers::broker::handle_mint_gh_token(store, params).await
+        }
+        "broker.mint_sub_persona" => {
+            crate::infra::handlers::broker::handle_mint_sub_persona(store, params).await
+        }
+        "broker_register_pid_watcher" => {
+            crate::infra::handlers::broker::handle_register_pid_watcher(store, params).await
+        }
 
-        // design §3 — mint the single-use presence nonce a widening op's
-        // presence-Device signature must cover (the G3 signing-driver's first
-        // call). Returns the nonce, the daemon fingerprint, and the exact
-        // canonical intent bytes to sign off-host. ConnectOnly proof-acquisition.
+        // handler_dispatch_prose_compacted: domain modules own detailed RPC contracts.
+        "presence/request_proof" | "presence_request_proof" => {
+            crate::infra::handlers::broker::handle_request_presence_proof(store, &ctx, params).await
+        }
+
         "presence/request_nonce" | "presence_request_nonce" => {
             handle_presence_request_nonce(store, &ctx, params)
         }
 
-        // V030-EMBER-DEVICE-LIST — ConnectOnly read of the full enrolled-device
-        // inventory. No vault tap; no presence gate. Returns all devices in
-        // `devices_current` from the identity event store. Exempt from the
-        // revoke-coverage audit (EXEMPT: no persona/grant params).
-        // Anchor: ember_device_list_surface_landed.
         "identity.device.list" | "identity_device_list" => {
             presence_runtime::handle_identity_device_list(store)
         }
 
-        // design §5 device enrollment — operator-bootstrap ceremony. The
-        // prepare→commit RPC that drives the merged
-        // `operator_identity::{genesis_enroll_plan, commit_first_run_enrollment}`
-        // primitives: PREPARE (no signatures) returns the exact bytes the
-        // operator's presence device must sign off-host; COMMIT (signatures
-        // present) appends + verifies the genesis/enroll events. The daemon never
-        // holds the operator device key. This RETIRES the old
-        // `presence/enroll` → `handle_first_run_enrollment` WebAuthn-passkey stub
-        // (it minted non-attested passkeys structurally barred from the presence
-        // class). The dashboard passkey ceremony / webauthn-rs machinery is kept
-        // for the future `genuine_app` attested-passkey lane; only this
-        // operator-enrollment entry point is retired.
         "identity.device.enroll" | "identity_device_enroll" => {
             handle_identity_device_enroll(store, params)
         }
 
-        // design §5 — read-only PREPARE half (tap-reduction). ConnectOnly: no
-        // key, no mutation, no vault; splitting it out of the OperatorPresence
-        // commit RPC drops a redundant native-unlock Touch ID tap.
         "identity.device.enroll_plan" | "identity_device_enroll_plan" => {
             handle_identity_device_enroll_plan(store, params)
         }
 
-        // design §5 / AC-2 — backup presence-device enrollment. PREPARE returns
-        // the exact DeviceEnrolled bytes an existing operator presence Device
-        // signs; COMMIT verifies that signature and appends the backup device.
         "identity.device.enroll_backup" | "identity_device_enroll_backup" => {
             handle_identity_device_enroll_backup(store, params)
         }
@@ -2641,237 +1375,54 @@ pub async fn dispatch_method_with_context(
             handle_identity_device_enroll_backup_plan(store, params)
         }
 
-        // V030-EMBER-DEVICE-REVOKE — operator-driven device revocation. Same
-        // two-call prepare/commit shape as `enroll_backup`: PREPARE returns the
-        // DeviceRevoked event bytes the authority presence Device signs;
-        // COMMIT verifies and appends. Daemon refuses to revoke the last
-        // active presence Device (would brick the authority set). The OOB
-        // signature on the event bytes IS the presence proof — this method is
-        // deliberately NOT in `is_presence_widening` (the event-body
-        // signature is structurally stronger than a chokepoint intent
-        // signature; the operator does not sign twice). EXEMPT from the
-        // revoke-coverage audit (no persona/grant params).
-        // Anchor: ember_device_revoke_surface_landed.
         "identity.device.revoke" | "identity_device_revoke" => {
-            // V030-EMBER-DEVICE-REVOKE F4.1 — handler is now async; it
-            // acquires `DaemonStore::identity_mutation_lock` across the
-            // open → guard → commit window so two concurrent COMMITs
-            // cannot each pass an independent pre-flight against stale
-            // per-instance materialized state. See the handler doc-comment
-            // for the race rationale.
             handle_identity_device_revoke(store, params).await
         }
 
-        // design §6 — off-host recovery-recipient enrollment (the printed `age`
-        // code). Same two-call shape as backup-device enrollment: PREPARE returns
-        // the `DeviceEnrolled(Recovery)` bytes an existing operator presence Device
-        // signs; COMMIT verifies that signature and appends the Recovery Device.
-        // The daemon holds neither the authority key nor the recovery secret.
         "identity.recovery.enroll" | "identity_recovery_enroll" => {
             handle_identity_recovery_enroll(store, params)
         }
 
-        // Credential-binding admin verb: credential-binding admin
-        // RPCs invoked by `ember bind {register, list, remove, move}`. The
-        // admin path does NOT require biometric — the operator
-        // authenticates to the daemon via PeerCred. Each handler enforces
-        // caller_persona validation (non-nil parseable UUID) and emits an
-        // audit row for register/remove/move. The dotted method names are
-        // canonical; the underscore aliases mirror the broker_* dispatch
-        // convention used by sibling routes.
         "broker.bindings.register" | "broker_bindings_register" => {
-            crate::broker::handler::handle_broker_bindings_register(
-                ctx.peer_cred_principal.as_ref(),
-                store,
-                params,
-            )
-            .await
+            crate::infra::handlers::broker::handle_bindings_register(store, &ctx, params).await
         }
         "broker.bindings.list" | "broker_bindings_list" => {
-            crate::broker::handler::handle_broker_bindings_list(
-                ctx.peer_cred_principal.as_ref(),
-                store,
-                params,
-            )
-            .await
+            crate::infra::handlers::broker::handle_bindings_list(store, &ctx, params).await
         }
         "broker.registry_status" | "broker_registry_status" => {
-            // -S3 intentionally-global ConnectOnly diagnostic: registry
-            // installation/authority posture is daemon-wide and carries no
-            // persona-owned rows.
-            let registry = crate::broker::handler::current_registry().ok_or_else(|| {
-                (
-                    -32000,
-                    "broker registry not initialised — start emberd to populate".to_string(),
-                )
-            })?;
-            crate::broker::handler::registry_status_with_registry(registry).await
+            crate::infra::handlers::broker::handle_registry_status().await
         }
         "broker.github_status" | "broker_github_status" => {
-            // -S3 intentionally-global ConnectOnly diagnostic: GitHub
-            // broker resolver posture is daemon/operator posture, not a
-            // persona inventory projection.
-            let registry = crate::broker::handler::current_registry().ok_or_else(|| {
-                (
-                    -32000,
-                    "broker registry not initialised — start emberd to populate".to_string(),
-                )
-            })?;
-            let resolver = crate::broker::authority::BrokerAuthorityResolver::current()
-                .ok_or_else(|| {
-                    (
-                        -32000,
-                        "broker authority resolver not initialised — start emberd to populate"
-                            .to_string(),
-                    )
-                })?;
-            crate::broker::handler::github_status_with_registry_and_resolver(
-                registry,
-                resolver.as_ref(),
-            )
-            .await
+            crate::infra::handlers::broker::handle_github_status().await
         }
-        "trust.list" | "trust_list" => {
-            // design §Component 2 — operator-visible trust-set
-            // introspection. Read-only; no peer-cred gating because the
-            // snapshot answers a "what is this daemon's posture?" question
-            // that any operator with socket access already learns by
-            // probing the manifest path. -S3 keeps this intentionally
-            // global because trust roots are daemon posture, not
-            // persona-owned rows. See trust::introspect.
-            crate::trust::introspect::handle_trust_list(params)
-        }
-        "trust.show" | "trust_show" => {
-            // design §Component 2 Phase 2 — drill-down lookup by full
-            // fingerprint or unique hex prefix. Same posture as
-            // `trust.list` (read-only, intentionally-global ConnectOnly).
-            crate::trust::introspect::handle_trust_show(params)
-        }
+        "trust.list" | "trust_list" => crate::trust::introspect::handle_trust_list(params),
+        "trust.show" | "trust_show" => crate::trust::introspect::handle_trust_show(params),
         "trust.explain" | "trust_explain" => {
-            // design §Component 2 Phase 3 — chain-walk a signed
-            // artifact back to its trust root. v1 supports
-            // `artifact_kind = "binary_manifest"`; Receipt + workflow
-            // grant land in follow-up tasks. Same intentionally-global
-            // daemon-posture read as `trust.list`.
             crate::trust::introspect::handle_trust_explain_with_store(Some(store), params)
         }
         "trust.rotate_dev_ir" | "trust_rotate_dev_ir" => {
-            // design §Component 3 — dev IdentityRoot rotation.
-            // The CLI side has already minted
-            // the new keypair (Touch ID gated), stashed it in Keychain
-            // at the `.v2` label, and is calling here to register the
-            // rotation + schedule the grace-window timer. The mutation
-            // is bookkeeping-only (registry entry); the trust-root
-            // snapshot itself updates at the next daemon startup when
-            // the operator-rewritten plist's `EMBER_TRUST_ROOTS`
-            // carries both keys (additive rotation per Component 3
-            // step 3). Anchor: `trust_rotate_dev_ir_landed`.
             crate::trust::rotation::handle_trust_rotate_dev_ir(params)
         }
         "trust.rotation_status" | "trust_rotation_status" => {
-            // design §Component 3 — read-only "is anything rotating?"
-            // query. Same intentionally-global posture as
-            // `trust.list`; safe to expose to any ConnectOnly caller.
             crate::trust::rotation::handle_trust_rotation_status(params)
         }
         "broker.bindings.remove" | "broker_bindings_remove" => {
-            crate::broker::handler::handle_broker_bindings_remove(
-                ctx.peer_cred_principal.as_ref(),
-                store,
-                params,
-            )
-            .await
+            crate::infra::handlers::broker::handle_bindings_remove(store, &ctx, params).await
         }
         "broker.bindings.move" | "broker_bindings_move" => {
-            crate::broker::handler::handle_broker_bindings_move(
-                ctx.peer_cred_principal.as_ref(),
-                store,
-                params,
-            )
-            .await
+            crate::infra::handlers::broker::handle_bindings_move(store, &ctx, params).await
         }
 
-        // Binding delete RPC (design §"binding.delete"):
-        // graceful delete of a SA→Persona binding. Revokes the workload
-        // Persona's grants (cascade via `revoke_persona`) so in-flight
-        // broker requests holding active grant references drain to
-        // completion while new lookups fail. The audit log captures a
-        // `binding.deleted` event keyed on `persona_id` +
-        // `binding_request_id` for idempotent reconciler retries. The
-        // canonical wire-form method is "binding.delete"; the
-        // underscore alias mirrors the broker_* dispatch convention.
         "binding.delete" | "binding_delete" => bindings::binding_delete(store, params).await,
 
-        // Binding revoke-urgent RPC (design
-        // §"binding.revoke_urgent"): compromise-response revocation.
-        // Cascades the same SQL flip as `binding.delete` but tags the
-        // audit row with `binding.revoke_urgent` so the operator can
-        // distinguish the two lifecycle paths in the receipt + alerting
-        // pipeline. Unlike `binding.delete`, the audit `outcome` is
-        // `"urgent"` so downstream consumers (alerting, dashboards,
-        // SOC2 evidence reports) can fire on the high-severity event
-        // without re-parsing details JSON. The wire-form method
-        // "binding.revoke_urgent" is canonical; the underscore alias
-        // matches the broker_* convention.
         "binding.revoke_urgent" | "binding_revoke_urgent" => {
             bindings::binding_revoke_urgent(store, params).await
         }
 
-        // Binding update RPC (design §"binding.update"):
-        // mutate metadata on an existing binding without revoking it.
-        // Today the persona row only carries a mutable `name` column;
-        // the broader binding-metadata fields the brief calls out
-        // (`cred_class_allowlist`, `lease_duration_cap`, etc.) live in
-        // the audit-log details JSON until the schema lands those
-        // columns. The audit row carries a before/after snapshot so
-        // the reconciler + receipt pipeline can correlate the mutation
-        // with its originating `binding_request_id`. The wire-form
-        // method "binding.update" is canonical; the underscore alias
-        // mirrors the broker_* dispatch convention.
         "binding.update" | "binding_update" => bindings::binding_update(store, params).await,
 
-        // Binding upsert RPC (design §"binding.upsert"):
-        // idempotent insert-or-update for the SA→Persona binding
-        // surface used by `ember-kernel`'s EmberServiceAccount
-        // reconciler. Replaces the placeholder "method not found"
-        // fallback that today causes the reconciler to log a stub-
-        // bind warning every reconcile pass. Semantics:
-        //   * If the persona row identified by `persona_id` exists,
-        //     update it in place (same surface as `binding.update`)
-        //     and emit `binding.upserted` audit row with a
-        //     before/after snapshot.
-        //   * If the persona row does not exist, create a fresh
-        //     persona using the requested `name` and emit
-        //     `binding.upserted` with `before: null` and the freshly-
-        //     created row in `after`. The daemon's canonical id
-        //     (UUID-suffixed per `create_persona`) is returned to
-        //     the reconciler in `persona_id`; the reconciler
-        //     persists that into `status.bound_persona_id`.
-        // The wire-form method "binding.upsert" is canonical; the
-        // underscore alias matches the broker_* dispatch convention.
         "binding.upsert" | "binding_upsert" => bindings::binding_upsert(store, params).await,
 
-        // Agent-persona RPC (design §9 + §6):
-        // atomic create_agent_persona binding container identity →
-        // Persona + attenuated child grant. Replaces the
-        // create_persona + delegate_grant two-call sequence with a
-        // single RPC whose state machine is the two-phase commit:
-        //
-        //   phase 1 — insert persona row with status='enrolling' +
-        //             bind to container_id + parent_grant_id
-        //             (CRIT-4: only one in-flight key per container)
-        //   phase 2 — delegate the parent grant to the new persona
-        //             with the requested narrowed scope
-        //   phase 3 — flip persona status enrolling → active
-        //
-        // If the daemon crashes between phase 1 and phase 3, the
-        // persona row stays in 'enrolling' and the reconciler refuses
-        // to spawn into that container slot (see
-        // DaemonStore::enrolling_persona_for_container). The
-        // container_id binding is persisted in both the `personas`
-        // table (via container_id column) AND the audit log (via
-        // `agent_persona.created` event) so reconcilers can
-        // reconstruct the binding from either source.
         "create_agent_persona" | "create_agent_persona_atomic" => {
             bindings::create_agent_persona(store, params).await
         }
@@ -2887,16 +1438,6 @@ pub async fn dispatch_method_with_context(
 
         "sops.unwrap" => sops::handle_unwrap(params),
 
-        // Launcher session RPC: register a new claude-code session.
-        //
-        // Called by the launcher immediately before spawning the `claude` child.
-        // Creates a `SessionMeta` file in `sessions_dir` and returns the
-        // `{session_id, grant_id, proxy_url}` triple the launcher injects as
-        // env vars. The daemon's proxy URL is emitted so the launcher doesn't
-        // need to hard-code a port.
-        //
-        // Params: `{ "persona": "<name_or_id>", "launcher_pid": <u32> }`
-        // Result: `{ "session_id": "...", "grant_id": "...", "proxy_url": "..." }`
         "register_session" => {
             crate::infra::handlers::session::handle_register_session(store, &ctx, params)
         }
@@ -2904,49 +1445,17 @@ pub async fn dispatch_method_with_context(
             crate::infra::handlers::session::handle_describe_runtime_attach_target(&ctx, params)
         }
 
-        // Launcher session RPC: close a claude-code session (clean exit).
-        //
-        // Called by the launcher after the `claude` child exits naturally. Emits
-        // a signed v2 `session.claude_code` Receipt with
-        // `termination_reason: clean_exit` into `<session_dir>/receipt.json`,
-        // closes the `SessionMeta`, and logs a `session.closed` audit event.
-        //
-        // Clean-exit revoke fix: CleanExit MUST NOT
-        // revoke the grant. A 24h grant supports many sessions; the previous
-        // unconditional revoke_grant call here was the second-half regression
-        // (the launcher goes through this RPC arm, not session_watcher, so
-        // #2366's session_watcher fix did not reach the launcher path).
-        //
-        // Params: `{ "session_id": "..." }`
-        // Result: `{ "closed": true, "receipt_id": "..." }`
         "close_session" => {
             crate::infra::handlers::session::handle_close_session(store, &ctx, params)
         }
 
-        // -S2 Door-1 leaf-pin (design §2). The launcher reports the pid of
-        // the harness child it just spawned; the per-session UDS accept gate
-        // admits a connection only from that exact pid (+ reuse-immune
-        // pidversion). See `infra::session_proxy::evaluate_primary_gate`.
-        //
-        // Params: `{ "session_id": "...", "leaf_pid": <u32> }`
-        // Result: `{ "leaf_pinned": <bool> }`
         "report_session_leaf" => {
             crate::infra::handlers::session::handle_report_session_leaf(&ctx, params)
         }
 
-        // design §5 output 3 — persist a reusable delegated-authority artifact
-        // from `ember catalog plan --save`. Writes the validated template TOML
-        // into the daemon's own overlay dir so a separate-uid managed daemon
-        // can resolve it at launch. OperatorPresence-gated (authority-shaping).
         "save_delegation_template" => {
             crate::infra::handlers::session::handle_save_delegation_template(store, &ctx, params)
         }
-
-        // BKR-4c (design §6): the `delegation_{revoke,list,show}` RPCs were
-        // retired with the legacy delegation sidecar (now `StandingGrant`). The
-        // per-session authority lives in the runtime persona's standing grant;
-        // operators inspect/revoke it via the unified `grant` surface (`ember
-        // grant {ls,show,revoke}`). Unknown-method callers hit the default arm.
 
         // Headless enrollment/runtime surfaces live in handler::headless.
         "headless_enroll" => headless::handle_enroll(store, &ctx, params),
@@ -2957,43 +1466,18 @@ pub async fn dispatch_method_with_context(
 
         "headless_preflight_gaps" => headless::handle_preflight_gaps(&ctx, params),
 
-        // Headless pre-flight Layer 1 — Layer 1 predictive
-        // pre-flight gate, wired over the daemon socket so the CLI can
-        // surface manifest-declared Construct gaps before headless dispatches
-        // a task that the enrolled persona's template cannot grant.
-        //
-        // Layer 1 pre-flight is wired into the socket surface.
-        //
-        // Per design §"Pre-flight scope check at enrollment" Layer 1: for
-        // each queued task that declares `constructs = ["<construct>.<action>"]`,
-        // resolve the union of action permissions through the bundled cohort-A
-        // manifest registry, diff against the enrolled persona template, and
-        // return the gap list. Slice B (prior change) shipped the resolver +
-        // manifest parser; this arm wires them into the socket surface.
-        //
-        // Params:
-        //   { "tasks": [ { "task_id": "<id>", "constructs": ["<c>.<a>", ...] }, ... ],
-        //     "template"?: ["<construct>.<action>", ...] }
-        //
-        // Result: JSON array of `{ "task_id": <id>, "identifier": <perm>,
-        //                          "scope": <string|null> }` — one entry per
-        //         permission a task needs that is NOT in `template`.
-        //
-        // Authorization: read-only over caller-supplied data; SO_PEERCRED +
-        // group `ember` ACL (design) is the only gate, matching
-        // `headless_preflight_gaps`.
         "headless_preflight_layer1" => {
             presence::record_activity();
             preflight::handle_headless_preflight_layer1(params)
         }
 
-        // -S3 — preflight authority coverage. Read-only, persona-scoped
-        // ConnectOnly. The daemon owns the covered/prompt/deny/missing verdict
-        // (authority root); the CLI only enumerates the catalog action set and
-        // renders the result.
         "preflight_authority_coverage" => {
             presence::record_activity();
             preflight::handle_preflight_authority_coverage(&ctx, params, store).await
+        }
+        "catalog.search_actions" | "catalog_search_actions" => {
+            presence::record_activity();
+            preflight::handle_catalog_search_actions(params)
         }
 
         _ => Err((-32601, "Method not found".to_string())),

@@ -15,19 +15,22 @@ use crate::launcher::presence;
 const PROD_EMBER_DAEMON_PATH: &str = "/usr/local/bin/emberd";
 const MANAGED_DAEMON_DRIFT_THRESHOLD: Duration = Duration::from_secs(300);
 
-/// Map a launcher label (e.g. `"ember codex"`) to the daemon `attestation_caller`
-/// key, or `None` for harnesses with no special per-session proxy lane. Codex
-/// gets `"codex-network-proxy"` so the daemon stands up the loopback-TCP
-/// responses lane (-S2 / design codex).
 /// Map a launcher label to its binary-pin manifest caller key, which also
 /// selects the daemon's per-session lane: `claude-code` → Door-1 peercred UDS
 /// (PR-C); `codex-network-proxy` → loopback-TCP responses-API-proxy (codex
-/// HOST lane). `None` → no per-session lane (transitional TCP).
+/// HOST lane); `cursor-agent` → loopback HTTPS egress proxy (audit/egress only,
+/// no model-auth brokering). `None` → no per-session lane (transitional TCP).
 fn attestation_caller_for_label(launcher_label: &str) -> Option<&'static str> {
     if launcher_label.contains("codex") {
         Some("codex-network-proxy")
+    } else if launcher_label.contains("cursor") {
+        Some("cursor-agent")
     } else if launcher_label.contains("claude") {
         Some("claude-code")
+    } else if launcher_label.contains("gemini") {
+        // design §2 — the gemini Code Assist lane: the daemon stands up the
+        // per-session loopback Code Assist proxy and returns `gemini_proxy_url`.
+        Some("gemini-code-assist-network-proxy")
     } else {
         None
     }
@@ -477,7 +480,16 @@ pub(crate) fn parse_register_session_result(
         .as_str()
         .map(|s| s.to_string());
     let git_proxy_url = result["git_proxy_url"].as_str().map(|s| s.to_string());
+    let cursor_egress_proxy_url = result["cursor_egress_proxy_url"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let codex_responses_proxy_url = result["codex_responses_proxy_url"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    // design §2 — per-session loopback Code Assist proxy base URL (gemini lane).
+    let gemini_proxy_url = result["gemini_proxy_url"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
@@ -560,7 +572,9 @@ pub(crate) fn parse_register_session_result(
         anthropic_base_url,
         anthropic_custom_headers,
         git_proxy_url,
+        cursor_egress_proxy_url,
         codex_responses_proxy_url,
+        gemini_proxy_url,
         ssh_auth_sock,
         delegation_id,
         delegation_template,
@@ -691,7 +705,11 @@ fn launcher_guidance_for_rpc_with_drift(
                     | "identity-missing"
             )
         });
-    let is_no_active_grant = code == -32004 && message.contains("no active grant for persona");
+    let is_no_active_grant = code == -32004
+        && (message.contains("no active grant for persona")
+            || message.contains("no active runtime-delegable grant for persona")
+            || (message.contains("no active ")
+                && message.contains(" runtime-delegable grant for persona")));
     let is_quarantined =
         message.contains("daemon quarantined") && message.contains("write-class method");
 
@@ -736,6 +754,7 @@ fn launcher_guidance_for_rpc_with_drift(
 
     if method == "register_session" && is_no_active_grant {
         return Some(render_no_active_grant_guidance(
+            message,
             rerun_hint,
             daemon_vault_appears_locked(socket_path),
         ));
@@ -777,20 +796,27 @@ fn daemon_vault_appears_locked(socket_path: &Path) -> bool {
         )
 }
 
-fn render_no_active_grant_guidance(rerun_hint: &str, vault_locked: bool) -> String {
-    let init_hint = if rerun_hint.contains("codex") {
-        "ember init --for codex"
-    } else {
-        "ember init --for claude"
-    };
+fn render_no_active_grant_guidance(message: &str, rerun_hint: &str, vault_locked: bool) -> String {
+    let init_hint = no_active_grant_init_hint(message, rerun_hint);
     if vault_locked {
         return format!(
             "the daemon vault is locked, so launcher grants cannot be read or refreshed yet. Run `ember vault unlock`, then re-run `{rerun_hint}`. If the grant is still missing after unlock, run `{init_hint}`."
         );
     }
     format!(
-        "no active grant is attached to this persona. Run `ember vault unlock` first in case the daemon session is locked, then re-run `{rerun_hint}`. If the grant is still missing, run `{init_hint}` to mint or refresh it."
+        "no active brokered runtime grant is attached to this persona. This is expected after recovery, reinstall, grant expiry, or launcher-exit revocation. Run `{init_hint}` to mint or refresh it, then re-run `{rerun_hint}`."
     )
+}
+
+fn no_active_grant_init_hint(message: &str, rerun_hint: &str) -> &'static str {
+    let rerun_args = || rerun_hint.split_whitespace();
+    if message.contains("cursor-default") || rerun_args().any(|arg| arg == "cursor") {
+        "ember init --for cursor"
+    } else if message.contains("codex-default") || rerun_args().any(|arg| arg == "codex") {
+        "ember init --for codex"
+    } else {
+        "ember init --for claude"
+    }
 }
 
 fn detect_repo_build_managed_daemon_drift() -> Option<RepoBuildManagedDaemonDrift> {
@@ -856,6 +882,10 @@ mod tests {
             attestation_caller_for_label("ember claude"),
             Some("claude-code")
         );
+        assert_eq!(
+            attestation_caller_for_label("ember cursor"),
+            Some("cursor-agent")
+        );
         // Non-harness labels → no per-session lane (transitional TCP).
         assert_eq!(attestation_caller_for_label("ember up"), None);
     }
@@ -882,6 +912,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_extracts_gemini_proxy_url() {
+        // design §2 — the gemini Code Assist lane returns a BARE base URL (no
+        // `/v1`); the launcher forwards it as `CODE_ASSIST_ENDPOINT`.
+        let result = json!({
+            "session_id": "sess_gemini",
+            "grant_id": "grant_gemini",
+            "proxy_url": "http://127.0.0.1:9000",
+            "gemini_proxy_url": "http://127.0.0.1:54322",
+        });
+        let reg = parse_register_session_result(
+            &result,
+            Path::new("/tmp/ignored.sock"),
+            "ember gemini",
+            AuthorityPosture::from_components(false, None),
+        )
+        .expect("parse");
+        assert_eq!(reg.gemini_proxy_url.as_deref(), Some("http://127.0.0.1:54322"));
+        // The codex field stays distinct and absent on a gemini registration.
+        assert!(reg.codex_responses_proxy_url.is_none());
+    }
+
+    #[test]
+    fn parse_extracts_cursor_egress_proxy_url() {
+        let result = json!({
+            "session_id": "sess_cursor",
+            "grant_id": "grant_cursor",
+            "proxy_url": "http://127.0.0.1:9000",
+            "cursor_egress_proxy_url": "http://127.0.0.1:61234",
+        });
+        let reg = parse_register_session_result(
+            &result,
+            Path::new("/tmp/ignored.sock"),
+            "ember cursor",
+            AuthorityPosture::from_components(false, None),
+        )
+        .expect("parse");
+        assert_eq!(
+            reg.cursor_egress_proxy_url.as_deref(),
+            Some("http://127.0.0.1:61234")
+        );
+    }
+
+    #[test]
     fn parse_codex_url_absent_is_none() {
         let result = json!({
             "session_id": "sess_x",
@@ -896,6 +969,8 @@ mod tests {
         )
         .expect("parse");
         assert!(reg.codex_responses_proxy_url.is_none());
+        assert!(reg.cursor_egress_proxy_url.is_none());
+        assert!(reg.gemini_proxy_url.is_none());
     }
 
     struct CwdGuard {
@@ -977,7 +1052,7 @@ mod tests {
             "ember claude --host",
         )
         .expect("expected guidance");
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("expected after recovery"));
         assert!(guidance.contains("ember init --for claude"));
         assert!(guidance.contains("ember claude --host"));
     }
@@ -992,9 +1067,57 @@ mod tests {
             "ember codex --isolated",
         )
         .expect("expected guidance");
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("expected after recovery"));
         assert!(guidance.contains("ember init --for codex"));
         assert!(guidance.contains("ember codex --isolated"));
+    }
+
+    #[test]
+    fn launcher_guidance_maps_no_active_grant_for_cursor_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            Path::new("/tmp/daemon.sock"),
+            "register_session",
+            -32004,
+            "no active grant for persona 'cursor-default'",
+            "ember cursor --host",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("expected after recovery"));
+        assert!(guidance.contains("ember init --for cursor"));
+        assert!(guidance.contains("ember cursor --host"));
+        assert!(!guidance.contains("ember init --for claude"));
+    }
+
+    #[test]
+    fn launcher_guidance_maps_openai_runtime_delegable_grant_for_codex_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            Path::new("daemon.sock"),
+            "register_session",
+            -32004,
+            "no active OpenAI runtime-delegable grant for persona 'codex-default'; this launcher session requires brokered model auth via openai/plan/chatgpt-oauth/<account>/<subject> and cannot fall back to legacy codex-default-v1 authority. Rerun `ember init --for codex` after storing the missing vault credential",
+            "ember codex --host",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("expected after recovery"));
+        assert!(guidance.contains("ember init --for codex"));
+        assert!(guidance.contains("ember codex --host"));
+        assert!(!guidance.starts_with("daemon error:"));
+    }
+
+    #[test]
+    fn launcher_guidance_maps_anthropic_runtime_delegable_grant_for_claude_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            Path::new("daemon.sock"),
+            "register_session",
+            -32004,
+            "no active Anthropic runtime-delegable grant for persona 'claude-code-default'; this launcher session requires brokered model auth via anthropic/plan/claude-oauth/* or anthropic/api/key/* and cannot fall back to legacy claude-code-default-v1 authority. Rerun `ember init --for claude` after storing the missing vault credential",
+            "ember claude --host",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("expected after recovery"));
+        assert!(guidance.contains("ember init --for claude"));
+        assert!(guidance.contains("ember claude --host"));
+        assert!(!guidance.starts_with("daemon error:"));
     }
 
     #[test]
@@ -1048,9 +1171,7 @@ mod tests {
     #[test]
     fn launcher_guidance_names_repo_build_vs_managed_daemon_drift() {
         let drift = RepoBuildManagedDaemonDrift {
-            launcher_path: PathBuf::from(
-                "/private/tmp/emberlink-live-main-dogfood-pass/target/debug/ember",
-            ),
+            launcher_path: PathBuf::from("target/debug/ember"),
             daemon_path: PathBuf::from("/usr/local/bin/emberd"),
         };
         let guidance = launcher_guidance_for_rpc_with_drift(
@@ -1064,18 +1185,18 @@ mod tests {
         .expect("expected guidance");
         assert!(guidance.contains("repo-built launcher"));
         assert!(guidance.contains("/usr/local/bin/emberd"));
-        assert!(guidance.contains(
-            "sudo /private/tmp/emberlink-live-main-dogfood-pass/target/debug/ember daemon install"
-        ));
-        assert!(guidance.contains(
-            "/private/tmp/emberlink-live-main-dogfood-pass/target/debug/ember codex --host"
-        ));
+        assert!(guidance.contains("sudo target/debug/ember daemon install"));
+        assert!(guidance.contains("target/debug/ember codex --host"));
         assert!(!guidance.contains("vault unlock"));
     }
 
     #[test]
     fn render_no_active_grant_guidance_prefers_unlock_when_vault_is_locked() {
-        let guidance = render_no_active_grant_guidance("ember codex --host", true);
+        let guidance = render_no_active_grant_guidance(
+            "no active grant for persona 'codex-default'",
+            "ember codex --host",
+            true,
+        );
         assert!(guidance.contains("ember vault unlock"));
         assert!(guidance.contains("ember codex --host"));
         assert!(guidance.contains("ember init --for codex"));
@@ -1117,7 +1238,9 @@ mod tests {
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: None,
+            cursor_egress_proxy_url: None,
             codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
             ssh_auth_sock: None,
             delegation_id: Some("del-one".to_string()),
             delegation_template: Some("release-proof".to_string()),

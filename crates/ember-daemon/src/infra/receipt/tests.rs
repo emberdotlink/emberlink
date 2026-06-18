@@ -13,7 +13,7 @@ fn ensure_identity() -> &'static DaemonPersona {
     current_identity().expect("identity was just initialised")
 }
 
-/// implementation-note-293 — journal append + mode-drift refusal.
+/// implementation-note-212 — journal append + mode-drift refusal.
 #[test]
 fn receipts_journal_appends_line_at_mode_0600() {
     use std::os::unix::fs::PermissionsExt;
@@ -1034,7 +1034,7 @@ fn load_or_create_accepts_correctly_permissioned_key_file() {
     );
 }
 
-/// implementation-note-294 (Option A):
+/// implementation-note-213 (Option A):
 /// `load_or_create` writes a `daemon_persona.pub` sidecar at mode
 /// 0644 containing the hex pubkey, so cross-uid CLI callers can
 /// resolve the trust anchor without 0600 read on the private key.
@@ -1063,7 +1063,7 @@ fn load_or_create_publishes_pubkey_sidecar() {
     );
 }
 
-/// implementation-note-294 (Option A):
+/// implementation-note-213 (Option A):
 /// `read_pubkey_sidecar_hex` round-trips the pubkey hex emitted
 /// by `DaemonPersona::pubkey_hex`.
 #[test]
@@ -1076,7 +1076,7 @@ fn read_pubkey_sidecar_hex_round_trips_pubkey() {
     assert_eq!(via_sidecar, id.pubkey_hex());
 }
 
-/// implementation-note-294 (Option A):
+/// implementation-note-213 (Option A):
 /// Reading the sidecar before `load_or_create` has run is an error
 /// — callers (e.g. `ember receipt tree`) then fall back to the
 /// legacy `load_or_create` path.

@@ -26,6 +26,7 @@ use crate::infra::receipt::{
     emit_payment_evaluated_receipt_current, emit_payment_settled_receipt_current,
 };
 use crate::infra::store::{DaemonStore, StoreError};
+use crate::trust::grant_projection::{parse_epoch, row_to_grant};
 use crate::trust::lease::LeaseKey;
 use core_grants::chain::{
     access_grant_envelope, build_single_statement_block, scope_to_actions_and_selector,
@@ -35,9 +36,11 @@ use core_grants::scope::{
 };
 use zeroize::Zeroizing;
 
-// implementation-note-357 — final phase cleanup pass completed (design phase C-FINAL)
-// implementation-note-358 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
-// implementation-note-359 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
+pub(crate) use crate::trust::grant_projection::{derive_wall_clock_secs, grant_info_to_core};
+
+// Final phase cleanup pass completed (design phase C-FINAL)
+// Internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
+// Legacy entry points delegate through DaemonGrantStore (design phase C-1)
 // --- Phase B: DaemonGrantStore adapter (design §2.3) ---
 // TODO: GrantInfo struct is retained as a daemon-internal DB projection
 // because receipt.rs, dashboard.rs, tailnet.rs, and handler.rs all depend on fields not present
@@ -275,51 +278,6 @@ impl From<core_grants::GrantError> for StoreError {
     }
 }
 
-/// Bridge: convert a `GrantInfo` row projection into an in-memory
-/// `core_grants::Grant` for state-machine operations.
-///
-/// TODO: this bridge exists because DaemonGrantStore::load
-/// and list_active still go through row_to_grant → GrantInfo. Once GrantInfo is
-/// replaced by a direct row→core_grants::Grant mapping, this function can be deleted.
-/// The mapping is intentionally lossy — scope is encoded as a capability-only Scope
-/// (resource_id and constraints are not round-tripped from the full design shape).
-pub(crate) fn grant_info_to_core(g: &GrantInfo) -> core_grants::Grant {
-    let state = match g.status.as_str() {
-        "paused" => core_grants::GrantState::Paused,
-        "revoked" | "expired" => core_grants::GrantState::Revoked,
-        _ => core_grants::GrantState::Active,
-    };
-    let expires_at = g.expires_at.as_deref().and_then(|s| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-    });
-    let parent_id = g
-        .parent_grant_id
-        .as_deref()
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
-    // Grant IDs are stored as "grant-{uuid}" — strip the prefix before parsing.
-    let raw_id = g.id.strip_prefix("grant-").unwrap_or(&g.id);
-    let id = uuid::Uuid::parse_str(raw_id).unwrap_or_else(|_| uuid::Uuid::nil());
-    core_grants::Grant {
-        id,
-        issuer: core_grants::PrincipalId(g.persona_id.clone()),
-        scope: core_grants::Scope {
-            capability: g.scope.clone(),
-            resource_id: None,
-            constraints: Vec::new(),
-        },
-        state,
-        expires_at,
-        parent_id,
-        delegation_depth: g.max_delegation_depth.unwrap_or(0),
-        usage: core_grants::Usage {
-            used: g.usage.tokens,
-        },
-        schema_version: core_grants::GRANT_SCHEMA_VERSION_PIN,
-    }
-}
-
 /// Adapter trait for grant persistence (design §2.3).
 ///
 /// `DaemonGrantStore` implements this trait over the SQLite store.
@@ -355,8 +313,8 @@ impl<'a> DaemonGrantStore<'a> {
 
     /// Load a `core_grants::Grant` by its daemon-format string ID ("grant-{uuid}").
     ///
-    /// Thin convenience bridge for handler.rs sites migrated in
-    /// implementation-note-237. Returns the state-machine type so callers can
+    /// Thin convenience bridge for migrated handler.rs sites.
+    /// Returns the state-machine type so callers can
     /// use `grant.state` / `grant.issuer` / `grant.expires_at` directly
     /// without going through the `GrantInfo` projection.
     pub fn load_grant(&self, id: &str) -> Result<core_grants::Grant, StoreError> {
@@ -774,162 +732,13 @@ fn synthetic_grant_from_unsigned_block(
 /// maps [`core_grants::chain::ChainBuildError`] onto `StoreError::InvalidInput`
 /// so daemon callers don't have to juggle two error enums.
 ///
-/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-70).
+/// Logic lives in `core_grants::chain::sign_block_zero_with`.
 pub(crate) fn sign_block_zero_with(
     root: &RootKeyPair,
     block: &Block,
 ) -> Result<SignedBlock, StoreError> {
     core_grants::chain::sign_block_zero_with(root, block)
         .map_err(|e| StoreError::InvalidInput(e.to_string()))
-}
-
-fn parse_epoch(s: Option<&str>) -> Option<u64> {
-    s.and_then(|v| DateTime::parse_from_rfc3339(v).ok())
-        .map(|dt| dt.with_timezone(&Utc).timestamp().max(0) as u64)
-}
-
-/// Derive `usage.wall_clock_secs` at read time — pure, no DB write.
-///
-/// The proxy never increments `wall_clock_secs` (it only deltas tokens/cents
-/// per call), so the stored value is always 0. This derivation computes the
-/// actual time the grant has been in force at the moment of the query.
-///
-/// Rules (per implementation-note-213):
-/// - If the grant has already expired (`expires_at` set and `now > expires_at`),
-///   return `min(expires_at, now) - created_at` clamped to `[0, budget_cap]`.
-/// - Otherwise return `now - created_at` clamped to `[0, budget_cap]`.
-/// - `budget_cap = None` means no wall-clock budget; elapsed time is still
-///   derived (for audit accuracy) but is not clamped.
-// implementation-note-213: shipped
-pub(crate) fn derive_wall_clock_secs(
-    now_secs: u64,
-    created_at_secs: u64,
-    expires_at_secs: Option<u64>,
-    budget_cap: Option<u64>,
-) -> u64 {
-    let effective_end = expires_at_secs
-        .map(|exp| exp.min(now_secs))
-        .unwrap_or(now_secs);
-    let elapsed = effective_end.saturating_sub(created_at_secs);
-    match budget_cap {
-        Some(cap) => elapsed.min(cap),
-        None => elapsed,
-    }
-}
-
-fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
-    let id: String = row.get(0)?;
-    let persona_id: String = row.get(1)?;
-    let credential_name: String = row.get(2)?;
-    let scope: String = row.get(3)?;
-    let created_at: String = row.get(4)?;
-    let expires_at: Option<String> = row.get(5)?;
-    let status: String = row.get(6)?;
-    let max_uses: Option<i64> = row.get(7)?;
-    let hours_start: Option<i64> = row.get(8)?;
-    let hours_end: Option<i64> = row.get(9)?;
-    let depth: Option<i64> = row.get(12)?;
-    let spending: Option<i64> = row.get(13)?;
-    let budget_json: Option<String> = row.get(14)?;
-    let usage_json: Option<String> = row.get(15)?;
-    let paused: i64 = row.get(16).unwrap_or(0);
-    let receipt_id: Option<String> = row.get(17)?;
-    let blocks_json: Option<String> = row.get(18)?;
-    // standing-parent columns. Older rows pre-migration may be
-    // missing these — `unwrap_or` keeps the read path resilient across
-    // ALTER TABLE rollouts.
-    let is_standing: i64 = row.get(19).unwrap_or(0);
-    let max_children_per_day: Option<i64> = row.get(20).unwrap_or(None);
-    let auto_delegate_scope_template: Option<String> = row.get(21).unwrap_or(None);
-
-    // Hydrate the canonical composite chain from blocks_json if present.
-    // If blocks_json parses to a non-empty chain, use its first-statement
-    // budget + usage for the `budget`/`usage` scalar projection. Otherwise,
-    // fall back to the flat `budget_json`/`usage_json` columns (legacy).
-    let flat_budget: Option<Budget> = budget_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
-    let flat_usage: Usage = usage_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-
-    let chain_first_stmt_view: Option<(Option<Budget>, Usage)> = blocks_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Vec<SignedBlock>>(raw).ok())
-        .and_then(|blocks| {
-            blocks
-                .first()
-                .and_then(|sb| sb.block.statements.first().cloned())
-                .map(|s| (s.budget, s.usage))
-        });
-
-    let (projected_budget, mut projected_usage) = match chain_first_stmt_view {
-        Some((b, u)) => (b, u),
-        None => (flat_budget, flat_usage),
-    };
-
-    // implementation-note-213: derive wall_clock_secs at read time.
-    // The proxy never increments this field; compute elapsed seconds from
-    // created_at/expires_at so signed receipts record actual time used.
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let created_at_epoch = parse_epoch(Some(&created_at)).unwrap_or(0);
-    let expires_at_epoch = parse_epoch(expires_at.as_deref());
-    let budget_wall_cap = projected_budget.as_ref().and_then(|b| b.wall_clock_secs);
-    projected_usage.wall_clock_secs = derive_wall_clock_secs(
-        now_secs,
-        created_at_epoch,
-        expires_at_epoch,
-        budget_wall_cap,
-    );
-
-    // Compute effective status at read time so callers see time-accurate state.
-    // Terminal states persisted in the column (revoked, abandoned, expired,
-    // exhausted_by_budget, expired_by_budget, parent_cascade_revoked) are kept as-is. For non-terminal
-    // stored states (active, paused) we additionally derive time-based expiry from
-    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-360).
-    let effective_status = if matches!(
-        status.as_str(),
-        "revoked"
-            | "abandoned"
-            | "expired"
-            | "exhausted_by_budget"
-            | "expired_by_budget"
-            | "parent_cascade_revoked"
-    ) {
-        status.clone()
-    } else {
-        GrantStatus::derive(&status, None, expires_at_epoch, now_secs)
-            .as_str()
-            .to_string()
-    };
-
-    Ok(GrantInfo {
-        id,
-        persona_id,
-        credential_name,
-        scope,
-        created_at,
-        expires_at,
-        status: effective_status,
-        max_uses_per_hour: max_uses.map(|v| v as u64),
-        allowed_hours_start: hours_start.map(|v| v as u32),
-        allowed_hours_end: hours_end.map(|v| v as u32),
-        allowed_targets: row.get(10)?,
-        parent_grant_id: row.get(11)?,
-        max_delegation_depth: depth.map(|v| v as u32),
-        spending_limit_cents: spending.map(|v| v as u64),
-        budget: projected_budget,
-        usage: projected_usage,
-        paused: paused != 0,
-        receipt_id,
-        is_standing: is_standing != 0,
-        max_children_per_day: max_children_per_day.map(|v| v as u64),
-        auto_delegate_scope_template,
-    })
 }
 
 /// Serialize an `AccessGrant`'s block chain to JSON for storage in
@@ -947,7 +756,7 @@ pub(crate) fn access_grant_blocks_to_json(g: &AccessGrant) -> Result<String, Sto
 ///
 /// Daemon-layer wrapper that maps [`core_grants::chain::ChainBuildError`] onto
 /// `StoreError::InvalidInput`. Logic lives in
-/// `core_grants::chain::access_grant_from_statements` (implementation-note-70).
+/// `core_grants::chain::access_grant_from_statements`.
 pub fn access_grant_from_statements(
     id: &str,
     persona_id: &str,
@@ -975,8 +784,7 @@ pub fn access_grant_from_statements(
 /// This is the preferred form for new callers — the `root` parameter is
 /// derived from the store rather than threaded in from the outside.
 /// Existing callers of [`access_grant_from_statements`] continue to
-/// compile unchanged; migrate them to this form incrementally
-/// (TODO P69K-C28-implementation-note-356 caller migration).
+/// compile unchanged; migrate them to this form incrementally.
 ///
 /// Returns the same value as calling `access_grant_from_statements` with
 /// the result of `store.persona_root_keypair(persona_id)`.
@@ -1584,7 +1392,7 @@ impl DaemonStore {
     }
 
     pub fn list_active_grants(&self) -> Result<Vec<GrantInfo>, StoreError> {
-        // implementation-note-189 — `paused` is a reversible state; the operator
+        // `paused` is a reversible state; the operator
         // who pauses a grant must still be able to find and resume it
         // without flipping the "show terminated" toggle (which is for
         // *terminal* states: revoked / expired / exhausted_by_budget).
@@ -2485,7 +2293,7 @@ impl DaemonStore {
             ),
         );
 
-        // implementation-note-109 — emit + persist a
+        // Emit + persist a
         // `spawn.witness` Receipt v2 envelope for this parent→child grant
         // edge. The witness binds the spawned (child) persona to the
         // parent's authorization via two independent signatures (CRIT-7
@@ -2523,8 +2331,7 @@ impl DaemonStore {
                         .ok()
                         .and_then(|p| p.container_id)
                         .unwrap_or_default();
-                    // implementation-note-83:
-                    // read the Bridge CA fingerprint cached on `DaemonStore`
+                    // Read the Bridge CA fingerprint cached on `DaemonStore`
                     // (wired in by `runtime.rs` after `load_or_mint_bridge_ca`
                     // succeeds at startup). In-memory test stores that never
                     // wired a Bridge CA return `None`; we pass `[0u8; 32]` in
@@ -2608,7 +2415,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-238 — read the per-Statement
+    /// Read the per-Statement
     /// revocation list for a grant. Returns the deserialized vector of
     /// revoked sids ("S0", "S1", ...). Missing or NULL column is treated
     /// as empty (legacy rows that predate the migration). Malformed JSON
@@ -2648,8 +2455,8 @@ impl DaemonStore {
         }
     }
 
-    // fn get_revoked_sids walks parent_persona_id ancestry (implementation-note-284)
-    /// implementation-note-284 — return the per-Statement
+    // fn get_revoked_sids walks parent_persona_id ancestry
+    /// Return the per-Statement
     /// revocation set for a grant **unioned with every ancestor persona's
     /// grant revocations**. Revoking an orchestrator persona's grant now
     /// cascades to all child / grandchild personas spawned under that
@@ -2725,7 +2532,7 @@ impl DaemonStore {
         self.grant_store().revoke_grant_statement(grant_id, sid)
     }
 
-    /// implementation-note-238 — append `sid` to the per-Statement
+    /// Append `sid` to the per-Statement
     /// revocation list for a grant. Idempotent: appending an already-revoked
     /// sid is a no-op. Emits a `grant.statement_revoked` audit event with
     /// the grant_id and statement sid.
@@ -2790,7 +2597,7 @@ impl DaemonStore {
     }
 
     pub(crate) fn revoke_grant_sql(&self, id: &str) -> Result<(), StoreError> {
-        // implementation-note-173 (F-S5-008 + F-S5-005): wrap the revoke +
+        // Audit-chain hardening: wrap the revoke +
         // audit chain emission + grant-receipt emission in a single
         // BEGIN IMMEDIATE transaction so partial failure can't leave a
         // revoked grant without its audit / receipt trail (or vice versa).
@@ -3144,7 +2951,7 @@ impl DaemonStore {
         Ok((exhausted, warned))
     }
 
-    /// implementation-note-240: per-grant version of the
+    /// Per-grant version of the
     /// background sweeps (`expire_stale_grants` + `expire_grants_by_wall_clock`)
     /// run synchronously on observation. `get_grant` already projects an
     /// `effective_status` from `expires_at` vs `now`, so callers can
@@ -3671,7 +3478,7 @@ impl DaemonStore {
                 if stmt.sid == statement_sid {
                     let before = stmt.usage.clone();
                     stmt.usage.tokens = stmt.usage.tokens.saturating_add(delta.tokens);
-                    // implementation-note-65: accumulate micro-cents
+                    // Accumulate micro-cents
                     // (sub-cent precision) and DERIVE the integer `cents`
                     // display value from it. Adding `delta.cents` directly
                     // would lose every sub-cent call to integer truncation,
@@ -3890,7 +3697,7 @@ impl DaemonStore {
     // ADR191_PAYMENT_BUILD_AHEAD — payment reserve/settle lane (rail adapter +
     // payment.evaluated/.settled receipts). This is BUILD-AHEAD substrate for
     // design (ResourceType::Payment via broker_exec rail). It is intentionally
-    // NOT wired to a live daemon RPC yet (the implementation-note-255 PreToolUse hook that
+    // NOT wired to a live daemon RPC yet (the PreToolUse hook that
     // formerly entered it was retired in chore/retire-cohort-a2-pretooluse-hook).
     // DO NOT delete these as "no callers / dead code" — they are exercised by the
     // tests below and are the seed of the design implementation. See design.

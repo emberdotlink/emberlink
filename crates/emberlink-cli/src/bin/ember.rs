@@ -1968,27 +1968,48 @@ fn resolve_operator_persona_id_from_list(
     personas: &[serde_json::Value],
     excluded_persona_id: &str,
 ) -> Result<String, core_types::ValidationError> {
-    if let Some(id) = personas.iter().find_map(|persona| {
-        (persona.get("id").and_then(|v| v.as_str()) != Some(excluded_persona_id)
-            && persona.get("name").and_then(|v| v.as_str()) == Some("root"))
-        .then(|| persona.get("id").and_then(|v| v.as_str()))
-        .flatten()
-    }) {
-        return Ok(id.to_string());
+    fn active_persona_id<'a>(
+        persona: &'a serde_json::Value,
+        excluded_persona_id: &str,
+    ) -> Option<&'a str> {
+        let id = persona.get("id").and_then(|v| v.as_str())?;
+        if id == excluded_persona_id {
+            return None;
+        }
+        let status = persona
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        (status == "active").then_some(id)
     }
 
-    if let Some(id) = personas.iter().find_map(|persona| {
+    fn active_durable_persona_id<'a>(
+        persona: &'a serde_json::Value,
+        excluded_persona_id: &str,
+    ) -> Option<&'a str> {
+        let id = active_persona_id(persona, excluded_persona_id)?;
         let name = persona
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        (persona.get("id").and_then(|v| v.as_str()) != Some(excluded_persona_id)
+        (!name.starts_with("runtime-")
             && !name.starts_with("orchestrator-")
-            && !name.starts_with("claude-code-")
             && !name.starts_with('_'))
-        .then(|| persona.get("id").and_then(|v| v.as_str()))
-        .flatten()
+        .then_some(id)
+    }
+
+    if let Some(id) = personas.iter().find_map(|persona| {
+        (persona.get("name").and_then(|v| v.as_str()) == Some("root"))
+            .then(|| active_persona_id(persona, excluded_persona_id))
+            .flatten()
     }) {
+        return Ok(id.to_string());
+    }
+
+    if let Some(id) = personas
+        .iter()
+        .find_map(|persona| active_durable_persona_id(persona, excluded_persona_id))
+    {
         return Ok(id.to_string());
     }
 
@@ -2590,7 +2611,24 @@ fn run_approval_resolve(
     ),
     core_types::ValidationError,
 > {
-    run_approval_resolve_with_caller(config, id, outcome, None)
+    let caller_persona_id = resolve_approval_operator_caller_persona_id(config, id)?;
+    run_approval_resolve_with_caller(config, id, outcome, caller_persona_id.as_deref())
+}
+
+fn resolve_approval_operator_caller_persona_id(
+    config: &DaemonConfig,
+    id: &str,
+) -> Result<Option<String>, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+
+    let (_, requests) = run_approval_list(config)?;
+    let Some(request) = requests.iter().find(|request| request.id == id) else {
+        return Ok(None);
+    };
+    resolve_operator_persona_id(config, &request.persona_id).map(Some)
 }
 
 fn run_approval_resolve_with_caller(
@@ -3067,6 +3105,52 @@ impl CodexRuntimeAuthTruth {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CursorRuntimeAuthTruth {
+    LaunchReadyGrant {
+        grant_id: String,
+        credential_name: String,
+    },
+    NoLaunchReadyGrant,
+}
+
+impl CursorRuntimeAuthTruth {
+    fn status_line(&self) -> String {
+        match self {
+            Self::LaunchReadyGrant {
+                credential_name, ..
+            } => format!(
+                "Cursor auth: Cursor account/model auth remains Cursor-owned; Ember launch grant ready ({credential_name}); model spend is not brokered."
+            ),
+            Self::NoLaunchReadyGrant => {
+                "Cursor auth: Cursor account/model auth remains Cursor-owned; no launch-ready Ember grant; model spend is not brokered.".to_string()
+            }
+        }
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        match self {
+            Self::LaunchReadyGrant {
+                grant_id,
+                credential_name,
+            } => serde_json::json!({
+                "kind": "cursor_owned_model_auth",
+                "model_auth_governed": false,
+                "launcher_grant_active": true,
+                "grant_id": grant_id,
+                "credential_name": credential_name,
+            }),
+            Self::NoLaunchReadyGrant => serde_json::json!({
+                "kind": "cursor_owned_model_auth",
+                "model_auth_governed": false,
+                "launcher_grant_active": false,
+                "grant_id": serde_json::Value::Null,
+                "credential_name": serde_json::Value::Null,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrimaryActionKind {
     Start,
@@ -3084,11 +3168,18 @@ fn push_row_section(out: &mut String, heading: &str, rows: &[(&str, &str)]) {
     if rows.is_empty() {
         return;
     }
+    const COMMAND_COLUMN_WIDTH: usize = 28;
+
     let theme = current_cli_render_theme();
     let _ = writeln!(out, "{}", style_section_heading(heading));
     for (left, right) in rows {
-        let command = format!("{left:<22}");
-        let _ = writeln!(out, "  {} {}", theme.command(&command), right);
+        if left.len() > COMMAND_COLUMN_WIDTH {
+            let _ = writeln!(out, "  {}", theme.command(left));
+            let _ = writeln!(out, "    {right}");
+        } else {
+            let command = format!("{left:<width$}", width = COMMAND_COLUMN_WIDTH);
+            let _ = writeln!(out, "  {} {right}", theme.command(&command));
+        }
     }
     let _ = writeln!(out);
 }
@@ -3978,6 +4069,8 @@ fn init_rerun_command(for_target: Option<OnboardingTarget>) -> &'static str {
     match for_target {
         Some(OnboardingTarget::Claude) => "`ember init --for claude`",
         Some(OnboardingTarget::Codex) => "`ember init --for codex`",
+        Some(OnboardingTarget::Cursor) => "`ember init --for cursor`",
+        Some(OnboardingTarget::Gemini) => "`ember init --for gemini`",
         None => "`ember init`",
     }
 }
@@ -4921,16 +5014,8 @@ fn cmd_init_for_claude_code(
     // 3. Repair the managed shadow toolchain up front so the first friendly
     //    launcher run uses installed product constructs rather than stale
     //    repo-local target artifacts.
-    let shadow_install = cc::install_managed_prod_shadow_path_with_manifest_repair()
+    let shadow_root = cc::install_managed_prod_shadow_path()
         .map_err(|e| format!("install managed shadow toolchain: {e}"))?;
-    if let Some(refresh) = &shadow_install.operator_manifest_refresh {
-        println!(
-            "  Manifest: refreshed operator binary manifest at {} ({} entries)",
-            refresh.manifest_path.display(),
-            refresh.entries_written
-        );
-    }
-    let shadow_root = shadow_install.shadow_root;
 
     // 3b. Front-load design §4 presence custody.
     //     A clean store reaches here with NO presence device and NO wrapped
@@ -5159,6 +5244,75 @@ fn cmd_init_for_codex(
     Ok(())
 }
 
+fn cmd_init_for_cursor(
+    config: &DaemonConfig,
+    cli_config_path: Option<&PathBuf>,
+    non_interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use emberlink_cli::onboarding::cursor as cu;
+
+    let persona_name = cu::cursor_persona_name();
+    let template_path = cu::default_grant_template_path()?;
+
+    if std::env::var("EMBER_SKIP_DAEMON_INSTALL_CHECK").is_err() {
+        let ember_cmd = ember_command_prefix_for_current_launcher();
+        ensure_managed_daemon_for_init(
+            config,
+            cli_config_path,
+            &ember_cmd,
+            &init_rerun_command_with_ember_command(&ember_cmd, Some(OnboardingTarget::Cursor)),
+            non_interactive,
+        )?;
+    }
+
+    let (mut persona_created, mut persona_id) =
+        prepare_runtime_persona_for_reenroll(config, &persona_name)
+            .map_err(|e| format!("prepare cursor persona (rpc): {e}"))?;
+
+    let template_written = cu::write_grant_template_if_missing(&template_path)?;
+
+    // Cursor baseline needs Ember custody for the local runtime grant, but it
+    // does not capture or broker Cursor account/model credentials.
+    let custody_outcome = ensure_claude_code_presence_custody(config, non_interactive)
+        .map_err(|e| format!("set up presence custody: {e}"))?;
+    println!("{}", custody_outcome.summary_line());
+
+    let grant = match ensure_cursor_runtime_grant(config, &persona_id) {
+        Ok(grant) => grant,
+        Err(err) => match recover_runtime_persona_after_secret_error(
+            config,
+            "Cursor",
+            &persona_name,
+            &persona_id,
+            &err,
+        )
+        .map_err(|e| format!("recover cursor persona (rpc): {e}"))?
+        {
+            Some(recovered_persona_id) => {
+                persona_created = true;
+                persona_id = recovered_persona_id;
+                ensure_cursor_runtime_grant(config, &persona_id)
+                    .map_err(|e| format!("ensure cursor grant after recovery (rpc): {e}"))?
+            }
+            None => return Err(format!("ensure cursor grant (rpc): {err}").into()),
+        },
+    };
+
+    let ember_cmd = ember_command_prefix_for_current_launcher();
+    println!(
+        "{}",
+        render_cursor_init_summary(
+            &persona_name,
+            persona_created,
+            &template_path,
+            template_written,
+            &grant,
+            &ember_cmd,
+        )
+    );
+    Ok(())
+}
+
 fn cmd_uninstall_for_codex() -> Result<(), Box<dyn std::error::Error>> {
     use emberlink_cli::onboarding::codex as co;
 
@@ -5168,6 +5322,196 @@ fn cmd_uninstall_for_codex() -> Result<(), Box<dyn std::error::Error>> {
          are left in place because they may be in use."
     );
     println!("{}", co::codex_auth_status_line());
+    Ok(())
+}
+
+fn cmd_uninstall_for_cursor() -> Result<(), Box<dyn std::error::Error>> {
+    use emberlink_cli::onboarding::cursor as cu;
+
+    println!("Uninstalling Cursor integration:");
+    println!(
+        "  Nothing to remove from Cursor config: the persona, grant, and template \
+         are left in place because they may be in use."
+    );
+    println!("{}", cu::cursor_auth_status_line());
+    Ok(())
+}
+
+/// Outcome of the gemini Code Assist credential import step (design §2).
+enum GeminiRuntimeCredentialOutcome {
+    AlreadyPresent,
+    Captured,
+    Absent,
+}
+
+impl GeminiRuntimeCredentialOutcome {
+    fn summary_line(&self) -> String {
+        use emberlink_cli::onboarding::gemini::GEMINI_CODE_ASSIST_CREDENTIAL as CRED;
+        match self {
+            Self::AlreadyPresent => format!("Gemini auth: reusing {CRED} from vault."),
+            Self::Captured => {
+                format!("Gemini auth: imported ~/.gemini/oauth_creds.json into {CRED}.")
+            }
+            Self::Absent => format!(
+                "Gemini auth: no {CRED} credential yet — sign in with Google in the Gemini CLI \
+                 (run `gemini`, choose \"Login with Google\"), then rerun `ember init --for gemini` to import it."
+            ),
+        }
+    }
+}
+
+/// Import the host Gemini CLI's Code Assist OAuth blob
+/// (`~/.gemini/oauth_creds.json`) into the presence-gated vault under the fixed
+/// `google/code-assist-oauth` name (design §2). Unlike codex there is no
+/// capture subprocess — the operator signs in via the native Gemini CLI first;
+/// this only automates the one-time import (with consent). The daemon owns the
+/// token lifecycle (refresh) + governed-use proxy; the durable refresh token
+/// never leaves the vault.
+fn ensure_gemini_code_assist_runtime_credential_with_capture(
+    config: &DaemonConfig,
+    non_interactive: bool,
+) -> Result<GeminiRuntimeCredentialOutcome, core_types::ValidationError> {
+    if gemini_code_assist_runtime_credential_present(config) {
+        return Ok(GeminiRuntimeCredentialOutcome::AlreadyPresent);
+    }
+    // Never silently import the durable credential without an interactive consent
+    // gate (adversarial M2; mirrors the codex lane). In non-interactive / no-TTY
+    // mode return Absent — the grant step then errors with actionable guidance to
+    // re-run interactively, rather than importing a durable refresh token unasked.
+    if non_interactive || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Ok(GeminiRuntimeCredentialOutcome::Absent);
+    }
+    let Some(host_path) = emberlink_cli::onboarding::gemini::host_oauth_creds_path() else {
+        return Ok(GeminiRuntimeCredentialOutcome::Absent);
+    };
+    let bytes = match std::fs::read(&host_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(GeminiRuntimeCredentialOutcome::Absent);
+        }
+        Err(e) => {
+            return Err(core_types::ValidationError::new(format!(
+                "read host Gemini oauth_creds at {}: {e}",
+                host_path.display()
+            )));
+        }
+    };
+    // Validate the blob parses as JSON before storing (a corrupt file should not
+    // silently land in the vault).
+    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+        core_types::ValidationError::new(format!(
+            "parse host Gemini oauth_creds at {}: {e}; re-run the Gemini \"Login with Google\" flow",
+            host_path.display()
+        ))
+    })?;
+
+    // Interactive by construction here (the non-interactive / no-TTY case
+    // returned Absent above). Require explicit consent before importing.
+    eprintln!(
+        "Ember can import your Gemini Code Assist sign-in ({}) into the presence-gated vault \
+         (the agent never sees the durable refresh token).",
+        host_path.display()
+    );
+    let proceed = prompt_yes_no_default_yes("Import your Gemini Code Assist sign-in now?")
+        .map_err(core_types::ValidationError::new)?;
+    if !proceed {
+        return Ok(GeminiRuntimeCredentialOutcome::Absent);
+    }
+
+    run_vault_store(
+        config,
+        "vault_add",
+        emberlink_cli::onboarding::gemini::GEMINI_CODE_ASSIST_CREDENTIAL,
+        &bytes,
+        Some("google code assist oauth (gemini runtime)"),
+        false,
+    )?;
+    Ok(GeminiRuntimeCredentialOutcome::Captured)
+}
+
+fn cmd_init_for_gemini(
+    config: &DaemonConfig,
+    cli_config_path: Option<&PathBuf>,
+    non_interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use emberlink_cli::onboarding::gemini as ge;
+
+    let persona_name = ge::gemini_persona_name();
+
+    if std::env::var("EMBER_SKIP_DAEMON_INSTALL_CHECK").is_err() {
+        let ember_cmd = ember_command_prefix_for_current_launcher();
+        ensure_managed_daemon_for_init(
+            config,
+            cli_config_path,
+            &ember_cmd,
+            &init_rerun_command_with_ember_command(&ember_cmd, Some(OnboardingTarget::Gemini)),
+            non_interactive,
+        )?;
+    }
+
+    let (mut persona_created, mut persona_id) =
+        prepare_runtime_persona_for_reenroll(config, &persona_name)
+            .map_err(|e| format!("prepare gemini persona (rpc): {e}"))?;
+
+    // Provider-agnostic design §4 presence custody — front-loaded through the
+    // same idempotent bootstrap as Claude/Codex.
+    let custody_outcome = ensure_claude_code_presence_custody(config, non_interactive)
+        .map_err(|e| format!("set up presence custody: {e}"))?;
+    println!("{}", custody_outcome.summary_line());
+
+    // Import the Code Assist OAuth blob into the vault so the grant step does not
+    // dead-end on a missing `google/code-assist-oauth` credential.
+    let cred_outcome = ensure_gemini_code_assist_runtime_credential_with_capture(
+        config,
+        non_interactive,
+    )
+    .map_err(|e| format!("prepare gemini runtime credential: {e}"))?;
+    println!("{}", cred_outcome.summary_line());
+
+    let grant = match ensure_gemini_runtime_grant(config, &persona_id) {
+        Ok(grant) => grant,
+        Err(err) => match recover_runtime_persona_after_secret_error(
+            config,
+            "Gemini",
+            &persona_name,
+            &persona_id,
+            &err,
+        )
+        .map_err(|e| format!("recover gemini persona (rpc): {e}"))?
+        {
+            Some(recovered_persona_id) => {
+                persona_created = true;
+                persona_id = recovered_persona_id;
+                ensure_gemini_runtime_grant(config, &persona_id)
+                    .map_err(|e| format!("ensure gemini grant after recovery (rpc): {e}"))?
+            }
+            None => return Err(format!("ensure gemini grant (rpc): {err}").into()),
+        },
+    };
+
+    let ember_cmd = ember_command_prefix_for_current_launcher();
+    println!(
+        "{}",
+        render_gemini_init_summary(
+            &persona_name,
+            persona_created,
+            &cred_outcome.summary_line(),
+            &grant,
+            &ember_cmd,
+        )
+    );
+    Ok(())
+}
+
+fn cmd_uninstall_for_gemini() -> Result<(), Box<dyn std::error::Error>> {
+    use emberlink_cli::onboarding::gemini as ge;
+
+    println!("Uninstalling Gemini integration:");
+    println!(
+        "  Nothing to remove from Gemini config: the persona, grant, and imported \
+         credential are left in place because they may be in use."
+    );
+    println!("{}", ge::gemini_auth_status_line());
     Ok(())
 }
 
@@ -5385,9 +5729,9 @@ fn launchd_trust_roots_for_install() -> String {
     match emberlink_cli::dev::identity_root::read_existing_dev_identity_root_pubkey_hex() {
         Ok(opt) => opt.unwrap_or_default(),
         Err(e) => {
-            // Non-fatal — daemon falls back to legacy posture (no manifest
-            // verify) if we can't read the dev IdentityRoot. Surface the
-            // diagnostic so operators see what's missing.
+            // Non-fatal — without this dev IdentityRoot, launchd gets no
+            // additional dev trust root. Surface the diagnostic so operators
+            // see what's missing.
             eprintln!(
                 "warning: could not read dev IdentityRoot for EMBER_TRUST_ROOTS \
                  (run `ember dev install` to provision): {e}"
@@ -5402,8 +5746,7 @@ fn launchd_trust_roots_for_install() -> String {
 /// Default flow (`--single-uid` not set):
 /// 1. Provision the `ember` system user + the `ember-clients` connect group
 ///    via [`ember_daemon::install::provision_ember_user`].
-/// 2. chown the daemon's at-rest state to `ember:ember-clients`, while keeping
-///    `~/.ember/binaries` operator-writable for signed manifest refreshes.
+/// 2. chown the daemon's at-rest state to `ember:ember-clients`.
 /// 3. Install the platform launcher (LaunchDaemon plist on macOS / systemd
 ///    unit on Linux) via [`ember_daemon::install::install_launchd_plist`] /
 ///    [`ember_daemon::install::install_systemd_unit`].
@@ -5673,9 +6016,10 @@ fn migrate_to_separate_uid() {
         home = %home.display(),
         "step 4/7: chowning data dirs to ember:ember-clients"
     );
+    let system_paths = ember_daemon::paths::DaemonPaths::system();
     println!(
-        "chowning daemon-owned {}/.ember state to ember:ember-clients and repairing binaries/ for operator manifest writes...",
-        home.display()
+        "chowning daemon-owned system state at {} to ember:ember-clients...",
+        system_paths.state_root.display()
     );
     if let Err(e) = ember_daemon::install::chown_ember_data_dirs(&home) {
         eprintln!("error: failed to chown daemon data dirs: {e}");
@@ -6024,7 +6368,7 @@ fn cmd_daemon_diagnose(config: &DaemonConfig) {
     // FINGERPRINT row — slice B prerequisite. Pre-B: unavailable.
     // Post-B: this row reports present(<hex prefix>) | absent | mismatch.
     println!(
-        "FINGERPRINT: unavailable (slice B pending — implementation-note-410)"
+        "FINGERPRINT: unavailable (slice B pending — implementation-note-317)"
     );
 
     // PATTERN row — best-effort pattern recognition from what the
@@ -6487,6 +6831,18 @@ fn main() {
                 eprintln!("error: {e}");
                 process::exit(1);
             }
+            if let Some(OnboardingTarget::Cursor) = for_target
+                && let Err(e) = cmd_init_for_cursor(&config, cli.config.as_ref(), non_interactive)
+            {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+            if let Some(OnboardingTarget::Gemini) = for_target
+                && let Err(e) = cmd_init_for_gemini(&config, cli.config.as_ref(), non_interactive)
+            {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
         }
 
         Commands::Uninstall {
@@ -6502,6 +6858,24 @@ fn main() {
             for_target: OnboardingTarget::Codex,
         } => {
             if let Err(e) = cmd_uninstall_for_codex() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Uninstall {
+            for_target: OnboardingTarget::Cursor,
+        } => {
+            if let Err(e) = cmd_uninstall_for_cursor() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Uninstall {
+            for_target: OnboardingTarget::Gemini,
+        } => {
+            if let Err(e) = cmd_uninstall_for_gemini() {
                 eprintln!("error: {e}");
                 process::exit(1);
             }
@@ -9878,6 +10252,56 @@ fn main() {
             unreachable!("session open either exec-replaces or returns Err");
         }
 
+        Commands::Gemini {
+            dev,
+            prod: _,
+            host,
+            isolated,
+            sandbox,
+            strict,
+            delegated,
+            attach_runtime_persona_id,
+            fork_runtime,
+            backend,
+            preset,
+            worktree,
+            branch,
+            purpose,
+            args,
+        } => {
+            let request = match emberlink_cli::session::gemini_alias_request(
+                dev,
+                host,
+                isolated,
+                matches!(sandbox, Some(SandboxRuntime::Sandvault)),
+                strict,
+                delegated,
+                attach_runtime_persona_id,
+                fork_runtime,
+                backend,
+                preset,
+                worktree,
+                branch,
+                purpose,
+                &args,
+            ) {
+                Ok(request) => request,
+                Err(e) => {
+                    let (rendered, exit_code) =
+                        render_launcher_actionable_error("gemini", &e.to_string());
+                    eprintln!("{rendered}");
+                    process::exit(exit_code);
+                }
+            };
+            if let Err(e) = emberlink_cli::session::cmd_session_open(&request) {
+                let (rendered, exit_code) =
+                    render_launcher_actionable_error("gemini", &e.to_string());
+                eprintln!("{rendered}");
+                process::exit(exit_code);
+            }
+            unreachable!("session open either exec-replaces or returns Err");
+        }
+
         Commands::Demo { action } => match action {
             DemoAction::Wedge { teardown } => {
                 if let Err(e) = emberlink_cli::demo::wedge::cmd_demo_wedge(teardown) {
@@ -10011,20 +10435,15 @@ fn main() {
                 tool_at_version,
                 from_path,
                 publisher,
+                manifest_path,
             } => {
                 let args = emberlink_cli::binary::install::BinaryInstallArgs {
                     tool_at_version,
                     from_path,
                     publisher,
+                    manifest_path,
                 };
-                let home = match dirs_next::home_dir() {
-                    Some(h) => h,
-                    None => {
-                        eprintln!("ember binary install: could not determine home directory");
-                        process::exit(1);
-                    }
-                };
-                if let Err(e) = emberlink_cli::binary::install::binary_install(&args, &home) {
+                if let Err(e) = emberlink_cli::binary::install::binary_install(&args) {
                     eprintln!("ember binary install: {e}");
                     process::exit(1);
                 }
@@ -10063,8 +10482,8 @@ fn main() {
                     process::exit(1);
                 }
             }
-            BinaryAction::List => {
-                if let Err(e) = emberlink_cli::binary::list::binary_list() {
+            BinaryAction::List { manifest_path } => {
+                if let Err(e) = emberlink_cli::binary::list::binary_list(manifest_path) {
                     eprintln!("ember binary list: {e}");
                     process::exit(1);
                 }
@@ -10076,8 +10495,14 @@ fn main() {
                     process::exit(1);
                 }
             }
-            BinaryAction::Remove { tool_at_version } => {
-                let args = emberlink_cli::binary::remove::BinaryRemoveArgs { tool_at_version };
+            BinaryAction::Remove {
+                tool_at_version,
+                manifest_path,
+            } => {
+                let args = emberlink_cli::binary::remove::BinaryRemoveArgs {
+                    tool_at_version,
+                    manifest_path,
+                };
                 if let Err(e) = emberlink_cli::binary::remove::binary_remove(&args) {
                     eprintln!("ember binary remove: {e}");
                     process::exit(1);

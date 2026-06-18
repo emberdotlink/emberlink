@@ -1,7 +1,8 @@
 //! MCP (Model Context Protocol) server for Emberlink agent authorization.
 //!
-//! Wraps the agent protocol as an MCP server using JSON-RPC 2.0 over stdio.
-//! Each tool maps 1:1 to an AgentRuntime method.
+//! Exposes Emberlink's canonical daemon control surface over JSON-RPC 2.0
+//! stdio. Dot-named canonical tools route through the daemon; the MCP
+//! process does not mint or expose credential material.
 
 pub mod cert_expiry;
 pub mod daemon_transport;
@@ -9,76 +10,87 @@ pub mod daemon_transport;
 use std::path::PathBuf;
 
 use daemon_transport::{DaemonTransport, DaemonTransportError};
-use emberlink_agent::protocol::AgentRequest;
-use emberlink_agent::protocol::methods::{
-    GRANT_STATUS, LIST_GRANTS, REQUEST_GRANT, USE_CREDENTIAL, WHOAMI,
-};
-use emberlink_agent::runtime::AgentRuntime;
 
 // --- JSON-RPC 2.0 types (shared via core-mcp; DRY-5) ---
 
 pub use core_mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+
+const CANONICAL_CONTROL_TOOLS: &[&str] = &[
+    "session.describe",
+    "catalog.search_actions",
+    "access.request",
+    "grant.list",
+    "status.get",
+    "evidence.query",
+    "evidence.get",
+];
+
+fn is_canonical_control_tool(tool_name: &str) -> bool {
+    CANONICAL_CONTROL_TOOLS.contains(&tool_name)
+}
 
 // --- MCP tool definitions ---
 
 fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
         {
-            "name": "whoami",
-            "description": "Get agent identity",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        },
-        {
-            "name": "list_grants",
-            "description": "List active grants for this agent",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        },
-        {
-            "name": "request_grant",
-            "description": "Request a new grant with scope and duration. Subject to the daemon's policy engine and pre-evaluation rate limit — the request may be auto-approved, queued for human approval, or denied.",
+            "name": "session.describe",
+            "description": "Describe a live Runtime Persona attach target without exposing endpoint credentials.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope": { "type": "string" },
+                    "runtime_persona_id": { "type": "string" }
+                },
+                "required": ["runtime_persona_id"]
+            }
+        },
+        {
+            "name": "catalog.search_actions",
+            "description": "Search the daemon's Action Manifest catalog projection. Results name package-scoped actions; invocation still requires a separate execution contract and authority check.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "service": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                }
+            }
+        },
+        {
+            "name": "access.request",
+            "description": "Request authority for a manifest action through the daemon. The daemon resolves authority need from the Action Manifest; resource_id or a typed target selects the concrete resource.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "persona_id": { "type": "string" },
+                    "action_ref": { "type": "string" },
+                    "credential_name": { "type": "string" },
                     "resource_id": { "type": "string" },
-                    "duration_secs": { "type": "integer" },
-                    "reason": { "type": "string" }
+                    "target": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["github_repo"] },
+                            "provider": { "type": "string", "enum": ["github"] },
+                            "repo": { "type": "string", "description": "Exact GitHub repository in owner/name form." }
+                        },
+                        "required": ["kind", "repo"]
+                    },
+                    "ttl_secs": { "type": "integer" },
+                    "reason": { "type": "string" },
+                    "tool_name": { "type": "string" },
+                    "target_host": { "type": "string" },
+                    "target_url": { "type": "string" }
                 },
-                "required": ["scope", "resource_id", "duration_secs"]
+                "required": ["persona_id", "action_ref", "credential_name"],
+                "anyOf": [
+                    { "required": ["resource_id"] },
+                    { "required": ["target"] }
+                ]
             }
         },
         {
-            "name": "grant_status",
-            "description": "Check status of a grant",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "grant_id": { "type": "string" }
-                },
-                "required": ["grant_id"]
-            }
-        },
-        {
-            "name": "use_credential",
-            "description": "Use a credential via an active grant",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "grant_id": { "type": "string" },
-                    "credential_id": { "type": "string" }
-                },
-                "required": ["grant_id", "credential_id"]
-            }
-        },
-        {
-            "name": "list_receipts",
-            "description": "List Grant Receipts — signed artifacts emitted when a grant reaches terminal state. Optionally filter by persona.",
+            "name": "grant.list",
+            "description": "List active grants visible to the caller, scoped by the daemon's trusted-principal rules.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -87,8 +99,31 @@ fn tool_definitions() -> serde_json::Value {
             }
         },
         {
-            "name": "get_receipt",
-            "description": "Fetch a single Grant Receipt by id. Returns the signed JSON body including Evidence (Ed25519 signature + signer pubkey).",
+            "name": "status.get",
+            "description": "Get the daemon status projection for the caller's runtime and authority posture.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "evidence.query",
+            "description": "Query receipt evidence with daemon-side filtering.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "grant_id": { "type": "string" },
+                    "resource": { "type": "string" },
+                    "since": { "type": "string" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "evidence.get",
+            "description": "Fetch one receipt or terminal-grant receipt by id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -96,58 +131,37 @@ fn tool_definitions() -> serde_json::Value {
                 },
                 "required": ["id"]
             }
-        },
-        {
-            "name": "grant_budget_status",
-            "description": "Get per-Statement budget + usage + percent_used for a composite grant. Returns lifecycle status (active/paused/exhausted_by_budget/revoked/expired) plus a per-statement array; SDK clients use this to render a runway view without subscribing to push events.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "grant_id": { "type": "string" }
-                },
-                "required": ["grant_id"]
-            }
         }
     ])
 }
 
 // --- MCP server ---
 
-/// MCP server wrapping an AgentRuntime.
-///
-/// Optionally holds a [`DaemonTransport`] for read-only observability
-/// tools (`list_receipts`, `get_receipt`) that bypass the agent runtime
-/// and route directly through the daemon socket. The runtime is still
-/// used for credential-touching tools.
+/// MCP server for Emberlink's canonical daemon control/read surface.
 pub struct McpServer {
-    runtime: AgentRuntime,
     daemon_transport: Option<DaemonTransport>,
 }
 
 impl McpServer {
-    pub fn new(runtime: AgentRuntime) -> Self {
+    pub fn new() -> Self {
         Self {
-            runtime,
             daemon_transport: None,
         }
     }
 
-    /// Build a server with daemon-transport observability tools wired.
-    /// `list_receipts` and `get_receipt` call through the transport.
-    pub fn with_daemon_socket(runtime: AgentRuntime, socket: PathBuf) -> Self {
+    /// Build a server with daemon-transport control tools wired.
+    pub fn with_daemon_socket(socket: PathBuf) -> Self {
         Self {
-            runtime,
             daemon_transport: Some(DaemonTransport::new(socket)),
         }
     }
 
     /// Build a server with a pre-constructed daemon transport. Used by the
-    /// in-container mTLS bridge path (implementation-note-485)
+    /// in-container mTLS bridge path (implementation-note-388)
     /// where the transport is an `Mtls` variant rather than a UDS path.
-    /// Same observability semantics as [`Self::with_daemon_socket`].
-    pub fn with_daemon_transport(runtime: AgentRuntime, transport: DaemonTransport) -> Self {
+    /// Same control-surface semantics as [`Self::with_daemon_socket`].
+    pub fn with_daemon_transport(transport: DaemonTransport) -> Self {
         Self {
-            runtime,
             daemon_transport: Some(transport),
         }
     }
@@ -224,10 +238,9 @@ impl McpServer {
         }
     }
 
-    /// Route an observability tool (`list_receipts` / `get_receipt`)
-    /// through the daemon transport. Fails closed with a descriptive
-    /// error when no transport is configured.
-    fn handle_receipt_tool(
+    /// Route a canonical control/read tool through the daemon transport.
+    /// Fails closed with a descriptive error when no transport is configured.
+    fn handle_daemon_control_tool(
         &self,
         req: &JsonRpcRequest,
         tool_name: &str,
@@ -242,7 +255,7 @@ impl McpServer {
                     result: Some(serde_json::json!({
                         "content": [{
                             "type": "text",
-                            "text": "daemon unreachable — receipts tools require --daemon-socket"
+                            "text": "daemon unreachable - daemon-routed MCP tools require --daemon-socket"
                         }],
                         "isError": true
                     })),
@@ -303,64 +316,20 @@ impl McpServer {
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-        // Observability tools route directly through the daemon socket
-        // when one is configured — they never touch the agent runtime.
-        if matches!(
-            tool_name,
-            "list_receipts" | "get_receipt" | "grant_budget_status"
-        ) {
-            return self.handle_receipt_tool(req, tool_name, &arguments);
+        // Canonical MCP tools route directly through the daemon socket.
+        if is_canonical_control_tool(tool_name) {
+            return self.handle_daemon_control_tool(req, tool_name, &arguments);
         }
 
-        // Map MCP tool name to agent method
-        let agent_method = match tool_name {
-            "whoami" => WHOAMI,
-            "list_grants" => LIST_GRANTS,
-            "request_grant" => REQUEST_GRANT,
-            "grant_status" => GRANT_STATUS,
-            "use_credential" => USE_CREDENTIAL,
-            other => {
-                return JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id.clone(),
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: format!("unknown tool: {other}"),
-                        data: None,
-                    }),
-                };
-            }
-        };
-
-        let agent_req = AgentRequest {
-            id: req.id.as_ref().map(|v| v.to_string()).unwrap_or_default(),
-            method: agent_method.to_string(),
-            params: arguments,
-        };
-
-        let resp = self.runtime.handle(&agent_req);
-
-        if let Some(err) = &resp.error {
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: req.id.clone(),
-                result: Some(serde_json::json!({
-                    "content": [{ "type": "text", "text": err.message }],
-                    "isError": true
-                })),
-                error: None,
-            }
-        } else {
-            let text = serde_json::to_string_pretty(&resp.result).unwrap_or_default();
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: req.id.clone(),
-                result: Some(serde_json::json!({
-                    "content": [{ "type": "text", "text": text }]
-                })),
-                error: None,
-            }
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: format!("unknown tool: {tool_name}"),
+                data: None,
+            }),
         }
     }
 }
@@ -368,19 +337,9 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use emberlink_agent::runtime::{AgentConfig, AgentRuntime};
-    use std::rc::Rc;
 
     fn test_server() -> McpServer {
-        let store = Rc::new(core_state::EventStore::default());
-        let runtime = AgentRuntime::new(
-            AgentConfig {
-                persona_id: "persona-test".to_string(),
-                label: Some("test-mcp".to_string()),
-            },
-            store,
-        );
-        McpServer::new(runtime)
+        McpServer::new()
     }
 
     #[test]
@@ -426,149 +385,128 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "whoami",
-                "list_grants",
-                "request_grant",
-                "grant_status",
-                "use_credential",
-                "list_receipts",
-                "get_receipt",
-                "grant_budget_status"
+                "session.describe",
+                "catalog.search_actions",
+                "access.request",
+                "grant.list",
+                "status.get",
+                "evidence.query",
+                "evidence.get"
             ]
         );
     }
 
     #[test]
-    fn request_grant_schema_requires_resource_id() {
+    fn canonical_control_tool_set_excludes_materialization_tools() {
+        assert_eq!(
+            CANONICAL_CONTROL_TOOLS,
+            &[
+                "session.describe",
+                "catalog.search_actions",
+                "access.request",
+                "grant.list",
+                "status.get",
+                "evidence.query",
+                "evidence.get",
+            ]
+        );
+        assert!(
+            !is_canonical_control_tool("use_credential"),
+            "credential materialization is not exposed as a canonical MCP tool"
+        );
+        assert!(
+            !is_canonical_control_tool("action.invoke"),
+            "generic action.invoke is intentionally not part of the public control surface"
+        );
+    }
+
+    #[test]
+    fn access_request_schema_names_manifest_target_contract() {
         let defs = tool_definitions();
         let tools = defs.as_array().unwrap();
-        let rg = tools.iter().find(|t| t["name"] == "request_grant").unwrap();
-        let required = rg["inputSchema"]["required"].as_array().unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "access.request")
+            .unwrap();
+        assert!(
+            tool["inputSchema"]["properties"].get("action").is_none(),
+            "legacy action field must not be advertised"
+        );
+        assert!(
+            tool["inputSchema"]["properties"].get("scope").is_none(),
+            "legacy scope field must not be advertised"
+        );
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
         let required_fields: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(
-            required_fields.contains(&"scope"),
-            "required must include scope"
+            required_fields.contains(&"action_ref"),
+            "canonical access requests should name an action_ref"
         );
         assert!(
-            required_fields.contains(&"duration_secs"),
-            "required must include duration_secs"
+            required_fields.contains(&"credential_name"),
+            "canonical access requests should name a credential class"
         );
-        assert!(
-            required_fields.contains(&"resource_id"),
-            "required must include resource_id — MCP clients trust the schema; omitting it causes runtime rejection"
+        let any_of = tool["inputSchema"]["anyOf"]
+            .as_array()
+            .expect("access.request schema should require resource_id or target");
+        assert_eq!(
+            any_of,
+            &vec![
+                serde_json::json!({"required": ["resource_id"]}),
+                serde_json::json!({"required": ["target"]}),
+            ]
         );
     }
 
     #[test]
-    fn tools_call_whoami() {
+    fn removed_legacy_tools_are_unknown() {
         let server = test_server();
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(3)),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "whoami",
-                "arguments": {}
-            })),
-        };
-        let resp = server.handle_request(&req).unwrap();
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        let content = &result["content"][0];
-        assert_eq!(content["type"], "text");
-        let text: serde_json::Value =
-            serde_json::from_str(content["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text["persona_id"], "persona-test");
+        for name in [
+            "whoami",
+            "list_grants",
+            "request_grant",
+            "grant_status",
+            "use_credential",
+        ] {
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(6)),
+                method: "tools/call".to_string(),
+                params: Some(serde_json::json!({
+                    "name": name,
+                    "arguments": {}
+                })),
+            };
+            let resp = server.handle_request(&req).unwrap();
+            assert!(resp.error.is_some(), "{name} should be a removed MCP tool");
+            assert_eq!(resp.error.unwrap().code, -32602);
+        }
     }
 
     #[test]
-    fn tools_call_list_grants_without_daemon_fails_closed() {
-        // Post-TODO-69I.1 behavior: `list_grants` now routes through the
-        // daemon so the agent can't serve stale state out of its local
-        // EventStore. The legacy in-process test server has no daemon
-        // link, so the call MUST fail closed with `DAEMON_UNAVAILABLE`.
+    fn canonical_tool_without_daemon_fails_closed() {
         let server = test_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(4)),
+            id: Some(serde_json::json!(7)),
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({
-                "name": "list_grants",
-                "arguments": {}
+                "name": "catalog.search_actions",
+                "arguments": { "query": "github" }
             })),
         };
         let resp = server.handle_request(&req).unwrap();
         assert!(
             resp.error.is_none(),
-            "tool calls surface agent errors via isError"
+            "daemon-routed tool failures are surfaced as MCP isError results"
         );
         let result = resp.result.unwrap();
-        assert_eq!(
-            result["isError"],
-            serde_json::json!(true),
-            "expected isError=true for fail-closed"
-        );
+        assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("daemon unreachable"),
-            "expected 'daemon unreachable' in error text, got: {text}"
+            "expected daemon unreachable error, got: {text}"
         );
-    }
-
-    #[test]
-    fn tools_call_request_grant_without_daemon_fails_closed() {
-        // TODO 69.1 follow-up: when the wrapped `AgentRuntime` has no daemon
-        // link (as in this legacy in-process MCP bridge), `request_grant`
-        // MUST fail closed rather than silently write an approval into the
-        // local store. This locks in the bypass closure.
-        let server = test_server();
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(5)),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "request_grant",
-                "arguments": {
-                    "scope": "read:passwords",
-                    "resource_id": "passwords",
-                    "duration_secs": 3600,
-                    "reason": "need access"
-                }
-            })),
-        };
-        let resp = server.handle_request(&req).unwrap();
-        assert!(
-            resp.error.is_none(),
-            "tool calls surface agent errors via isError"
-        );
-        let result = resp.result.unwrap();
-        assert_eq!(
-            result["isError"], true,
-            "request_grant without a daemon link must be reported as an error"
-        );
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("access denied") || text.contains("policy engine"),
-            "error text should indicate the bypass was closed, got: {text}"
-        );
-    }
-
-    #[test]
-    fn tools_call_request_grant_missing_scope_is_error() {
-        let server = test_server();
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(6)),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "name": "request_grant",
-                "arguments": { "duration_secs": 3600 }
-            })),
-        };
-        let resp = server.handle_request(&req).unwrap();
-        // Agent errors are returned as tool results with isError=true
-        let result = resp.result.unwrap();
-        assert_eq!(result["isError"], true);
     }
 
     #[test]
@@ -576,7 +514,7 @@ mod tests {
         let server = test_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(7)),
+            id: Some(serde_json::json!(8)),
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({
                 "name": "nonexistent",
@@ -593,7 +531,7 @@ mod tests {
         let server = test_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(8)),
+            id: Some(serde_json::json!(9)),
             method: "bogus/method".to_string(),
             params: None,
         };
@@ -663,20 +601,20 @@ mod tests {
             .unwrap();
         let list_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 8);
+        assert_eq!(tools, CANONICAL_CONTROL_TOOLS.len());
 
-        // 4. Call a tool
+        // 4. Canonical tools fail closed without a daemon transport.
         let call_req = serde_json::json!({
             "jsonrpc": "2.0", "id": 3,
             "method": "tools/call",
-            "params": { "name": "whoami", "arguments": {} }
+            "params": { "name": "catalog.search_actions", "arguments": { "query": "github" } }
         });
         let resp = server
             .process_line(&serde_json::to_string(&call_req).unwrap())
             .unwrap();
         let call_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         assert!(call_resp.error.is_none());
-        let content = &call_resp.result.unwrap()["content"][0];
-        assert_eq!(content["type"], "text");
+        let result = call_resp.result.unwrap();
+        assert_eq!(result["isError"], true);
     }
 }

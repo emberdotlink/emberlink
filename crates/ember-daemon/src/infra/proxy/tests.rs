@@ -481,7 +481,7 @@ async fn handle_request_boxed(
     // Post-flight meter (test parity with production).
     let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
     if let Some(mut delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
-        // T-implementation-note-286: production
+        // Production
         // metering folds in `record_upstream_request` to mint the
         // billable request count. The test harness always returns
         // 200, so success is unconditional — match the production
@@ -809,6 +809,72 @@ fn proxy_llm_request(
         .header("X-Ember-Test-Response-Body", response_body)
         .body(Full::new(Bytes::from(req_body)))
         .unwrap()
+}
+
+#[tokio::test]
+async fn proxy_call_receipt_hook_mints_signed_receipt_id() {
+    let identity_dir = tempfile::tempdir().expect("identity tempdir");
+    let _ = crate::infra::receipt::init_identity(identity_dir.path());
+    let state = make_state();
+    let persona = state.store.create_persona("proxy-call").unwrap();
+    let statement = stmt_session("S1", 20_000);
+    let grant_id = seed_composite_grant(
+        &state,
+        &persona.id,
+        "anthropic-key",
+        vec![stmt_credential("S0"), statement.clone()],
+    );
+    let resolved = core_proxy_forward::ResolvedGrant {
+        grant_id: grant_id.clone(),
+        persona_id: persona.id.clone(),
+        credential_name: "anthropic-key".into(),
+        statement_sid: statement.sid.clone(),
+        statement,
+        grant_scope: "*".into(),
+        allowed_targets: None,
+    };
+    let call = core_proxy_forward::ProxyCallReceiptRequest {
+        method: "POST".into(),
+        path: "/v1/messages".into(),
+        status: 200,
+        tokens_in: 120,
+        tokens_out: 192,
+        outcome: "complete".into(),
+    };
+    let backend = DaemonPolicyBackend::new(Arc::clone(&state));
+
+    let receipt_id = backend
+        .issue_proxy_call_receipt(&resolved, &call)
+        .await
+        .expect("receipt hook should not error")
+        .expect("daemon backend should mint a receipt");
+
+    assert_eq!(receipt_id.len(), 64, "receipt_id should be canonical hex");
+    assert!(
+        !receipt_id.starts_with("r-"),
+        "proxy_call receipt_id must not use the old demo hash prefix"
+    );
+    let raw = state
+        .store
+        .get_receipt_v2_envelope_json(&receipt_id)
+        .expect("receipt should be persisted");
+    let envelope: core_events::receipt::ReceiptEnvelope =
+        serde_json::from_str(&raw).expect("stored envelope should parse");
+    assert_eq!(envelope.receipt_id, receipt_id);
+    assert_eq!(envelope.kind, core_events::receipt::RECEIPT_KIND_PROXY_CALL);
+    assert!(envelope.signature.is_some(), "receipt should be signed");
+    let body: core_events::receipt::ProxyCallBody =
+        serde_json::from_value(envelope.body).expect("proxy.call body should parse");
+    assert_eq!(body.persona_id, persona.id);
+    assert_eq!(body.grant_id, grant_id);
+    assert_eq!(body.statement_sid, "S1");
+    assert_eq!(body.method, "POST");
+    assert_eq!(body.path, "/v1/messages");
+    assert_eq!(body.status, 200);
+    assert_eq!(body.tokens_in, 120);
+    assert_eq!(body.tokens_out, 192);
+    assert_eq!(body.tokens_total, 312);
+    assert_eq!(body.outcome, "complete");
 }
 
 /// Call helper that takes a `Full<Bytes>` body — used for tests that
@@ -1383,7 +1449,7 @@ fn threshold_warning_broadcasts_to_subscribers() {
         [0x42u8; 32],
     )));
     let state = Arc::new(ProxyState::new(store, None));
-    // implementation-note-287: the broadcast channel + threshold
+    // The broadcast channel + threshold
     // debounce set now live on the sink, not on `ProxyState`. Install
     // the sink immediately after construction. `OnceLock::set` returns
     // `Result<(), Arc<DaemonEventSink>>` whose Err variant does not
@@ -1474,7 +1540,7 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
         [0x42u8; 32],
     )));
     let state = Arc::new(ProxyState::new(store, None));
-    // implementation-note-287: see sibling test — sink ownership of
+    // See sibling test — sink ownership of
     // events_tx + threshold_emitted moved out of ProxyState.
     let sink = Arc::new(DaemonEventSink::new(state.clone(), Some(events_tx.clone())));
     let _ = state.event_sink.set(sink.clone());
@@ -1525,7 +1591,7 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
 }
 
 // P69L spike Day-1 pure-function tests for git echo helpers moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-81).
+// `core-proxy-forward::r#match::tests`.
 
 #[test]
 fn base64_std_encode_matches_rfc_vectors() {
@@ -2823,10 +2889,10 @@ fn filter_drops_proxy_authorization_forwarded_via_te_trailer_connection() {
 }
 
 // development milestone: strict host-suffix matching unit tests moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-81).
+// `core-proxy-forward::r#match::tests`.
 
 // ------------------------------------------------------------------
-// implementation-note-196 — FINDING B: provider-aware auth
+// FINDING B: provider-aware auth
 // injection. Mirrors `git_echo_grant_backed_lookup_injects_correct_auth`
 // for the LLM proxy path, but tests the helper directly because
 // `handle_request` consults the target URL for the live TCP connection
@@ -4253,7 +4319,7 @@ fn test_non_streaming_unchanged() {
     );
 }
 
-/// C44-implementation-note-288 regression guard — the proxy.meter audit event
+/// Credential-correlation regression guard — the proxy.meter audit event
 /// must NOT emit the raw credential alias in any field. Readers of the
 /// audit log must not be able to correlate persona → credential by
 /// scanning rows. The raw alias stays in `statement_usage`/grant rows;
@@ -5656,7 +5722,7 @@ fn credential_bytes_zeroized_on_drop() {
     unsafe { ManuallyDrop::drop(&mut md) };
 }
 
-/// T-implementation-note-286 regression guard.
+/// Upstream-usage-requests regression guard.
 ///
 /// `usage.requests` must reflect upstream-confirmed responses, not a
 /// pre-flight tally. Driving the post-flight meter once with an
@@ -5755,7 +5821,7 @@ fn record_upstream_request_only_credits_on_success() {
     assert_eq!(record_upstream_request("api.github.com", true, true), 0,);
 }
 
-/// BEAT-7-implementation-note-191 — `statement_revoked_response` emits a
+/// `statement_revoked_response` emits a
 /// structured JSON 403 naming the persona + statement so clients can
 /// distinguish revoke from a generic scope/audit denial. Locks the
 /// public shape `{"error":"statement_revoked","persona_id":..,
@@ -6166,7 +6232,7 @@ async fn resolve_grant_refuses_when_issuing_persona_root_unauthorized() {
     }
 }
 
-// implementation-note-215: DaemonEventSink::record_threshold_crossing
+// DaemonEventSink::record_threshold_crossing
 // dedupes repeated calls on the same (grant_id, statement_sid, axis, band)
 // tuple. Mirrors the existing in-place `ProxyState.threshold_emitted`
 // semantics so the trait-routed code path is independently correct before

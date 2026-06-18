@@ -21,7 +21,7 @@
 //!   A partial triple is an operator misconfiguration and we surface
 //!   it loudly rather than silently picking up the env fallback.
 //!
-//! This file exists for implementation-note-127;
+//! This file exists for implementation-note-107;
 //! the runtime wireup that consumes it lands in PR4B alongside the
 //! `EMBER_VAULT_FIRST` flag.
 

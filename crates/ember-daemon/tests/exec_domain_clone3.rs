@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-349 — integration tests for the
+//! implementation-note-249 — integration tests for the
 //! clone3 user-namespace spawn primitive (design §Component 2).
 //!
 //! ## Test scope
@@ -112,7 +112,7 @@ fn clone3_namespace_spawn_runs_as_mapped_uid() {
     let Some(subuid_start) = current_user_subuid() else {
         eprintln!(
             "skip: no /etc/subuid entry for current user — \
-             companion task implementation-note-167 provisions \
+             companion task implementation-note-141 provisions \
              the range at daemon install time"
         );
         return;
@@ -188,7 +188,7 @@ fn clone3_namespace_spawn_runs_as_mapped_uid() {
         Err(ExecDomainError::NewuidmapNotInstalled { binary }) => {
             // The shadow-utils/uidmap setuid helper is not on PATH.
             // Production daemon hosts must have it installed (the
-            // implementation-note-167 install path documents
+            // implementation-note-141 install path documents
             // the package dependency).
             eprintln!(
                 "skip: {binary} not installed — test host lacks \

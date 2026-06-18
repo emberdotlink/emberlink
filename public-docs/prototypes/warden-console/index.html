@@ -1,0 +1,1231 @@
+<!doctype html>
+<!--
+  Warden Console public prototype mock.
+  Static HTML/CSS/JS with fictional data only. No daemon wiring, no network writes,
+  and no release-behavior promise. Open in a browser, drag the TTL clock, and use
+  the mock controls to explore the intended authority model.
+-->
+<html lang="en" data-view="desk">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Warden Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+/* ---- public prototype tokens ---- */
+:root{
+  --coal:#0b0b0b; --furnace:#151515; --ash:#262626; --smoke:#8a8580; --bone:#f3efe6;
+  --ember:#d96a1d; --hot-ember:#ff8b2b; --oxide:#8b3f19; --signal-red:#c54b32; --trace-blue:#6ea8ff;
+  --font-display:'Space Grotesk',system-ui,sans-serif;
+  --font-body:'IBM Plex Sans',system-ui,sans-serif;
+  --font-mono:'IBM Plex Mono','Fira Code',monospace;
+  --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-6:24px;--space-8:32px;--space-12:48px;--space-16:64px;
+  --radius-sm:4px;--radius-md:6px;--radius-lg:10px;
+  --duration-micro:150ms;--duration-panel:220ms;--ease-out:cubic-bezier(0.2,0.8,0.3,1);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--coal); color:var(--bone); font-family:var(--font-body);
+  font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased;
+  display:grid; grid-template-columns:212px 1fr; height:100vh; overflow:hidden;
+}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+h1,h2,h3,.disp{font-family:var(--font-display);letter-spacing:-0.02em;margin:0}
+button{font-family:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--trace-blue);outline-offset:2px}
+.eyebrow{font-family:var(--font-mono);font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:0.1em;color:var(--smoke)}
+
+/* ---- sidebar ---- */
+aside{background:var(--furnace);border-right:1px solid var(--ash);display:flex;flex-direction:column;padding:var(--space-4) 0}
+.brand{padding:0 var(--space-4) var(--space-6);display:flex;align-items:center;gap:var(--space-2)}
+.brand .spark{width:18px;height:18px;flex:none}
+.brand b{font-family:var(--font-display);font-weight:700;font-size:15px;letter-spacing:-0.01em}
+.brand small{display:block;font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:0.14em;color:var(--smoke);margin-top:2px}
+nav{display:flex;flex-direction:column;gap:2px;padding:0 var(--space-2)}
+.navitem{display:flex;align-items:center;gap:var(--space-3);padding:9px var(--space-3);border:none;background:none;color:var(--smoke);
+  font-family:var(--font-mono);font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;text-align:left;border-radius:var(--radius-sm);transition:color var(--duration-micro) var(--ease-out),background var(--duration-micro)}
+.navitem:hover{color:var(--bone);background:var(--ash)}
+.navitem[aria-current="true"]{color:var(--ember);background:color-mix(in oklch,var(--ember) 12%,transparent)}
+.navitem .dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.0}
+.navitem[aria-current="true"] .dot{opacity:1}
+.navsub{font-size:10px;color:var(--smoke);opacity:.7;padding:2px var(--space-3) 2px 38px;font-family:var(--font-mono)}
+.spacer{flex:1}
+.presence{margin:0 var(--space-3);padding:var(--space-3);border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--coal)}
+.presence .row{display:flex;justify-content:space-between;align-items:center;gap:var(--space-2)}
+.presence .label{font-size:11px;color:var(--smoke)}
+.freshbar{height:4px;border-radius:2px;background:var(--ash);overflow:hidden;margin-top:8px}
+.freshbar i{display:block;height:100%;background:var(--ember);transition:width 1s linear}
+.armed{margin-top:8px;font-family:var(--font-mono);font-size:10px;color:var(--smoke)}
+.armed b{color:var(--hot-ember);font-weight:600}
+
+/* ---- main ---- */
+main{overflow-y:auto;padding:var(--space-6) var(--space-8)}
+.view{display:none}
+[data-view="desk"] #v-desk{display:block}
+[data-view="lease"] #v-lease{display:block}
+[data-view="hold"] #v-hold{display:block}
+[data-view="lookback"] #v-lookback{display:block}
+[data-view="setup"] #v-setup{display:block}
+[data-view="roster"] #v-roster{display:block}
+.pagehead{display:flex;align-items:baseline;justify-content:space-between;border-bottom:1px solid var(--ash);padding-bottom:var(--space-4);margin-bottom:var(--space-6)}
+.pagehead h1{font-size:22px;font-weight:700}
+.pagehead .sub{font-family:var(--font-mono);font-size:11px;color:var(--smoke);margin-top:4px}
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--ash);margin-bottom:var(--space-6)}
+.tab{padding:8px 16px;font-family:var(--font-mono);font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;border:none;border-bottom:2px solid transparent;background:none;color:var(--smoke);cursor:pointer;transition:color var(--duration-micro) var(--ease-out)}
+.tab:hover{color:var(--bone)}
+.tab[data-active="true"]{color:var(--ember);border-bottom-color:var(--ember)}
+
+/* hero band (NOT a 4-KPI card grid: one integrated band, dominant pair + companions) */
+.hero{display:flex;align-items:stretch;gap:var(--space-8);border-bottom:1px solid var(--ash);padding-bottom:var(--space-6);margin-bottom:var(--space-6)}
+.hero .lead{flex:none}
+.hero .lead .eyebrow{margin-bottom:6px}
+.hero .floor{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:46px;font-weight:600;line-height:1;color:var(--ember);letter-spacing:-0.01em}
+.hero .floor.warn{color:var(--hot-ember)}
+.hero .leadcap{font-size:12px;color:var(--smoke);margin-top:6px;max-width:200px}
+.hero .vr{width:1px;background:var(--ash)}
+.hero .blast{flex:1;display:flex;flex-direction:column;justify-content:center}
+.hero .blast .eyebrow{margin-bottom:10px}
+.blastrow{display:flex;gap:var(--space-2);flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border:1px solid var(--ash);border-radius:999px;background:var(--furnace);font-family:var(--font-mono);font-size:11px;color:var(--bone)}
+.chip svg{width:12px;height:12px;flex:none}
+.chip .w{font-weight:600}
+.chip.heavy{border-color:color-mix(in oklch,var(--signal-red) 50%,var(--ash));background:color-mix(in oklch,var(--signal-red) 12%,var(--furnace))}
+.chip.heavy svg{color:var(--signal-red)}
+.hero .companions{flex:none;display:flex;flex-direction:column;justify-content:center;gap:10px;text-align:right;min-width:150px}
+.companions .stat{display:flex;flex-direction:column}
+.companions .n{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:18px;font-weight:600;color:var(--bone)}
+.companions .n.q{color:var(--hot-ember)}
+.companions .k{font-size:11px;color:var(--smoke)}
+
+/* two-column floor */
+.floorgrid{display:grid;grid-template-columns:268px 1fr;gap:var(--space-6);align-items:start}
+.col-h{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:var(--space-3)}
+.col-h h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;font-family:var(--font-mono);color:var(--bone)}
+.col-h .count{font-family:var(--font-mono);font-size:11px;color:var(--smoke)}
+
+/* decision queue (slim rail) */
+.queue{display:flex;flex-direction:column;gap:var(--space-3)}
+.intentcard{border:1px solid var(--ash);border-radius:var(--radius-lg);background:var(--furnace);padding:var(--space-4);transition:border-color var(--duration-panel) var(--ease-out),transform var(--duration-panel)}
+.intentcard:hover{border-color:var(--smoke)}
+.intentcard .who{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.persona-chip{font-family:var(--font-mono);font-size:11px;color:var(--bone);background:var(--ash);padding:2px 7px;border-radius:var(--radius-sm)}
+.intentcard h3{font-size:14px;font-weight:600;margin-bottom:4px}
+.intentcard .meta{font-family:var(--font-mono);font-size:11px;color:var(--smoke);margin-bottom:var(--space-3)}
+.stmtmini{font-family:var(--font-mono);font-size:11px;color:var(--smoke);padding:3px 0;display:flex;gap:6px;align-items:center}
+.stmtmini svg{width:11px;height:11px;color:var(--smoke);flex:none}
+.btn{border:1px solid var(--ash);background:var(--coal);color:var(--bone);padding:9px var(--space-4);border-radius:var(--radius-md);font-size:13px;font-weight:500;transition:all var(--duration-micro) var(--ease-out);width:100%}
+.btn:hover{border-color:var(--smoke)}
+.btn.primary{background:var(--ember);border-color:var(--ember);color:var(--coal);font-weight:600}
+.btn.primary:hover{background:var(--hot-ember);border-color:var(--hot-ember)}
+.btn.danger{color:var(--signal-red);border-color:color-mix(in oklch,var(--signal-red) 40%,var(--ash))}
+.btn.danger:hover{background:color-mix(in oklch,var(--signal-red) 14%,var(--coal));border-color:var(--signal-red)}
+.queue-empty{border:1px dashed var(--ash);border-radius:var(--radius-lg);padding:var(--space-4);color:var(--smoke);font-size:12px}
+
+/* authority-out map */
+.map{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:var(--space-4)}
+.leasecard{border:1px solid var(--ash);border-radius:var(--radius-lg);background:var(--furnace);padding:var(--space-4);cursor:pointer;transition:border-color var(--duration-panel) var(--ease-out),transform var(--duration-panel)}
+.leasecard:hover{border-color:var(--smoke);transform:translateY(-2px)}
+.leasecard.ignite{animation:ignite 700ms var(--ease-out)}
+@keyframes ignite{0%{opacity:0;transform:scale(.94)}60%{box-shadow:0 0 0 2px color-mix(in oklch,var(--hot-ember) 60%,transparent)}100%{opacity:1;transform:scale(1)}}
+.leasecard .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-3)}
+.ring-wrap{display:flex;justify-content:center;margin:var(--space-2) 0 var(--space-3)}
+.ringlabels{text-align:center}
+.ringlabels .pair{font-size:10px;color:var(--smoke);line-height:1.35}
+.ringlabels .pair b{color:var(--bone);font-weight:500}
+.budgets{display:flex;flex-direction:column;gap:7px;margin-top:var(--space-3)}
+.bullet{display:flex;align-items:center;gap:8px}
+.bullet .lab{font-family:var(--font-mono);font-size:10px;color:var(--smoke);width:46px;flex:none}
+.bullet .track{position:relative;height:8px;flex:1;background:var(--ash);border-radius:2px;overflow:visible}
+.bullet .val{position:absolute;left:0;top:0;height:100%;background:var(--ember);border-radius:2px;transition:width 1s linear}
+.bullet .val.exhausted{background:var(--signal-red)}
+.bullet .cap{position:absolute;top:-2px;width:2px;height:12px;background:var(--bone)}
+.bullet .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:10px;color:var(--bone);width:58px;flex:none;text-align:right}
+.custody{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10px}
+.custody.warded{color:var(--bone)} .custody.minted{color:var(--smoke)} .custody.unknown{color:var(--hot-ember)}
+.custody svg{width:13px;height:13px}
+
+/* inert shelf */
+.shelf{margin-top:var(--space-6);border-top:1px solid var(--ash);padding-top:var(--space-4)}
+.inertrow{display:flex;align-items:center;gap:var(--space-3);padding:9px var(--space-3);border-radius:var(--radius-sm);opacity:.55}
+.inertrow:hover{opacity:.8;background:var(--furnace)}
+.inertrow .ic{width:8px;height:8px;border-radius:50%;border:1px solid var(--smoke);flex:none}
+.inertrow .nm{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.inertrow .st{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-left:auto}
+
+/* ---- compose sheet (Ark dialog grammar) ---- */
+.scrim{position:fixed;inset:0;background:rgba(11,11,11,.8);backdrop-filter:blur(4px);z-index:40;display:none}
+.sheet{position:fixed;top:0;right:0;height:100vh;width:560px;max-width:94vw;background:var(--furnace);border-left:1px solid var(--ash);z-index:50;
+  transform:translateX(100%);transition:transform var(--duration-panel) var(--ease-out);display:flex;flex-direction:column}
+body.compose .scrim{display:block}
+body.compose .sheet{transform:translateX(0)}
+.sheet header{padding:var(--space-6) var(--space-6) var(--space-4);border-bottom:1px solid var(--ash)}
+.sheet header .eyebrow{margin-bottom:8px}
+.sheet header h2{font-size:19px;font-weight:700}
+.sheet .body{padding:var(--space-6);overflow-y:auto;flex:1}
+.sheet .foot{padding:var(--space-4) var(--space-6);border-top:1px solid var(--ash);background:var(--coal)}
+.stmtrow{display:flex;align-items:flex-start;gap:var(--space-3);padding:var(--space-3) 0;border-bottom:1px solid var(--ash)}
+.stmtrow:last-child{border-bottom:none}
+.stmtrow.dropped{opacity:.4}
+.stmtrow .ck{margin-top:2px;width:16px;height:16px;accent-color:var(--ember);flex:none}
+.stmtrow .sv{flex:1}
+.stmtrow .verb{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.stmtrow .verb .v{color:var(--ember)}
+.stmtrow .sel{font-family:var(--font-mono);font-size:11px;color:var(--smoke);margin-top:2px}
+.stmtrow .bd{font-family:var(--font-mono);font-size:11px;color:var(--smoke);text-align:right;white-space:nowrap}
+
+/* TTL clock dial */
+.dialzone{display:flex;gap:var(--space-6);align-items:center;margin:var(--space-6) 0;padding:var(--space-4);border:1px solid var(--ash);border-radius:var(--radius-lg);background:var(--coal)}
+.dial{position:relative;width:148px;height:148px;flex:none;touch-action:none;cursor:grab}
+.dial:active{cursor:grabbing}
+.dialmid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;text-align:center}
+.dialmid .t{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:26px;font-weight:600;color:var(--ember)}
+.dialmid .k{font-size:9px;color:var(--smoke);text-transform:uppercase;letter-spacing:0.1em;font-family:var(--font-mono)}
+.dialinfo{flex:1}
+.dialinfo .eyebrow{margin-bottom:8px}
+.dualline{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.dualline .d{display:flex;align-items:baseline;gap:8px}
+.dualline .d .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:16px;color:var(--bone);font-weight:600;min-width:64px}
+.dualline .d .cap{font-size:11px;color:var(--smoke)}
+.identity-note{margin-top:10px;font-size:11px;color:var(--smoke);border-top:1px dashed var(--ash);padding-top:8px}
+.identity-note b{color:var(--hot-ember)}
+
+.intentsentence{font-size:14px;line-height:1.55;color:var(--bone);background:var(--coal);border:1px solid var(--ash);border-radius:var(--radius-md);padding:var(--space-4);margin-top:var(--space-2)}
+.intentsentence b{color:var(--ember);font-weight:600}
+.custmeter{display:flex;align-items:center;gap:8px;margin-top:var(--space-3);font-family:var(--font-mono);font-size:11px;color:var(--smoke)}
+
+.touchbar{display:flex;align-items:center;gap:var(--space-3);width:100%;background:var(--ember);color:var(--coal);border:none;border-radius:var(--radius-md);padding:14px var(--space-4);font-family:var(--font-display);font-weight:600;font-size:15px;justify-content:center;transition:background var(--duration-micro) var(--ease-out)}
+.touchbar:hover{background:var(--hot-ember)}
+.touchbar svg{width:18px;height:18px}
+.foot .hint{font-size:11px;color:var(--smoke);text-align:center;margin-top:8px;font-family:var(--font-mono)}
+
+/* ---- lease detail ---- */
+.lease-back{display:inline-flex;align-items:center;gap:6px;background:none;border:none;color:var(--smoke);font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:0.06em;padding:0;margin-bottom:var(--space-4)}
+.lease-back:hover{color:var(--bone)}
+.lease-grid{display:grid;grid-template-columns:280px 1fr;gap:var(--space-8);align-items:start}
+.bigring{display:flex;flex-direction:column;align-items:center;gap:var(--space-3)}
+.bigring .dual{text-align:center}
+.bigring .dual .line{font-size:12px;color:var(--smoke);line-height:1.5}
+.bigring .dual .line b{color:var(--bone);font-weight:500}
+.section{margin-bottom:var(--space-6)}
+.section .eyebrow{margin-bottom:var(--space-3);display:block}
+.chain{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-family:var(--font-mono);font-size:11px}
+.chain .blk{padding:4px 9px;border:1px solid var(--ash);border-radius:var(--radius-sm);background:var(--furnace);color:var(--bone)}
+.chain .arrow{color:var(--smoke)}
+.gates{display:flex;gap:var(--space-3);flex-wrap:wrap}
+.gate{flex:1;min-width:150px;border:1px solid var(--ash);border-radius:var(--radius-md);padding:var(--space-3);background:var(--furnace)}
+.gate.passive{opacity:.6}
+.gate .gt{font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--bone);margin-bottom:3px}
+.gate .gd{font-size:11px;color:var(--smoke);line-height:1.4}
+.gate .gtag{display:inline-block;margin-top:8px;font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:0.08em;padding:2px 6px;border-radius:3px}
+.gate.passive .gtag{background:var(--ash);color:var(--smoke)}
+.gate.tap .gtag{background:color-mix(in oklch,var(--ember) 20%,transparent);color:var(--ember)}
+.btnrow{display:flex;gap:var(--space-3);margin-top:var(--space-4)}
+.btnrow .btn{width:auto;flex:1}
+
+.toast-wrap{position:fixed;bottom:var(--space-6);right:var(--space-6);z-index:60;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.toast{background:var(--furnace);border:1px solid var(--ash);border-radius:var(--radius-md);padding:var(--space-3) var(--space-4);box-shadow:0 4px 16px rgba(0,0,0,.4);display:flex;gap:10px;align-items:center;max-width:340px;animation:slidein var(--duration-panel) var(--ease-out)}
+@keyframes slidein{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
+.toast .seal{width:26px;height:26px;flex:none;color:var(--ember)}
+.toast .tt{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.toast .td{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+
+/* ---- HOLD · projector monitor ---- */
+.attach{border:1px solid var(--ash);border-radius:var(--radius-lg);background:var(--furnace);margin-bottom:var(--space-4);overflow:hidden}
+.attach .ahead{display:flex;align-items:center;gap:var(--space-3);padding:var(--space-4);border-bottom:1px solid var(--ash);background:var(--coal)}
+.attach .path{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.attach .path .arr{color:var(--smoke);margin:0 6px}
+.attach .path .ep{color:var(--ember)}
+.edge{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;padding:3px 8px;border-radius:999px;border:1px solid}
+.edge.strong{color:var(--ember);border-color:color-mix(in oklch,var(--ember) 50%,var(--ash))}
+.edge.mid{color:var(--hot-ember);border-color:color-mix(in oklch,var(--hot-ember) 45%,var(--ash))}
+.edge.weak{color:var(--smoke);border-color:var(--ash)}
+.attach .miniring{margin-left:auto;display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:11px;color:var(--smoke)}
+.attach .preview-tag{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:0.08em;color:var(--smoke);padding:2px 7px;border:1px dashed var(--ash);border-radius:3px;margin-left:8px}
+.prow{display:flex;align-items:center;gap:var(--space-3);padding:var(--space-3) var(--space-4);border-bottom:1px solid var(--ash);cursor:pointer;transition:background var(--duration-micro)}
+.prow:last-child{border-bottom:none}
+.prow:hover{background:var(--coal)}
+.prow.killed{opacity:.55}
+.prow.killed .pverb{text-decoration:line-through;color:var(--smoke)}
+.prow .pic{width:26px;height:26px;border-radius:var(--radius-sm);background:var(--coal);display:flex;align-items:center;justify-content:center;color:var(--ember);flex:none}
+.prow .pic svg{width:15px;height:15px}
+.prow.killed .pic{color:var(--signal-red)}
+.prow .pmeta{flex:none;width:170px}
+.prow .pverb{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.prow .psel{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+.prow .pbar{flex:1}
+.prow .pnum{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:11px;color:var(--bone);width:96px;text-align:right;flex:none}
+.prow .pstat{width:120px;text-align:right;flex:none;font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--ember)}
+.prow.killed .pstat{color:var(--signal-red)}
+.spark{display:flex;align-items:flex-end;gap:2px;height:18px}
+.spark i{width:3px;background:var(--ember);border-radius:1px;opacity:.85}
+.prow.killed .spark i{background:var(--signal-red);opacity:.4}
+
+/* ---- LOOK BACK · receipts ---- */
+.rcard{border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--furnace);margin-bottom:var(--space-3);overflow:hidden}
+.rcard .rtop{display:flex;align-items:center;gap:var(--space-3);padding:var(--space-3) var(--space-4);cursor:pointer}
+.rcard .rseal{width:30px;height:30px;color:var(--ember);flex:none}
+.rcard .rwho{flex:1}
+.rcard .rk{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.rcard .rfp{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+.rkind{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:0.08em;padding:2px 7px;border-radius:3px;background:var(--ash);color:var(--smoke)}
+.verifies{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10px;color:var(--ember)}
+.verifies svg{width:12px;height:12px}
+.rcard .rbody{display:none;padding:0 var(--space-4) var(--space-4) 58px;border-top:1px solid var(--ash)}
+.rcard[data-open="true"] .rbody{display:block}
+.rchain{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-family:var(--font-mono);font-size:11px;margin:var(--space-3) 0}
+.rchain .blk{padding:4px 9px;border:1px solid var(--ash);border-radius:var(--radius-sm);background:var(--coal);color:var(--bone)}
+.rchain .blk small{color:var(--smoke);display:block;font-size:9px}
+.rchain .arrow{color:var(--smoke)}
+.cli{font-family:var(--font-mono);font-size:11px;color:var(--bone);background:var(--coal);border:1px solid var(--ash);border-radius:var(--radius-sm);padding:8px 10px;margin-top:8px;display:flex;align-items:center;gap:8px}
+.cli .pmt{color:var(--ember)}
+.cli .ok{margin-left:auto;color:var(--ember)}
+
+/* ---- LOOK BACK · audit ledger ---- */
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:var(--space-6)}
+.fchip{padding:6px 12px;border:1px solid var(--ash);border-radius:999px;background:var(--furnace);color:var(--smoke);font-size:12px;cursor:pointer;transition:all var(--duration-micro)}
+.fchip:hover{color:var(--bone)}
+.fchip[data-active="true"]{color:var(--bone);border-color:var(--smoke);background:var(--ash)}
+.fchip[data-active="true"][data-danger="1"]{color:var(--signal-red);border-color:color-mix(in oklch,var(--signal-red) 50%,var(--ash));background:color-mix(in oklch,var(--signal-red) 12%,var(--furnace))}
+.ledger{position:relative;padding-left:24px}
+.ledger:before{content:"";position:absolute;left:7px;top:6px;bottom:6px;width:2px;background:var(--ash)}
+.lrow{position:relative;display:flex;gap:var(--space-3);padding:10px 0;align-items:flex-start}
+.lrow .node{position:absolute;left:-21px;top:14px;width:10px;height:10px;border-radius:50%;border:2px solid var(--smoke);background:var(--coal)}
+.lrow.receipt .node{border-color:var(--ember);background:var(--ember)}
+.lrow.danger .node{border-color:var(--signal-red);background:var(--signal-red)}
+.lrow .ltime{font-family:var(--font-mono);font-size:10px;color:var(--smoke);width:62px;flex:none;padding-top:2px}
+.lrow .lbody{flex:1}
+.lrow .lk{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.lrow.receipt .lk b{color:var(--ember)}
+.lrow.danger .lk{color:var(--signal-red)}
+.lrow .ld{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+.lrow .ltag{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:0.06em;padding:2px 7px;border-radius:3px;flex:none;align-self:center}
+.ltag.witnessed{background:var(--ash);color:var(--smoke)}
+.ltag.sealed{background:color-mix(in oklch,var(--ember) 18%,transparent);color:var(--ember)}
+.lrow .lhash{font-family:var(--font-mono);font-size:9px;color:var(--smoke);opacity:.6;margin-top:3px}
+
+/* ---- SET UP · devices + custody ---- */
+.spof{display:flex;align-items:center;gap:10px;border:1px solid color-mix(in oklch,var(--hot-ember) 45%,var(--ash));background:color-mix(in oklch,var(--hot-ember) 10%,var(--furnace));border-radius:var(--radius-md);padding:var(--space-3) var(--space-4);margin-bottom:var(--space-6);font-size:13px;color:var(--bone)}
+.spof svg{width:18px;height:18px;color:var(--hot-ember);flex:none}
+.cgroup{margin-bottom:var(--space-6)}
+.cgroup .gh{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--smoke);margin-bottom:var(--space-3)}
+.cgroup .gh b{color:var(--bone)}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:var(--space-3)}
+.dcard{border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--furnace);padding:var(--space-4)}
+.dcard.presence{border-color:color-mix(in oklch,var(--ember) 40%,var(--ash))}
+.dcard .dt{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.dcard .dt svg{width:16px;height:16px;color:var(--ember)}
+.dcard .dn{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.dcard .dattest{font-family:var(--font-mono);font-size:10px;color:var(--smoke);line-height:1.5}
+.dcard .dfp{font-family:var(--font-mono);font-size:10px;color:var(--smoke);word-break:break-all;margin-top:6px;padding-top:6px;border-top:1px solid var(--ash)}
+.oob{border:1px dashed color-mix(in oklch,var(--ember) 40%,var(--ash));border-radius:var(--radius-md);padding:var(--space-4);background:var(--coal);margin-top:var(--space-4)}
+.oob h3{font-size:14px;font-weight:600;margin-bottom:6px}
+.oob p{font-size:12px;color:var(--smoke);margin:0 0 var(--space-3)}
+.oob input{width:100%;font-family:var(--font-mono);font-size:13px;background:var(--furnace);border:1px solid var(--ash);border-radius:var(--radius-sm);color:var(--bone);padding:9px 12px}
+.oob input:focus{border-color:var(--ember);outline:none}
+.oob .match{font-family:var(--font-mono);font-size:11px;margin-top:8px}
+.facetgrid{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3)}
+.fcard{border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--furnace);padding:var(--space-4)}
+.fcard .fr{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.fcard .fr .res{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.fcard .grade{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;margin-left:auto;padding:2px 7px;border-radius:3px}
+.grade.full{background:color-mix(in oklch,var(--ember) 18%,transparent);color:var(--ember)}
+.grade.partial{background:color-mix(in oklch,var(--hot-ember) 18%,transparent);color:var(--hot-ember)}
+.grade.unknown{background:var(--ash);color:var(--smoke)}
+.facets{display:flex;gap:var(--space-2);margin-top:8px}
+.facet{flex:1;font-family:var(--font-mono);font-size:10px;color:var(--smoke);border:1px solid var(--ash);border-radius:var(--radius-sm);padding:6px 8px}
+.facet b{color:var(--bone);display:block;margin-top:2px}
+.weakest{font-size:11px;color:var(--smoke);margin-top:10px;font-style:italic}
+
+/* ---- scope toggle (team0 seam) ---- */
+.scope{margin:0 var(--space-3) var(--space-4);display:flex;background:var(--coal);border:1px solid var(--ash);border-radius:var(--radius-md);padding:3px}
+.scope button{flex:1;border:none;background:none;color:var(--smoke);font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;padding:6px 4px;border-radius:var(--radius-sm);cursor:pointer;transition:all var(--duration-micro)}
+.scope button[data-on="true"]{background:var(--ash);color:var(--ember)}
+.scope button:hover{color:var(--bone)}
+.owner-chip{font-family:var(--font-mono);font-size:10px;color:var(--smoke);display:inline-flex;align-items:center;gap:4px}
+.owner-chip .od{width:6px;height:6px;border-radius:50%;background:var(--ember)}
+.owner-chip.dana .od{background:var(--trace-blue)} .owner-chip.sam .od{background:var(--hot-ember)}
+.navitem .tag0{margin-left:auto;font-size:8px;letter-spacing:0.1em;color:var(--smoke);border:1px solid var(--ash);border-radius:3px;padding:1px 4px}
+.navitem[data-on="true"] .tag0{color:var(--ember);border-color:color-mix(in oklch,var(--ember) 40%,var(--ash))}
+
+/* ---- roster ---- */
+.member{display:flex;align-items:center;gap:var(--space-4);padding:var(--space-3) var(--space-4);border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--furnace);margin-bottom:var(--space-3)}
+.member .av{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:12px;color:var(--coal);font-weight:600;flex:none}
+.member .mn{font-family:var(--font-mono);font-size:13px;color:var(--bone)}
+.member .mr{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+.member .mstat{margin-left:auto;text-align:right;font-family:var(--font-mono);font-size:11px;color:var(--smoke)}
+.member .mstat b{color:var(--bone)}
+.cosign-note{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10px;color:var(--ember);margin-top:3px}
+.cosign-note svg,.omatch svg,.match svg,.simlog svg,.cli svg,.rstate svg{width:13px;height:13px;flex:none;vertical-align:-2px;display:inline-block}
+.admitted{font-family:var(--font-mono);font-size:10px;color:var(--smoke)}
+
+/* ---- compose co-authority slot ---- */
+.cosign{display:flex;align-items:center;gap:var(--space-3);border:1px dashed color-mix(in oklch,var(--trace-blue) 35%,var(--ash));border-radius:var(--radius-md);padding:var(--space-3);margin-top:var(--space-3);background:color-mix(in oklch,var(--trace-blue) 6%,var(--coal))}
+.cosign svg{width:18px;height:18px;color:var(--trace-blue);flex:none}
+.cosign .ct{font-family:var(--font-mono);font-size:11px;color:var(--bone)}
+.cosign .cd{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+.cosign .cs{margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--trace-blue)}
+
+/* ---- recovery ---- */
+.recip{display:flex;align-items:center;gap:var(--space-3);padding:var(--space-3) var(--space-4);border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--furnace);margin-bottom:var(--space-2)}
+.recip .rank{width:22px;height:22px;border-radius:50%;border:1px solid var(--ash);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:11px;color:var(--ember);flex:none}
+.recip .rkind{font-family:var(--font-mono);font-size:12px;color:var(--bone)}
+.recip .rsub{font-family:var(--font-mono);font-size:10px;color:var(--smoke);margin-top:2px}
+.recip .rstate{margin-left:auto;font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.05em}
+.recip .rstate.ready{color:var(--ember)} .recip .rstate.pending{color:var(--smoke)} .recip .rstate.approved{color:var(--ember)}
+.thresh{font-family:var(--font-mono);font-size:11px;color:var(--smoke);margin:var(--space-3) 0 var(--space-6)}
+.thresh b{color:var(--bone)}
+.simbox{border:1px solid var(--ash);border-radius:var(--radius-md);background:var(--coal);padding:var(--space-4);margin-top:var(--space-6)}
+.simbox h3{font-size:13px;font-weight:600;margin-bottom:var(--space-3)}
+.simlog{font-family:var(--font-mono);font-size:11px;color:var(--smoke);line-height:1.9;min-height:120px;white-space:pre-line}
+.simlog .ok{color:var(--ember)} .simlog .warn{color:var(--hot-ember)}
+.cool{height:4px;border-radius:2px;background:var(--ash);overflow:hidden;margin-top:8px}
+.cool i{display:block;height:100%;background:var(--hot-ember);width:0;transition:width 1s linear}
+
+/* ---- onboarding wizard ---- */
+.onboard{position:fixed;inset:0;background:var(--coal);z-index:80;display:none;flex-direction:column;align-items:center;justify-content:center;padding:var(--space-8)}
+body.onboarding .onboard{display:flex}
+.onboard .ow{width:560px;max-width:92vw;text-align:center}
+.onboard .osteps{display:flex;align-items:center;gap:var(--space-2);margin-bottom:var(--space-8);justify-content:center}
+.onboard .snode{width:26px;height:26px;border-radius:50%;border:2px solid var(--ash);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:11px;color:var(--smoke);flex:none}
+.onboard .snode[data-state="current"]{border-color:var(--ember);color:var(--ember)}
+.onboard .snode[data-state="done"]{border-color:var(--ember);background:var(--ember);color:var(--coal)}
+.onboard .ssep{height:2px;width:40px;background:var(--ash)}
+.onboard .ssep[data-done="true"]{background:var(--ember)}
+.onboard .eyebrow{margin-bottom:var(--space-3)}
+.onboard h2{font-size:26px;font-weight:700;margin-bottom:var(--space-3)}
+.onboard p{color:var(--smoke);font-size:14px;line-height:1.6;max-width:440px;margin:0 auto var(--space-6)}
+.onboard p b{color:var(--bone);font-weight:500}
+.onboard .obtns{display:flex;gap:var(--space-3);justify-content:center}
+.onboard .obtns .btn{width:auto;padding:11px var(--space-6)}
+.onboard .ovisual{margin:0 auto var(--space-6);width:120px;height:120px}
+.onboard input{width:100%;max-width:400px;font-family:var(--font-mono);font-size:13px;background:var(--furnace);border:1px solid var(--ash);border-radius:var(--radius-sm);color:var(--bone);padding:11px 14px;margin:0 auto var(--space-2);display:block}
+.onboard input:focus{border-color:var(--ember);outline:none}
+.onboard .omatch{font-family:var(--font-mono);font-size:11px;min-height:18px;margin-bottom:var(--space-4)}
+.startbar{margin:0 var(--space-3) var(--space-3)}
+.startbar button{width:100%;border:1px solid color-mix(in oklch,var(--ember) 40%,var(--ash));background:none;color:var(--ember);font-family:var(--font-mono);font-size:11px;padding:8px;border-radius:var(--radius-sm);cursor:pointer}
+.startbar button:hover{background:color-mix(in oklch,var(--ember) 12%,transparent)}
+.mocknote{position:fixed;right:18px;bottom:14px;z-index:70;border:1px solid color-mix(in oklch,var(--ember) 35%,var(--ash));border-radius:var(--radius-sm);background:color-mix(in oklch,var(--coal) 88%,var(--ember));color:var(--bone);font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;text-transform:uppercase;padding:6px 9px;box-shadow:0 8px 24px rgba(0,0,0,.32)}
+
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="mocknote" aria-label="Prototype mock with fictional data">prototype mock · fictional data</div>
+<!-- ============ SIDEBAR ============ -->
+<aside>
+  <div class="brand">
+    <svg class="spark" viewBox="0 0 24 24" fill="none"><path d="M12 2 C12 8 7 9 7 14 a5 5 0 0 0 10 0 C17 9 12 8 12 2 Z" fill="var(--ember)"/><path d="M12 11 c0 3-2 3.5-2 5.5 a2 2 0 0 0 4 0 C14 14 12 14 12 11Z" fill="var(--hot-ember)"/></svg>
+    <div><b>Emberlink</b><small>Warden Console</small></div>
+  </div>
+  <div class="scope" role="group" aria-label="viewer scope">
+    <button data-scope="mine" data-on="true">mine</button>
+    <button data-scope="team" data-on="false">team0</button>
+  </div>
+  <nav>
+    <button class="navitem" data-nav="desk" aria-current="true"><span class="dot"></span>Decide</button>
+    <div class="navsub">queue · compose</div>
+    <button class="navitem" data-nav="hold"><span class="dot"></span>Hold</button>
+    <div class="navsub">leases · attachments</div>
+    <button class="navitem" data-nav="lookback"><span class="dot"></span>Look back</button>
+    <div class="navsub">receipts · audit</div>
+    <button class="navitem" data-nav="setup"><span class="dot"></span>Set up</button>
+    <div class="navsub">devices · custody · recovery</div>
+    <button class="navitem" data-nav="roster" data-on="false"><span class="dot"></span>Roster<span class="tag0">team0</span></button>
+    <div class="navsub">members · co-sign</div>
+  </nav>
+  <div class="spacer"></div>
+  <div class="startbar"><button id="startsetup">▸ run first-run setup</button></div>
+  <div class="presence">
+    <div class="row"><span class="label">Presence proof</span><span class="mono" style="font-size:11px;color:var(--ember)" id="fresh-pct">fresh</span></div>
+    <div class="freshbar"><i id="fresh-bar" style="width:82%"></i></div>
+    <div class="armed">armed intent: <b id="armed">none</b></div>
+  </div>
+</aside>
+
+<!-- ============ MAIN ============ -->
+<main>
+  <!-- ---- DESK ---- -->
+  <section class="view" id="v-desk">
+    <div class="hero">
+      <div class="lead">
+        <div class="eyebrow">next agent goes inert in</div>
+        <div class="floor mono" id="floor">28:14</div>
+        <div class="leadcap">the soonest a live lease expires. the thing about to ask you for a tap.</div>
+      </div>
+      <div class="vr"></div>
+      <div class="blast">
+        <div class="eyebrow">standing authority out · scope-weighted</div>
+        <div class="blastrow" id="blastrow"></div>
+      </div>
+      <div class="companions">
+        <div class="stat"><span class="n q" id="decN">1</span><span class="k">decision waiting</span></div>
+        <div class="stat"><span class="n mono" id="liveN">2</span><span class="k">live leases</span></div>
+      </div>
+    </div>
+
+    <div class="floorgrid">
+      <!-- decision queue rail -->
+      <div>
+        <div class="col-h"><h2>Decide</h2><span class="count" id="qcount">1 waiting</span></div>
+        <div class="queue" id="queue"></div>
+      </div>
+      <!-- authority-out map -->
+      <div>
+        <div class="col-h"><h2>Authority out</h2><span class="count" id="mapcount">2 live</span></div>
+        <div class="map" id="map"></div>
+        <div class="shelf">
+          <div class="eyebrow" style="margin-bottom:10px">Inert · identity with no live lease</div>
+          <div id="inert"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---- LEASE DETAIL ---- -->
+  <section class="view" id="v-lease"></section>
+
+  <!-- ---- HOLD · live attachments / projector monitor ---- -->
+  <section class="view" id="v-hold">
+    <div class="pagehead">
+      <div><h1>Live attachments</h1><div class="sub">one row per authority lane · keyed on the attachment endpoint, not a grant id</div></div>
+      <span class="preview-tag">per-projector streams · preview</span>
+    </div>
+    <div id="attachlist"></div>
+  </section>
+
+  <!-- ---- LOOK BACK · receipts + audit ---- -->
+  <section class="view" id="v-lookback">
+    <div class="pagehead">
+      <div><h1>Look back</h1><div class="sub">grant receipts prove authority · the audit ledger records what the daemon witnessed</div></div>
+    </div>
+    <div class="tabs">
+      <button class="tab" data-tab="receipts" data-active="true">Grant receipts · root-verifiable</button>
+      <button class="tab" data-tab="audit">Audit ledger · hash-chained</button>
+    </div>
+    <div id="tab-receipts"></div>
+    <div id="tab-audit" style="display:none"></div>
+  </section>
+
+  <!-- ---- SET UP · devices + custody ---- -->
+  <section class="view" id="v-setup">
+    <div class="pagehead">
+      <div><h1>Set up</h1><div class="sub">the device-set root, presence custody, and what each grant can actually prove</div></div>
+    </div>
+    <div class="tabs">
+      <button class="tab" data-tab="devices" data-active="true">Devices &amp; presence</button>
+      <button class="tab" data-tab="custody">Custody &amp; attribution</button>
+      <button class="tab" data-tab="recovery">Recovery</button>
+    </div>
+    <div id="tab-devices"></div>
+    <div id="tab-custody" style="display:none"></div>
+    <div id="tab-recovery" style="display:none"></div>
+  </section>
+
+  <!-- ---- ROSTER (team0 seam) ---- -->
+  <section class="view" id="v-roster"></section>
+</main>
+
+<!-- ============ ONBOARDING WIZARD ============ -->
+<div class="onboard"><div class="ow" id="onboard-ow"></div></div>
+
+<!-- ============ COMPOSE SHEET ============ -->
+<div class="scrim" id="scrim"></div>
+<div class="sheet" role="dialog" aria-label="Compose and authorize">
+  <header>
+    <div class="eyebrow">Decide · compose &amp; authorize</div>
+    <h2 id="sheet-title">Mint workflow lease</h2>
+  </header>
+  <div class="body">
+    <div class="eyebrow" style="margin-bottom:8px">Statements in this bundle · uncheck to narrow before the tap</div>
+    <div id="stmtlist"></div>
+
+    <div class="dialzone">
+      <div class="dial" id="dial" role="slider" aria-label="Lease time to live" aria-valuemin="1" aria-valuemax="420" aria-valuenow="60" tabindex="0">
+        <svg viewBox="0 0 120 120" width="148" height="148">
+          <circle cx="60" cy="60" r="52" fill="none" stroke="var(--ash)" stroke-width="9"/>
+          <circle id="dialarc" cx="60" cy="60" r="52" fill="none" stroke="var(--ember)" stroke-width="9" stroke-linecap="round"
+                  transform="rotate(-90 60 60)" stroke-dasharray="326.7" stroke-dashoffset="280"/>
+          <circle id="dialknob" cx="60" cy="8" r="7" fill="var(--hot-ember)" stroke="var(--coal)" stroke-width="2"/>
+        </svg>
+        <div class="dialmid"><span class="t mono" id="dialt">60m</span><span class="k">lease ttl</span></div>
+      </div>
+      <div class="dialinfo">
+        <div class="eyebrow">one number, two meanings</div>
+        <div class="dualline">
+          <div class="d"><span class="num mono" id="dual-a">1:00:00</span><span class="cap">runs without you</span></div>
+          <div class="d"><span class="num mono" id="dual-b">1:00:00</span><span class="cap">max blast radius if compromised</span></div>
+        </div>
+        <div class="identity-note">drag the clock. as the window shrinks, <b>the blast radius shrinks with it</b>. they are the same number.</div>
+      </div>
+    </div>
+
+    <div class="eyebrow" style="margin-bottom:6px">What you are about to authorize</div>
+    <div class="intentsentence" id="intent"></div>
+    <div class="custmeter">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--bone)" stroke-width="1.6"><path d="M12 3l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V6z"/></svg>
+      attribution: <span style="color:var(--bone)">full</span> · all four resources warded (every use brokered, provable)
+    </div>
+  </div>
+  <div class="foot">
+    <div class="cosign" id="cosign-slot" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V6z"/><path d="M9 12l2 2 4-4"/></svg>
+      <div><div class="ct">Co-authority co-sign required</div><div class="cd">a second authority node co-signs this lease use · two-person rule, no second human</div></div>
+      <span class="cs">node B ready</span>
+    </div>
+    <button class="touchbar" id="authorize">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 11c-1.5 0-2.5 1-2.5 2.8 0 1.6.6 3 .6 3M12 7c-3 0-5 2-5 5 0 2 .4 3.4.4 3.4M16.6 14.5c.2-1 .4-2 .4-2.5a5 5 0 0 0-7.6-4.3M12 11v2.5"/><circle cx="12" cy="12" r="9"/></svg>
+      Touch ID to open
+    </button>
+    <div class="hint">one gesture · one bundle · no tap-stacking. a second demand is a separate ceremony.</div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script>
+/* ---------- vector icons (no emoji) ---------- */
+const I = {
+  git:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 8.5v7M6 15.5c7 0 9-2 9-4.5"/></svg>',
+  llm:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v3M5 8l2 2M19 8l-2 2"/><rect x="6" y="9" width="12" height="9" rx="2.5"/><path d="M9.5 13h.01M14.5 13h.01"/></svg>',
+  ssh:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg>',
+  repo:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 4h11a1 1 0 0 1 1 1v15l-7-3-7 3V6a2 2 0 0 1 2-2z"/></svg>',
+  pay:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18"/></svg>',
+  warded:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V6z" fill="color-mix(in oklch,currentColor 18%,transparent)"/></svg>',
+  minted:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="2.6 2.2"><circle cx="8" cy="14" r="3.5"/><path d="M10.5 11.5L19 3M16 6l2 2M13 9l2 2"/></svg>',
+  seal:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="12" cy="10" r="6"/><path d="M9 15l-1.5 6L12 19l4.5 2L15 15"/><path d="M12 7v3l2 1" stroke-width="1.2"/></svg>'
+};
+
+/* ---------- mock state ---------- */
+const fmt = s => { s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return h>0 ? `${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}` : `${m}:${String(x).padStart(2,'0')}`; };
+const mmss = s => { s=Math.max(0,Math.round(s)); const m=Math.floor(s/60),x=s%60; return `${m}:${String(x).padStart(2,'0')}`; };
+
+let leases = [
+  { id:'lease-3f', persona:'runtime/claude-3f', durable:'durable/dev0', ttl:1800, rem:1694,
+    weight:'heavy', custody:'warded',
+    budgets:[ {lab:'claude', used:2.1, cap:5, unit:'$', tick:0.018}, {lab:'git push', used:1, cap:3, unit:'×', tick:0} ],
+    stmts:[
+      {icon:'git', v:'github:repo:push', sel:'example/repo'},
+      {icon:'llm', v:'anthropic:session:call', sel:'claude · ≤ $5'},
+      {icon:'ssh', v:'ssh:key:sign', sel:'deploy@example'},
+      {icon:'repo', v:'github:repo:read', sel:'example/repo'} ] },
+  { id:'lease-a1', persona:'runtime/codex-a1', durable:'durable/dev0', ttl:3600, rem:2710,
+    weight:'light', custody:'minted',
+    budgets:[ {lab:'codex', used:0.6, cap:2, unit:'$', tick:0.006} ],
+    stmts:[ {icon:'llm', v:'openai:session:call', sel:'codex · ≤ $2'}, {icon:'repo', v:'github:repo:read', sel:'docs/*'} ] }
+];
+let inert = [ {nm:'runtime/claude-9b', st:'lease expired 14m ago'}, {nm:'durable/dev0', st:'admin · no runtime live'} ];
+let decisions = [
+  { id:'dec-1', persona:'runtime/claude-3f', title:'Mint workflow lease', count:4, ttl:60,
+    stmts:[
+      {icon:'git', v:'github:repo', verb:'push', sel:'example/repo', bd:''},
+      {icon:'llm', v:'anthropic:session', verb:'call', sel:'claude', bd:'≤ $5'},
+      {icon:'ssh', v:'ssh:key', verb:'sign', sel:'deploy@example', bd:''},
+      {icon:'repo', v:'github:repo', verb:'read', sel:'example/repo', bd:''} ] }
+];
+
+/* ---------- render: blast roll-up ---------- */
+function renderBlast(){
+  const el = document.getElementById('blastrow'); el.innerHTML='';
+  const parts = [
+    {icon:'pay', t:'$5 payments lane', heavy:true},
+    {icon:'git', t:'1 repo write'},
+    {icon:'ssh', t:'1 ssh sign'},
+    {icon:'llm', t:'2 model sessions'}
+  ];
+  parts.forEach(p=>{ const c=document.createElement('span'); c.className='chip'+(p.heavy?' heavy':'');
+    c.innerHTML=`${I[p.icon]}<span class="w">${p.t}</span>`; el.appendChild(c); });
+}
+
+/* ---------- render: ring svg ---------- */
+function ringSVG(rem, ttl, size=92){
+  const r=size/2-9, C=2*Math.PI*r, frac=Math.max(0,Math.min(1,rem/ttl));
+  // cooling color: hotter when more time remains; depleting = safer = cooler
+  let col = frac>0.5?'var(--ember)':frac>0.25?'var(--ember)':frac>0.12?'var(--oxide)':'var(--smoke)';
+  const soon = rem<120;
+  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+    <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="var(--ash)" stroke-width="8"/>
+    <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="${col}" stroke-width="8" stroke-linecap="round"
+      transform="rotate(-90 ${size/2} ${size/2})" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${(C*(1-frac)).toFixed(1)}"/>
+    ${soon?`<circle cx="${size/2}" cy="9" r="3.4" fill="var(--hot-ember)"/>`:''}
+  </svg>`;
+}
+
+/* ---------- render: authority-out map ---------- */
+function renderMap(){
+  const map=document.getElementById('map'); map.innerHTML='';
+  leases.forEach(L=>{
+    const card=document.createElement('div'); card.className='leasecard'; card.dataset.id=L.id;
+    if(L._ignite){card.classList.add('ignite'); delete L._ignite;}
+    const cust = L.custody==='warded'
+      ? `<span class="custody warded">${I.warded}warded</span>`
+      : `<span class="custody minted">${I.minted}minted · in-mesh</span>`;
+    card.innerHTML = `
+      <div class="top">
+        <span class="persona-chip">${L.persona}</span>
+        ${cust}
+      </div>
+      <div class="ring-wrap">${ringSVG(L.rem,L.ttl)}</div>
+      <div class="ringlabels">
+        <div class="pair"><b class="mono ttl">${mmss(L.rem)}</b> runs without you</div>
+        <div class="pair"><b class="mono ttl">${mmss(L.rem)}</b> max blast radius</div>
+      </div>
+      <div class="budgets">${L.budgets.map(b=>bulletHTML(b)).join('')}</div>`;
+    card.addEventListener('click',()=>openLease(L.id));
+    map.appendChild(card);
+  });
+  document.getElementById('mapcount').textContent = leases.length+' live';
+  document.getElementById('liveN').textContent = leases.length;
+}
+function bulletHTML(b){
+  const frac=Math.min(1,b.used/b.cap), ex=frac>=1;
+  const num = b.unit==='$'?`$${b.used.toFixed(2)}/${b.cap}`:`${Math.round(b.used)}/${b.cap}${b.unit}`;
+  return `<div class="bullet"><span class="lab">${b.lab}</span>
+    <span class="track"><i class="val${ex?' exhausted':''}" style="width:${(frac*100).toFixed(0)}%"></i><i class="cap" style="left:100%"></i></span>
+    <span class="num">${num}</span></div>`;
+}
+
+/* ---------- render: inert shelf ---------- */
+function renderInert(){
+  const el=document.getElementById('inert'); el.innerHTML='';
+  inert.forEach(p=>{ const r=document.createElement('div'); r.className='inertrow';
+    r.innerHTML=`<span class="ic"></span><span class="nm">${p.nm}</span><span class="st">${p.st}</span>`; el.appendChild(r); });
+}
+
+/* ---------- render: decision queue ---------- */
+function renderQueue(){
+  const q=document.getElementById('queue'); q.innerHTML='';
+  if(!decisions.length){ q.innerHTML=`<div class="queue-empty">Nothing waiting. Run <b style="color:var(--bone)">ember claude</b> to start a session.</div>`; }
+  decisions.forEach(d=>{
+    const c=document.createElement('div'); c.className='intentcard';
+    c.innerHTML=`<div class="who"><span class="persona-chip">${d.persona}</span></div>
+      <h3>${d.title}</h3>
+      <div class="meta">${d.count} statements · one approval · ${d.ttl}m proposed</div>
+      ${d.stmts.slice(0,4).map(s=>`<div class="stmtmini">${I[s.icon]}<span>${s.v}:${s.verb} · ${s.sel}</span></div>`).join('')}
+      <div style="margin-top:14px"><button class="btn primary" data-dec="${d.id}">Review &amp; authorize</button></div>`;
+    c.querySelector('button').addEventListener('click',()=>openCompose(d.id));
+    q.appendChild(c);
+  });
+  document.getElementById('qcount').textContent = decisions.length+' waiting';
+  document.getElementById('decN').textContent = decisions.length;
+}
+
+/* ---------- compose sheet ---------- */
+let dialMin = 60; let activeDec=null;
+function openCompose(id){
+  activeDec = decisions.find(d=>d.id===id); if(!activeDec) return;
+  document.getElementById('sheet-title').textContent = activeDec.title;
+  const list=document.getElementById('stmtlist'); list.innerHTML='';
+  activeDec.stmts.forEach((s,i)=>{
+    const row=document.createElement('div'); row.className='stmtrow'; row.dataset.i=i;
+    row.innerHTML=`<input class="ck" type="checkbox" checked aria-label="include ${s.v}">
+      <div class="sv"><div class="verb">${s.v}:<span class="v">${s.verb}</span></div><div class="sel">${s.sel}</div></div>
+      <div class="bd">${s.bd||''}</div>`;
+    row.querySelector('.ck').addEventListener('change',e=>{ row.classList.toggle('dropped',!e.target.checked); updateIntent(); });
+    list.appendChild(row);
+  });
+  dialMin = activeDec.ttl; setDial(dialMin); updateIntent();
+  document.getElementById('armed').textContent = activeDec.persona+' · mint';
+  document.body.classList.add('compose');
+}
+function closeCompose(){ document.body.classList.remove('compose'); document.getElementById('armed').textContent='none'; }
+function activeStmts(){ return [...document.querySelectorAll('.stmtrow')].filter(r=>!r.classList.contains('dropped'))
+  .map(r=>activeDec.stmts[+r.dataset.i]); }
+function updateIntent(){
+  const s=activeStmts(); const has=k=>s.some(x=>x.icon===k);
+  const bits=[]; if(has('git'))bits.push('push to <b>example/repo</b>'); if(has('llm'))bits.push('call <b>Claude for up to $5</b>');
+  if(has('ssh'))bits.push('sign with the <b>deploy ssh key</b>'); if(has('repo')&&!has('git'))bits.push('read <b>example/repo</b>');
+  const who = activeDec?activeDec.persona:'the runtime';
+  document.getElementById('intent').innerHTML =
+    `You are about to let <b>${who}</b> ${bits.join(', ')||'<b>nothing, all statements narrowed away</b>'}, for <b>${dialMin>=60?(dialMin/60).toFixed(dialMin%60?1:0)+' hour'+(dialMin>=120?'s':''):dialMin+' minutes'}</b>.`;
+}
+function setDial(min){
+  dialMin=Math.max(1,Math.min(420,Math.round(min)));
+  const frac=Math.log(dialMin)/Math.log(420); const C=326.7;
+  const arc=document.getElementById('dialarc'); arc.setAttribute('stroke-dashoffset',(C*(1-frac)).toFixed(1));
+  // knob position
+  const ang=frac*2*Math.PI - Math.PI/2; const cx=60+52*Math.cos(ang), cy=60+52*Math.sin(ang);
+  const k=document.getElementById('dialknob'); k.setAttribute('cx',cx.toFixed(1)); k.setAttribute('cy',cy.toFixed(1));
+  document.getElementById('dialt').textContent = dialMin>=60?(dialMin/60).toFixed(dialMin%60?1:0)+'h':dialMin+'m';
+  const secs=dialMin*60;
+  document.getElementById('dual-a').textContent=fmt(secs);
+  document.getElementById('dual-b').textContent=fmt(secs);
+  document.getElementById('dial').setAttribute('aria-valuenow',dialMin);
+  if(activeDec) updateIntent();
+}
+/* drag the clock */
+(function(){
+  const dial=document.getElementById('dial'); let dragging=false;
+  function fromPt(e){
+    const r=dial.getBoundingClientRect(); const cx=r.left+r.width/2, cy=r.top+r.height/2;
+    const x=(e.touches?e.touches[0].clientX:e.clientX)-cx, y=(e.touches?e.touches[0].clientY:e.clientY)-cy;
+    let a=Math.atan2(y,x)+Math.PI/2; if(a<0)a+=2*Math.PI; const f=a/(2*Math.PI); setDial(Math.round(Math.exp(f*Math.log(420))));
+  }
+  dial.addEventListener('pointerdown',e=>{dragging=true;dial.setPointerCapture(e.pointerId);fromPt(e);});
+  dial.addEventListener('pointermove',e=>{if(dragging)fromPt(e);});
+  dial.addEventListener('pointerup',()=>dragging=false);
+  dial.addEventListener('keydown',e=>{ if(e.key==='ArrowUp'||e.key==='ArrowRight'){setDial(dialMin+5);e.preventDefault();}
+    if(e.key==='ArrowDown'||e.key==='ArrowLeft'){setDial(dialMin-5);e.preventDefault();} });
+})();
+
+/* authorize -> ignite a lease + drop a receipt */
+document.getElementById('authorize').addEventListener('click',()=>{
+  const stmts=activeStmts(); if(!stmts.length){return;}
+  const secs=dialMin*60;
+  leases.unshift({ id:'lease-'+Math.random().toString(36).slice(2,5), persona:activeDec.persona, durable:'durable/dev0',
+    ttl:secs, rem:secs, weight:'heavy', custody:'warded', _ignite:true,
+    budgets:[{lab:'claude',used:0,cap:5,unit:'$',tick:0.02},{lab:'git push',used:0,cap:3,unit:'×',tick:0}],
+    stmts:stmts.map(s=>({icon:s.icon,v:s.v+':'+s.verb,sel:s.sel})) });
+  decisions = decisions.filter(d=>d.id!==activeDec.id);
+  closeCompose(); renderQueue(); renderMap(); refreshFloor();
+  dropReceipt('grant.mint · '+activeDec.persona, mmss(secs)+' lease · 4 statements · verifies offline');
+});
+
+/* ---------- lease detail ---------- */
+function openLease(id){
+  const L=leases.find(x=>x.id===id); if(!L)return;
+  const v=document.getElementById('v-lease');
+  v.innerHTML=`
+    <button class="lease-back" id="back">&larr; back to desk</button>
+    <div class="lease-grid">
+      <div class="bigring">
+        ${ringSVG(L.rem,L.ttl,184)}
+        <div class="dual">
+          <div class="line"><b class="mono" id="ld-a">${fmt(L.rem)}</b> runs without you</div>
+          <div class="line"><b class="mono" id="ld-b">${fmt(L.rem)}</b> max blast radius if compromised</div>
+        </div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--smoke);text-align:center;margin-top:6px">
+          same number · ${L.custody==='warded'?'attribution: full (warded)':'attribution: in-mesh (minted)'}</div>
+      </div>
+      <div>
+        <div class="section"><span class="eyebrow">backing grant chain · attenuation</span>
+          <div class="chain"><span class="blk">block-0 · ${L.durable}</span><span class="arrow">&rarr;</span>
+            <span class="blk">attenuate</span><span class="arrow">&rarr;</span><span class="blk">${L.persona}</span></div></div>
+        <div class="section"><span class="eyebrow">statements active · budget (signed cap) vs usage (unsigned ticker)</span>
+          <div class="budgets" style="max-width:460px">${L.budgets.map(b=>bulletHTML(b)).join('')}</div>
+          <div style="margin-top:8px">${L.stmts.map(s=>`<div class="stmtmini">${I[s.icon]||I.repo}<span>${s.v} · ${s.sel}</span></div>`).join('')}</div></div>
+        <div class="section"><span class="eyebrow">lifecycle · three gates, three different proofs</span>
+          <div class="gates">
+            <div class="gate passive"><div class="gt">Reattach / rebind</div><div class="gd">caller re-binds. rides the window, cannot extend.</div><span class="gtag">no presence</span></div>
+            <div class="gate tap"><div class="gt">Renew / extend</div><div class="gd">presence tap mints new time.</div><span class="gtag">presence = new time</span></div>
+            <div class="gate tap"><div class="gt">Scope-widen</div><div class="gd">presence tap mints new authority.</div><span class="gtag">presence = new authority</span></div>
+          </div>
+          <div class="btnrow">
+            <button class="btn" id="renew">Renew (Touch ID)</button>
+            <button class="btn" id="widen">Widen</button>
+            <button class="btn danger" id="revoke">Revoke now (fails closed)</button>
+          </div></div>
+      </div>
+    </div>`;
+  v.querySelector('#back').addEventListener('click',()=>setView('desk'));
+  v.querySelector('#revoke').addEventListener('click',()=>{
+    leases=leases.filter(x=>x.id!==id); inert.unshift({nm:L.persona,st:'revoked just now · cascade fired'});
+    dropReceipt('grant.revoke · '+L.persona,'authority dropped · children cascade-revoked');
+    setView('desk'); renderMap(); renderInert(); refreshFloor();
+  });
+  v.querySelector('#renew').addEventListener('click',()=>{ L.rem=L.ttl; dropReceipt('grant.renew · '+L.persona,'lease window reset · '+mmss(L.ttl)); openLease(id); refreshFloor(); });
+  v.dataset.lease=id;
+  setView('lease');
+}
+
+/* ---------- receipts (toast stream) ---------- */
+function dropReceipt(title,desc){
+  const w=document.getElementById('toasts');
+  const t=document.createElement('div'); t.className='toast';
+  t.innerHTML=`<span class="seal">${I.seal}</span><div><div class="tt">${title}</div><div class="td">${desc}</div></div>`;
+  w.appendChild(t); setTimeout(()=>{t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(()=>t.remove(),300);},5200);
+}
+
+/* ---------- floor / hero ---------- */
+function refreshFloor(){
+  if(!leases.length){ document.getElementById('floor').textContent='··:··'; document.getElementById('floor').classList.remove('warn');
+    document.querySelector('.lead .leadcap').textContent='nothing is live. inert and calm.'; return; }
+  const min=Math.min(...leases.map(l=>l.rem));
+  const f=document.getElementById('floor'); f.textContent=mmss(min); f.classList.toggle('warn',min<120);
+}
+
+/* ---------- view switch ---------- */
+function setView(v){ document.documentElement.dataset.view=v; }
+
+/* ---------- tick ---------- */
+let reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+setInterval(()=>{
+  leases.forEach(L=>{ L.rem=Math.max(0,L.rem-1); L.budgets.forEach(b=>{ if(b.tick) b.used=Math.min(b.cap,b.used+b.tick); }); });
+  // update visible rings/budgets cheaply
+  if(document.documentElement.dataset.view==='desk'){ renderMap(); refreshFloor(); }
+  else if(document.documentElement.dataset.view==='lease'){
+    const id=document.getElementById('v-lease').dataset.lease; const L=leases.find(x=>x.id===id);
+    if(L){ const a=document.getElementById('ld-a'),b=document.getElementById('ld-b'); if(a){a.textContent=fmt(L.rem);b.textContent=fmt(L.rem);} }
+  }
+  // presence freshness ages out
+  const bar=document.getElementById('fresh-bar'); let w=parseFloat(bar.style.width)||82; w=Math.max(0,w-0.25); bar.style.width=w+'%';
+  document.getElementById('fresh-pct').textContent = w>40?'fresh':w>15?'aging':'stale';
+  document.getElementById('fresh-pct').style.color = w>40?'var(--ember)':w>15?'var(--hot-ember)':'var(--signal-red)';
+}, 1000);
+
+document.getElementById('scrim').addEventListener('click',closeCompose);
+window.addEventListener('keydown',e=>{ if(e.key==='Escape')closeCompose(); });
+
+/* ---------- extra icons ---------- */
+I.check='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l4.5 4.5L19 7"/></svg>';
+I.warn='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17.5v.01"/></svg>';
+I.device='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="11" rx="1.5"/><path d="M2 20h20"/></svg>';
+I.exec='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>';
+
+/* ========== HOLD · projector monitor ========== */
+let attachments = [
+  { id:'att-3f', persona:'runtime/claude-3f', binding:'cb-77', endpoint:'att://3f9c…e21', edge:'leaf-exact', leaseId:'lease-3f',
+    projectors:[
+      {kind:'llm', verb:'anthropic:session:call', sel:'claude-opus · ≤ $5', used:2.14, cap:5, unit:'$', tick:0.02, live:true, spark:[]},
+      {kind:'git', verb:'github:repo:push', sel:'example/repo', used:1, cap:3, unit:'×', tick:0, live:true, spark:[]},
+      {kind:'ssh', verb:'ssh:key:sign', sel:'deploy@example', used:0, cap:1, unit:'×', tick:0, live:false, spark:[]} ] },
+  { id:'att-a1', persona:'runtime/codex-a1', binding:'cb-22', endpoint:'att://a1b4…7cd', edge:'owner-uid', leaseId:'lease-a1',
+    projectors:[ {kind:'llm', verb:'openai:session:call', sel:'codex · ≤ $2', used:0.61, cap:2, unit:'$', tick:0.008, live:true, spark:[]} ] }
+];
+function prowHTML(aid,i,p){
+  const frac=Math.min(1,p.used/p.cap);
+  const num=p.unit==='$'?`$${p.used.toFixed(2)}/${p.cap}`:`${Math.round(p.used)}/${p.cap}${p.unit}`;
+  const spark=(p.spark||[]).map(h=>`<i style="height:${h}px"></i>`).join('')||'<i style="height:3px"></i>';
+  const stat=p.killed?'broker fails closed':p.live?'streaming':'idle';
+  return `<div class="prow${p.killed?' killed':''}" data-aid="${aid}" data-pi="${i}" tabindex="0" role="button" aria-label="narrow ${p.verb}">
+    <span class="pic">${I[p.kind]||I.llm}</span>
+    <span class="pmeta"><div class="pverb">${p.verb}</div><div class="psel">${p.sel}</div></span>
+    <span class="pbar"><div class="spark">${spark}</div></span>
+    <span class="pnum">${num}</span>
+    <span class="pstat">${stat}</span></div>`;
+}
+function renderHold(){
+  const el=document.getElementById('attachlist'); el.innerHTML='';
+  if(!attachments.length){ el.innerHTML='<div class="queue-empty">No live attachments. Run <b style="color:var(--bone)">ember claude</b> to open one.</div>'; return; }
+  attachments.forEach(A=>{
+    const L=leases.find(l=>l.id===A.leaseId);
+    const ec=A.edge==='leaf-exact'||A.edge==='cert-san'?'strong':A.edge==='owner-uid'?'mid':'weak';
+    const card=document.createElement('div'); card.className='attach';
+    card.innerHTML=`<div class="ahead">
+        <span class="path">${A.persona}<span class="arr">→</span>${A.binding}<span class="arr">→</span><span class="ep">${A.endpoint}</span></span>
+        <span class="edge ${ec}">edge: ${A.edge}</span>
+        <span class="miniring">${L?ringSVG(L.rem,L.ttl,32):''}<span class="mono">${L?mmss(L.rem):'inert'}</span></span></div>
+      <div>${A.projectors.map((p,i)=>prowHTML(A.id,i,p)).join('')}</div>`;
+    el.appendChild(card);
+  });
+  el.querySelectorAll('.prow').forEach(r=>{
+    const act=()=>{ const A=attachments.find(a=>a.id===r.dataset.aid); const p=A.projectors[+r.dataset.pi];
+      p.killed=!p.killed; if(p.killed){p.live=false; dropReceipt('broker.deny · '+p.verb,'narrowed mid-flight · broker fails closed'); document.getElementById('armed').textContent='narrow · '+p.verb;}
+      renderHold(); };
+    r.addEventListener('click',act);
+    r.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();act();} });
+  });
+}
+
+/* ========== LOOK BACK · receipts ========== */
+let receipts = [
+  {id:'rcpt-9f2', kind:'atomic', k:'broker.mint · github push token', fp:'ed25519:7a3c…91f', chain:['durable/dev0','attenuate','runtime/claude-3f','broker.mint']},
+  {id:'rcpt-8b1', kind:'session', k:'session.claude_code · 30m workflow lease', fp:'ed25519:7a3c…91f', chain:['durable/dev0','attenuate','runtime/claude-3f']},
+  {id:'rcpt-7a0', kind:'atomic', k:'seal.unsealed · anthropic credential', fp:'ed25519:7a3c…91f', chain:['durable/dev0','vault','seal.unsealed']},
+  {id:'rcpt-6c4', kind:'atomic', k:'grant.revoke · runtime/claude-9b (cascade)', fp:'ed25519:7a3c…91f', chain:['durable/dev0','runtime/claude-9b','revoke']}
+];
+function renderReceipts(){
+  const el=document.getElementById('tab-receipts'); el.innerHTML='';
+  receipts.forEach(r=>{
+    const c=document.createElement('div'); c.className='rcard'; c.dataset.open='false';
+    c.innerHTML=`<div class="rtop" tabindex="0" role="button">
+        <span class="rseal">${I.seal}</span>
+        <span class="rwho"><div class="rk">${r.k}</div><div class="rfp">${r.fp} · ${r.id}</div></span>
+        <span class="rkind">${r.kind}</span>
+        <span class="verifies">${I.check} verifies offline</span></div>
+      <div class="rbody">
+        <div class="rchain">${r.chain.map((b,i)=>`${i?'<span class="arrow">→</span>':''}<span class="blk">${b}</span>`).join('')}</div>
+        <div class="cli"><span class="pmt">$</span> ember receipt verify ${r.id} <span class="ok">${I.check} signature ok</span></div></div>`;
+    const top=c.querySelector('.rtop'); const tog=()=>c.dataset.open=c.dataset.open==='true'?'false':'true';
+    top.addEventListener('click',tog); top.addEventListener('keydown',e=>{if(e.key==='Enter'){tog();}});
+    el.appendChild(c);
+  });
+}
+
+/* ========== LOOK BACK · audit ledger ========== */
+let audit = [
+  {t:'14:32:07', cls:'receipt', k:'grant.mint <b>runtime/claude-3f</b>', d:'4 statements · 30m lease · one biometric', hash:'7a3c…91f'},
+  {t:'14:32:09', cls:'mat', k:'broker.materialization · anthropic', d:'credential injected · pre-write audit OK', hash:'b0c1…a02'},
+  {t:'14:33:48', cls:'mat', k:'broker.exec · git push', d:'github:repo:push → example/repo', hash:'c2d3…b71'},
+  {t:'14:34:12', cls:'danger', k:'DENIED · github:repo:delete', d:'need ⊄ grant · not covered by any statement', hash:'d4e5…c93'},
+  {t:'14:35:01', cls:'danger', k:'JIT escalation · payments lane', d:'awaited presence 60s · expired, auto-denied', hash:'e6f7…d12'},
+  {t:'14:36:20', cls:'receipt', k:'grant.revoke <b>runtime/claude-9b</b>', d:'cascade fired · 2 child grants revoked', hash:'f8a9…e44'},
+  {t:'14:36:21', cls:'mat', k:'broker.fail-closed · claude-9b lanes', d:'4 projectors dropped on revoke', hash:'0a1b…f55'}
+];
+let auditFilter='all';
+function renderAudit(){
+  const el=document.getElementById('tab-audit');
+  el.innerHTML=`<div class="filters">
+      <button class="fchip" data-f="all" data-active="true">What did my agents do</button>
+      <button class="fchip" data-f="danger" data-danger="1">Did anything go wrong</button>
+      <button class="fchip" data-f="receipt">Provable decisions</button>
+    </div><div class="ledger" id="ledger"></div>`;
+  el.querySelectorAll('.fchip').forEach(ch=>ch.addEventListener('click',()=>{
+    auditFilter=ch.dataset.f; el.querySelectorAll('.fchip').forEach(x=>x.dataset.active=x===ch?'true':'false'); paintLedger();
+  }));
+  paintLedger();
+}
+function paintLedger(){
+  const L=document.getElementById('ledger'); if(!L)return; L.innerHTML='';
+  audit.filter(a=>auditFilter==='all'||(auditFilter==='danger'&&a.cls==='danger')||(auditFilter==='receipt'&&a.cls==='receipt')).forEach(a=>{
+    const cls=a.cls==='receipt'?'receipt':a.cls==='danger'?'danger':'';
+    const tag=a.cls==='receipt'?'<span class="ltag sealed">root-verifiable</span>':'<span class="ltag witnessed">daemon-witnessed</span>';
+    const row=document.createElement('div'); row.className='lrow '+cls;
+    row.innerHTML=`<span class="node"></span><span class="ltime">${a.t}</span>
+      <span class="lbody"><div class="lk">${a.k}</div><div class="ld">${a.d}</div><div class="lhash">prev ‹ ${a.hash}</div></span>${tag}`;
+    L.appendChild(row);
+  });
+}
+
+/* ========== SET UP · devices + custody ========== */
+let devices = {
+  presence:[ {name:'MacBook · Secure Enclave', attest:'.userPresence SE key · biometric or passcode', fp:'p256:04a9 7c2e 91b3 3f1'} ],
+  daemon:[ {name:'emberd software key', attest:'cannot satisfy presence · signs daemon-lifecycle receipts only', fp:'ed25519:7a3c 5d8e 91f'} ],
+  'co-authority':[],
+  container:[ {name:'spawn · claude-3f', attest:'per-spawn mTLS · cert-SAN, revoked on session close', fp:'spiffe://ember/claude-3f'} ]
+};
+function renderDevices(){
+  const el=document.getElementById('tab-devices');
+  const pres=devices.presence.length;
+  let html = pres<=1 ? `<div class="spof">${I.warn}<span>Only ${pres} presence device enrolled. Lose it and you lose the only key that can open authority. Root authority is meant to be a <b>set</b> (1-of-N). Enroll a second below.</span></div>` : '';
+  [['presence','the only keys that can open authority'],['daemon','software, cannot satisfy presence'],['co-authority','second-node co-sign · team0'],['container','per-spawn mTLS']].forEach(([k,desc])=>{
+    const list=devices[k]||[];
+    html+=`<div class="cgroup"><div class="gh">${k.replace('-',' ')} · <b>${desc}</b></div>`;
+    html+= list.length ? `<div class="dgrid">${list.map(d=>`<div class="dcard ${k==='presence'?'presence':''}">
+        <div class="dt">${I.device}<span class="dn">${d.name}</span></div>
+        <div class="dattest">${d.attest}</div><div class="dfp">${d.fp}</div></div>`).join('')}</div>`
+      : `<div style="font-family:var(--font-mono);font-size:11px;color:var(--smoke)">none enrolled</div>`;
+    html+='</div>';
+  });
+  html+=`<div class="oob"><h3>Enroll a presence device</h3>
+      <p>type or scan the device's published fingerprint to confirm it out of band. no blind "I confirm" checkbox. an active match closes the trust-on-first-use gap.</p>
+      <input id="oobin" placeholder="p256:04a9 7c2e … (paste the fingerprint shown on the device)" autocomplete="off">
+      <div class="match" id="oobmatch"></div></div>`;
+  el.innerHTML=html;
+  const inp=el.querySelector('#oobin'); const norm=s=>s.replace(/[^a-z0-9]/gi,'').toLowerCase();
+  const target=norm('p256:04a9 7c2e 91b3 3f1');
+  inp.addEventListener('input',()=>{ const m=document.getElementById('oobmatch'); const v=norm(inp.value);
+    if(!v){m.textContent='';return;}
+    if(target.startsWith(v)){ m.style.color='var(--ember)'; m.innerHTML=I.check+' matches the device anchor. safe to enroll'; }
+    else { m.style.color='var(--signal-red)'; m.textContent='✗ no match. do not enroll'; }
+  });
+}
+let custodyRes = [
+  {res:'anthropic credential', value:'warded', place:'sealed', grade:'full', why:'every use brokered, witnessed per exercise. provable'},
+  {res:'github app token', value:'warded', place:'sealed', grade:'full', why:'minted fresh per call, composed at the hub'},
+  {res:'ssh deploy key', value:'warded', place:'local', grade:'full', why:'signature bridge · raw key never crosses the daemon boundary'},
+  {res:'codex credential', value:'minted', place:'sealed', grade:'partial', why:'minted-in-mesh · downstream uses composed per-exercise at the hub'},
+  {res:'stripe key (example)', value:'minted', place:'local', grade:'unknown', why:'minted-out-of-mesh · uses not witnessed. attribution stops at issuance'}
+];
+function renderCustody(){
+  const el=document.getElementById('tab-custody');
+  el.innerHTML=`<div class="facetgrid">${custodyRes.map(r=>`<div class="fcard">
+      <div class="fr"><span class="res">${r.res}</span><span class="grade ${r.grade}">${r.grade}</span></div>
+      <div class="facets"><div class="facet">value<b>${r.value}</b></div><div class="facet">placement<b>${r.place}</b></div></div>
+      <div class="weakest">${r.why}</div></div>`).join('')}</div>
+    <div style="margin-top:24px;font-family:var(--font-mono);font-size:11px;color:var(--smoke);max-width:600px;line-height:1.7">
+      a grant's audit honesty equals its <b style="color:var(--bone)">weakest-custody resource</b>. the grade is derived from the actual enforcement path, never self-declared. when the broker cannot witness a use it reads <b style="color:var(--hot-ember)">unknown</b>, never an optimistic "full". we never claim an audit we cannot deliver.</div>`;
+}
+
+/* ========== routing + tabs ========== */
+function wireTabs(){
+  document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+    const grp=t.closest('.view'); grp.querySelectorAll('.tab').forEach(x=>x.dataset.active=x===t?'true':'false');
+    grp.querySelectorAll('[id^="tab-"]').forEach(p=>p.style.display = p.id==='tab-'+t.dataset.tab?'block':'none');
+  }));
+}
+const _origSetView=setView;
+setView=function(v){ document.documentElement.dataset.view=v;
+  document.querySelectorAll('.navitem').forEach(n=>n.setAttribute('aria-current', n.dataset.nav===v||(v==='lease'&&n.dataset.nav==='hold')?'true':'false'));
+  if(v==='hold')renderHold();
+  if(v==='lookback'){renderReceipts();renderAudit();}
+  if(v==='setup'){renderDevices();renderCustody();}
+};
+document.querySelectorAll('.navitem').forEach(n=>n.addEventListener('click',()=>{ if(n.dataset.nav)setView(n.dataset.nav); }));
+
+/* projector streaming + presence aging (separate from desk tick) */
+setInterval(()=>{
+  attachments.forEach(A=>A.projectors.forEach(p=>{ if(p.live&&!p.killed){
+    p.used=Math.min(p.cap,p.used+(p.tick||0));
+    p.spark.push(4+Math.round(Math.random()*13)); if(p.spark.length>18)p.spark.shift();
+  }}));
+  if(document.documentElement.dataset.view==='hold') renderHold();
+}, 1000);
+
+/* ========== team0 seam · scope toggle ========== */
+let scope='mine';
+leases.push(
+  { id:'lease-d2', persona:'runtime/claude-d2', durable:'durable/dana', owner:'dana', ttl:1800, rem:900, custody:'warded',
+    budgets:[{lab:'claude',used:3.2,cap:5,unit:'$',tick:0.015}],
+    stmts:[{icon:'repo',v:'github:repo:read · infra/*',sel:''},{icon:'llm',v:'anthropic:session:call · ≤ $5',sel:''}] },
+  { id:'lease-s7', persona:'runtime/codex-s7', durable:'durable/sam', owner:'sam', ttl:3600, rem:280, custody:'minted',
+    budgets:[{lab:'codex',used:1.8,cap:2,unit:'$',tick:0.01}],
+    stmts:[{icon:'pay',v:'stripe:refund:create · ≤ $50',sel:''}] }
+);
+function visibleLeases(){ return scope==='team' ? leases : leases.filter(l=>(l.owner||'alex')==='alex'); }
+
+renderMap=function(){
+  const map=document.getElementById('map'); if(!map)return; map.innerHTML='';
+  visibleLeases().forEach(L=>{
+    const card=document.createElement('div'); card.className='leasecard'; card.dataset.id=L.id;
+    if(L._ignite){card.classList.add('ignite'); delete L._ignite;}
+    const cust = L.custody==='warded' ? `<span class="custody warded">${I.warded}warded</span>` : `<span class="custody minted">${I.minted}minted</span>`;
+    const owner = `<span class="owner-chip ${L.owner||'alex'}"><span class="od"></span>${L.owner||'alex'}</span>`;
+    card.innerHTML = `<div class="top"><span class="persona-chip">${L.persona}</span>${scope==='team'?owner:cust}</div>
+      <div class="ring-wrap">${ringSVG(L.rem,L.ttl)}</div>
+      <div class="ringlabels"><div class="pair"><b class="mono ttl">${mmss(L.rem)}</b> runs without you</div><div class="pair"><b class="mono ttl">${mmss(L.rem)}</b> max blast radius</div></div>
+      <div class="budgets">${L.budgets.map(b=>bulletHTML(b)).join('')}</div>`;
+    card.addEventListener('click',()=>openLease(L.id));
+    map.appendChild(card);
+  });
+  const n=visibleLeases().length;
+  document.getElementById('mapcount').textContent=n+' live'; document.getElementById('liveN').textContent=n;
+};
+refreshFloor=function(){
+  const vis=visibleLeases();
+  if(!vis.length){ document.getElementById('floor').textContent='··:··'; document.getElementById('floor').classList.remove('warn'); document.querySelector('.lead .leadcap').textContent='nothing is live. inert and calm.'; return; }
+  const min=Math.min(...vis.map(l=>l.rem)); const f=document.getElementById('floor'); f.textContent=mmss(min); f.classList.toggle('warn',min<120);
+  document.querySelector('.lead .leadcap').textContent='the soonest a live lease expires. the thing about to ask you for a tap.';
+};
+renderBlast=function(){
+  const el=document.getElementById('blastrow'); el.innerHTML='';
+  const parts = scope==='team'
+    ? [{icon:'pay',t:'$55 payments lane',heavy:true},{icon:'git',t:'2 repo writes'},{icon:'ssh',t:'1 ssh sign'},{icon:'llm',t:'4 model sessions'},{icon:'',t:'across 3 operators'}]
+    : [{icon:'pay',t:'$5 payments lane',heavy:true},{icon:'git',t:'1 repo write'},{icon:'ssh',t:'1 ssh sign'},{icon:'llm',t:'2 model sessions'}];
+  parts.forEach(p=>{ const c=document.createElement('span'); c.className='chip'+(p.heavy?' heavy':''); c.innerHTML=`${p.icon?I[p.icon]:''}<span class="w">${p.t}</span>`; el.appendChild(c); });
+};
+const _renderQueue=renderQueue;
+renderQueue=function(){
+  _renderQueue();
+  if(scope==='team'){
+    const q=document.getElementById('queue');
+    const c=document.createElement('div'); c.className='intentcard';
+    c.innerHTML=`<div class="who"><span class="persona-chip">runtime/codex-s7</span><span class="owner-chip sam" style="margin-left:6px"><span class="od"></span>sam</span></div>
+      <h3>JIT escalation · payments</h3>
+      <div class="meta">sam's agent requests $50 refund authority · routed to you</div>
+      <div class="stmtmini">${I.pay}<span>stripe:refund:create · ≤ $50</span></div>
+      <div style="margin-top:14px;display:flex;gap:8px"><button class="btn primary" style="flex:1">Route &amp; co-sign</button><button class="btn danger" style="flex:1">Deny</button></div>`;
+    q.appendChild(c);
+    document.getElementById('qcount').textContent='2 waiting'; document.getElementById('decN').textContent='2';
+  }
+};
+function setScope(s){
+  scope=s;
+  document.querySelectorAll('.scope button').forEach(b=>b.dataset.on=b.dataset.scope===s?'true':'false');
+  const rn=document.querySelector('.navitem[data-nav="roster"]'); if(rn)rn.dataset.on=s==='team'?'true':'false';
+  document.body.classList.toggle('team',s==='team');
+  const cs=document.getElementById('cosign-slot'); if(cs)cs.style.display=s==='team'?'flex':'none';
+  renderBlast(); renderMap(); renderQueue(); refreshFloor();
+  if(document.documentElement.dataset.view==='roster') renderRoster();
+}
+document.querySelectorAll('.scope button').forEach(b=>b.addEventListener('click',()=>setScope(b.dataset.scope)));
+
+/* ========== roster ========== */
+let teamMembers=[
+  {name:'alex', role:'Admin Persona · dev0 owner', agents:2, init:'A', col:'var(--ember)', admitted:'first enrolled device key', cosign:true},
+  {name:'dana', role:'engineer', agents:1, init:'D', col:'var(--trace-blue)', admitted:'IdP (okta) + admin-persona co-sign', cosign:false},
+  {name:'sam', role:'engineer', agents:1, init:'S', col:'var(--hot-ember)', admitted:'IdP (okta) + admin-persona co-sign', cosign:false}
+];
+function renderRoster(){
+  const v=document.getElementById('v-roster');
+  v.innerHTML=`<div class="pagehead"><div><h1>Roster</h1><div class="sub">members admitted to the Embernet · IdP identity, admin-persona co-signed into the roster</div></div><span class="preview-tag">team0 · seam preview</span></div>
+    ${teamMembers.map(m=>`<div class="member">
+      <span class="av" style="background:${m.col}">${m.init}</span>
+      <div><div class="mn">${m.name}</div><div class="mr">${m.role}</div>${m.cosign?'<div class="cosign-note">'+I.check+' co-authority signer (two-person rule)</div>':'<div class="admitted">admitted via '+m.admitted+'</div>'}</div>
+      <div class="mstat"><b>${m.agents}</b> live agent${m.agents>1?'s':''}<div style="font-size:10px;color:var(--ember)">view their authority →</div></div></div>`).join('')}
+    <div style="margin-top:24px;font-family:var(--font-mono);font-size:11px;color:var(--smoke);max-width:620px;line-height:1.7">an IdP user is <b style="color:var(--bone)">admitted</b>, then the Admin Persona co-signs their pubkey into the roster, so an IdP breach is not a roster breach. removing a member cascade-revokes every grant their agents hold.</div>`;
+}
+
+/* ========== recovery ========== */
+let recipients=[
+  {rank:1,kind:'YubiKey 5C · hardware',sub:'co-authority custody · kept offline'},
+  {rank:2,kind:'MacBook Secure Enclave',sub:'presence custody'},
+  {rank:3,kind:'printed BIP-39 code',sub:'recovery custody · in a safe'}
+];
+function renderRecovery(){
+  const el=document.getElementById('tab-recovery');
+  el.innerHTML=`<div class="thresh">recovery needs <b>any 2 of 3</b> ranked recipients · multi-recipient KEK_s · AC-7 allowlist · the daemon's software key can never be a recipient</div>
+    ${recipients.map(r=>`<div class="recip"><span class="rank">${r.rank}</span>
+      <div><div class="rkind">${r.kind}</div><div class="rsub">${r.sub}</div></div>
+      <span class="rstate ready">ready</span></div>`).join('')}
+    <div class="simbox"><h3>Lost a device?</h3>
+      <button class="btn" id="runrec" style="width:auto;padding:9px 18px">Simulate recovery to a new device</button>
+      <div class="simlog" id="simlog">no recovery in progress.</div>
+      <div class="cool"><i id="coolbar"></i></div></div>`;
+  el.querySelector('#runrec').addEventListener('click',runRecovery);
+}
+let recTimer=null;
+function runRecovery(){
+  if(recTimer)return;
+  const log=document.getElementById('simlog'); const cool=document.getElementById('coolbar');
+  const steps=[
+    'device MacBook-SE reported lost. opening recovery request…',
+    '<span class="ok">'+I.check+'</span> recipient 1 (YubiKey 5C) approved · 1 of 2',
+    '<span class="ok">'+I.check+'</span> recipient 2 (printed BIP-39) approved · 2 of 2 threshold met',
+    '<span class="warn">cooldown 72h enforced (AC-7 allowlist), compressed for demo…</span>',
+    '<span class="ok">'+I.check+'</span> KEK_s reconstructed from 2 recipients',
+    '<span class="ok">'+I.check+'</span> identity re-anchored to a new presence device · old device revoked',
+    'recovery complete. you hold authority again.'
+  ];
+  let i=0; log.innerHTML='';
+  recTimer=setInterval(()=>{
+    if(i<steps.length){ log.innerHTML+=(i?'\n':'')+steps[i]; if(i===3)cool.style.width='100%'; i++; }
+    else { clearInterval(recTimer); recTimer=null; }
+  },850);
+}
+
+/* ========== onboarding wizard ========== */
+let obStep=0;
+const obSteps=[
+  {eyebrow:'welcome', h:'Emberlink holds your agents&#39; authority', p:'Your agent never holds your credentials. It asks, you decide, and the daemon mints a <b>short-lived, scoped lease</b> then brokers each use. Let&#39;s set up the one thing it can&#39;t run without: <b>you</b>.', cta:'Begin', visual:'spark'},
+  {eyebrow:'enroll presence', h:'Enroll your presence device', p:'Touch ID on this Mac becomes the only key that can <b>open</b> authority. Confirm its anchor out of band by typing the fingerprint shown on the device. No blind trust.', input:true, cta:'Enroll', visual:'key'},
+  {eyebrow:'first grant', h:'Give your agent its first lease', p:'Let Claude <b>read this repo</b> for <b>1 hour</b>. One tap mints the lease. When the hour is up, the agent goes inert on its own.', cta:'Mint with Touch ID', visual:'ring'},
+  {eyebrow:'ready', h:'You&#39;re the only one who can open authority', p:'That is the whole idea. Your desk is live. Watch what your agents do, and revoke anything with one click.', cta:'Open the Warden Console', visual:'check'}
+];
+function renderOnboard(){
+  const s=obSteps[obStep]; const ow=document.getElementById('onboard-ow');
+  const dots=obSteps.map((x,i)=>`<div class="snode" data-state="${i<obStep?'done':i===obStep?'current':'todo'}">${i<obStep?'✓':(i+1)}</div>${i<obSteps.length-1?`<div class="ssep" data-done="${i<obStep}"></div>`:''}`).join('');
+  let visual='';
+  if(s.visual==='ring') visual=`<div class="ovisual">${ringSVG(3600,3600,120)}</div>`;
+  if(s.visual==='spark') visual=`<svg class="ovisual" viewBox="0 0 24 24" fill="none"><path d="M12 2 C12 8 7 9 7 14 a5 5 0 0 0 10 0 C17 9 12 8 12 2 Z" fill="var(--ember)"/><path d="M12 11 c0 3-2 3.5-2 5.5 a2 2 0 0 0 4 0 C14 14 12 14 12 11Z" fill="var(--hot-ember)"/></svg>`;
+  if(s.visual==='key') visual=`<svg class="ovisual" viewBox="0 0 24 24" fill="none" stroke="var(--ember)" stroke-width="1.4"><circle cx="8" cy="14" r="4"/><path d="M11 11l8-8M16 3l3 3M13 6l3 3"/></svg>`;
+  if(s.visual==='check') visual=`<svg class="ovisual" viewBox="0 0 24 24" fill="none" stroke="var(--ember)" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M7 12l3.5 3.5L17 8"/></svg>`;
+  ow.innerHTML=`<div class="osteps">${dots}</div>${visual}<div class="eyebrow">${s.eyebrow}</div><h2>${s.h}</h2><p>${s.p}</p>
+    ${s.input?`<input id="obfp" placeholder="p256:04a9 7c2e … (fingerprint on the device)" autocomplete="off"><div class="omatch" id="obmatch"></div>`:''}
+    <div class="obtns">${obStep>0&&obStep<obSteps.length-1?'<button class="btn" id="obback">Back</button>':''}<button class="btn primary" id="obnext">${s.cta}</button></div>`;
+  if(s.input){ const inp=ow.querySelector('#obfp'); const norm=v=>v.replace(/[^a-z0-9]/gi,'').toLowerCase(); const target=norm('p256:04a9 7c2e 91b3 3f1');
+    inp.focus();
+    inp.addEventListener('input',()=>{ const m=document.getElementById('obmatch'); const v=norm(inp.value); if(!v){m.textContent='';return;} if(target.startsWith(v)){m.style.color='var(--ember)';m.innerHTML=I.check+' matches the device anchor';}else{m.style.color='var(--signal-red)';m.textContent='no match yet';} }); }
+  ow.querySelector('#obnext').addEventListener('click',()=>{ if(obStep<obSteps.length-1){obStep++;renderOnboard();} else {document.body.classList.remove('onboarding'); obStep=0; dropReceipt('grant.mint · runtime/claude-3f','first lease · 1h · welcome to your desk');} });
+  const bk=ow.querySelector('#obback'); if(bk)bk.addEventListener('click',()=>{obStep--;renderOnboard();});
+}
+function startOnboard(){ obStep=0; document.body.classList.add('onboarding'); renderOnboard(); }
+document.getElementById('startsetup').addEventListener('click',startOnboard);
+
+/* setView: add roster + recovery */
+setView=function(v){ document.documentElement.dataset.view=v;
+  document.querySelectorAll('.navitem').forEach(n=>n.setAttribute('aria-current', n.dataset.nav===v||(v==='lease'&&n.dataset.nav==='hold')?'true':'false'));
+  if(v==='roster'&&scope!=='team') setScope('team');
+  if(v==='hold')renderHold();
+  if(v==='lookback'){renderReceipts();renderAudit();}
+  if(v==='setup'){renderDevices();renderCustody();renderRecovery();}
+  if(v==='roster')renderRoster();
+};
+
+/* ---------- init ---------- */
+renderBlast(); renderQueue(); renderMap(); renderInert(); refreshFloor(); wireTabs();
+if(location.hash==='#compose') openCompose('dec-1');
+if(location.hash==='#lease') openLease('lease-3f');
+if(location.hash==='#hold') setView('hold');
+if(location.hash==='#lookback'||location.hash==='#audit'){ setView('lookback'); if(location.hash==='#audit') document.querySelector('.tab[data-tab="audit"]').click(); }
+if(location.hash==='#setup'||location.hash==='#custody'||location.hash==='#recovery'){ setView('setup'); if(location.hash==='#custody') document.querySelector('.tab[data-tab="custody"]').click(); if(location.hash==='#recovery') document.querySelector('.tab[data-tab="recovery"]').click(); }
+if(location.hash==='#team') setScope('team');
+if(location.hash==='#roster'){ setScope('team'); setView('roster'); }
+if(location.hash==='#onboard') startOnboard();
+if(location.hash==='#tcompose'){ setScope('team'); openCompose('dec-1'); }
+</script>
+</body>
+</html>

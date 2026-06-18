@@ -1,4 +1,4 @@
-//! Receipt redaction rule engine (implementation-note-82).
+//! Receipt redaction rule engine (implementation-note-63).
 //!
 //! Receipts contain raw tool outputs that may include secrets, PII, or PHI;
 //! redaction is applied before a receipt is exported (e.g. to a third party
@@ -202,6 +202,7 @@ fn apply_rule_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     #[test]
@@ -361,6 +362,106 @@ mod tests {
         for leaf in leaves {
             let any = rules.iter().any(|r| r.path.ends_with(leaf));
             assert!(any, "default rules missing leaf: {leaf}");
+        }
+    }
+
+    fn scalar_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|n| Value::Number(n.into())),
+            "[a-zA-Z0-9 _.-]{0,32}".prop_map(Value::String),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Anchor: core_receipts_proptest_redaction_landed
+        #[test]
+        fn hash_strategy_matches_sha256_of_original_json(value in scalar_value()) {
+            let mut v = json!({ "secret": value.clone(), "keep": "unchanged" });
+            let rules = vec![RedactionRule {
+                path: "secret".to_string(),
+                strategy: RedactionStrategy::Hash,
+            }];
+            let expected = {
+                let original = serde_json::to_vec(&value).unwrap();
+                let mut hasher = Sha256::new();
+                hasher.update(&original);
+                format!("sha256:{}", hex::encode(hasher.finalize()))
+            };
+
+            let report = apply_redactions(&mut v, &rules);
+
+            prop_assert_eq!(report.total_matches, 1);
+            prop_assert_eq!(report.paths_redacted, vec!["secret"]);
+            prop_assert_eq!(&v["secret"], &Value::String(expected));
+            prop_assert_eq!(&v["keep"], &json!("unchanged"));
+        }
+
+        #[test]
+        fn wildcard_array_mask_reports_every_matched_index(values in proptest::collection::vec("[a-zA-Z0-9 _.-]{0,16}", 0..16)) {
+            let events: Vec<Value> = values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| json!({
+                    "password": value,
+                    "keep": format!("keep-{idx}"),
+                }))
+                .collect();
+            let mut v = json!({ "events": events });
+            let rules = vec![RedactionRule {
+                path: "events.*.password".to_string(),
+                strategy: RedactionStrategy::Mask("<REDACTED>".to_string()),
+            }];
+
+            let report = apply_redactions(&mut v, &rules);
+
+            prop_assert_eq!(report.total_matches, values.len());
+            prop_assert_eq!(
+                report.paths_redacted,
+                (0..values.len())
+                    .map(|idx| format!("events.{idx}.password"))
+                    .collect::<Vec<_>>()
+            );
+            for idx in 0..values.len() {
+                prop_assert_eq!(&v["events"][idx]["password"], &json!("<REDACTED>"));
+                prop_assert_eq!(&v["events"][idx]["keep"], &json!(format!("keep-{idx}")));
+            }
+        }
+
+        #[test]
+        fn non_matching_literal_rule_preserves_document(key in "[a-z]{1,12}", value in scalar_value()) {
+            prop_assume!(key != "password");
+            let original = json!({ key.clone(): value, "stable": ["left", "alone"] });
+            let mut v = original.clone();
+            let rules = vec![RedactionRule {
+                path: "password".to_string(),
+                strategy: RedactionStrategy::Mask("<REDACTED>".to_string()),
+            }];
+
+            let report = apply_redactions(&mut v, &rules);
+
+            prop_assert_eq!(report.total_matches, 0);
+            prop_assert!(report.paths_redacted.is_empty());
+            prop_assert_eq!(v, original);
+        }
+
+        #[test]
+        fn drop_object_field_removes_only_target(secret in scalar_value(), keep in scalar_value()) {
+            let mut v = json!({ "api_key": secret, "keep": keep.clone() });
+            let rules = vec![RedactionRule {
+                path: "api_key".to_string(),
+                strategy: RedactionStrategy::Drop,
+            }];
+
+            let report = apply_redactions(&mut v, &rules);
+
+            prop_assert_eq!(report.total_matches, 1);
+            prop_assert_eq!(report.paths_redacted, vec!["api_key"]);
+            prop_assert!(v.get("api_key").is_none());
+            prop_assert_eq!(&v["keep"], &keep);
         }
     }
 }

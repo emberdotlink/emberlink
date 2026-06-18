@@ -5,7 +5,7 @@
 //! Encodes *who* signed a given image manifest and enforces channel-level
 //! constraints on which builder identities are permitted.
 //!
-//! Two signing principals are recognised (update-policy
+//! Two signing principals are recognised (design note
 //! D6):
 //!
 //! - **CI keyless** (`Ci`) — sigstore / Fulcio OIDC issuing a short-lived

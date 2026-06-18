@@ -588,9 +588,14 @@ fn write_fake_runner_binary(path: &std::path::Path) {
     }
 }
 
-fn write_runner_manifest(home: &std::path::Path, tool_name: &str, binary_path: &std::path::Path) {
+fn write_runner_manifest(
+    home: &std::path::Path,
+    tool_name: &str,
+    binary_path: &std::path::Path,
+) -> std::path::PathBuf {
     let manifest_dir = home.join(".ember/binaries");
     std::fs::create_dir_all(&manifest_dir).expect("mkdir manifest dir");
+    let manifest_path = manifest_dir.join("manifest.toml");
     let manifest_body = format!(
         "\
 [[entries]]
@@ -604,8 +609,8 @@ channel = \"bundled\"
 ",
         binary_path.display()
     );
-    std::fs::write(manifest_dir.join("manifest.toml"), manifest_body)
-        .expect("write runner manifest");
+    std::fs::write(&manifest_path, manifest_body).expect("write runner manifest");
+    manifest_path
 }
 
 fn write_managed_worktree(home: &std::path::Path, runtime_id: &str) -> std::path::PathBuf {
@@ -632,15 +637,21 @@ fn write_executable_script(path: &std::path::Path, body: &str) {
 
 struct HomeEnvGuard {
     previous_home: Option<std::ffi::OsString>,
+    previous_manifest_path: Option<std::ffi::OsString>,
 }
 
 impl HomeEnvGuard {
-    fn set(home: &std::path::Path) -> Self {
+    fn set(home: &std::path::Path, manifest_path: &std::path::Path) -> Self {
         let previous_home = std::env::var_os("HOME");
+        let previous_manifest_path = std::env::var_os("EMBER_MANIFEST_PATH");
         unsafe {
             std::env::set_var("HOME", home);
+            std::env::set_var("EMBER_MANIFEST_PATH", manifest_path);
         }
-        Self { previous_home }
+        Self {
+            previous_home,
+            previous_manifest_path,
+        }
     }
 }
 
@@ -652,6 +663,14 @@ impl Drop for HomeEnvGuard {
             },
             None => unsafe {
                 std::env::remove_var("HOME");
+            },
+        }
+        match self.previous_manifest_path.take() {
+            Some(path) => unsafe {
+                std::env::set_var("EMBER_MANIFEST_PATH", path);
+            },
+            None => unsafe {
+                std::env::remove_var("EMBER_MANIFEST_PATH");
             },
         }
     }
@@ -694,10 +713,10 @@ impl RunnerFixture {
         } else {
             write_fake_runner_binary(&binary_path);
         }
-        write_runner_manifest(home.path(), tool_name, &binary_path);
+        let manifest_path = write_runner_manifest(home.path(), tool_name, &binary_path);
         let runtime_id = format!("rt-{}", uuid::Uuid::new_v4().simple());
         let worktree_path = write_managed_worktree(home.path(), &runtime_id);
-        let home_guard = HomeEnvGuard::set(home.path());
+        let home_guard = HomeEnvGuard::set(home.path(), &manifest_path);
 
         Self {
             _home: home,
@@ -921,7 +940,7 @@ async fn resolve_refuses_unsigned_script_outside_registered_paths() {
 async fn resolve_accepts_authoring_script_from_registered_path() {
     // T2 acceptance for AUTHOR flow: register `~/code/my-construct/`,
     // run a script in that dir → daemon emits authoring receipt
-    // (`authoring = true`). Plaintext wiring still implementation-note-146-
+    // (`authoring = true`). Plaintext wiring still implementation-note-126-
     // IMPL so the call returns -32001, but the gate's authoring
     // accept Receipt fires first and is recorded.
     let _guard = process_state_test_guard();
@@ -1196,7 +1215,7 @@ async fn broker_exec_receipt_records_supplied_session_id() {
     );
 }
 
-/// implementation-note-114 acceptance: the broker_exec child runs
+/// implementation-note-97 acceptance: the broker_exec child runs
 /// with a per-spawn ephemeral HOME (a tempdir owned by the daemon uid),
 /// NEVER the operator's HOME inherited from the daemon's launchd env.
 /// This is the structural invariant that lets the broker's injected
@@ -1328,7 +1347,7 @@ async fn broker_exec_refuses_when_shim_claim_disagrees_with_daemon_classifier() 
 }
 
 // ---------------------------------------------------------------------
-// implementation-note-147 — action-level policy
+// implementation-note-127 — action-level policy
 // gating via construct.toml manifest bytes.
 // ---------------------------------------------------------------------
 
@@ -2209,7 +2228,7 @@ async fn allowlist_proceeds_with_matching_binding() {
     }
 }
 
-// ─── implementation-note-137 ──────────────────────────────────────
+// ─── implementation-note-117 ──────────────────────────────────────
 
 /// Helper: init a tempdir as a git repo with one seed commit on `main`,
 /// `origin/main` ref pointing at the same SHA. Returns the path.

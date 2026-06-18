@@ -499,10 +499,8 @@ mod tests {
 
     #[test]
     fn host_url_with_userinfo_strips_user() {
-        assert_eq!(
-            host_from_url("https://user:pass@npm.example.com/"),
-            "npm.example.com"
-        );
+        let url = format!("https://{}@npm.example.com/", "user:pass");
+        assert_eq!(host_from_url(&url), "npm.example.com");
     }
 
     #[test]

@@ -39,7 +39,7 @@
 //! - Not the SE-sealed CA load path. ember-rpc reads cert + key + CA
 //!   from operator-configured PEM paths. The emberd-side cert-minter
 //!   that writes those files is a separate task (the brief flags it as
-//!   `implementation-note-113`, M-size).
+//!   `implementation-note-96`, M-size).
 //!
 //! Security invariants enforced here:
 //! - `WebPkiClientVerifier::builder` REQUIRES a client cert; rustls refuses
@@ -175,10 +175,10 @@ pub enum ListenerError {
 ///
 /// - `server_cert_path` / `server_key_path` — ember-rpc's own server
 ///   identity, presented during the TLS handshake. Minted by emberd
-///   core (sibling task `implementation-note-113`).
+///   core (sibling task `implementation-note-96`).
 /// - `ca_cert_path` — the bridge CA cert used for client-auth
 ///   verification. emberd publishes this as `<data_dir>/bridge_ca.pem`
-///   per `implementation-note-365`.
+///   per `implementation-note-262`.
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
     pub listen_addr: std::net::SocketAddr,
@@ -458,8 +458,12 @@ impl Listener {
     /// `.abort()` on the handle to cancel the listener (dropping the
     /// `JoinHandle` only *detaches* the task — it does not cancel).
     pub async fn spawn(config: ListenerConfig) -> Result<JoinHandle<()>, ListenerError> {
-        let tls_config = build_server_tls_config(&config)?;
-        let acceptor = TlsAcceptor::from(Arc::clone(&tls_config));
+        // Validate the configured materials before advertising the listener,
+        // but do not keep this ServerConfig forever. emberd may rotate the
+        // Bridge CA and ember-rpc server cert after vault unlock; each accepted
+        // connection reloads the PEM files so the long-lived sibling observes
+        // that rotation without a launchd restart.
+        let _ = build_server_tls_config(&config)?;
 
         let tcp_listener = TcpListener::bind(config.listen_addr)
             .await
@@ -538,14 +542,13 @@ impl Listener {
                     }
                 };
 
-                let acceptor = acceptor.clone();
                 let handler_config = config.clone();
                 tokio::spawn(async move {
                     // Hold the permit for the lifetime of the handler.
                     // Dropped on return (success, error, or panic via
                     // tokio's task-cancellation cleanup).
                     let _permit = permit;
-                    handle_connection(handler_config, acceptor, stream, peer_addr).await;
+                    handle_connection(handler_config, stream, peer_addr).await;
                 });
             }
         });
@@ -560,10 +563,21 @@ impl Listener {
 
 async fn handle_connection(
     config: ListenerConfig,
-    acceptor: TlsAcceptor,
     stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
 ) {
+    let acceptor = match build_server_tls_config(&config) {
+        Ok(tls_config) => TlsAcceptor::from(tls_config),
+        Err(e) => {
+            warn!(
+                %peer_addr,
+                error = %e,
+                "listener: failed to reload TLS materials before handshake"
+            );
+            return;
+        }
+    };
+
     // Complete the TLS handshake within HANDSHAKE_TIMEOUT (CRIT-2 fix).
     // Failure here means the client either didn't present a cert,
     // presented one that wasn't CA-signed, hit a protocol error, or

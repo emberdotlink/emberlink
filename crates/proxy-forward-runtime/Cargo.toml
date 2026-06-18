@@ -46,6 +46,11 @@ core-construct-runtime = { path = "../core-construct-runtime" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Test-only: the live gemini smoke test installs the process-level rustls
+# CryptoProvider the production daemon installs at boot (runtime.rs) — the
+# guarded forward client assumes one is already present. `ring` matches the
+# `hyper-rustls` provider feature above.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [lints]
 workspace = true

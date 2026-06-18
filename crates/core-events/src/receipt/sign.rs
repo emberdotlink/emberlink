@@ -52,13 +52,13 @@ pub enum SignError {
     #[error("spawn.witness parent_signature verification failed")]
     SpawnWitnessParentSignatureInvalid,
     /// Rotation-chain walk could not reach the signer of the target Receipt.
-    /// Per implementation-note-57 §"Errors:".
+    /// Per implementation-note-38 §"Errors:".
     #[error("untrusted signer: rotation chain did not reach the receipt signer")]
     UntrustedSigner,
     /// A witness in the rotation chain failed its own signature check, or the
     /// chain order is wrong (witness signed by a key not yet in the trust set,
     /// or `rotated_at` not monotonically ascending).
-    /// Per implementation-note-57 §"Errors:".
+    /// Per implementation-note-38 §"Errors:".
     #[error("broken chain: witness {index} failed verification: {reason}")]
     BrokenChain { index: usize, reason: String },
 }
@@ -234,7 +234,7 @@ pub fn verify_spawn_witness_parent_signature(
 }
 
 // identity_rotation_witness_chain_verified —
-// implementation-note-57 checkpoint. The chain-walk verifier
+// implementation-note-38 checkpoint. The chain-walk verifier
 // below threads the caller's trust set forward through a sorted slice
 // of `identity.rotation_witness` Receipts so a Receipt signed by an
 // identity not in the caller's initial trust set still verifies, so
@@ -555,7 +555,7 @@ mod tests {
     }
 
     // ===== Rotation-chain walk tests
-    // (implementation-note-57) =====
+    // (implementation-note-38) =====
     //
     // Anchor: identity_rotation_witness_chain_verified
 

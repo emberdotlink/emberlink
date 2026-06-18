@@ -210,7 +210,7 @@ pub fn close_session_ttl_expiry(
 /// with `TerminationReason::CleanExit` so test code does not need access to
 /// the private `close_session` signature.
 ///
-/// implementation-note-341: clean_exit MUST NOT revoke
+/// implementation-note-244: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 pub fn close_session_clean_exit(
     session_store: &SessionStore,
@@ -263,7 +263,7 @@ pub fn close_session_heartbeat_orphan(
 ///
 /// # Grant revocation policy
 ///
-/// implementation-note-341: clean_exit MUST NOT revoke
+/// implementation-note-244: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 ///
 /// Grant revocation is performed ONLY for:
@@ -295,7 +295,7 @@ fn close_session(
 ) {
     // Evaluate revocation policy before moving termination_reason into the Receipt.
     //
-    // implementation-note-341: clean_exit MUST NOT revoke
+    // implementation-note-244: clean_exit MUST NOT revoke
     // the grant — multiple sessions per 24h grant is the contract.
     let should_revoke = !matches!(termination_reason, TerminationReason::CleanExit);
     let meta = session_store.read(session_id).ok().flatten();

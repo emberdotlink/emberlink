@@ -2,7 +2,7 @@
 //! keychain-held operator/workstation Durable Persona seeds from a
 //! backup file produced by `ember trust backup`.
 //!
-//! Per design §Component 4 and implementation-note-34.
+//! Per design §Component 4 and implementation-note-21.
 //!
 //! ## Flow
 //!

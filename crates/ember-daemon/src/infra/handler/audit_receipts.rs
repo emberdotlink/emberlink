@@ -11,7 +11,7 @@ use crate::trust::policy::PolicyEngine;
 
 use super::{RequestContext, current_dispatch_deployment_tier, is_quarantined};
 
-pub(super) fn handle_verify(store: &DaemonStore, params: &Value) -> Result<Value, (i32, String)> {
+pub(crate) fn handle_verify(store: &DaemonStore, params: &Value) -> Result<Value, (i32, String)> {
     // -S3 intentionally-global ConnectOnly diagnostic: verifies chain
     // integrity for the daemon audit log as a whole. Actor filtering would
     // hide the tamper state this method exists to surface.
@@ -374,7 +374,7 @@ pub(super) fn handle_repair_chain(
     }
 }
 
-pub(super) fn handle_audit_query(
+pub(crate) fn handle_audit_query(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -496,7 +496,7 @@ pub(super) fn handle_receipt_tree(
     Ok(serde_json::to_value(tree).unwrap_or(Value::Null))
 }
 
-pub(super) fn handle_receipt_query(
+pub(crate) fn handle_receipt_query(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -527,7 +527,7 @@ pub(super) fn handle_receipt_query(
     Ok(Value::Array(list))
 }
 
-pub(super) fn handle_list_receipts(
+pub(crate) fn handle_list_receipts(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -549,7 +549,7 @@ pub(super) fn handle_list_receipts(
     Ok(Value::Array(list))
 }
 
-pub(super) fn handle_get_receipt(
+pub(crate) fn handle_get_receipt(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,

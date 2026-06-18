@@ -1,13 +1,13 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! UDS frame protocol for `ember-exec` (implementation-note-381).
+//! UDS frame protocol for `ember-exec` (implementation-note-286).
 //!
 //! Wire format: length-prefixed JSON frames. Each frame is a `u32` big-endian
 //! byte length followed by `length` bytes of UTF-8 JSON. The JSON deserialises
 //! into an [`ExecFrame`] enum with a `type` discriminant per `serde(tag)`.
 //!
 //! The hash-verify, setuid-drop, and spawn-integration layers (subtasks B and
-//! C of the implementation-note-51 decomposition) consume these frames
+//! C of the implementation-note-288 decomposition) consume these frames
 //! but do not modify the protocol — the protocol stays stable across the
 //! three-step rollout.
 

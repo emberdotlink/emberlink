@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::infra::store::{DaemonStore, StoreError};
 
-/// implementation-note-171 — convert unix-ms to an RFC3339 string so
+/// Convert unix-ms to an RFC3339 string so
 /// the date-range filter compares lexicographically against the existing TEXT
 /// `timestamp` column. Negative or out-of-range values clamp to the unix epoch.
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -36,21 +36,21 @@ pub struct AuditFilter {
     pub agent_id: Option<String>,
     pub action: Option<String>,
     pub limit: Option<usize>,
-    /// implementation-note-172 — filter to actions that start with this prefix,
+    /// Filter to actions that start with this prefix,
     /// e.g. `"grant."` shows only grant-family events. Rendering-layer only;
     /// applied after the SQL fetch so the limit still governs the fetch window.
     pub action_prefix: Option<String>,
-    /// implementation-note-171 — alias for `agent_id`. Both populate
+    /// Alias for `agent_id`. Both populate
     /// the `agent_id = ?` clause; if both are set, `persona_id` wins.
     pub persona_id: Option<String>,
-    /// implementation-note-171 — narrow to rows whose `credential`
+    /// Narrow to rows whose `credential`
     /// column starts with this prefix. SQL `LIKE` with appended `%`.
     pub scope: Option<String>,
-    /// implementation-note-171 — inclusive lower bound (unix ms).
+    /// Inclusive lower bound (unix ms).
     /// Converted to RFC3339 before binding so it compares against the
     /// existing TEXT timestamp column.
     pub since_ms: Option<i64>,
-    /// implementation-note-171 — inclusive upper bound (unix ms).
+    /// Inclusive upper bound (unix ms).
     pub before_ms: Option<i64>,
 }
 
@@ -123,10 +123,10 @@ impl DaemonStore {
     }
 
     pub fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, StoreError> {
-        // implementation-note-171 — dynamic positional binding so we
+        // Dynamic positional binding so we
         // can compose any combination of {agent_id, action, persona_id, scope,
         // since_ms, before_ms} without the previous hand-numbered ladder.
-        // implementation-note-173: filter out the chain-anchor checkpoint row.
+        // Audit-chain: filter out the chain-anchor checkpoint row.
         // It's an internal artifact of the tamper-evident chain (see
         // migrate() in store.rs); not a user-visible audit event. The
         // chain verifier (subtask C) reads the table directly and DOES see
@@ -195,7 +195,7 @@ impl DaemonStore {
             .query_map(rusqlite::params_from_iter(binds.iter()), map_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        // implementation-note-172 — action_prefix filter applied post-fetch so
+        // Action_prefix filter applied post-fetch so
         // the SQL limit governs the fetch window; the prefix narrows what
         // the dashboard displays. Empty/whitespace prefix is a no-op.
         if let Some(ref prefix) = filter.action_prefix {
@@ -208,7 +208,7 @@ impl DaemonStore {
         Ok(entries)
     }
 
-    /// implementation-note-171 — test helper to insert an audit row
+    /// Test helper to insert an audit row
     /// with an explicit timestamp string (so date-range tests can pin
     /// timestamps without sleeping).
     ///
@@ -233,7 +233,7 @@ impl DaemonStore {
     }
 
     pub fn audit_count(&self) -> Result<u64, StoreError> {
-        // implementation-note-173: same internal-checkpoint exclusion as
+        // Same internal-checkpoint exclusion as
         // query_audit so the user-facing count matches what query_audit
         // returns.
         let count: i64 = self.conn().query_row(
@@ -244,7 +244,7 @@ impl DaemonStore {
         Ok(count as u64)
     }
 
-    /// F-implementation-note-174 — force-rotate the active audit-chain segment to free SQLite
+    /// Force-rotate the active audit-chain segment to free SQLite
     /// page space when the audit-store is full.
     ///
     /// Rotation inserts a `audit.forced_rotation` bridge row as the genesis of
@@ -273,7 +273,7 @@ impl DaemonStore {
     pub fn force_rotate_audit_segment(&self) -> Result<ForcedRotationOutcome, StoreError> {
         // Quarantine gate — refuse while the chain is known-broken.
         if crate::infra::handler::is_quarantined() {
-            tracing::warn!("daemon quarantined; refusing forced audit-chain rotation (F-implementation-note-174)");
+            tracing::warn!("daemon quarantined; refusing forced audit-chain rotation (F-implementation-note-145)");
             return Err(StoreError::Quarantined {
                 action: "audit.forced_rotation".to_string(),
             });
@@ -374,7 +374,7 @@ pub struct ForcedRotationOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-173 — tamper-evident audit chain
+// tamper-evident audit chain
 // ---------------------------------------------------------------------------
 
 /// Append an audit event to `audit_log` with a blake3 chain hash linking it
@@ -581,7 +581,7 @@ fn canonical_audit_row_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-175 — chain verifier
+// chain verifier
 // ---------------------------------------------------------------------------
 
 /// audit_verifier_outcome_v2 — outcome of a chain-verification walk.
@@ -732,7 +732,7 @@ pub(crate) fn inter_segment_seed_row_hash(
 /// Walk the audit chain forward from the genesis row, recomputing each
 /// row's `blake3(prev_hash || canonical_row_bytes)` and asserting it
 /// matches the stored `row_hash`. Pre-chain rows (NULL `row_hash`,
-/// inserted before the implementation-note-173 migration landed) are
+/// inserted before the audit-chain migration landed) are
 /// skipped — the verifier walks only chained rows.
 ///
 /// `tail` limits the walk to the most recent N rows (for sampling startup
@@ -1169,8 +1169,8 @@ fn detect_incomplete_repair(
 /// audit_repair_chain_rpc_landed — repair strategy discriminator. v0.3
 /// ships exactly `Truncate` (the `truncate_after_row` primitive named by
 /// design v2 §2). `TombstoneSegment` is reserved for a future
-/// "preserve broken rows, mint a tombstone-only repair" flow filed under
-/// `implementation-note-176`; dispatching it from v0.3
+/// "preserve broken rows, mint a tombstone-only repair" flow;
+/// dispatching it from v0.3
 /// returns `-32602 unsupported repair_kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[test]
     fn persona_filter_isolates_rows() {
-        // implementation-note-171 — persona_id targets the agent_id
+        // persona_id targets the agent_id
         // column; a row tagged "persona-x" should not surface when querying
         // for "persona-y".
         let store = DaemonStore::open_in_memory().unwrap();
@@ -1773,7 +1773,7 @@ mod tests {
 
     #[test]
     fn since_before_bound_timestamps() {
-        // implementation-note-171 — since_ms / before_ms inclusive
+        // since_ms / before_ms inclusive
         // bounds. Insert three rows at t=100/200/300 ms; query [150, 250]
         // expects only the t=200 row.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -1869,7 +1869,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-175 — verifier walks a fresh chain and reports Ok.
+    /// Verifier walks a fresh chain and reports Ok.
     #[test]
     fn audit_verify_chain_passes_on_untampered_log() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -1894,7 +1894,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-175 — verifier detects a tampered row.
+    /// Verifier detects a tampered row.
     /// Seeds 3 chained events, hand-corrupts row 2's `details` column
     /// (bypassing the chain primitive's hash recompute), asserts the
     /// verifier emits `VerifyOutcome::Break` at the corrupted row.
@@ -1948,7 +1948,7 @@ mod tests {
         crate::infra::handler::force_quarantine_latch_for_test(false);
     }
 
-    /// implementation-note-175 — sampling mode walks only the last N rows.
+    /// Sampling mode walks only the last N rows.
     #[test]
     fn audit_verify_chain_tail_walks_only_last_n() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -2105,7 +2105,7 @@ mod tests {
         assert_eq!(out, None, "consistent tombstone+receipt must not flag");
     }
 
-    /// implementation-note-173 — chain advances: every row's `prev_hash`
+    /// Chain advances: every row's `prev_hash`
     /// equals the prior row's `row_hash`. Genesis row carries `prev_hash =
     /// NULL`. Two back-to-back appends must produce a row whose `prev_hash`
     /// matches the genesis row's `row_hash`, then another whose `prev_hash`

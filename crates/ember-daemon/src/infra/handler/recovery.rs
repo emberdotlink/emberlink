@@ -978,6 +978,19 @@ fn emit_recovery_action_receipt_with_mode(
             format!("recovery_action_receipt: serialize receipt: {e}"),
         )
     })?;
+    store
+        .store_atomic_receipt_v2(
+            &envelope,
+            "",
+            body.operator_persona_id.as_deref().unwrap_or(""),
+            outcome,
+        )
+        .map_err(|e| {
+            (
+                -32030,
+                format!("recovery_action_receipt: persist receipt artifact: {e}"),
+            )
+        })?;
     let persisted = match store.log_event(
         None,
         RECEIPT_KIND_RECOVERY_ACTION,

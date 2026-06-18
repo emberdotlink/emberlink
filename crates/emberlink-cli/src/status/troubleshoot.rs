@@ -264,7 +264,7 @@ mod tests {
             "F-DAEMON-2",
             "F-DAEMON-3",
             "F-INSTALL-1",
-            "F-implementation-note-453",
+            "F-implementation-note-356",
         ] {
             // Each F-code's line MUST surface as [fail].
             let line = out

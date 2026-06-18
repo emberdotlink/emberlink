@@ -1,7 +1,7 @@
 use super::*;
 
 // sealed_mek_blob_format_landed tests.
-// implementation-note-319 — T1 round-trip
+// implementation-note-224 — T1 round-trip
 // and the five negative cases (wrong passphrase, tampered magic,
 // tampered ciphertext, tampered fingerprint, version mismatch).
 

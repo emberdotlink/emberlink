@@ -1,27 +1,85 @@
-
-
-> [!NOTE]
-> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
-
 # Receipts and Audit
 
 Emberlink does not just broker authority. It also leaves evidence behind.
 
 The current public evidence model has three parts:
 
-- **Receipts** — signed artifacts describing grant-bearing actions or decisions
-- **Audit log** — local event history stored by the daemon
-- **Verification** — commands that prove a receipt or audit artifact is structurally valid
+- **Receipts**: signed artifacts describing grant-bearing actions or decisions
+- **Audit log**: local event history stored by the daemon
+- **Verification**: commands that prove a receipt or audit artifact is structurally valid
 
 ## Mental model
 
 Use these terms precisely:
 
-- **Grant** — the scoped authority Emberlink issued for some action
-- **Receipt** — the signed artifact that proves what happened
-- **Audit event** — the local daemon-side event row that records state and activity history
+- **Grant**: the scoped authority Emberlink issued for some action
+- **Receipt**: the signed artifact that proves what happened
+- **Audit event**: the local daemon-side event row that records state and activity history
 
 The receipt is the portable artifact. The audit log is the local history.
+
+## Evidence Flow
+
+![A receipt file and expected public key are checked locally; verification passes when the signature and canonical hash match, or breaks when the artifact changed](../assets/diagrams/receipt-verification.svg)
+
+```text
+action request
+  |
+  v
+grant and policy decision
+  |
+  v
+materialization event
+  |
+  v
+execution result
+  |
+  v
+claim events
+  |
+  +--> local audit history
+  |
+  +--> signed receipt artifact
+```
+
+The same delegated action can produce local audit history and receipt evidence.
+Use the audit log to inspect what happened on this daemon. Use the receipt when
+you need a portable artifact.
+
+## What a Receipt Proves
+
+A receipt proves that a daemon identity signed an artifact about a specific
+delegated authority event.
+
+For Receipt v2, the common envelope carries fields such as:
+
+- receipt version and kind
+- receipt id
+- persona id
+- grant id
+- daemon root id
+- start and termination times
+- key fingerprint
+- trace context
+- canonical hash algorithm
+- body
+- signature
+
+The details matter because verification should not depend on trusting the
+current UI, transcript, or host shell. A verifier can rebuild the canonical
+bytes and check the signature against the stated key fingerprint.
+
+## Atomic and Session Receipts
+
+There are two useful receipt scopes:
+
+- **Atomic receipts** describe one delegated action or decision.
+- **Session receipts** summarize a larger run and can aggregate claim events,
+  counts, and roots.
+
+Most first-time users start with the latest receipt export. Builders should
+understand that the receipt model is designed to support both one action and a
+larger session story.
 
 ## Current truth
 
@@ -102,7 +160,7 @@ For most users, the evidence loop is:
 
 ## Next page
 
-- [Evidence Reference](../reference/evidence-reference/)
+- [Evidence Reference](../reference/evidence-reference.md)
 
 ## Support boundary
 
@@ -114,7 +172,7 @@ If you are looking for recovery or repair, start with:
 
 ```bash
 ember status
-ember status --troubleshoot
+ember doctor
 ember receipt list
 ember audit query
 ```

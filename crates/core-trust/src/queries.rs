@@ -227,6 +227,8 @@ pub fn export_trust_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn att(attester: &str, subject: &str, domain: &str, score: f32) -> TrustAttestation {
         TrustAttestation {
@@ -236,6 +238,93 @@ mod tests {
             domain: domain.to_string(),
             score,
             recipient_bound: None,
+        }
+    }
+
+    fn indexed_attestation(idx: usize, from: u8, to: u8) -> TrustAttestation {
+        let attester = format!("node_{}", from % 8);
+        let subject = format!("node_{}", to % 8);
+        TrustAttestation {
+            id: format!("att:{idx}:{attester}:{subject}"),
+            attester,
+            subject,
+            domain: "relay".to_string(),
+            score: 1.0,
+            recipient_bound: None,
+        }
+    }
+
+    fn private_attestation(idx: u8) -> TrustAttestation {
+        TrustAttestation {
+            id: format!("att:private:{idx}"),
+            attester: "node_0".to_string(),
+            subject: format!("private_{idx}"),
+            domain: "relay".to_string(),
+            score: 1.0,
+            recipient_bound: Some("peer-only".to_string()),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn trust_network_keeps_public_bfs_bounded_and_recipient_private(
+            pairs in proptest::collection::vec((0u8..8, 0u8..8), 0..32),
+            private_indices in proptest::collection::vec(0u8..8, 0..8),
+            max_depth in 0usize..16,
+        ) {
+            let mut attestations: Vec<TrustAttestation> = pairs
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (from, to))| indexed_attestation(idx, from, to))
+                .collect();
+            attestations.extend(private_indices.into_iter().map(private_attestation));
+
+            let graph = trust_network(&attestations, "node_0", max_depth);
+            let effective_depth = max_depth.min(MAX_NETWORK_DEPTH);
+            let mut seen = BTreeSet::new();
+            let mut depths = std::collections::BTreeMap::new();
+
+            for node in &graph.nodes {
+                prop_assert!(seen.insert(node.id.as_str()), "duplicate node {}", node.id);
+                prop_assert!(
+                    node.depth <= effective_depth,
+                    "node {} exceeded max depth {effective_depth}: {}",
+                    node.id,
+                    node.depth
+                );
+                prop_assert!(
+                    !node.id.starts_with("private_"),
+                    "recipient-bound node leaked into public trust graph: {}",
+                    node.id
+                );
+                depths.insert(node.id.as_str(), node.depth);
+            }
+
+            prop_assert_eq!(depths.get("node_0"), Some(&0));
+
+            for edge in &graph.edges {
+                prop_assert!(
+                    !edge.from.starts_with("private_") && !edge.to.starts_with("private_"),
+                    "recipient-bound edge leaked into public trust graph: {:?}",
+                    edge
+                );
+                let from_depth = depths
+                    .get(edge.from.as_str())
+                    .copied()
+                    .ok_or_else(|| TestCaseError::fail(format!("edge from missing node: {edge:?}")))?;
+                prop_assert!(
+                    from_depth < effective_depth,
+                    "edge emitted from depth-limited node at depth {from_depth}: {:?}",
+                    edge
+                );
+                prop_assert!(
+                    depths.contains_key(edge.to.as_str()),
+                    "edge target missing from node set: {:?}",
+                    edge
+                );
+            }
         }
     }
 

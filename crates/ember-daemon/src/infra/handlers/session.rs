@@ -18,6 +18,7 @@ use crate::infra::{
     handlers::principal::{
         ensure_connect_only_owner_matches_trusted_principal, trusted_request_persona,
     },
+    handlers::session_authority_lane::{mint_runtime_lane, resolve_runtime_attach_target},
     receipt::current_identity,
     rpc_error::RpcError,
     store::DaemonStore,
@@ -36,6 +37,14 @@ const ANTHROPIC_RUNTIME_CREDENTIAL_HINT: &str =
 const OPENAI_PROVIDER_CREDENTIAL_PREFIX: &str = "openai/";
 const OPENAI_CHATGPT_PLAN_CREDENTIAL_PREFIX: &str = "openai/plan/chatgpt-oauth/";
 const OPENAI_RUNTIME_CREDENTIAL_HINT: &str = "openai/plan/chatgpt-oauth/<account>/<subject>";
+// design §2 — gemini Code Assist OAuth ("Sign in with Google") lane. The
+// credential is the harvested `oauth_creds` blob stored under a single
+// `google/code-assist-oauth` name (no `<account>/<subject>` sub-segments like
+// the OpenAI plan credential), so the "prefix" is the full credential name.
+const GOOGLE_PROVIDER_CREDENTIAL_PREFIX: &str = "google/";
+const GOOGLE_CODE_ASSIST_OAUTH_CREDENTIAL: &str = "google/code-assist-oauth";
+const GOOGLE_RUNTIME_CREDENTIAL_HINT: &str = "google/code-assist-oauth";
+const GEMINI_DEFAULT_SCOPE: &str = "gemini-default-v1";
 const ENDPOINT_GROUP_ROLLBACK_KEY: &str = "__endpoint_group_lifecycle";
 
 /// target_state_anchor: SCION-everywhere — synthetic socket-path key for
@@ -45,6 +54,118 @@ const ENDPOINT_GROUP_ROLLBACK_KEY: &str = "__endpoint_group_lifecycle";
 /// per-agent UDS enrollments produced by the SCION path.
 pub(crate) fn host_mode_enrollment_socket_path(session_id: &str) -> String {
     format!("host-mode/{session_id}")
+}
+
+/// target_state_anchor: session_lookup_or_open_owned_by_session_handler —
+/// `session.lookup_or_open` JSON-RPC verb — peercred-bound session
+/// lookup/creation per the peercred principal-binding contract.
+///
+/// This helper is the kernel-attested identity barrier for session-open.
+/// On launcher flows that also establish caller enrollment and attach
+/// workflow authority, those steps must remain a compound atomic
+/// transaction: callers must not observe a "session opened first,
+/// authority attached later" gap. The richer launcher-facing path lives
+/// in `infra::handlers::session::handle_register_session`; this helper
+/// keeps the low-level peercred gate explicit so future refactors do not
+/// weaken the invariant by treating `session.lookup_or_open` as a casual
+/// lookup.
+///
+/// Returns the (session_id, persona, parent_pid) triple for the
+/// caller's existing session, or opens a fresh session bound to the
+/// kernel-attested principal. The persona identity is sourced from
+/// the kernel-attested `PeerCredPrincipal` — a caller cannot lie
+/// about which persona they are.
+///
+/// **Principal binding gates** (per design §"Subprocess identity
+/// spoofing (Phase 1)"):
+///
+/// - When `principal` is `None`, the call is refused with `-32401`
+///   ("principal binding unavailable") — `session.lookup_or_open`
+///   is wire-only and demands kernel attestation.
+/// - When `params.persona` is supplied AND the persona's bound uid
+///   does not match `principal.uid`, refuse with `-32004`.
+/// - When `params.parent_pid` is supplied AND it disagrees with
+///   `principal.pid`, refuse with `-32004` — the brief calls this
+///   out: "refuses caller-supplied `parent_pid` that does not match
+///   peer pid".
+///
+/// Params: `{ "persona"?: <string>, "parent_pid"?: <i32> }`
+/// Result: `{ "session_id": <string>, "persona_id"?: <string>,
+///            "parent_pid": <i32>, "socket_path": <string> }`
+///
+/// Implements the peercred principal-binding contract.
+pub(crate) async fn handle_session_lookup_or_open(
+    principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let principal = principal.ok_or_else(|| {
+        RpcError::OperatorAttestationFailed(
+            "session.lookup_or_open requires kernel-attested principal — \
+         wire-only RPC, refused on Internal source"
+                .to_string(),
+        )
+    })?;
+
+    // Refuse if the bound peer has been
+    // reaped between connection-accept and this RPC dispatch. PID-reuse
+    // could otherwise hand the freshly-recycled PID to a new process
+    // that this session would then bind to.
+    crate::broker::handler::check_principal_is_alive(Some(principal))?;
+
+    // Persona-name → bound-uid check (when the caller asserts which
+    // persona they're opening a session for, kernel attests it).
+    // Gate
+    // now consults `agent_socket_enrollments` (the new authority) via
+    // the store, falling back to the legacy thread-local registry
+    // during the transition.
+    crate::broker::handler::check_principal_against_persona(
+        Some(principal),
+        store,
+        params,
+        "persona",
+    )?;
+
+    // parent_pid binding: brief calls this out — caller-supplied
+    // parent_pid that does not match peer pid is refused.
+    if let Some(claimed_pid) = params.get("parent_pid").and_then(|v| v.as_i64())
+        && claimed_pid as i32 != principal.pid
+    {
+        tracing::warn!(
+            claimed_parent_pid = claimed_pid,
+            principal_pid = principal.pid,
+            principal_uid = principal.uid,
+            "session.lookup_or_open: rejecting — claimed parent_pid disagrees with kernel-attested peer pid"
+        );
+        return Err(RpcError::NotFound(
+            format!(
+                "principal binding mismatch: claimed parent_pid {} does not match kernel-attested peer pid {}",
+                claimed_pid, principal.pid
+            ),
+        )
+        .into());
+    }
+
+    // Mint a fresh session id. Production wiring (registry of open
+    // sessions, persistence under `sessions_dir`, etc.) lives in the
+    // sibling agent-persona-lifecycle task; this surface
+    // establishes the peercred gate so the production wiring can
+    // drop into a kernel-attested foundation.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let session_id = format!("sess_{:032x}", nanos);
+
+    let mut response = json!({
+        "session_id": session_id,
+        "parent_pid": principal.pid,
+        "socket_path": principal.socket_path.display().to_string(),
+    });
+    if let Some(persona) = params.get("persona").and_then(|v| v.as_str()) {
+        response["persona_id"] = json!(persona);
+    }
+    Ok(response)
 }
 
 fn parse_register_session_workspace_binding(
@@ -106,7 +227,7 @@ pub(crate) struct RegisterSessionBridgeClientBundle {
     pub(crate) ca_cert_pem: String,
 }
 
-// Manual Debug redacts `client_key_pem` (implementation-note-227 #2 review MED-3): the
+// Manual Debug redacts `client_key_pem` (implementation-note-183 #2 review MED-3): the
 // private key must never reach a log line via a stray `{:?}`. Serialize is
 // derived (the key must cross the wire to the orchestrator), but Debug is not.
 impl std::fmt::Debug for RegisterSessionBridgeClientBundle {
@@ -118,16 +239,6 @@ impl std::fmt::Debug for RegisterSessionBridgeClientBundle {
             .field("ca_cert_pem", &self.ca_cert_pem)
             .finish()
     }
-}
-
-struct RuntimeLaneOpen {
-    runtime_persona_id: String,
-    runtime_grant_id: String,
-    durable_persona_id: String,
-    caller_binding_id: String,
-    authority_strict: bool,
-    delegation_id: Option<String>,
-    delegation_template: Option<String>,
 }
 
 struct EndpointGroup<'a> {
@@ -178,7 +289,12 @@ impl<'a> EndpointGroup<'a> {
         }
 
         let _ = crate::infra::session_proxy::request_close(session_id);
-        let _ = crate::infra::codex_proxy::request_close_codex(session_id);
+        // Session-keyed; tears down whichever credential-projector loopback
+        // lane (codex / gemini) this session opened (design §2).
+        let _ = crate::infra::loopback_proxy::request_close_loopback(session_id);
+        // Cursor baseline is egress/audit only and intentionally separate from
+        // the credential-injecting loopback projector registry.
+        let _ = crate::infra::cursor_egress_proxy::request_close_cursor_egress(session_id);
     }
 
     fn open_session_proxy(
@@ -189,7 +305,19 @@ impl<'a> EndpointGroup<'a> {
     }
 
     fn open_codex_proxy(&self, bound_uid: u32) -> Option<u16> {
-        crate::infra::codex_proxy::request_open_codex(&self.session_id, bound_uid)
+        crate::infra::loopback_proxy::request_open_codex(&self.session_id, bound_uid)
+    }
+
+    fn open_gemini_proxy(&self, bound_uid: u32) -> Option<u16> {
+        crate::infra::loopback_proxy::request_open_gemini(&self.session_id, bound_uid)
+    }
+
+    fn open_cursor_egress_proxy(&self, runtime_persona_id: &str, bound_uid: u32) -> Option<u16> {
+        crate::infra::cursor_egress_proxy::request_open_cursor_egress(
+            &self.session_id,
+            runtime_persona_id,
+            bound_uid,
+        )
     }
 }
 
@@ -971,7 +1099,7 @@ pub(crate) fn handle_register_session(
     // in-container forwarder slice; until then this grants the authority + Receipt
     // that the S1 fail-closed gate checks.
     let want_ssh_agent = params["ssh_agent"].as_bool().unwrap_or(false);
-    // design §2 / implementation-note-227 #2 — when the orchestrator spawns a SCION worker
+    // design §2 / implementation-note-183 #2 — when the orchestrator spawns a SCION worker
     // container it passes the container id so the minted bridge client cert's
     // SPIFFE SAN binds the real container (`spiffe://emberd/container/<id>`,
     // cross-checked to persona) rather than defaulting to the session id. Other
@@ -1132,7 +1260,7 @@ pub(crate) fn handle_register_session(
     // SCION container (design); the SCION path's
     // `enroll_container_persona` is the long-term writer.
     //
-    // implementation-note-280 Step E (option b): because
+    // implementation-note-204 Step E (option b): because
     // register_session is the enrollment WRITER for the row below, it is
     // deliberately the one broker entry point that does NOT call
     // `check_principal_enrollment_strict`. Gating the writer on prior
@@ -1183,6 +1311,12 @@ pub(crate) fn handle_register_session(
     // -S2 (design codex) — set to the per-session loopback-TCP responses
     // proxy URL when this is a codex session (see the codex branch below).
     let mut codex_responses_proxy_url: Option<String> = None;
+    // design §2 — set to the per-session loopback-TCP Code Assist proxy URL
+    // (BARE base, no `/v1`) when this is a gemini Code Assist session.
+    let mut gemini_proxy_url: Option<String> = None;
+    // Cursor baseline is not a model-auth projector. Set only when the daemon
+    // opens a per-session generic CONNECT egress proxy for allowlist/audit.
+    let mut cursor_egress_proxy_url: Option<String> = None;
     let mut uds_socket_path: Option<PathBuf> = None;
     if let Some(bound_uid) = host_mode_peer_uid {
         // Seed the sticky manifest-enrolled latch while the vault is unlocked
@@ -1212,8 +1346,35 @@ pub(crate) fn handle_register_session(
                     RpcError::Internal(
                         "register_session: codex responses proxy failed to bind".to_string(),
                     )
-                })?;
+            })?;
             codex_responses_proxy_url = Some(format!("http://127.0.0.1:{port}/v1"));
+        } else if attestation_caller.as_deref() == Some("gemini-code-assist-network-proxy") {
+            // design §2 — gemini Code Assist HOST lane. Like codex, the
+            // gemini-cli dials a `base_url` (its `CODE_ASSIST_ENDPOINT`) and
+            // cannot send `X-Ember-*` headers, so we stand up a per-session
+            // loopback-TCP listener dispatching the Code Assist OAuth projector
+            // (server-side daemon-refreshed Bearer injection + `cloudcode-pa`
+            // host pin). The URL is the BARE base (no `/v1`): the CLI builds
+            // `${endpoint}/v1internal:<method>` itself.
+            let port = register_guard
+                .endpoint_group
+                .open_gemini_proxy(bound_uid)
+                .ok_or_else(|| {
+                    RpcError::Internal(
+                        "register_session: gemini code-assist proxy failed to bind".to_string(),
+                    )
+                })?;
+            gemini_proxy_url = Some(format!("http://127.0.0.1:{port}"));
+        } else if attestation_caller.as_deref() == Some("cursor-agent") {
+            let port = register_guard
+                .endpoint_group
+                .open_cursor_egress_proxy(&lane.runtime_persona_id, bound_uid)
+                .ok_or_else(|| {
+                    RpcError::Internal(
+                        "register_session: cursor egress proxy failed to bind".to_string(),
+                    )
+                })?;
+            cursor_egress_proxy_url = Some(format!("http://127.0.0.1:{port}"));
         } else if use_anthropic_uds_lane {
             let opened_path = register_guard
                 .endpoint_group
@@ -1246,7 +1407,7 @@ pub(crate) fn handle_register_session(
     //     blocking + `.unix_socket()`). It IS the connecting process (not a
     //     launched child), so it reports its OWN pid via `report_session_leaf`
     //     — the leaf-pin binds the forge pid directly. This replaces the
-    //     transitional TCP gateway PR-E guarded off (implementation-note-281).
+    //     transitional TCP gateway PR-E guarded off (implementation-note-205).
     let workflow_log_suffix = match (&delegation_id, &delegation_template) {
         (Some(wf_id), Some(template)) => {
             format!(" delegation_id={wf_id} delegation_template={template}")
@@ -1293,7 +1454,7 @@ pub(crate) fn handle_register_session(
                 tracing::warn!(
                     "register_session: llm_proxy_url absent from RequestContext \
                  (SocketListener.with_llm_proxy_url not called?) — \
-                 falling back to hardcoded 8484; implementation-note-229"
+                 falling back to hardcoded 8484; implementation-note-197"
                 );
                 "http://127.0.0.1:8484".to_string()
             }
@@ -1361,6 +1522,12 @@ pub(crate) fn handle_register_session(
     }
     if let Some(codex_url) = codex_responses_proxy_url {
         response["codex_responses_proxy_url"] = json!(codex_url);
+    }
+    if let Some(gemini_url) = gemini_proxy_url {
+        response["gemini_proxy_url"] = json!(gemini_url);
+    }
+    if let Some(cursor_url) = cursor_egress_proxy_url {
+        response["cursor_egress_proxy_url"] = json!(cursor_url);
     }
     if let Some(binding) = workspace_binding.as_ref() {
         response["workspace_ref"] = json!(binding.workspace_ref);
@@ -1493,97 +1660,6 @@ pub(crate) fn handle_describe_runtime_attach_target(
     }))
 }
 
-fn resolve_runtime_attach_target(
-    session_store: &core_state::SessionStore,
-    runtime_persona_id: &str,
-    durable_persona_id: &str,
-) -> Result<RuntimeLaneOpen, (i32, String)> {
-    let meta = session_store
-        .find_open_by_runtime_persona(runtime_persona_id)
-        .map_err(|e| {
-            RpcError::Internal(format!("register_session: list open attachments: {e}"))
-        })?
-        .ok_or_else(|| {
-            RpcError::NotFound(format!(
-                "register_session: runtime persona '{}' is not live; launch a fresh runtime or attach to an active one",
-                runtime_persona_id
-            ))
-        })?;
-
-    if meta.durable_persona.as_deref() != Some(durable_persona_id) {
-        return Err(RpcError::NotFound(
-            "register_session: attach target belongs to a different durable persona".to_string(),
-        )
-        .into());
-    }
-    let caller_binding_id = meta.caller_binding_id.clone().ok_or_else(|| {
-        RpcError::Internal("register_session: attach target missing caller_binding_id".to_string())
-    })?;
-    Ok(RuntimeLaneOpen {
-        runtime_persona_id: meta.persona,
-        runtime_grant_id: meta.grant_id,
-        durable_persona_id: durable_persona_id.to_string(),
-        caller_binding_id,
-        authority_strict: meta.authority_strict,
-        delegation_id: meta.delegation_id,
-        delegation_template: meta.delegation_template,
-    })
-}
-
-fn mint_runtime_lane(
-    store: &DaemonStore,
-    durable_persona: &crate::infra::persona::PersonaInfo,
-    parent_grant: &crate::trust::grant::GrantInfo,
-    caller_binding_id: &str,
-    authority_strict: bool,
-    github_needs: Option<&[String]>,
-) -> Result<RuntimeLaneOpen, (i32, String)> {
-    let child_ttl_secs = derive_runtime_child_ttl_secs(parent_grant)?;
-    let (runtime_persona, runtime_grant) = crate::infra::persona::runtime_persona_two_phase_commit(
-        store,
-        &durable_persona.name,
-        &parent_grant.id,
-        &parent_grant.scope,
-        child_ttl_secs,
-        github_needs,
-    )
-    .map_err(|e| RpcError::Internal(format!("register_session: mint runtime persona lane: {e}")))?;
-    Ok(RuntimeLaneOpen {
-        runtime_persona_id: runtime_persona.id,
-        runtime_grant_id: runtime_grant.id,
-        durable_persona_id: durable_persona.id.clone(),
-        caller_binding_id: caller_binding_id.to_string(),
-        authority_strict,
-        delegation_id: None,
-        delegation_template: None,
-    })
-}
-
-fn derive_runtime_child_ttl_secs(
-    parent_grant: &crate::trust::grant::GrantInfo,
-) -> Result<u64, (i32, String)> {
-    let expires_at = parent_grant.expires_at.as_deref().ok_or_else(|| {
-        RpcError::PresenceLocked(format!(
-            "register_session: active grant '{}' is not bounded; rerun `ember init` to provision a bounded, runtime-delegable grant",
-            parent_grant.id
-        ))
-    })?;
-    let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)
-        .map_err(|e| RpcError::Internal(format!("register_session: parse grant expiry: {e}")))?
-        .with_timezone(&chrono::Utc);
-    let remaining = expiry
-        .signed_duration_since(chrono::Utc::now())
-        .num_seconds();
-    if remaining <= 0 {
-        return Err(RpcError::PresenceLocked(format!(
-            "register_session: active grant '{}' is already expired; mint a fresh durable grant before launching",
-            parent_grant.id
-        ))
-        .into());
-    }
-    Ok(remaining as u64)
-}
-
 pub(crate) fn mint_register_session_bridge_client_bundle(
     vault: &crate::infra::vault::Vault,
     persona_id: &str,
@@ -1616,7 +1692,7 @@ pub(crate) fn mint_register_session_bridge_client_bundle(
         RpcError::Internal(format!("register_session: mint ember-rpc server cert: {e}"))
     })?;
     // SPIFFE container SAN binds to the orchestrator-supplied container id when
-    // present (implementation-note-227 #2 / design §2); otherwise the session id is the
+    // present (implementation-note-183 #2 / design §2); otherwise the session id is the
     // container ref, preserving the daemon-sandbox lane's existing SAN shape.
     let container_ref = container_id.unwrap_or(session_id);
     let (client_cert_pem, client_key_pem) = bridge_ca
@@ -2113,14 +2189,21 @@ fn resolve_register_session_persona(
 pub(crate) enum GatewayLane {
     Anthropic,
     OpenAi,
+    /// The gemini Code Assist ("Sign in with Google") lane (design §2). Binds a
+    /// `google/`-prefixed OAuth grant so the loopback projector resolves the
+    /// daemon-refreshed Bearer for the session.
+    Google,
 }
 
 /// Map the launcher-asserted `attestation_caller` to the gateway lane.
-/// `codex-network-proxy` → OpenAI (the codex GPT-plan lane, -S2); every
-/// other current model client uses the Anthropic lane.
+/// `codex-network-proxy` → OpenAI (the codex GPT-plan lane, -S2);
+/// `gemini-code-assist-network-proxy` → Google (design §2). Cursor's
+/// account/session remains Cursor-owned, so `cursor-agent` does not require a
+/// brokered model-auth grant and falls through to the ambient-grant lane.
 pub(crate) fn gateway_lane_for_register_session(params: &Value) -> GatewayLane {
     match params.get("attestation_caller").and_then(|v| v.as_str()) {
         Some("codex-network-proxy") => GatewayLane::OpenAi,
+        Some("gemini-code-assist-network-proxy") => GatewayLane::Google,
         _ => GatewayLane::Anthropic,
     }
 }
@@ -2128,7 +2211,12 @@ pub(crate) fn gateway_lane_for_register_session(params: &Value) -> GatewayLane {
 pub(crate) fn gateway_lane_requires_brokered_model_auth(params: &Value) -> bool {
     matches!(
         params.get("attestation_caller").and_then(|v| v.as_str()),
-        Some("claude-code" | "headless-runtime" | "codex-network-proxy")
+        Some(
+            "claude-code"
+                | "headless-runtime"
+                | "codex-network-proxy"
+                | "gemini-code-assist-network-proxy"
+        )
     )
 }
 
@@ -2193,6 +2281,12 @@ fn resolve_register_session_active_grant(
                 CODEX_DEFAULT_SCOPE,
                 "codex",
             ),
+            GatewayLane::Google => (
+                "Google",
+                GOOGLE_RUNTIME_CREDENTIAL_HINT,
+                GEMINI_DEFAULT_SCOPE,
+                "gemini",
+            ),
         };
         return Err((
             -32004,
@@ -2221,6 +2315,10 @@ fn is_anthropic_gateway_credential_name(credential_name: &str) -> bool {
 
 fn is_openai_gateway_credential_name(credential_name: &str) -> bool {
     credential_name.starts_with(OPENAI_PROVIDER_CREDENTIAL_PREFIX)
+}
+
+fn is_google_gateway_credential_name(credential_name: &str) -> bool {
+    credential_name.starts_with(GOOGLE_PROVIDER_CREDENTIAL_PREFIX)
 }
 
 /// Lane-aware preference rank for an active grant. Lower = more preferred;
@@ -2263,6 +2361,20 @@ fn active_grant_gateway_preference_rank(
             Some(match active_grant.credential_name.as_str() {
                 name if name.starts_with(OPENAI_CHATGPT_PLAN_CREDENTIAL_PREFIX) => 0,
                 name if is_openai_gateway_credential_name(name) => 1,
+                _ => 2,
+            })
+        }
+        GatewayLane::Google => {
+            if !active_grant_supports_google_gateway(
+                store,
+                active_grant,
+                require_github_operation_authority,
+            ) {
+                return None;
+            }
+            Some(match active_grant.credential_name.as_str() {
+                name if name == GOOGLE_CODE_ASSIST_OAUTH_CREDENTIAL => 0,
+                name if is_google_gateway_credential_name(name) => 1,
                 _ => 2,
             })
         }
@@ -2327,6 +2439,67 @@ fn active_grant_supports_openai_gateway(
 
     has_matching_credential_stmt
         && has_openai_session_stmt
+        && (!require_github_operation_authority || has_github_operation_authority)
+}
+
+/// Whether an active grant is shaped for the gemini Code Assist Google gateway:
+/// its credential is `google/*`, its chain carries a Credential statement for
+/// that credential, a Session statement allowing `llm:generate` against a
+/// `google/*` target, and, when the launcher selected a delegation template,
+/// GitHub operation authority to narrow for `ember-gh` constructs (symmetric
+/// with [`active_grant_supports_openai_gateway`]).
+fn active_grant_supports_google_gateway(
+    store: &DaemonStore,
+    active_grant: &crate::trust::grant::GrantInfo,
+    require_github_operation_authority: bool,
+) -> bool {
+    let credential_name = active_grant.credential_name.as_str();
+    if !is_google_gateway_credential_name(credential_name) {
+        return false;
+    }
+
+    let chain = match store.get_access_grant(&active_grant.id) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::warn!(
+                grant_id = %active_grant.id,
+                error = %e,
+                "register_session: failed to load active grant chain for google gateway shaping"
+            );
+            return false;
+        }
+    };
+
+    let mut has_matching_credential_stmt = false;
+    let mut has_google_session_stmt = false;
+    let mut has_github_operation_authority = false;
+    for (_idx, stmt) in chain.statements() {
+        match stmt.resource_type {
+            core_grant_types::ResourceType::Credential => {
+                has_matching_credential_stmt |= matches!(
+                    &stmt.resource,
+                    core_grant_types::ResourceSelector::Exact { value } if value == credential_name
+                );
+                has_github_operation_authority |= statement_has_github_operation_authority(&stmt);
+            }
+            core_grant_types::ResourceType::Session => {
+                let allows_llm_generate =
+                    stmt.actions.iter().any(|action| action == "llm:generate");
+                let targets_google = matches!(
+                    &stmt.resource,
+                    core_grant_types::ResourceSelector::Glob { pattern } if pattern.starts_with("google/")
+                ) || matches!(
+                    &stmt.resource,
+                    core_grant_types::ResourceSelector::Exact { value } if value.starts_with("google/")
+                );
+                has_google_session_stmt |= allows_llm_generate && targets_google;
+            }
+            _ => {}
+        }
+    }
+
+    has_matching_credential_stmt
+        && has_google_session_stmt
         && (!require_github_operation_authority || has_github_operation_authority)
 }
 
@@ -2600,7 +2773,7 @@ pub(crate) fn mint_sandbox_gateway_env(
                     runtime_persona_id,
                     &session_id,
                     // Daemon-sandbox lane keeps the session-id-as-container-ref
-                    // SAN; the orchestrator lane (implementation-note-227 #2) supplies its
+                    // SAN; the orchestrator lane (implementation-note-183 #2) supplies its
                     // real container id via the register_session param instead.
                     None,
                 ) {
@@ -3045,6 +3218,17 @@ mod tests {
             gateway_lane_for_register_session(&json!({"attestation_caller": "claude-code"})),
             GatewayLane::Anthropic
         );
+        // design §2 — the gemini Code Assist caller routes to the Google lane.
+        assert_eq!(
+            gateway_lane_for_register_session(
+                &json!({"attestation_caller": "gemini-code-assist-network-proxy"})
+            ),
+            GatewayLane::Google
+        );
+        assert_eq!(
+            gateway_lane_for_register_session(&json!({"attestation_caller": "cursor-agent"})),
+            GatewayLane::Anthropic
+        );
         // Absent attestation_caller preserves prior behavior (Anthropic).
         assert_eq!(
             gateway_lane_for_register_session(&json!({})),
@@ -3059,6 +3243,18 @@ mod tests {
         assert!(gateway_lane_requires_brokered_model_auth(
             &json!({"attestation_caller": "headless-runtime"})
         ));
+        assert!(
+            gateway_lane_requires_brokered_model_auth(
+                &json!({"attestation_caller": "gemini-code-assist-network-proxy"})
+            ),
+            "the gemini Code Assist lane is a governed brokered-model-auth lane"
+        );
+        assert!(
+            !gateway_lane_requires_brokered_model_auth(
+                &json!({"attestation_caller": "cursor-agent"})
+            ),
+            "Cursor egress proxying is not governed model-auth brokering"
+        );
         assert!(
             !gateway_lane_requires_brokered_model_auth(&json!({})),
             "untagged register_session callers are not modeled as LLM sessions"
@@ -3082,6 +3278,10 @@ mod tests {
         assert!(
             !register_session_uses_anthropic_uds_lane(Some("codex-network-proxy"), false),
             "Codex uses its responses proxy lane, not the Anthropic UDS lane"
+        );
+        assert!(
+            !register_session_uses_anthropic_uds_lane(Some("cursor-agent"), false),
+            "Cursor uses its egress proxy lane, not the Anthropic UDS lane"
         );
     }
 

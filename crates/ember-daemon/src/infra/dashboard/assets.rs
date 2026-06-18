@@ -3,7 +3,7 @@
 /// `/approvals/{id}` page so the two surfaces can never drift. Injected
 /// into both templates via `{{COMPOSITE_STATEMENTS_JS}}`. The function name
 /// `render_composite_statements` (and the rendered class `composite-statements`)
-/// are the implementation-note-188 target_state_anchor markers — search for
+/// are the target_state_anchor markers — search for
 /// either if you are tracing why the page hides "3 statements" by default.
 pub const COMPOSITE_STATEMENTS_JS: &str = r#"
 // render_composite_statements — single source of truth for the composite
@@ -42,7 +42,7 @@ function renderCompositeStatements(stmts){
   const rows = stmts.map(function(s,i){
     const actions = (s.actions||[]).map(displayActionKey).join(',');
     const resource = renderResourceSelector(s.resource);
-    // implementation-note-189 — `time:wall_clock on * · 90s` reads as
+    // implementation-note-148 — `time:wall_clock on * · 90s` reads as
     // technical noise (time isn't bound to a resource). When the
     // selector resolves to wildcard, drop the `on *` clause and let
     // the budget speak for itself.
@@ -100,7 +100,7 @@ a{color:var(--accent);text-decoration:none}
 #header .meta{display:flex;align-items:center;gap:16px;color:var(--text-muted);font-size:12px}
 #header .status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--success)}
 #header .status-dot.offline{background:var(--danger);box-shadow:0 0 6px var(--danger)}
-/* implementation-note-190: ambient daemon-identity strip in the
+/* implementation-note-149: ambient daemon-identity strip in the
    header. Subtle by design — the viewer registers it in peripheral
    vision so the verify-time --pubkey arg lands as recognition rather
    than mystery. Prominent treatment lives on the receipt detail page. */
@@ -164,7 +164,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .composite-stmt-idx{color:var(--text-muted);font-weight:600}
 .approval-link{color:var(--accent);text-decoration:none}
 .approval-link:hover{text-decoration:underline}
-/* implementation-note-189 — hover preview of the composite breakdown
+/* implementation-note-148 — hover preview of the composite breakdown
    surfaces what's hidden behind the "N statements" link without
    forcing the operator to navigate. CSS-only — no JS needed; the
    inline preview shares its render with the dedicated /approvals
@@ -284,7 +284,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
     <div class="card"><div class="label">Audit Events</div><div class="value" id="cnt-audit">—</div></div>
   </div>
 
-  <!-- BEAT-7-implementation-note-191 — per-agent panel grouped by persona_id so an
+  <!-- BEAT-7-implementation-note-150 — per-agent panel grouped by persona_id so an
        operator can revoke worker-a's anthropic statement without affecting
        worker-b. Each tile lists the agent's active grants with inline links
        to the per-statement revoke buttons on the grant detail page. The
@@ -321,7 +321,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
           <option value="vault.">vault.*</option>
           <option value="sandbox.">sandbox.*</option>
         </select>
-        <!-- implementation-note-171 — persona/scope/date filters -->
+        <!-- implementation-note-151 — persona/scope/date filters -->
         <input type="text" id="audit-persona-filter" placeholder="persona id" oninput="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;width:120px">
         <input type="text" id="audit-scope-filter" placeholder="scope prefix" oninput="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;width:120px">
         <input type="date" id="audit-since-filter" onchange="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px">
@@ -360,7 +360,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
         <input type="text" id="receipt-persona-filter" placeholder="persona id…" oninput="loadReceipts()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text-primary);font-family:inherit;font-size:11px;width:140px">
       </div>
     </div>
-    <!-- implementation-note-192 — cross-receipt search panel.
+    <!-- implementation-note-152 — cross-receipt search panel.
          Three text inputs (persona / scope / grant) live-fire searchReceipts()
          on input; the clear button resets and falls back to loadReceipts(). -->
     <div class="receipt-search" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;padding:8px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
@@ -416,7 +416,7 @@ const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const CSRF_HEADERS = {'X-Ember-CSRF-Token': CSRF_TOKEN};
 {{COMPOSITE_STATEMENTS_JS}}
 function ts(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
-// implementation-note-172 — relative_time / formatRelative: render audit + grant
+// implementation-note-153 — relative_time / formatRelative: render audit + grant
 // timestamps as 'Just now' / '12s ago' / '3 min ago' / '04/26 1:34 AM'
 // long-tail fallback so screenshots don't lead with raw ISO strings. Tooltip
 // (title=) keeps the precise ISO for operators who need it.
@@ -445,7 +445,7 @@ function relTime(iso){
 }
 function trunc(s,n){if(!s)return'—';return s.length>n?s.slice(0,n)+'…':s;}
 function truncPersona(s){if(!s)return'—';const p='persona-';if(s.startsWith(p)){return escapeHtml(p+s.slice(p.length,p.length+12));}return escapeHtml(trunc(s,20));}
-// implementation-note-172 — persona.name primary label; raw persona_id moves to
+// implementation-note-153 — persona.name primary label; raw persona_id moves to
 // the tooltip so screenshots show real names instead of UUID prefixes.
 // Falls back to truncPersona when no name was returned by the API.
 function personaLabel(id, name){
@@ -457,7 +457,7 @@ function personaLabel(id, name){
 function badge(cls,text){return`<span class="badge ${escapeHtml(cls)}">${escapeHtml(text)}</span>`;}
 function grantStatusClass(s){if(s==='active')return'active';if(s==='expired')return'expired';if(s==='revoked'||s==='abandoned')return'revoked';if(s==='exhausted_by_budget'||s==='expired_by_budget')return'exhausted';return '';}
 
-// implementation-note-189 — humanize audit-event labels for the timeline
+// implementation-note-148 — humanize audit-event labels for the timeline
 // render. Raw event names are dot-segmented identifiers used by the
 // Python/TS agent SDKs to demultiplex; on screen they read as log
 // lines, not product copy. Map known events to spaces-and-capitals.
@@ -525,13 +525,13 @@ function updateGrantRow(grantId, g) {
   if(statusCell) statusCell.innerHTML = badge(g.status, g.status);
 }
 
-// implementation-note-172 — pick the most demo-meaningful budget axis from a
+// implementation-note-153 — pick the most demo-meaningful budget axis from a
 // composite grant's statements array (cents > tokens > wall_clock_secs).
 // Returns a gauge-wrap div, or '<span …>none</span>' when no statement has
 // a budget cap set.
 function compositeGrantBudgetGauge(stmts) {
   if(!Array.isArray(stmts) || stmts.length===0) return '<span style="color:var(--text-dim);font-size:11px">—</span>';
-  // implementation-note-193 — build a compact per-statement budget summary so
+  // implementation-note-154 — build a compact per-statement budget summary so
   // the operator sees all caps, not just the "best" single axis.
   const capParts = [];
   for(const s of stmts) {
@@ -545,8 +545,8 @@ function compositeGrantBudgetGauge(stmts) {
   if(!capParts.length) return '<span style="color:var(--text-dim);font-size:11px">none</span>';
   return '<span style="color:var(--text-muted);font-size:11px">'+capParts.join(' | ')+'</span>';
 }
-// implementation-note-193: shipped
-// implementation-note-193 — scope cell for the Active Grants table. Composite
+// implementation-note-154: shipped
+// implementation-note-154 — scope cell for the Active Grants table. Composite
 // grants show "N statements · action1, action2, action3" so the operator
 // sees real scope instead of '*'. Single-statement grants show flat scope.
 function grantScopeText(g) {
@@ -560,13 +560,13 @@ function grantScopeText(g) {
   return escapeHtml(g.scope||'—');
 }
 function renderBudgetGauge(g) {
-  // implementation-note-194 — composite grants surface their real
+  // implementation-note-155 — composite grants surface their real
   // budget via the canonical `statements` array (same name across all three
   // /api/grants* endpoints). Delegate to the composite helper when present.
   const stmts = Array.isArray(g.statements) ? g.statements : null;
   if(stmts && stmts.length>0) {
     let html = compositeGrantBudgetGauge(stmts);
-    // implementation-note-189 — only show the budget-cell banner for soft
+    // implementation-note-148 — only show the budget-cell banner for soft
     // pause (paused flag set but status still active). Hard pause flips
     // g.status to "paused" which already renders as a yellow pill in
     // the Status column; doubling up overlaps the budget text.
@@ -655,13 +655,14 @@ async function submitExtend(){
   if(!resp.ok){const e=await resp.json().catch(()=>({error:'failed'}));alert('Extend failed: '+(e.error||resp.status));}
   loadDashboard();
 }
-// implementation-note-107: WebAuthn ceremony — auth/begin → navigator.credentials.get()
+// implementation-note-89: WebAuthn ceremony — auth/begin → navigator.credentials.get()
 // → POST /api/approvals/<id>/<action> with the verified assertion.
 //
 // The daemon mints a challenge bound to the specific approval_id at
 // auth/begin; the assertion that comes back from the platform
 // authenticator is verified server-side against the persona's
-// enrolled passkey before the approval state flips. There is no
+// enrolled passkey before the approval state flips. Approve Always
+// uses this same path before creating a standing grant. There is no
 // fail-open: if the browser doesn't surface WebAuthn, or the user
 // cancels TouchID, or the assertion doesn't verify, the daemon
 // refuses the state transition with 401 and the approval stays
@@ -734,8 +735,7 @@ async function approveRequest(id){
   if(await approveOrDeny(id, 'approve')) loadDashboard();
 }
 async function approveAlwaysRequest(id){
-  await fetch(`/api/approvals/${id}/approve-always`,{method:'POST',headers:CSRF_HEADERS});
-  loadDashboard();
+  if(await approveOrDeny(id, 'approve-always')) loadDashboard();
 }
 async function denyRequest(id){
   if(await approveOrDeny(id, 'deny')) loadDashboard();
@@ -817,7 +817,7 @@ function credentialToJson(cred){
   if(typeof cred.authenticatorAttachment === 'string') out.authenticatorAttachment = cred.authenticatorAttachment;
   return out;
 }
-// implementation-note-195 — dismiss a pending approval card.
+// implementation-note-156 — dismiss a pending approval card.
 // Records approval.dismissed in the audit log; does NOT re-fire desktop
 // notifications. Card vanishes immediately on success.
 async function dismissApproval(id){
@@ -880,13 +880,13 @@ async function loadDashboard(){
   try{
     const showAll=document.getElementById('show-all-grants')?.checked;
     const grantsUrl=showAll?'/api/grants/all':'/api/grants';
-    // implementation-note-172 — operator audit hides internal lifecycle events
+    // implementation-note-153 — operator audit hides internal lifecycle events
     // (vault.auto_unseal_from_keyring + *.internal.*) by default; toggle
     // surfaces them via ?include_internal=1. Action filter dropdown narrows
     // to one family (grant.*, approval.*, broker.*, etc.) via ?action_filter=.
     const showInternal=document.getElementById('show-internal-events')?.checked;
     const actionFilter=document.getElementById('audit-action-filter')?.value||'';
-    // implementation-note-171 — persona/scope/since query params.
+    // implementation-note-151 — persona/scope/since query params.
     const personaFilter=document.getElementById('audit-persona-filter')?.value?.trim()||'';
     const scopeFilter=document.getElementById('audit-scope-filter')?.value?.trim()||'';
     const sinceDate=document.getElementById('audit-since-filter')?.value||'';
@@ -941,12 +941,12 @@ async function loadDashboard(){
     const pending=Number(status.pending_approvals??approvals.length??0);
     document.getElementById('cnt-approvals').textContent=String(pending);
     document.getElementById('cnt-audit').textContent=status.audit_events??audit.length??'0';
-    // implementation-note-189 — surface pending count in the browser tab
+    // implementation-note-148 — surface pending count in the browser tab
     // title so a YC viewer scanning the take notices the counter
     // tick. Reverts to bare "ember" when nothing's awaiting.
     document.title = pending > 0 ? `ember · ${pending} pending` : 'ember';
 
-    // BEAT-7-implementation-note-191 — per-agent tiles. Group active grants by
+    // BEAT-7-implementation-note-150 — per-agent tiles. Group active grants by
     // persona_id; each tile shows the persona alias + a credential roll-up
     // with links to the grant detail page (where per-statement revoke
     // buttons live). Terminal/show-all grants are excluded so the panel
@@ -1003,9 +1003,9 @@ async function loadDashboard(){
         <td>${renderGrantActions(g)}</td>
       </tr>`).join('');
       // Connect SSE for active grants with budgets (simple or composite).
-      // implementation-note-172 — also wire composite grants whose statements carry
+      // implementation-note-153 — also wire composite grants whose statements carry
       // a budget so the gauge ticks up in real time during the demo.
-      // implementation-note-194 — read `statements` (canonical name).
+      // implementation-note-155 — read `statements` (canonical name).
       grants.filter(g=>g.status==='active'&&(
         (g.budget&&(g.budget.tokens!=null||g.budget.cents!=null))||
         (Array.isArray(g.statements)&&g.statements.some(s=>s.budget&&(s.budget.cents!=null||s.budget.tokens!=null||s.budget.wall_clock_secs!=null)))
@@ -1018,13 +1018,13 @@ async function loadDashboard(){
       ac.innerHTML='<div class="empty">Awaiting approval requests.</div>';
     }else{
       ac.innerHTML=approvals.map(a=>{
-        // implementation-note-188 — composite breakdown moved to the
+        // implementation-note-157 — composite breakdown moved to the
         // dedicated /approvals/{id} page (behind a Show details disclosure).
         // Cards now render a one-line summary + link so the dashboard stays
         // glanceable for the demo. Single-statement approvals keep the
         // legacy per-field row layout.
         const stmts = Array.isArray(a.composite_statements) ? a.composite_statements : null;
-        // implementation-note-189 — composite scope cell surfaces a hover
+        // implementation-note-148 — composite scope cell surfaces a hover
         // preview of the inline breakdown so the operator can see what
         // they would be approving without navigating to the detail page.
         // The preview reuses renderCompositeStatements so the dashboard
@@ -1033,12 +1033,12 @@ async function loadDashboard(){
         <div class="row"><span class="field">Scope</span><span class="scope-hover"><a class="field-val approval-link" href="/approvals/${a.id}" tabindex="0">${compositeSummary(stmts)}</a><span class="scope-preview">${renderCompositeStatements(stmts)}</span></span></div>` : `
         <div class="row"><span class="field">Credential</span><span class="field-val">${escapeHtml(a.credential_name||'—')}</span></div>
         <div class="row"><span class="field">Scope</span><a class="field-val approval-link" href="/approvals/${a.id}">${escapeHtml(a.scope||'—')}</a></div>`;
-        // implementation-note-189 — for composites the row's flat `action` is
+        // implementation-note-148 — for composites the row's flat `action` is
         // statement 0's verb, which misrepresents a multi-verb chain.
         // Surface "composite (N statements)" instead so the card matches
         // the detail page and what the storyboard voiceover claims.
         const action_label = stmts ? `composite (${stmts.length} statements)` : escapeHtml(a.action||'—');
-        // implementation-note-189 — composite approvals are multi-statement
+        // implementation-note-148 — composite approvals are multi-statement
         // chains; the card only shows the summary, not the breakdown.
         // The operator must never approve a chain they cannot see, so
         // for composites the card surfaces Review (→ detail page) +
@@ -1231,7 +1231,7 @@ async function loadReceipts(){
     if(rb)rb.innerHTML='<tr><td colspan="6" class="empty">error loading receipts</td></tr>';
   }
 }
-// implementation-note-192 — cross-receipt search. When any input
+// implementation-note-152 — cross-receipt search. When any input
 // has a value we hit /api/receipts/search and render the result in the
 // existing receipts table; an empty form falls back to loadReceipts() so
 // the standard signed/since filters resume.
@@ -1269,7 +1269,7 @@ function clearReceiptSearch(){
 loadDashboard();
 loadReceipts();
 loadMaturation();
-// implementation-note-190 — fetch the daemon's Ed25519 identity once
+// implementation-note-149 — fetch the daemon's Ed25519 identity once
 // on load + every 2s thereafter. Success populates the header
 // fingerprint and clears the daemon-offline class; failure adds it.
 // The fingerprint persists in the DOM after failure so the closing
@@ -1298,7 +1298,7 @@ async function loadIdentity(){
 }
 loadIdentity();
 setInterval(loadIdentity, 2000);
-// implementation-note-196 — FINDING C: drop the dashboard refresh
+// implementation-note-158 — FINDING C: drop the dashboard refresh
 // cadence from 5s to 2s so the cents-gauge ticks visibly during Beat 4
 // of the WEDGE storyboard (where the agent burns through the budget
 // call-by-call). SSE handles instantaneous warning/exhaust transitions;
@@ -1308,7 +1308,7 @@ setInterval(loadIdentity, 2000);
 setInterval(loadDashboard,2000);
 setInterval(loadReceipts,15000);
 
-// implementation-note-197 — live receipts panel: stream new receipt rows from
+// implementation-note-159 — live receipts panel: stream new receipt rows from
 // /api/receipts/stream and prepend them to #receipts-list. EventSource
 // auto-reconnects via the server-emitted retry hint, so the client stays
 // live without a manual setInterval poll. Capped at 50 visible rows so
@@ -1376,7 +1376,7 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
 .card-title{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:16px}
 .field{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .field:last-of-type{border-bottom:none;margin-bottom:0;padding-bottom:0}
-/* implementation-note-189 — author-defined `display:flex` overrides the
+/* implementation-note-148 — author-defined `display:flex` overrides the
    user-agent `[hidden]{display:none}` rule (CSS specificity gotcha),
    so `el.hidden = true` had no visible effect on `.field` rows.
    Explicit override below restores the expected behavior. */
@@ -1418,7 +1418,7 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
   <div class="field"><span class="field-label">Risk</span><span class="field-val"><span class="badge {{RISK_LEVEL}}">{{RISK_LEVEL}}</span></span></div>
   <div class="field"><span class="field-label">Persona</span><span class="field-val">{{PERSONA_PREFIX}}</span></div>
   <div class="field"><span class="field-label">Requested</span><span class="field-val">{{CREATED_AT}}</span></div>
-  <!-- implementation-note-189 — composite breakdown is the scope. Always
+  <!-- implementation-note-148 — composite breakdown is the scope. Always
        visible so the operator can never approve a chain they cannot
        see. Hidden only for single-statement approvals (which do not
        have a meaningful breakdown). -->
@@ -1442,7 +1442,7 @@ let breakdownRendered = false;
 function renderBreakdown(stmts){
   if(breakdownRendered) return;
   if(!Array.isArray(stmts) || stmts.length===0) return;
-  // implementation-note-189 — composite breakdown is the scope. Show it
+  // implementation-note-148 — composite breakdown is the scope. Show it
   // inline as soon as the page loads; never gate "what am I approving?"
   // behind a disclosure. The flat Credential and Scope rows are
   // statement 0's projection — misleading for a multi-statement chain
@@ -1482,7 +1482,7 @@ async function pollStatus(){
 // Fire once on load so the breakdown appears without waiting 2s.
 pollStatus();
 pollTimer = setInterval(pollStatus, 2000);
-// implementation-note-107: dedicated approval page — same auth/begin →
+// implementation-note-89: dedicated approval page — same auth/begin →
 // navigator.credentials.get() → POST/<action> ceremony as the main
 // dashboard pending-approvals card. Fail-closed: no WebAuthn, no
 // state flip.
@@ -1531,7 +1531,7 @@ async function resolve(action){
   const btns = document.querySelectorAll('.btn');
   btns.forEach(b=>b.disabled=true);
   try{
-    const needsBio = action === 'approve' || action === 'deny';
+    const needsBio = action === 'approve' || action === 'deny' || action === 'approve-always';
     const headers = {'X-Ember-CSRF-Token':CSRF_TOKEN,'content-type':'application/json'};
     let body;
     if(needsBio){
@@ -1596,7 +1596,7 @@ async function resolve(action){
 </body>
 </html>"#;
 
-/// implementation-note-107: first-run passkey enrollment page at `/settings/passkeys`.
+/// First-run passkey enrollment page at `/settings/passkeys`.
 ///
 /// Guides the operator through registering their platform authenticator
 /// (Touch ID on macOS, Windows Hello on Windows). Calls

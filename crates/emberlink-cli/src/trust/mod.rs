@@ -4,7 +4,7 @@
 //! ships `ember trust show <root-id>` drill-down. Phase 3 ships
 //! `ember trust explain <artifact-path>` chain walk (binary_manifest +
 //! receipt artifact kinds at minimum; authority_delegation lands in
-//! implementation-note-362).
+//! implementation-note-257).
 //!
 //! All three surfaces are wired in `crates/emberlink-cli/src/bin/ember.rs`
 //! via `TrustAction::{List,Show,Explain}` dispatch arms. Daemon-side
@@ -21,7 +21,7 @@
 //! workstation Durable Persona export for compatibility recovery of
 //! software-custodied material. Device-rooted operator-authority
 //! recovery is handled by presence-device enrollment.
-//! Anchor: `trust_backup_restore_landed` (implementation-note-34).
+//! Anchor: `trust_backup_restore_landed` (implementation-note-21).
 
 pub mod backup;
 pub mod explain;

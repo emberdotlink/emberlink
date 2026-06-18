@@ -7,8 +7,6 @@ pub use admission::{AdmissionError, AdmittedRequest};
 /// signature so a signed payload for this wire cannot be replayed into a
 /// different protocol that happens to share the responder's signing key
 /// (design §4 algorithm-confusion / cross-protocol guard).
-///
-/// implementation-note-490 acceptance #2.
 pub const RESPOND_GRANT_REQUEST_DOMAIN_SEP: &[u8] = b"emberlink-relay/respond-grant-request/v1\0";
 
 /// Nonce size required on `RESPOND_GRANT_REQUEST` frames (32 raw bytes,
@@ -174,7 +172,7 @@ impl RelayConfig {
                     tls_self_signed = true;
                 }
                 "--no-tls" => {
-                    // implementation-note-490 Tier A §A4:
+                    // Tier A §A4:
                     // mandatory TLS in production. The `insecure-no-tls` feature
                     // is OFF by default; production builds reject this flag as
                     // unknown rather than silently downgrading to plain TCP.
@@ -187,7 +185,7 @@ impl RelayConfig {
                     {
                         return Err("--no-tls is rejected in production builds; \
                              rebuild with --features insecure-no-tls only for test \
-                             loopback rigs (implementation-note-490)"
+                             loopback rigs (implementation-note-392)"
                             .to_string());
                     }
                 }
@@ -379,7 +377,7 @@ pub enum GrantRequestStatus {
 
 /// A grant request from an agent to a human identity.
 ///
-/// **At-rest sealing — implementation-note-491.** The relay used
+/// **At-rest sealing.** The relay used
 /// to store the requester id, scope, and justification as plaintext
 /// `String` fields. The relay contract mandates that relays see only opaque
 /// encrypted envelopes — "relays never hold plaintext content" — and the
@@ -394,8 +392,7 @@ pub enum GrantRequestStatus {
 ///
 /// `target_signing_pubkey` is the responder's persona signing key,
 /// posted in cleartext by the requester at REQUEST time so the relay can
-/// verify the signature attached to the matching `RESPOND_GRANT_REQUEST`
-/// (implementation-note-490 acceptance #2).
+/// verify the signature attached to the matching `RESPOND_GRANT_REQUEST`.
 /// The signing-pubkey itself is public material; carrying it on the
 /// wire does not leak anything design protects.
 #[derive(Debug, Clone)]
@@ -424,7 +421,7 @@ pub struct RelayState {
     pub grant_requests: HashMap<String, Vec<GrantRequest>>,
     /// Monotonically increasing counter for grant request IDs.
     pub next_grant_request_id: u64,
-    /// implementation-note-490: nonces consumed by
+    /// Nonces consumed by
     /// accepted `RESPOND_GRANT_REQUEST` frames. Each successful response
     /// inserts its 32-byte nonce here; replays are rejected with
     /// `REJECTED nonce replay`. Bounded by `MAX_CONSUMED_NONCES` to cap
@@ -793,10 +790,9 @@ pub enum Command {
     /// Fetch a stored credential: `FETCH_CREDENTIAL <grant-id>`
     FetchCredential(String),
     /// Request a grant from a human identity. The plaintext requester /
-    /// scope / justification fields are sealed off-relay per
-    /// `implementation-note-491`; only the routing-required
-    /// `target_id` and the responder's expected signing pubkey ride in
-    /// cleartext.
+    /// scope / justification fields are sealed off-relay; only the
+    /// routing-required `target_id` and the responder's expected signing
+    /// pubkey ride in cleartext.
     ///
     /// Wire format:
     /// `REQUEST_GRANT <target-id> <target-signing-pubkey-hex> <sealed-payload-hex>`
@@ -809,8 +805,7 @@ pub enum Command {
     FetchGrantRequests(String),
     /// Respond to a grant request with a nonce + signature so the relay
     /// can authenticate the responder rather than trusting an unauth'd
-    /// admission token (implementation-note-490
-    /// acceptance #2).
+    /// admission token.
     ///
     /// Wire format:
     /// `RESPOND_GRANT_REQUEST <request-id> <approved|denied> <nonce-hex> <signature-hex>`
@@ -1139,7 +1134,7 @@ pub fn handle_fetch_credential(
 ///
 /// Expected format: `<target-id> <target-signing-pubkey-hex> <sealed-payload-hex>`
 ///
-/// Per implementation-note-491, the requester id, scope, and
+/// The requester id, scope, and
 /// justification all ride inside `sealed-payload-hex` — the relay sees
 /// only opaque sealed bytes for those fields. `target_id` stays
 /// cleartext because the relay routes fetch queries by it (the minimum
@@ -1224,8 +1219,7 @@ fn parse_respond_grant_request(remainder: &str) -> Command {
     }
 }
 
-/// Build the canonical signed payload bound to a `RESPOND_GRANT_REQUEST`
-/// (implementation-note-490 acceptance #2).
+/// Build the canonical signed payload bound to a `RESPOND_GRANT_REQUEST`.
 ///
 /// The payload is `DOMAIN_SEP || request_id_bytes || verdict_byte ||
 /// nonce_raw`. Including the verdict byte means a "denied" signature
@@ -1251,7 +1245,7 @@ pub fn respond_grant_request_signing_payload(
 
 /// Store a grant request from an agent targeting a human identity.
 ///
-/// Per `implementation-note-491`, the requester id, scope, and
+/// The requester id, scope, and
 /// justification have been sealed off-relay; only the routing-required
 /// `target_id` and the responder's signing pubkey (used later to verify
 /// the matching `RESPOND_GRANT_REQUEST` signature) ride in cleartext.
@@ -1308,7 +1302,7 @@ pub fn handle_request_grant(
 /// - `NONE` if no requests exist for this target.
 /// - Newline-separated JSON objects for each request, followed by `END`.
 ///
-/// Per `implementation-note-491` the requester id / scope /
+/// The requester id / scope /
 /// justification fields are emitted as a single hex-encoded
 /// `sealed_payload`; the responder unseals them outside the relay's
 /// address space. The relay never reconstructs plaintext for any of
@@ -1353,7 +1347,7 @@ pub fn handle_fetch_grant_requests(
     respond(stream, lines.join("\n").as_bytes());
 }
 
-// respond_grant_request_signed — implementation-note-490
+// respond_grant_request_signed
 /// Respond to a grant request (approve or deny).
 ///
 /// The caller MUST supply a fresh `nonce_raw` and a signature over
@@ -2090,7 +2084,7 @@ WEBSOCKET:
                            release containment.
     --no-ws                Disable the WebSocket listener (default)
 
-TLS OPTIONS (mandatory in production builds — implementation-note-492):
+TLS OPTIONS (mandatory in production builds — implementation-note-393):
     --tls-self-signed   Generate a self-signed certificate at startup (default)
     --tls-cert <path>   Path to PEM certificate file (e.g., Let's Encrypt fullchain.pem)
     --tls-key <path>    Path to PEM private key file (e.g., Let's Encrypt privkey.pem)

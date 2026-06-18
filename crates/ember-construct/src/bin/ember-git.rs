@@ -15,7 +15,7 @@
 //! shim never blocks the wrapped tool. The checkpoint anchors that
 //! contract here so a grep verifies the per-vendor binary's audit
 //! coverage as a single unit. Per
-//! implementation-note-97 + design.
+//! implementation-note-78 + design.
 
 use std::process::ExitCode;
 fn main() -> ExitCode {

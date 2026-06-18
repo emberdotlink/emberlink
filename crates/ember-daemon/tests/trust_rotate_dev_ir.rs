@@ -1,5 +1,5 @@
 //! T2 integration tests for the dev-IR rotation handlers
-//! (implementation-note-221, design §Component 3).
+//! (implementation-note-260, design §Component 3).
 //!
 //! Exercises the JSON-RPC handler entry points directly against the
 //! daemon's process-global rotation registry. Skips the full socket

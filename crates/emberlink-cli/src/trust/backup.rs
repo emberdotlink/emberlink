@@ -51,7 +51,7 @@ pub use crate::trust::principal_keychain::{
     WORKSTATION_PERSONA_KEYCHAIN_LABEL as DEV_IR_KEYCHAIN_LABEL,
 };
 
-// trust_backup_restore_landed — checkpoint anchoring this PR (implementation-note-34).
+// trust_backup_restore_landed — checkpoint anchoring this PR (implementation-note-21).
 // Used by the failing-test grep `grep -c trust_backup_restore_landed ...` in the brief.
 
 // Compatibility aliases for the backup/restore V1 envelope vocabulary.

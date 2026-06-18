@@ -1272,7 +1272,7 @@ pub(super) fn run_vault_list(
 ///
 /// vault_actions_migrated_to_rpc: under design's separate-uid posture the
 /// daemon owns the SQLite DB; the prior `open_store(config)` local fallback
-/// was silently-broken-by-design. Per implementation-note-408
+/// was silently-broken-by-design. Per implementation-note-315
 /// the fallback branch was removed; missing-socket errors surface clearly
 /// through `call_daemon_method`.
 pub(super) fn run_vault_remove(
@@ -1290,7 +1290,7 @@ pub(super) fn run_vault_remove(
 
 /// Fetch a vault entry via the daemon's `vault_get` RPC.
 ///
-/// Local fallback removed per implementation-note-408;
+/// Local fallback removed per implementation-note-315;
 /// see the `vault_actions_migrated_to_rpc` note on [`run_vault_remove`].
 pub(super) fn run_vault_get(
     config: &DaemonConfig,
@@ -1329,7 +1329,7 @@ pub(super) fn run_vault_get(
 
 /// Store a vault entry via the daemon's `vault_add` or `vault_put` RPC.
 ///
-/// Local fallback removed per implementation-note-408;
+/// Local fallback removed per implementation-note-315;
 /// see the `vault_actions_migrated_to_rpc` note on [`run_vault_remove`].
 pub(super) fn run_vault_store(
     config: &DaemonConfig,
@@ -1371,7 +1371,7 @@ pub(super) fn run_vault_store(
 
 /// Migrate MEK keyring ACL via the daemon's `vault_migrate_acl` RPC.
 ///
-/// Per implementation-note-408: routes through the
+/// Per implementation-note-315: routes through the
 /// daemon so the operation lands in the daemon's audit log
 /// (`vault.mek_acl_migrated`) and respects the separate-uid keyring scope
 /// (design). The CLI's prior direct `migrate_mek_acl()` call bypassed
@@ -1738,7 +1738,7 @@ fn run_vault_import_sealed(config: &DaemonConfig, args: &VaultImportArgs) -> Res
     Ok(())
 }
 
-/// Per implementation-note-409: refuse `ember vault add --value <secret>`
+/// Per implementation-note-316: refuse `ember vault add --value <secret>`
 /// argv form because it leaks the secret to shell history, `ps auxww`, and
 /// transcript-capturing harnesses. Centralized so future credential-input
 /// CLI surfaces can call it.

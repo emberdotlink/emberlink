@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-162 — T2 integration tests.
+//! implementation-note-264 — T2 integration tests.
 //!
 //! Verifies the production read-site for `core_grant_types::capabilities::
 //! CAPABILITY_ISOLATION_MAP` inside the `broker.mint_sub_persona` RPC

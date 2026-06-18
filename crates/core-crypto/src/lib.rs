@@ -154,7 +154,7 @@ pub trait Verifier {
     fn verify(&self, public_key: &PublicKey, payload: &[u8], signature: &Signature) -> bool;
 }
 
-/// implementation-note-37 C6: probe trait that lets `LocalKeySigner`
+/// implementation-note-24 C6: probe trait that lets `LocalKeySigner`
 /// refuse to sign when the underlying persona's status is anything
 /// other than `active` (revoked, enrolling, archived, …). Injected at
 /// signer construction time so `core-crypto` does not pull a SQLite or
@@ -172,7 +172,7 @@ pub trait PersonaActiveProbe: Send + Sync {
     fn is_active(&self) -> bool;
 }
 
-/// implementation-note-37 C6: error variant returned from
+/// implementation-note-24 C6: error variant returned from
 /// [`LocalKeySigner::try_sign`] when the attached
 /// [`PersonaActiveProbe`] reports the persona is not active. Surfaced as
 /// a fresh error rather than reusing `ValidationError` so call sites
@@ -201,7 +201,7 @@ impl std::error::Error for SignerError {}
 pub struct LocalKeySigner {
     public_key: PublicKey,
     signing_key: SigningKey,
-    /// implementation-note-37 C6 — optional probe consulted by
+    /// implementation-note-24 C6 — optional probe consulted by
     /// [`LocalKeySigner::try_sign`]. `None` for legacy construction
     /// paths (tests + any caller predating C6) which means try_sign
     /// always succeeds. Production callers attach a probe via
@@ -245,7 +245,7 @@ impl LocalKeySigner {
         })
     }
 
-    /// implementation-note-37 C6: attach a [`PersonaActiveProbe`] so
+    /// implementation-note-24 C6: attach a [`PersonaActiveProbe`] so
     /// [`Self::try_sign`] consults it before signing. Returns the same
     /// signer with the probe set — chains naturally off
     /// `from_local_key_pair`.
@@ -254,7 +254,7 @@ impl LocalKeySigner {
         self
     }
 
-    /// implementation-note-37 C6: fallible signing entry point.
+    /// implementation-note-24 C6: fallible signing entry point.
     /// Consults the attached [`PersonaActiveProbe`] (if any) and
     /// refuses to sign when the persona is not active. When no probe
     /// is attached, behaves identically to [`Signer::sign`].
@@ -270,7 +270,7 @@ impl LocalKeySigner {
 }
 
 impl Signer for LocalKeySigner {
-    /// implementation-note-37 C6 note: the legacy infallible `sign`
+    /// implementation-note-24 C6 note: the legacy infallible `sign`
     /// remains for call sites that have not migrated to [`Self::try_sign`].
     /// When a probe is attached and reports the persona is inactive,
     /// this method panics with a clear message — fail-loud is preferred
@@ -1322,7 +1322,7 @@ mod tests {
         assert!(!DeviceSignatureVerifier.verify(&p256_pk, payload, &ed_sig));
     }
 
-    /// implementation-note-37 C6: `LocalKeySigner::try_sign` consults
+    /// implementation-note-24 C6: `LocalKeySigner::try_sign` consults
     /// the attached `PersonaActiveProbe` and refuses to sign when the
     /// persona is not active. The test injects two probes (active and
     /// inactive) and asserts the corresponding outcome.

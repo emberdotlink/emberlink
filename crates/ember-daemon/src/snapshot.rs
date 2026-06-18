@@ -12,7 +12,7 @@
 //!      lanes are cryptographically independent (security review H2).
 //!   3. Described by a signed [`SnapshotManifest`] chained via `prev_snapshot_id`.
 //!
-//! **Snapshot scope** (per implementation-note-68, design §Decision):
+//! **Snapshot scope** (per implementation-note-49, design §Decision):
 //!   - `credentials` table rows (vault-sealed blobs)
 //!   - `vault.salt` file bytes (critical: without it the MEK cannot be rebuilt)
 //!   - `personas` table rows
@@ -852,7 +852,7 @@ pub async fn pull_cluster_snapshot(
 ///
 /// Call [`SnapshotPuller::maybe_pull`] on a Tokio interval at daemon startup.
 /// Only active when `snapshot_pull_endpoint` is configured (per design
-/// implementation-note-206).
+/// implementation-note-245).
 pub struct SnapshotPuller {
     interval_secs: u64,
     last_pulled_at: Mutex<Option<Instant>>,

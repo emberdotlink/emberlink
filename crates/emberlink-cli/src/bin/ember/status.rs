@@ -145,6 +145,19 @@ pub(super) fn detect_codex_runtime_auth_truth(
     CodexRuntimeAuthTruth::NoActiveBrokeredSession
 }
 
+pub(super) fn detect_cursor_runtime_auth_truth(
+    summary: &ember_daemon::infra::status::StatusSummary,
+) -> CursorRuntimeAuthTruth {
+    if let Some(grant) = cursor_launch_ready_grant(summary) {
+        return CursorRuntimeAuthTruth::LaunchReadyGrant {
+            grant_id: grant.id.clone(),
+            credential_name: grant.credential_name.clone(),
+        };
+    }
+
+    CursorRuntimeAuthTruth::NoLaunchReadyGrant
+}
+
 fn summary_grant_has_live_lease(
     summary: &ember_daemon::infra::status::StatusSummary,
     grant_id: &str,
@@ -155,20 +168,57 @@ fn summary_grant_has_live_lease(
         .any(|live_grant_id| live_grant_id == grant_id)
 }
 
+fn summary_grant_supports_runtime_persona_delegation(
+    grant: &ember_daemon::trust::grant::GrantInfo,
+) -> bool {
+    grant.max_delegation_depth.unwrap_or(0) > 0
+}
+
+fn active_persona_id_by_name<'a>(
+    summary: &'a ember_daemon::infra::status::StatusSummary,
+    name: &str,
+) -> Option<&'a str> {
+    summary
+        .personas
+        .iter()
+        .find(|persona| persona.name == name && persona.status == "active")
+        .map(|persona| persona.id.as_str())
+}
+
+fn cursor_launch_ready_grant(
+    summary: &ember_daemon::infra::status::StatusSummary,
+) -> Option<&ember_daemon::trust::grant::GrantInfo> {
+    let cursor_persona_id = active_persona_id_by_name(summary, "cursor-default")?;
+    summary.grants.iter().find(|grant| {
+        grant.persona_id == cursor_persona_id
+            && grant.status == "active"
+            && grant.scope == CURSOR_DEFAULT_SCOPE
+            && grant.credential_name == CURSOR_DEFAULT_SCOPE
+            && summary_grant_supports_runtime_persona_delegation(grant)
+            && summary_grant_has_live_lease(summary, &grant.id)
+    })
+}
+
 pub(super) fn runtime_auth_section(
     summary: &ember_daemon::infra::status::StatusSummary,
 ) -> UiSection {
     let claude = detect_claude_runtime_auth_truth(summary);
     let codex = detect_codex_runtime_auth_truth(summary);
+    let cursor = detect_cursor_runtime_auth_truth(summary);
     UiSection {
         heading: "Auth",
-        lines: vec![claude.status_line(), codex.status_line()],
+        lines: vec![
+            claude.status_line(),
+            codex.status_line(),
+            cursor.status_line(),
+        ],
     }
 }
 
 pub(super) fn status_json_value(overview: &StatusOverview) -> serde_json::Value {
     let claude_auth = detect_claude_runtime_auth_truth(&overview.summary);
     let codex_auth = detect_codex_runtime_auth_truth(&overview.summary);
+    let cursor_auth = detect_cursor_runtime_auth_truth(&overview.summary);
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "daemon": {
@@ -189,6 +239,7 @@ pub(super) fn status_json_value(overview: &StatusOverview) -> serde_json::Value 
         "auth": {
             "claude": claude_auth.json_value(),
             "codex": codex_auth.json_value(),
+            "cursor": cursor_auth.json_value(),
         },
         "lanes": status_lanes_json(overview),
         "vault": {
@@ -329,8 +380,8 @@ pub(super) struct StatusLane {
 
 /// Compute the per-lane onboarding checklist from the already-gathered
 /// `StatusOverview`. Pure — no I/O — so the whole at-a-glance matrix is
-/// unit-testable. Lane order matches OSCAR's mock: Daemon, Presence, Claude,
-/// Codex, GitHub, Shadow PATH.
+/// unit-testable. Lane order matches OSCAR's mock plus the Cursor launcher
+/// lane: Daemon, Presence, Claude, Codex, Cursor, GitHub, Shadow PATH.
 pub(super) fn compute_status_lanes(overview: &StatusOverview) -> Vec<StatusLane> {
     let ember_cmd = ember_command_prefix_for_launcher_lane(overview.current_launcher_lane.as_ref());
     let daemon_install = sudo_daemon_install_command_with_ember_command(&ember_cmd);
@@ -338,7 +389,7 @@ pub(super) fn compute_status_lanes(overview: &StatusOverview) -> Vec<StatusLane>
     let vault_unlock = vault_unlock_command_with_ember_command(&ember_cmd);
     let doctor = format!("{ember_cmd} doctor");
 
-    let mut lanes = Vec::with_capacity(6);
+    let mut lanes = Vec::with_capacity(7);
 
     // 1. Daemon ----------------------------------------------------------
     lanes.push(match &overview.banner {
@@ -430,7 +481,23 @@ pub(super) fn compute_status_lanes(overview: &StatusOverview) -> Vec<StatusLane>
         },
     });
 
-    // 5. GitHub ----------------------------------------------------------
+    // 5. Cursor launcher/session governance -----------------------------
+    lanes.push(match detect_cursor_runtime_auth_truth(&overview.summary) {
+        CursorRuntimeAuthTruth::LaunchReadyGrant { .. } => StatusLane {
+            name: "Cursor",
+            mark: StatusLaneMark::Ok,
+            detail: "launch grant ready; model auth Cursor-owned".to_string(),
+            next_action: None,
+        },
+        CursorRuntimeAuthTruth::NoLaunchReadyGrant => StatusLane {
+            name: "Cursor",
+            mark: StatusLaneMark::Fail,
+            detail: "no launch-ready grant; model auth Cursor-owned".to_string(),
+            next_action: Some(format!("{ember_cmd} init --for cursor")),
+        },
+    });
+
+    // 6. GitHub ----------------------------------------------------------
     lanes.push(match overview.github_status.as_ref() {
         Some(github) => match github.lane.as_str() {
             "pat" => StatusLane {
@@ -463,7 +530,7 @@ pub(super) fn compute_status_lanes(overview: &StatusOverview) -> Vec<StatusLane>
         },
     });
 
-    // 6. Shadow PATH / launcher -----------------------------------------
+    // 7. Shadow PATH / launcher -----------------------------------------
     lanes.push(match overview.launcher_issue.as_ref() {
         Some(issue) => StatusLane {
             name: "Shadow PATH",
@@ -535,13 +602,14 @@ pub(super) fn render_status_overview_text(overview: &StatusOverview) -> String {
     let vault_unlock_cmd = vault_unlock_command_with_ember_command(&ember_cmd);
     let claude_cmd = format!("{ember_cmd} claude");
     let codex_cmd = format!("{ember_cmd} codex");
+    let cursor_cmd = format!("{ember_cmd} cursor");
     let trust_list_cmd = format!("{ember_cmd} trust list");
     let counts = status_counts_line(&overview.summary);
 
     if !overview.ember_initialized {
         return render_compact_card(
             "Not set up yet",
-            "Ember is not initialized on this machine.",
+            "Ember is not initialized on this machine. Start with one managed agent lane.",
             &[counts],
             &[
                 UiSection {
@@ -550,7 +618,7 @@ pub(super) fn render_status_overview_text(overview: &StatusOverview) -> String {
                         "{}",
                         command_row(
                             format!("{ember_cmd} init --for claude"),
-                            "Set up the canonical Claude path"
+                            "Set up Claude as the first managed lane"
                         )
                     )],
                 },
@@ -756,8 +824,9 @@ pub(super) fn render_status_overview_text(overview: &StatusOverview) -> String {
                 UiSection {
                     heading: "After unlock",
                     lines: vec![
-                        command_row(claude_cmd, "Launch the canonical Claude path"),
-                        command_row(codex_cmd, "Launch the Codex path"),
+                        command_row(claude_cmd, "Open the managed Claude session"),
+                        command_row(codex_cmd, "Open the managed Codex session"),
+                        command_row(cursor_cmd, "Open the Cursor host baseline path"),
                     ],
                 },
                 UiSection {
@@ -879,18 +948,19 @@ pub(super) fn render_status_overview_text(overview: &StatusOverview) -> String {
     }
     render_compact_card(
         "Ready",
-        "The primary Ember launcher path is ready on this machine.",
+        "Launch through Ember, use your normal tools, then verify the receipt.",
         &details,
         &[
             UiSection {
                 heading: "Next",
-                lines: vec![command_row(claude_cmd, "Launch the canonical Claude path")],
+                lines: vec![command_row(claude_cmd, "Open the managed Claude session")],
             },
             runtime_auth_section(&overview.summary),
             UiSection {
                 heading: "Also",
                 lines: vec![
-                    command_row(codex_cmd, "Launch the Codex path"),
+                    command_row(codex_cmd, "Open the managed Codex session"),
+                    command_row(cursor_cmd, "Open the Cursor host baseline path"),
                     command_row(trust_list_cmd, "Confirm trust roots are readable"),
                     command_row("ember explain init", "Read the setup and launch story"),
                 ],
@@ -902,21 +972,21 @@ pub(super) fn render_status_overview_text(overview: &StatusOverview) -> String {
 pub(super) fn render_uninitialized_home_screen() -> String {
     render_compact_card(
         "Not set up yet",
-        "Ember is not initialized on this machine.",
+        "Ember is not initialized on this machine. Start with one managed agent lane.",
         &[],
         &[
             UiSection {
                 heading: "Start",
                 lines: vec![command_row(
                     "ember init --for claude",
-                    "Set up the canonical Claude path",
+                    "Set up Claude as the first managed lane",
                 )],
             },
             UiSection {
                 heading: "Also",
                 lines: vec![
                     command_row("ember status", "Check readiness and repair steps"),
-                    command_row("ember codex", "Launch Codex with Ember wiring"),
+                    command_row("ember codex", "Open Codex with Ember wiring"),
                     command_row("ember explain init", "Read the full setup flow"),
                 ],
             },
@@ -1019,6 +1089,7 @@ pub(super) fn render_doctor_text(overview: &StatusOverview) -> String {
     let vault_unlock_cmd = vault_unlock_command_with_ember_command(&ember_cmd);
     let claude_cmd = format!("{ember_cmd} claude");
     let codex_cmd = format!("{ember_cmd} codex");
+    let cursor_cmd = format!("{ember_cmd} cursor");
     let receipt_export_cmd = format!("{ember_cmd} receipt export --latest --format md");
     let counts = status_counts_line(&overview.summary);
 
@@ -1078,7 +1149,7 @@ pub(super) fn render_doctor_text(overview: &StatusOverview) -> String {
                 ),
                 _ => (
                     "Ready",
-                    "The primary Ember launcher path is ready on this machine.",
+                    "Launch through Ember, use your normal tools, then verify the receipt.",
                 ),
             },
         }
@@ -1146,7 +1217,7 @@ pub(super) fn render_doctor_text(overview: &StatusOverview) -> String {
             heading: "Do this",
             lines: vec![command_row(
                 format!("{ember_cmd} init --for claude"),
-                "Set up the canonical Claude path",
+                "Set up Claude as the first managed lane",
             )],
         });
     } else if overview.launcher_issue.is_some() {
@@ -1234,8 +1305,9 @@ pub(super) fn render_doctor_text(overview: &StatusOverview) -> String {
                 sections.push(UiSection {
                     heading: "After unlock",
                     lines: vec![
-                        command_row(claude_cmd.clone(), "Launch the canonical Claude path"),
-                        command_row(codex_cmd, "Launch the Codex path"),
+                        command_row(claude_cmd.clone(), "Open the managed Claude session"),
+                        command_row(codex_cmd, "Open the managed Codex session"),
+                        command_row(cursor_cmd.clone(), "Open the Cursor host baseline path"),
                     ],
                 });
             }
@@ -1263,7 +1335,14 @@ pub(super) fn render_doctor_text(overview: &StatusOverview) -> String {
                         heading: "Next",
                         lines: vec![command_row(
                             claude_cmd.clone(),
-                            "Launch the canonical Claude path",
+                            "Open the managed Claude session",
+                        )],
+                    });
+                    sections.push(UiSection {
+                        heading: "Also",
+                        lines: vec![command_row(
+                            cursor_cmd.clone(),
+                            "Open the Cursor host baseline path",
                         )],
                     });
                 }

@@ -13,7 +13,7 @@
 //!
 //! This module stands up the *capability* that replaces that: **one
 //! Unix socket per session**, spawned when a session registers and torn down
-//! when it closes (the implementation-note-235 pattern — the socket path
+//! when it closes (the implementation-note-218 pattern — the socket path
 //! *is* the attachment binding). Every accepted connection runs a **fail-closed
 //! authorization gate** before a single byte is forwarded:
 //!
@@ -45,7 +45,7 @@
 //! Arms 1–3 are **always hard-closed** — a rejected connection is dropped
 //! (`Ok(None)` from `ProxyAcceptor::accept_authorized`), never fail-open. This
 //! is independent of the rollout-gated per-RPC fail-open arm at
-//! `broker/handler.rs` (`implementation-note-280`), which this
+//! `broker/handler.rs` (`implementation-note-204`), which this
 //! module does not touch.
 //!
 //! ## Why not `proc_pidinfo` (the superseded PR-B/PR-C gate)

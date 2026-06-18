@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 // Daemon transport resolution
 // ---------------------------------------------------------------------------
 //
-// Subtask A of implementation-note-28. The
+// Subtask A of implementation-note-20. The
 // construct shims (`ember-gh`, `ember-git`, etc.) historically only
 // dialed the daemon over a host-local Unix socket. design §Component 1
 // adds an in-container path that has to traverse the host boundary via

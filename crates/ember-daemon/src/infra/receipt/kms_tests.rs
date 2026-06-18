@@ -140,7 +140,7 @@ fn ensure_identity_for_kms_test() -> &'static DaemonPersona {
     current_identity().expect("identity was just initialised")
 }
 
-/// EMBER-implementation-note-248 — mixed-kind audit query. Seed two kms receipts for
+/// EMBER-implementation-note-184 — mixed-kind audit query. Seed two kms receipts for
 /// the same persona (one wrap, one unwrap) plus one for a different
 /// persona; the actor filter must return only the matching pair, and
 /// the rows must be sorted `materialized_at DESC`.
@@ -185,7 +185,7 @@ fn list_receipt_rows_filters_by_actor_and_sorts_desc() {
     );
 }
 
-/// EMBER-implementation-note-248 — kind filter narrows to a single discriminator.
+/// EMBER-implementation-note-184 — kind filter narrows to a single discriminator.
 #[test]
 fn list_receipt_rows_filters_by_kind() {
     let _ = ensure_identity_for_kms_test();
@@ -207,7 +207,7 @@ fn list_receipt_rows_filters_by_kind() {
     assert_eq!(wraps[0].resource, "k1");
 }
 
-/// EMBER-implementation-note-248 — resource substring filter (post-fetch) narrows
+/// EMBER-implementation-note-184 — resource substring filter (post-fetch) narrows
 /// matches without forcing exact equality.
 #[test]
 fn list_receipt_rows_filters_by_resource_substring() {
@@ -231,7 +231,7 @@ fn list_receipt_rows_filters_by_resource_substring() {
     assert!(rows.iter().all(|r| r.resource.contains("tokens")));
 }
 
-/// EMBER-implementation-note-248 — index existence sanity check. Inspect the
+/// EMBER-implementation-note-184 — index existence sanity check. Inspect the
 /// sqlite_master catalog and confirm the new audit-CLI indexes were
 /// created by the migration.
 #[test]

@@ -30,7 +30,7 @@ serde_json = "1"
 [features]
 # Default: TLS is mandatory. The `--no-tls` flag is rejected as unknown.
 default = []
-# implementation-note-490: opt-in escape hatch that
+# implementation-note-392: opt-in escape hatch that
 # re-exposes the `--no-tls` flag for integration tests that spawn the relay
 # binary against a plain-TCP loopback (see crates/core-sim/tests/agent_e2e.rs).
 # MUST NOT be enabled in production builds — the `./x insiders` release lane

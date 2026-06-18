@@ -2296,7 +2296,7 @@ impl DaemonStore {
                 presence_policy TEXT NOT NULL DEFAULT 'lane_default'
             );
 
-            -- audit_chain_v2_schema_landed (implementation-note-315).
+            -- audit_chain_v2_schema_landed (implementation-note-219).
             -- v2 audit_log shape from CREATE TABLE on fresh DBs. The CHECK
             -- constraint encodes the chain invariant. segment_id is NOT NULL
             -- with NO DEFAULT (per R5 / pass-2 finding #4) so an older binary
@@ -2396,7 +2396,7 @@ impl DaemonStore {
                 composite_statements_json TEXT,
                 result_grant_id TEXT,
                 resolution_kind TEXT NOT NULL DEFAULT 'grant',
-                -- implementation-note-13:
+                -- implementation-note-186:
                 -- grant-shaping fields preserved through the approval queue so
                 -- the resolver can re-stamp them on the minted grant.
                 max_delegation_depth INTEGER,
@@ -2443,7 +2443,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
 
-            -- implementation-note-107: server-persisted WebAuthn credentials.
+            -- implementation-note-89: server-persisted WebAuthn credentials.
             -- Each row is a passkey enrolled by a persona via
             -- /settings/passkeys; the `passkey_json` column is the
             -- webauthn-rs `Passkey` type (serde JSON serialization)
@@ -2542,7 +2542,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_scope_segment
                 ON claim_journal_claims(scope_kind, scope_id, segment_no, segment_seq);
 
-            -- implementation-note-107: in-flight WebAuthn ceremony state.
+            -- implementation-note-89: in-flight WebAuthn ceremony state.
             -- Registration ceremonies and authentication ceremonies
             -- both stash `state_json` here keyed by a freshly-minted
             -- challenge_id; the corresponding finish endpoint reads it
@@ -2597,7 +2597,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_presence_challenges_op
                 ON presence_challenges(op_id);
 
-            -- credential_bindings_table_schema — implementation-note-316
+            -- credential_bindings_table_schema — implementation-note-220
             -- Daemon-controlled credential-target allowlist: binds a
             -- principal (persona) + working-tree (canonical absolute
             -- repo-root path) + remote-name to a specific remote URL.

@@ -10,7 +10,7 @@
 //! the only place the wire frame is turned into a [`core_personas::MtlsPrincipal`]
 //! that gets stamped into `DispatchSource::Bridge`.
 //!
-//! # `emberd_core_bincode_receiver_hardened` (checkpoint — `implementation-note-178`)
+//! # `emberd_core_bincode_receiver_hardened` (checkpoint — `implementation-note-147`)
 //!
 //! This file IS the realized G4.2-hardened typed-message receiver. The original
 //! task brief referenced a `typed_receiver.rs` / `typed_messages.rs` shape that

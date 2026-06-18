@@ -367,6 +367,14 @@ fn render_launch_script(
             }
         }
         HarnessKind::Cursor => {}
+        // design §2: gemini's Code Assist loopback proxy is HOST-only for now
+        // (the daemon returns no `gemini_proxy_url` for container sessions), so
+        // `ember gemini` rejects sandvault/isolated placement at the launch layer
+        // and this arm is unreachable in practice. Defensive fail-closed unset so
+        // no ambient Google credential leaks into a container shell.
+        HarnessKind::Gemini => {
+            out.push_str("unset GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI GOOGLE_GEMINI_BASE_URL GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_PROJECT_ID GOOGLE_CLOUD_LOCATION GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CLOUD_ACCESS_TOKEN GEMINI_FORCE_ENCRYPTED_FILE_STORAGE\n");
+        }
         HarnessKind::Other => {}
     }
 
@@ -431,6 +439,9 @@ fn harness_binary(harness: HarnessKind) -> String {
         HarnessKind::Cursor => {
             std::env::var("EMBER_CURSOR_BIN").unwrap_or_else(|_| "cursor-agent".to_string())
         }
+        HarnessKind::Gemini => {
+            std::env::var("EMBER_GEMINI_BIN").unwrap_or_else(|_| "gemini".to_string())
+        }
         HarnessKind::Other => "sh".to_string(),
     }
 }
@@ -440,6 +451,7 @@ fn harness_label(harness: HarnessKind) -> &'static str {
         HarnessKind::Claude => "claude",
         HarnessKind::Codex => "codex",
         HarnessKind::Cursor => "cursor",
+        HarnessKind::Gemini => "gemini",
         HarnessKind::Other => "harness",
     }
 }

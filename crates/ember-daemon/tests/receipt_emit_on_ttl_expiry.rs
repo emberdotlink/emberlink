@@ -1,4 +1,4 @@
-//! implementation-note-377 regression coverage.
+//! implementation-note-278 regression coverage.
 //!
 //! Reproduces the bug where the TTL-expiry sweep silently failed to emit
 //! a Grant Receipt: the sweep call site discarded the wrapper's return

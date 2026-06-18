@@ -81,8 +81,16 @@ pub struct ConstructAction {
     pub key: String,
     /// design action contract version from the current carrier.
     pub action_version: Option<String>,
+    /// Current carrier's default authority disposition for this action.
+    pub default_policy: Option<String>,
+    /// Current carrier's coarse risk label for operator/catalog projection.
+    pub risk_tier: Option<String>,
     /// Optional convention labels surfaced from `[[actions]].semantic_labels`.
     pub semantic_labels: Vec<String>,
+    /// Manifest-declared abstract authority need. Empty means unresolved, not
+    /// "no authority needed"; use-time materialization must still fail closed
+    /// when an action requires brokered material and no need is declared.
+    pub need: Vec<String>,
     /// Action-scoped authority families. When empty, callers should fall back
     /// to the manifest-wide [`ConstructManifest::authority_refs`] list.
     pub authority_refs: Vec<String>,
@@ -186,8 +194,14 @@ struct RawAction {
     key: String,
     #[serde(default)]
     action_version: Option<String>,
+    #[serde(default, rename = "default")]
+    default_policy: Option<String>,
+    #[serde(default)]
+    risk_tier: Option<String>,
     #[serde(default)]
     semantic_labels: Vec<String>,
+    #[serde(default)]
+    need: Vec<String>,
     #[serde(default)]
     authority_refs: Vec<String>,
     #[serde(default)]
@@ -243,7 +257,10 @@ pub fn parse_construct_manifest_str(text: &str) -> Result<ConstructManifest, tom
         .map(|a| ConstructAction {
             key: a.key,
             action_version: a.action_version,
+            default_policy: a.default_policy,
+            risk_tier: a.risk_tier,
             semantic_labels: a.semantic_labels,
+            need: a.need,
             authority_refs: first_non_empty(
                 a.authority_refs,
                 broker_authority_refs(&a.material_classes),
@@ -531,6 +548,16 @@ biometric = "required"
             vec![
                 "github.pull_request.write".to_string(),
                 "scm.pull_request.write".to_string()
+            ]
+        );
+        assert_eq!(pr_create.default_policy.as_deref(), Some("permit"));
+        assert_eq!(pr_create.risk_tier.as_deref(), Some("medium"));
+        assert_eq!(
+            pr_create.need,
+            vec![
+                "github:metadata:read".to_string(),
+                "github:contents:write".to_string(),
+                "github:pull_request:create".to_string()
             ]
         );
     }

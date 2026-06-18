@@ -1,19 +1,38 @@
 use super::*;
 
-#[tokio::test]
-async fn dispatch_method_uses_provided_policy() {
-    let store = DaemonStore::open_in_memory().unwrap();
-    let vault = test_vault();
-    // Custom policy: deny "test.action" explicitly.
-    let custom = PolicyEngine::new(PolicyConfig {
+const GH_PR_LIST_ACTION_REF: &str = "registry.ember.systems/ember-systems/ember-gh/pr_list@v1";
+const GH_REPO_DELETE_ACTION_REF: &str =
+    "registry.ember.systems/ember-systems/ember-gh/repo_delete@v1";
+
+fn auto_policy_for(action: &str) -> PolicyEngine {
+    PolicyEngine::new(PolicyConfig {
         rules: vec![PolicyRule {
-            action: ActionSelector::named("test.action"),
-            risk: RiskLevel::High,
+            action: ActionSelector::parse(action).expect("valid action selector"),
+            risk: RiskLevel::Low,
+            requirement: ApprovalRequirement::Auto,
+            tier: None,
+        }],
+        ..PolicyConfig::default()
+    })
+}
+
+fn deny_policy_for(action: &str) -> PolicyEngine {
+    PolicyEngine::new(PolicyConfig {
+        rules: vec![PolicyRule {
+            action: ActionSelector::parse(action).expect("valid action selector"),
+            risk: RiskLevel::Critical,
             requirement: ApprovalRequirement::Denied,
             tier: None,
         }],
         ..PolicyConfig::default()
-    });
+    })
+}
+
+#[tokio::test]
+async fn manifest_request_uses_provided_policy() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let custom = deny_policy_for(GH_PR_LIST_ACTION_REF);
     let rl = test_rate_limiter();
 
     let persona = dispatch_method(
@@ -37,8 +56,8 @@ async fn dispatch_method_uses_provided_policy() {
         &json!({
             "persona_id": persona_id,
             "credential_name": "some-key",
-            "scope": "read",
-            "action": "test.action",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "target": {"kind": "github_repo", "repo": "octo/repo"},
         }),
     )
     .await
@@ -52,7 +71,7 @@ async fn dispatch_method_uses_provided_policy() {
 async fn grant_issuance_logged_to_audit() {
     let store = DaemonStore::open_in_memory().unwrap();
     let vault = test_vault();
-    let policy = test_policy();
+    let policy = auto_policy_for(GH_PR_LIST_ACTION_REF);
     let rl = test_rate_limiter();
 
     let persona = dispatch_method(
@@ -77,8 +96,8 @@ async fn grant_issuance_logged_to_audit() {
         &json!({
             "persona_id": persona_id,
             "credential_name": "audit-cred",
-            "scope": "read",
-            "action": "deploy.staging",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "resource_id": "octo/repo",
         }),
     )
     .await
@@ -114,7 +133,326 @@ async fn grant_issuance_logged_to_audit() {
 }
 
 #[tokio::test]
-async fn request_access_blocking_timeout() {
+async fn manifest_action_ref_auto_request_mints_need_statements_for_typed_target() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = auto_policy_for(GH_PR_LIST_ACTION_REF);
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "manifest-auto"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+
+    let result = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "target": {"kind": "github_repo", "provider": "github", "repo": "octo/repo"},
+            "ttl_secs": 600
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["status"], "approved", "got: {result}");
+    assert_eq!(result["decision"], "auto_approve");
+    assert_eq!(result["action_ref"], GH_PR_LIST_ACTION_REF);
+    assert_eq!(result["need_source"], "manifest");
+    assert_eq!(result["target_source"], "target.github_repo");
+    assert_eq!(
+        result["need"],
+        json!(["github:metadata:read", "github:pull_request:read"])
+    );
+
+    let grant_id = result["grant_id"].as_str().unwrap();
+    let grant = store.get_access_grant(grant_id).unwrap();
+    let statements: Vec<_> = grant.statements().map(|(_, stmt)| stmt.clone()).collect();
+    assert_eq!(
+        statements.len(),
+        2,
+        "grant should preserve one statement per need atom"
+    );
+    assert_eq!(statements[0].actions, vec!["github:metadata:read"]);
+    assert_eq!(statements[1].actions, vec!["github:pull_request:read"]);
+    for stmt in &statements {
+        assert_eq!(
+            stmt.resource_type,
+            core_grant_types::ResourceType::Credential
+        );
+        assert_eq!(
+            stmt.resource,
+            core_grant_types::ResourceSelector::Exact {
+                value: "octo/repo".to_string()
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn manifest_action_ref_rejects_removed_action_and_scope_fields() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = auto_policy_for(GH_PR_LIST_ACTION_REF);
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "manifest-reject-old-fields"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+
+    let action_err = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "action": "caller.supplied.action",
+            "target": {"kind": "github_repo", "repo": "octo/repo"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(action_err.0, -32602);
+    assert!(
+        action_err.1.contains("no longer accepts 'action'"),
+        "error should reject removed action field: {action_err:?}"
+    );
+
+    let scope_err = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "scope": "github:repo:octo/repo"
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(scope_err.0, -32602);
+    assert!(
+        scope_err.1.contains("no longer accepts 'scope'"),
+        "error should reject removed scope field: {scope_err:?}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_action_ref_requires_resource_id_or_typed_target() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = auto_policy_for(GH_PR_LIST_ACTION_REF);
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "manifest-missing-target"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+
+    let err = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_PR_LIST_ACTION_REF
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.0, -32602);
+    assert!(
+        err.1.contains("resource_id") && err.1.contains("target"),
+        "error should require target selector: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_action_ref_required_request_submits_composite_approval() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = test_policy();
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "manifest-pending"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+
+    let result = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "target": {"kind": "github_repo", "repo": "octo/repo"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["status"], "pending", "got: {result}");
+    assert_eq!(result["decision"], "require_approval");
+    assert_eq!(result["action_ref"], GH_PR_LIST_ACTION_REF);
+    assert_eq!(result["need_source"], "manifest");
+
+    let approval_id = result["approval_id"].as_str().unwrap();
+    let approval = store.get_approval(approval_id).unwrap();
+    assert_eq!(approval.action, GH_PR_LIST_ACTION_REF);
+    let statements = approval
+        .composite_statements
+        .expect("manifest request should carry typed statements");
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[0].actions, vec!["github:metadata:read"]);
+    assert_eq!(statements[1].actions, vec!["github:pull_request:read"]);
+}
+
+#[tokio::test]
+async fn manifest_action_ref_with_missing_need_fails_closed() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = auto_policy_for(GH_REPO_DELETE_ACTION_REF);
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "manifest-missing-need"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+
+    let err = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_REPO_DELETE_ACTION_REF,
+            "target": {"kind": "github_repo", "repo": "octo/repo"}
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.0, -32602);
+    assert!(
+        err.1.contains("declares no need"),
+        "error should name missing manifest need: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_action_ref_standing_grant_bypasses_deny_policy() {
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = deny_policy_for(GH_PR_LIST_ACTION_REF);
+    let rl = test_rate_limiter();
+
+    let persona = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "create_persona",
+        &json!({"name": "manifest-standing"}),
+    )
+    .await
+    .unwrap();
+    let persona_id = persona["id"].as_str().unwrap();
+    store
+        .create_standing_grant(
+            persona_id,
+            &ActionSelector::parse(GH_PR_LIST_ACTION_REF).unwrap(),
+            "*",
+            None,
+        )
+        .unwrap();
+
+    let result = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "request_access",
+        &json!({
+            "persona_id": persona_id,
+            "credential_name": "github-token",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "target": {"kind": "github_repo", "repo": "octo/repo"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["status"], "approved", "got: {result}");
+    assert_eq!(result["source"], "standing_grant");
+    assert_eq!(result["action_ref"], GH_PR_LIST_ACTION_REF);
+    let grant = store
+        .get_access_grant(result["grant_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(grant.statement_count(), 2);
+}
+
+#[tokio::test]
+async fn request_access_blocking_is_not_a_daemon_method() {
     let store = DaemonStore::open_in_memory().unwrap();
     let vault = test_vault();
     let policy = test_policy();
@@ -131,8 +469,7 @@ async fn request_access_blocking_timeout() {
     .unwrap();
     let persona_id = persona["id"].as_str().unwrap();
 
-    // Request with 1 second timeout; nobody will approve.
-    let result = dispatch_method(
+    let err = dispatch_method(
         &store,
         &vault,
         &policy,
@@ -145,16 +482,20 @@ async fn request_access_blocking_timeout() {
         }),
     )
     .await
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(result["status"], "timeout");
+    assert_eq!(err.0, -32601);
+    assert!(
+        err.1.contains("Method not found"),
+        "removed method must fall through to unknown-method dispatch: {err:?}"
+    );
 }
 
 #[tokio::test]
 async fn request_access_denies_when_rate_limit_exceeded() {
     let store = DaemonStore::open_in_memory().unwrap();
     let vault = test_vault();
-    let policy = test_policy();
+    let policy = auto_policy_for(GH_PR_LIST_ACTION_REF);
     // Tight limiter: exactly 1 request per persona+action in a 60s window.
     let rl = RefCell::new(RateLimiter::new(1, 60));
 
@@ -170,8 +511,7 @@ async fn request_access_denies_when_rate_limit_exceeded() {
     .unwrap();
     let persona_id = persona["id"].as_str().unwrap();
 
-    // First request goes through. "deploy.staging" is auto-approved under the
-    // default policy, so a grant is created.
+    // First manifest request goes through and mints a composite grant.
     let first = dispatch_method(
         &store,
         &vault,
@@ -181,8 +521,8 @@ async fn request_access_denies_when_rate_limit_exceeded() {
         &json!({
             "persona_id": persona_id,
             "credential_name": "some-key",
-            "scope": "read",
-            "action": "deploy.staging",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "resource_id": "octo/repo",
         }),
     )
     .await
@@ -201,8 +541,8 @@ async fn request_access_denies_when_rate_limit_exceeded() {
         &json!({
             "persona_id": persona_id,
             "credential_name": "some-key",
-            "scope": "read",
-            "action": "deploy.staging",
+            "action_ref": GH_PR_LIST_ACTION_REF,
+            "resource_id": "octo/repo",
         }),
     )
     .await
@@ -218,7 +558,7 @@ async fn request_access_denies_when_rate_limit_exceeded() {
     assert_eq!(pending_before.len(), pending_after.len());
 }
 
-// ---- implementation-note-62: await_approval block-and-poll RPC -----------------
+// ---- implementation-note-43: await_approval block-and-poll RPC -----------------
 
 #[tokio::test]
 async fn await_approval_returns_approved_when_resolved_mid_poll() {

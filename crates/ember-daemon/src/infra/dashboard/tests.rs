@@ -40,12 +40,12 @@ fn make_state() -> Arc<DashboardState> {
         csrf_token: TEST_CSRF_TOKEN.to_string(),
         started_at: std::time::Instant::now(),
         expected_origin: TEST_EXPECTED_ORIGIN.to_string(),
-        // implementation-note-198: default to a well-known
+        // Default to a well-known
         // localhost addr so most tests see a "bound" dashboard; tests
         // that exercise the "not bound" branch override directly.
         dashboard_actual_addr: Some("127.0.0.1:3141".parse().expect("test addr parse")),
         data_dir: std::path::PathBuf::from("/tmp/.ember-test/data"),
-        // implementation-note-107: tests don't construct a gate; the
+        // Tests don't construct a gate; the
         // approval handler falls back to the legacy
         // `{biometric: bool}` body field when this is `None`.
         #[cfg(feature = "webauthn")]
@@ -101,7 +101,7 @@ async fn call_post_wrong_csrf(state: Arc<DashboardState>, path: &str) -> Respons
 
 async fn handle_dashboard_boxed(
     state: Arc<DashboardState>,
-    req: Request<impl hyper::body::Body>,
+    req: Request<impl hyper::body::Body + 'static>,
 ) -> Response<Full<Bytes>> {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
@@ -131,7 +131,7 @@ async fn handle_dashboard_boxed(
                 .iter()
                 .filter(|p| p.status == "active")
                 .count();
-            // implementation-note-198: mirror the production
+            // Mirror the production
             // handler so `api_status_*` tests cover the new field shape.
             let dashboard_addr_bound = state.dashboard_actual_addr.map(|a| a.to_string());
             let body = serde_json::json!({
@@ -152,7 +152,7 @@ async fn handle_dashboard_boxed(
             let body: Vec<serde_json::Value> = grants
                 .iter()
                 .map(|g| {
-                    // implementation-note-194 — test handler mirrors
+                    // Test handler mirrors
                     // production: emit the per-Statement array under
                     // `statements` (the canonical name from
                     // grant_to_json_with_store) so JS callers no longer
@@ -196,7 +196,7 @@ async fn handle_dashboard_boxed(
             let id = path.strip_prefix("/api/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    // implementation-note-172 — surface persona.name for the
+                    // Surface persona.name for the
                     // approval-detail render path (test handler mirrors
                     // production).
                     let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
@@ -214,7 +214,7 @@ async fn handle_dashboard_boxed(
                             "status": a.status,
                             "reason": a.reason,
                             "created_at": a.created_at,
-                            // implementation-note-188 — mirrors production handler so
+                            // Mirrors production handler so
                             // the polled /api/approvals/{id} response carries the
                             // composite_statements array; the page JS calls
                             // renderBreakdown(data.composite_statements) on each poll.
@@ -229,7 +229,7 @@ async fn handle_dashboard_boxed(
 
         (Method::GET, "/api/audit") => {
             use crate::infra::audit::AuditFilter;
-            // implementation-note-172 — mirror the production handler's
+            // Mirror the production handler's
             // `?include_internal=1` toggle and `?action_filter=<prefix>`
             // so test coverage reflects the same operator-audit semantics.
             let (include_internal, action_filter) = req
@@ -282,7 +282,6 @@ async fn handle_dashboard_boxed(
         }
 
         (Method::GET, "/api/maturation/candidates") => {
-            // implementation-note-199: shipped
             let conn = state.store.conn();
             let mut stmt = match conn.prepare(
                 "SELECT action, credential, COUNT(*) as freq, MAX(timestamp) as last_seen \
@@ -399,7 +398,7 @@ async fn handle_dashboard_boxed(
             && path.starts_with("/api/grants/")
             && path.ends_with("/revoke-statement") =>
         {
-            // implementation-note-200 — test handler mirrors
+            // Test handler mirrors
             // the production per-statement revoke route.
             if !origin_ok(&headers, &state.expected_origin) {
                 error_response(403, "origin or referer header missing or mismatched")
@@ -474,7 +473,8 @@ async fn handle_dashboard_boxed(
                     .strip_prefix("/api/approvals/")
                     .unwrap()
                     .strip_suffix("/approve-always")
-                    .unwrap();
+                    .unwrap()
+                    .to_string();
                 // standing_grant_expires_at_capped: see sibling fix at
                 // dashboard.rs:3074 for the rationale (strict RFC-3339
                 // + 29 days to stay safely inside MAX_GRANT_TTL_SECS).
@@ -482,19 +482,18 @@ async fn handle_dashboard_boxed(
                     let twenty_nine_days = chrono::Utc::now() + chrono::Duration::days(29);
                     Some(twenty_nine_days.to_rfc3339())
                 };
-                match state.store.resolve_approval(
+                resolve_approval_via_dashboard(
+                    state,
+                    req,
                     id,
-                    &ApprovalOutcome::Always {
+                    ApprovalOutcome::Always {
                         scope: None,
                         expires_at,
                     },
-                ) {
-                    Ok(()) => json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({"approved": true, "standing_grant_created": true}),
-                    ),
-                    Err(e) => error_response(400, &e.to_string()),
-                }
+                    "approved",
+                    true,
+                )
+                .await
             }
         }
 
@@ -555,7 +554,7 @@ async fn handle_dashboard_boxed(
             }
         }
 
-        // implementation-note-195 — dismiss (test handler)
+        // Dismiss (test handler)
         _ if method == Method::POST
             && path.starts_with("/api/approvals/")
             && path.ends_with("/dismiss") =>
@@ -665,7 +664,7 @@ async fn handle_dashboard_boxed(
         }
 
         // 69K.7: grant detail
-        // implementation-note-194 — test handler mirrors
+        // Test handler mirrors
         // production by routing through `grant_to_json_with_store`, so
         // /api/grants/{id} emits the canonical `statements` array (same
         // shape as /api/grants and /api/grants/all).
@@ -830,7 +829,7 @@ async fn handle_dashboard_boxed(
             }
         }
 
-        // implementation-note-197 — test handler for `/api/receipts/stream`.
+        // Test handler for `/api/receipts/stream`.
         // Mirrors the production single-shot SSE snapshot so route
         // tests can assert content-type + framing without spinning
         // up a real listener.
@@ -919,7 +918,7 @@ async fn handle_dashboard_boxed(
             }
         }
 
-        // implementation-note-192 — test handler mirrors the
+        // Test handler mirrors the
         // production `/api/receipts/search` route so `searchReceipts`-
         // style tests can assert filter behavior without spinning up a
         // real listener.
@@ -1060,7 +1059,7 @@ async fn unknown_path_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-// implementation-note-107: the old `/api/webauthn/challenge` stub
+// The old `/api/webauthn/challenge` stub
 // (returns random bytes the client claims it signed) is gone;
 // the new flow is `/api/webauthn/{register,auth}/{begin,complete}`
 // with real signature verification at finish time. The new flow's
@@ -1070,7 +1069,7 @@ async fn unknown_path_returns_404() {
 // `qember.sh demo headless` (which uses the CLI biometric path
 // that also honors `EMBER_DISABLE_BIO=1`).
 
-/// implementation-note-201 — `resolve_approval_with_biometric` records the
+/// `resolve_approval_with_biometric` records the
 /// biometric flag + credential_id in the audit log so an auditor can
 /// distinguish hardware-attested approvals from click-throughs.
 #[tokio::test]
@@ -1157,7 +1156,7 @@ async fn api_grants_returns_created_grant() {
     assert_eq!(arr[0]["persona_id"], persona.id);
 }
 
-/// implementation-note-194 — /api/grants list must include the
+/// /api/grants list must include the
 /// per-Statement array under the canonical field name `statements`
 /// (matching grant_to_json_with_store / /api/grants/all / /api/grants/{id})
 /// so the dashboard JS can render real scope + budget for multi-statement
@@ -1238,7 +1237,7 @@ async fn api_grants_list_includes_statements_for_composite_grant() {
         .expect("statements must be an array");
     assert_eq!(stmts_field.len(), 2, "should have 2 statements");
 
-    // implementation-note-194 — assert the legacy
+    // Assert the legacy
     // `composite_statements` field is gone from /api/grants. The list
     // endpoint must align on `statements` (the canonical name used by
     // /api/grants/all and /api/grants/{id}).
@@ -1264,7 +1263,7 @@ async fn api_grants_list_includes_statements_for_composite_grant() {
     assert!(sb["budget"].is_null(), "SB budget must be null");
 }
 
-/// implementation-note-194 — /api/grants list and
+/// /api/grants list and
 /// /api/grants/{id} detail must emit the per-Statement array under the
 /// same field name (`statements`). Without this, dashboard JS callers
 /// have to fall back through `g.statements || g.composite_statements`
@@ -1347,7 +1346,7 @@ async fn api_grants_list_and_detail_field_shapes_match() {
         "/api/grants/{{id}} must emit `statements` as an array"
     );
 
-    // dashboard_agent_tree_view_promoted — implementation-note-202
+    // dashboard_agent_tree_view_promoted
     // Slice A: list + detail must both expose parent_persona_id,
     // parent_persona_name, and revoked_sids so the Active Agents tile
     // can render the delegation tree + inline revoke without a
@@ -1896,7 +1895,7 @@ async fn approval_deep_link_approve_without_csrf_returns_403() {
 
 #[tokio::test]
 async fn approval_deep_link_renders_composite_breakdown_inline() {
-    // implementation-note-189 — the dedicated /approvals/{id} page must
+    // The dedicated /approvals/{id} page must
     // surface the full per-statement breakdown inline, never gated
     // behind a "Show details" disclosure. The operator must never be
     // one click away from approving authority chains they cannot see.
@@ -1975,7 +1974,7 @@ async fn approval_deep_link_renders_composite_breakdown_inline() {
     assert!(s.contains("Deny"));
 }
 
-// --- implementation-note-189 — composite render polish ---
+// --- composite render polish ---
 
 #[tokio::test]
 async fn composite_statements_js_handles_internally_tagged_resource_selector() {
@@ -2109,7 +2108,7 @@ fn approval_page_escapes_agent_controlled_fields() {
 
 #[tokio::test]
 async fn dashboard_card_template_routes_composite_through_detail_review() {
-    // implementation-note-189 — composite approvals are multi-statement
+    // Composite approvals are multi-statement
     // chains; the dashboard pending-approvals card only shows the
     // summary ("composite (N statements)"), not the breakdown. The
     // operator must never approve a chain they cannot see, so the
@@ -2143,7 +2142,7 @@ async fn dashboard_card_template_routes_composite_through_detail_review() {
 
 #[tokio::test]
 async fn composite_statement_render_drops_on_star_for_any_resource() {
-    // implementation-note-189 — `time:wall_clock on * · 90s` reads as
+    // `time:wall_clock on * · 90s` reads as
     // technical noise; time isn't bound to a resource. When the
     // selector resolves to wildcard, the JS render now elides the
     // `on *` clause. Assert the shipped helper contains the elision
@@ -2251,7 +2250,7 @@ async fn approval_detail_page_renders_composite_action_label() {
 
 #[tokio::test]
 async fn approval_detail_page_renders_persona_name_with_identifier() {
-    // implementation-note-189 — Persona field shows "<name> <identifier>"
+    // Persona field shows "<name> <identifier>"
     // so the operator sees both the human-friendly handle (e.g.
     // `qa`) and the unique persona-id suffix used in audit logs
     // and grant chains. The previous "name only" rendering hid the
@@ -2280,7 +2279,7 @@ async fn approval_detail_page_renders_persona_name_with_identifier() {
 
 #[tokio::test]
 async fn dashboard_html_inlines_shared_composite_helper() {
-    // implementation-note-188 — the dashboard pending-approvals card and
+    // The dashboard pending-approvals card and
     // the dedicated /approvals/{id} page share a single JS helper for
     // rendering the composite-statement breakdown. Assert the helper is
     // baked into the dashboard HTML so the two surfaces cannot drift.
@@ -2400,6 +2399,11 @@ async fn api_approvals_approve_always_endpoint_works() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["approved"], true);
     assert_eq!(json["standing_grant_created"], true);
+    assert_eq!(
+        json["biometric"], false,
+        "test fixture has no WebAuthn gate, but approve-always must still route through the shared approval helper"
+    );
+    assert_eq!(json["credential_id"], serde_json::Value::Null);
 
     // Approval should be resolved
     let resolved = state.store.get_approval(&req.id).unwrap();
@@ -2638,7 +2642,7 @@ async fn sse_endpoint_unknown_grant_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-// implementation-note-197 — `/api/receipts/stream` is the live receipts panel
+// `/api/receipts/stream` is the live receipts panel
 // SSE feed. Empty-store path must still return 200 + event-stream
 // content-type so the EventSource client transitions to `open`.
 #[tokio::test]
@@ -3250,7 +3254,7 @@ fn origin_ok_mismatched_referer_fails() {
     assert!(!origin_ok(&h, "http://127.0.0.1:3141"));
 }
 
-// --- implementation-note-107 follow-up: loopback aliases ---
+// --- loopback aliases ---
 // The dashboard binds to 127.0.0.1, but the WebAuthn rp_id is pinned to
 // `localhost`, so a browser following the WebAuthn flow sends
 // `Origin: http://localhost:<port>`. Both forms are the same loopback
@@ -3387,7 +3391,7 @@ async fn post_approve_with_matching_referer_only_passes_origin_check() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-// --- implementation-note-195: dismiss endpoint ---
+// --- dismiss endpoint ---
 
 #[tokio::test]
 async fn dismiss_approval_returns_200_and_removes_from_pending() {
@@ -3464,7 +3468,7 @@ async fn dismiss_approval_without_csrf_returns_403() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
-// --- implementation-note-172: audit action_filter query param ---
+// --- audit action_filter query param ---
 
 #[tokio::test]
 async fn audit_action_filter_returns_only_matching_prefix() {
@@ -3517,7 +3521,7 @@ async fn audit_action_filter_empty_returns_all() {
     assert_eq!(arr.len(), 2, "empty filter returns all events");
 }
 
-// --- implementation-note-203: /api/receipts endpoint ---
+// --- /api/receipts endpoint ---
 
 /// Ensure the receipts singleton identity is active (mirrors receipt.rs
 /// test helper) so revoke_grant can emit signed receipts.
@@ -3739,7 +3743,7 @@ async fn api_receipts_persona_filter_isolates_results() {
 
 #[tokio::test]
 async fn receipts_search_persona_isolates_rows() {
-    // implementation-note-192 — `/api/receipts/search?persona=`
+    // `/api/receipts/search?persona=`
     // must surface only receipts whose persona_id matches.
     ensure_receipt_identity();
     let state = make_state();
@@ -4336,7 +4340,7 @@ async fn dashboard_html_contains_zero_state_first_receipt_panel() {
 
 #[tokio::test]
 async fn approval_page_no_longer_has_narrow_button() {
-    // implementation-note-204: disabled Narrow button was removed for clean screenshots.
+    // The disabled Narrow button was removed for clean screenshots.
     let state = make_state();
     let persona = state.store.create_persona("agent-narrow-check").unwrap();
     let req = state
@@ -4360,7 +4364,7 @@ async fn approval_page_no_longer_has_narrow_button() {
     );
 }
 
-/// implementation-note-201 — `/settings/passkeys` returns the enrollment page with
+/// `/settings/passkeys` returns the enrollment page with
 /// expected content so operators can register their platform authenticator.
 #[tokio::test]
 async fn settings_passkeys_returns_enrollment_page() {
@@ -4394,7 +4398,7 @@ async fn settings_passkeys_returns_enrollment_page() {
     );
 }
 
-/// implementation-note-107 — the `/approvals/{id}` page wires the real
+/// The `/approvals/{id}` page wires the real
 /// auth/begin → navigator.credentials.get → POST/<action> ceremony
 /// into the resolve() function so Approve/Deny calls carry a verified
 /// WebAuthn assertion (same as the main dashboard cards).
@@ -4425,9 +4429,29 @@ async fn approval_page_resolve_calls_webauthn_ceremony() {
         html.contains("challenge_id"),
         "/approvals/{{id}} page must forward the challenge_id from auth/begin"
     );
+    assert!(
+        html.contains(
+            "const needsBio = action === 'approve' || action === 'deny' || action === 'approve-always';"
+        ),
+        "/approvals/{{id}} page must require WebAuthn before approve-always creates a standing grant"
+    );
 }
 
-/// implementation-note-188 — the `/approvals/{id}` dedicated page must
+#[test]
+fn dashboard_approve_always_uses_webauthn_ceremony() {
+    assert!(
+        DASHBOARD_HTML.contains("if(await approveOrDeny(id, 'approve-always')) loadDashboard();"),
+        "main dashboard approve-always must use the same WebAuthn ceremony as approve/deny"
+    );
+    assert!(
+        !DASHBOARD_HTML.contains(
+            "fetch(`/api/approvals/${id}/approve-always`,{method:'POST',headers:CSRF_HEADERS})"
+        ),
+        "approve-always must not bypass the WebAuthn helper with a bare CSRF-only POST"
+    );
+}
+
+/// The `/approvals/{id}` dedicated page must
 /// expose composite_statements via the polled JSON AND embed the shared
 /// renderCompositeStatements helper so the breakdown renders identically
 /// to the main dashboard card. This is the YC-partner deep-link path.

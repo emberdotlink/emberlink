@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-370 (M10 of design) — T2/T3
+//! implementation-note-267 (M10 of design) — T2/T3
 //! happy-path coverage for the bridge cert refresh protocol.
 //!
 //! Anchor: `daemon_bridge_t2_t3_refresh_tests_landed`.
@@ -46,7 +46,7 @@
 //! ## T2 — client-side refresh band timing (pure math)
 //!
 //! design §Component 1 Table 1 locks the client-side refresh band
-//! timer at 50% / 75% / 90% / 99% TTL elapsed. The M6 client (`implementation-note-274-
+//! timer at 50% / 75% / 90% / 99% TTL elapsed. The M6 client (`implementation-note-254-
 //! EMBERLINK-MCP-CERT-REFRESH-CLIENT` — not yet shipped at M10 land) is
 //! the consumer. `refresh_band_timing_*_t2` locks the band-math
 //! invariants the M6 scheduler will load-bear against, so a future M6
@@ -527,7 +527,7 @@ async fn refresh_cert_with_pinned_expired_cert_is_denied_t2() {
 //
 // design §Component 1 Table 1 locks the band timer at 50% / 75% / 90%
 // / 99% of TTL elapsed (`not_before + total * band_pct`). The M6
-// client (implementation-note-371 — ready, not yet
+// client (implementation-note-268 — ready, not yet
 // shipped at M10 land) is the scheduler. Lock the band-math invariants
 // here so any future M6 implementation that drifts from the table
 // surfaces at `cargo test` time. Mirrors the existing 90% deadline

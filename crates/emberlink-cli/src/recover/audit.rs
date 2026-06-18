@@ -9,11 +9,8 @@
 //!   broken segment (design v2)
 //!
 //! F-code surface:
-//! - `F-implementation-note-174` — disk full; force-rotate the active audit-chain segment.
+//! - `F-implementation-note-145` — disk full; force-rotate the active audit-chain segment.
 //!
-//! ## Checkpoint for `target_state_anchor`
-//!
-//! `recover_f_audit_1_landed` — F-implementation-note-174 disk-full force-rotate.
 
 use clap::{Args, ValueEnum};
 
@@ -27,11 +24,11 @@ pub struct RecoverAuditArgs {
     pub scope: Option<AuditScope>,
 
     /// Target a specific F-code recovery action directly.
-    /// `F-implementation-note-174` force-rotates the audit segment to free SQLite space.
+    /// `F-implementation-note-145` force-rotates the audit segment to free SQLite space.
     #[arg(long, value_name = "F_CODE", id = "audit_f_code")]
     pub f_code: Option<String>,
 
-    /// Required for `--f-code F-implementation-note-174`: acknowledge that you understand
+    /// Required for `--f-code F-implementation-note-145`: acknowledge that you understand
     /// rotation creates a new segment and old rows are NOT deleted (they
     /// remain in the SQLite file until you archive them). Prevents
     /// accidental invocation.
@@ -74,10 +71,10 @@ pub(crate) fn handle_with_context(args: RecoverAuditArgs, _ctx: &RecoverContext)
     // F-code dispatch takes priority over scope routing.
     if let Some(ref f_code) = args.f_code {
         return match f_code.to_ascii_uppercase().as_str() {
-            "F-implementation-note-174" => handle_f_audit_1(&args),
+            "F-implementation-note-145" => handle_f_audit_1(&args),
             other => Err(RecoverError::usage(format!(
                 "unknown F-code `{other}` for `ember recover audit`; \
-                 valid F-codes: F-implementation-note-174"
+                 valid F-codes: F-implementation-note-145"
             ))),
         };
     }
@@ -89,21 +86,21 @@ pub(crate) fn handle_with_context(args: RecoverAuditArgs, _ctx: &RecoverContext)
 
     println!(
         "ember recover audit (scope={scope}): scaffold only — per-F-code \
-         implementations land as implementation-note-450-* tasks ship. See \
-         `ember recover --explain F-implementation-note-174` (or 2) for the F-code-anchored runbook."
+         implementations land as implementation-note-353-* tasks ship. See \
+         `ember recover --explain F-implementation-note-145` (or 2) for the F-code-anchored runbook."
     );
     note_receipt_contract("audit", &scope);
     Ok(RecoverOutcome::ok())
 }
 
 // ---------------------------------------------------------------------------
-// F-implementation-note-174 — Disk full; force-rotate the active audit-chain segment
+// F-implementation-note-145 — Disk full; force-rotate the active audit-chain segment
 // ---------------------------------------------------------------------------
 //
 // recover_f_audit_1_landed
 //
-// design §F-implementation-note-174: daemon refuses any new broker_exec with "audit store
-// full." Recovery: `ember recover audit --f-code F-implementation-note-174 --force-rotate`
+// design §F-implementation-note-145: daemon refuses any new broker_exec with "audit store
+// full." Recovery: `ember recover audit --f-code F-implementation-note-145 --force-rotate`
 // forces a new segment via `DaemonStore::force_rotate_audit_segment`.
 //
 // SECURITY NOTE: this is security-lane code. It writes directly to the
@@ -126,7 +123,7 @@ pub(crate) fn handle_with_context(args: RecoverAuditArgs, _ctx: &RecoverContext)
 fn handle_f_audit_1(args: &RecoverAuditArgs) -> RecoverResult {
     if !args.force_rotate {
         return Err(RecoverError::usage(
-            "F-implementation-note-174 requires --force-rotate to confirm you understand:\n\
+            "F-implementation-note-145 requires --force-rotate to confirm you understand:\n\
              \n\
              - Rotation creates a new audit-chain segment.\n\
              - Rows in prior segments are NOT deleted; they remain in the SQLite file.\n\
@@ -138,7 +135,7 @@ fn handle_f_audit_1(args: &RecoverAuditArgs) -> RecoverResult {
         ));
     }
 
-    println!("ember recover audit F-implementation-note-174 — force-rotate audit segment");
+    println!("ember recover audit F-implementation-note-145 — force-rotate audit segment");
     println!();
 
     // ADVERSARIAL-REVIEW-20260612 #1 — Quarantine gate is dead in the CLI
@@ -148,7 +145,7 @@ fn handle_f_audit_1(args: &RecoverAuditArgs) -> RecoverResult {
     // quarantine). This preserves the spirit of the quarantine gate for the
     // out-of-band recovery path. We also warn the operator explicitly.
     eprintln!(
-        "  [warn] F-implementation-note-174 runs outside the daemon process. The daemon's quarantine \
+        "  [warn] F-implementation-note-145 runs outside the daemon process. The daemon's quarantine \
          state cannot be read from here. A chain-integrity pre-check is performed \
          before rotation to detect known-broken chains."
     );
@@ -193,7 +190,7 @@ fn handle_f_audit_1(args: &RecoverAuditArgs) -> RecoverResult {
     println!();
     println!("To restart the daemon after this rotation:\n  ember recover daemon --prod");
 
-    note_receipt_contract("audit", "F-implementation-note-174");
+    note_receipt_contract("audit", "F-implementation-note-145");
     Ok(RecoverOutcome::ok())
 }
 
@@ -238,7 +235,7 @@ fn pre_rotation_chain_check(store: &ember_daemon::infra::store::DaemonStore) -> 
                 "chain integrity check FAILED ({detail}); rotation refused.\n\
                  The chain is broken — force-rotating would hide the break in a closed segment.\n\
                  Fix the chain break first via `ember recover audit-chain --dry-run`,\n\
-                 then retry F-implementation-note-174."
+                 then retry F-implementation-note-145."
             )))
         }
         VerifyOutcome::ChainTopologyInvariantViolation {
@@ -338,12 +335,12 @@ mod tests {
     fn f_audit_1_requires_force_rotate_flag() {
         let args = RecoverAuditArgs {
             scope: None,
-            f_code: Some("F-implementation-note-174".into()),
+            f_code: Some("F-implementation-note-145".into()),
             force_rotate: false,
             db_path: None,
         };
         let result = handle(args);
-        let err = result.expect_err("F-implementation-note-174 without --force-rotate should error");
+        let err = result.expect_err("F-implementation-note-145 without --force-rotate should error");
         assert!(
             err.to_string().contains("--force-rotate"),
             "error should mention --force-rotate; got: {err}"
@@ -363,7 +360,7 @@ mod tests {
         let err = result.expect_err("f-audit-1 without --force-rotate should error");
         assert!(
             err.to_string().contains("--force-rotate"),
-            "case-insensitive dispatch reached F-implementation-note-174 handler; got: {err}"
+            "case-insensitive dispatch reached F-implementation-note-145 handler; got: {err}"
         );
     }
 
@@ -371,7 +368,7 @@ mod tests {
     fn unknown_f_code_returns_usage_error() {
         let args = RecoverAuditArgs {
             scope: None,
-            f_code: Some("F-implementation-note-451".into()),
+            f_code: Some("F-implementation-note-354".into()),
             force_rotate: false,
             db_path: None,
         };
@@ -398,7 +395,7 @@ mod tests {
         );
     }
 
-    /// F-implementation-note-174 with --force-rotate on an in-memory store completes successfully.
+    /// F-implementation-note-145 with --force-rotate on an in-memory store completes successfully.
     /// Uses the daemon's `DaemonStore::open_in_memory` for isolation.
     #[test]
     fn f_audit_1_force_rotate_on_in_memory_store_succeeds() {
@@ -463,7 +460,7 @@ mod tests {
         );
     }
 
-    /// F-implementation-note-174 twice produces two distinct new segments.
+    /// F-implementation-note-145 twice produces two distinct new segments.
     #[test]
     fn f_audit_1_two_rotations_produce_distinct_segments() {
         let store = ember_daemon::infra::store::DaemonStore::open_in_memory()

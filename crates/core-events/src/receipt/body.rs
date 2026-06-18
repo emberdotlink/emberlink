@@ -60,7 +60,7 @@ pub struct ClaimSegmentDigest {
 }
 
 /// Generic Receipt v2 body. Kind-specific extensions live in sibling modules
-/// (e.g. `receipt::cohort_a` will add `audit_gaps[]` per implementation-note-53).
+/// (e.g. `receipt::cohort_a` will add `audit_gaps[]` per implementation-note-34).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReceiptBody {
     pub claim_events: Vec<ClaimEvent>,

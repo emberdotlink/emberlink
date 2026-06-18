@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
-
 # MCP Integration
 
 `emberlink-mcp` is the MCP server for Emberlink’s daemon-backed authority
@@ -14,13 +9,14 @@ local daemon.
 Use MCP when you want daemon tools exposed directly into an MCP-capable agent
 environment.
 
-This is a different layer than `ember claude`:
+This is a different layer than the managed launchers:
 
 - `ember claude` is the canonical managed launcher path
+- `ember codex` is the supported advanced Codex launcher path
 - `emberlink-mcp` is the daemon tool surface exposed as MCP
 
 If you are choosing between surfaces, start with
-[Choose an integration surface](./choosing-an-integration-surface/).
+[Choose an integration surface](./choosing-an-integration-surface.md).
 
 ## Current truth
 
@@ -53,13 +49,20 @@ The current MCP shape looks like:
     "ember": {
       "command": "emberlink-mcp",
       "args": [
-        "--persona", "my-agent-persona",
-        "--daemon-socket", "${HOME}/.ember/run/daemon.sock"
+        "--persona", "my-agent-persona"
       ]
     }
   }
 }
 ```
+
+Do not pass `--daemon-socket` for a normal install. The default follows the
+installed daemon's platform socket.
+
+Override it only for non-standard installs. The current platform sockets are:
+
+- macOS: `/Library/Application Support/Emberlink/run/daemon.sock`
+- Linux: `/run/ember/daemon.sock`
 
 ## Daemon prerequisite
 
@@ -102,4 +105,4 @@ onboarding path for the pre-release operator story.
 
 ## Next page
 
-- [MCP tool reference](../reference/mcp-tools/)
+- [MCP tool reference](../reference/mcp-tools.md)

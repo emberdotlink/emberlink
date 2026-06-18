@@ -18,8 +18,7 @@
 //!   changes.
 //!
 //! - `@operator` → reserved; rejected with a structured error pointing
-//!   at the slice-E daemon signing-paths work
-//!   (`implementation-note-463`).
+//!   at the slice-E daemon signing-paths work.
 //!
 //! - `did:key:...` → reserved; rejected with a structured error
 //!   pointing at the slice-B grant-types work which carries the
@@ -66,10 +65,6 @@
 //! making the CLI safe to re-run. If the recovery is more involved,
 //! `ember recover authority --scope identity-root` is the entry point.
 //!
-//! Anchor: `identity_root_persona_cli_unified_rotate_landed`
-//! (the previous `trust_rotate_dev_ir_landed` is kept inline as a
-//! back-link to prior change's surface; the new checkpoint anchors this
-//! implementation-note-464 delta).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -81,9 +76,6 @@ use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
 use crate::dev::identity_root::fingerprint_of;
 use crate::trust::backup::KEYCHAIN_SERVICE;
 
-// identity_root_persona_cli_unified_rotate_landed — checkpoint anchoring
-// the implementation-note-464 delta.
-// Back-link to the predecessor: trust_rotate_dev_ir_landed (prior change).
 
 /// Canonical macOS Keychain label for the pre-rotation workstation
 /// Durable Persona signing seed. Same label as
@@ -116,11 +108,11 @@ pub enum PrincipalTarget {
     /// the rotation outcome.
     WorkstationDurablePersona { migration_hint: Option<String> },
     /// Operator-role Durable Persona — reserved; rotation lands in
-    /// slice E (implementation-note-463).
+    /// the slice-E daemon signing-paths work.
     OperatorDurablePersona,
     /// Self-parented root Principal addressed by did:key — reserved;
     /// resolution requires the Principal directory shipping in slice B
-    /// (implementation-note-465).
+    /// (the grant-types work).
     RootPrincipalById { did_key: String },
 }
 
@@ -274,7 +266,7 @@ pub fn run(
                 TrustRotateError::PrincipalRotationNotWired {
                     target: "operator-role Durable Persona",
                     detail:
-                        "lands in implementation-note-463"
+                        "lands in implementation-note-367"
                             .to_string(),
                 }
             );
@@ -287,7 +279,7 @@ pub fn run(
                     target: "root Principal by did:key",
                     detail: format!(
                         "Principal directory resolves '{did_key}' in \
-                         implementation-note-465"
+                         implementation-note-368"
                     ),
                 }
             );
@@ -407,9 +399,8 @@ pub fn run_rotate_workstation_durable_persona(
     };
 
     // Step 6: register with daemon. v0.3.0 keeps the existing
-    // `trust.rotate_dev_ir` RPC method name — slice E
-    // (implementation-note-463)
-    // owns any daemon-side method-name change. The CLI surface is
+    // `trust.rotate_dev_ir` RPC method name — the slice-E daemon
+    // signing-paths work owns any daemon-side method-name change. The CLI surface is
     // already principal-shaped; the wire name is implementation
     // detail.
     let registry_resp = call_trust_rotate_dev_ir(
@@ -533,9 +524,8 @@ fn resign_manifest(path: &Path, signer: &SigningKey) -> Result<(), TrustRotateEr
 /// decoded response body on success; surfaces structured errors on
 /// socket failure or RPC error.
 ///
-/// The method name stays `trust.rotate_dev_ir` for v0.3.0; slice E
-/// (`implementation-note-463`)
-/// owns the daemon-side rename. The CLI calls this only after
+/// The method name stays `trust.rotate_dev_ir` for v0.3.0; the slice-E
+/// daemon signing-paths work owns the daemon-side rename. The CLI calls this only after
 /// resolving the operator-supplied target to a workstation Durable
 /// Persona, so the wire payload is already Principal-shaped at the
 /// caller boundary.
@@ -836,9 +826,6 @@ mod tests {
         assert!(sig.starts_with("ed25519:"));
     }
 
-    // identity_root_persona_cli_unified_rotate_landed — three CLI
-    // dispatch tests required by the
-    // implementation-note-464 brief.
 
     #[test]
     fn trust_rotate_accepts_principal_id_or_label() {
@@ -959,11 +946,11 @@ mod tests {
         let err = TrustRotateError::PrincipalRotationNotWired {
             target: "operator-role Durable Persona",
             detail:
-                "lands in implementation-note-463"
+                "lands in implementation-note-367"
                     .to_string(),
         };
         let rendered = err.to_string();
         assert!(rendered.contains("operator-role Durable Persona"));
-        assert!(rendered.contains("implementation-note-463"));
+        assert!(rendered.contains("implementation-note-367"));
     }
 }

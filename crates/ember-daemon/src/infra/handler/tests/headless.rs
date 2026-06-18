@@ -712,9 +712,9 @@ async fn headless_revoke_prunes_headless_scope_rows() {
     );
 }
 
-// ─── implementation-note-242 ────────────────────
+// ─── implementation-note-178 ────────────────────
 //
-// implementation-note-243
+// implementation-note-179
 //
 // Coverage for the `headless_preflight_layer1` dispatch arm. The
 // resolver itself is exhaustively unit-tested in

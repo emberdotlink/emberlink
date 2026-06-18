@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-355 — T3 integration coverage
+//! implementation-note-255 — T3 integration coverage
 //! for the bridge-CA publish-format reconciliation (Option A: emberd
 //! publishes both raw `bridge_ca.pub` and PEM `bridge_ca.pem`).
 //!
@@ -227,7 +227,7 @@ async fn emberd_published_pem_loads_into_ember_rpc_listener_and_handshake_green(
     };
     let listener_handle = Listener::spawn(config).await.expect(
         "ember-rpc Listener::spawn must succeed against emberd's published bridge_ca.pem \
-         (implementation-note-355)",
+         (implementation-note-255)",
     );
     // Give the accept loop a moment to install.
     tokio::time::sleep(Duration::from_millis(50)).await;

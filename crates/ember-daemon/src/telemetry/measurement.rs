@@ -4,10 +4,10 @@
 //!
 //! Anchor: `empirical_sample_pre_v031_retune_landed`
 //!
-//! Per `implementation-note-223` (`release-checklist`) and design:
+//! Per `implementation-note-240` (`release-checklist`) and design:
 //! emberd collects daemon-local, anonymized structural metrics during the
 //! v0.3.0 friendly-drop window so v0.3.1 cohort retune decisions
-//! (`implementation-note-352`) ride on data, not guesses.
+//! (`implementation-note-252`) ride on data, not guesses.
 //!
 //! ## Five measurement categories
 //!

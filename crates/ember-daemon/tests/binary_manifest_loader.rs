@@ -7,7 +7,7 @@
 //! that legitimately need filesystem I/O against the signed-manifest reader is
 //! a T2 integration file like this one.
 //!
-//! Refiled per `implementation-note-125`. Tests cover:
+//! Refiled per `implementation-note-261`. Tests cover:
 //! - TOML round-trip via `load_manifest`
 //! - sidecar-signature verifier happy / tampered / missing-sidecar paths
 //! - trust-root SET parameterization (release-only / release+dev / release+N /

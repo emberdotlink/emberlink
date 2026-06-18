@@ -1,5 +1,5 @@
 //! emberlink_mcp_mtls_client_handshake — T2 smoke tests for the
-//! implementation-note-485 in-container bridge transport.
+//! implementation-note-388 in-container bridge transport.
 //!
 //! Mirrors the test substrate in `crates/ember-rpc/tests/listener_smoke.rs`:
 //! in-test CA + leaf certs minted via `rcgen`, no PEM fixtures committed
@@ -437,7 +437,7 @@ fn loaded_client_cert_parses_validity_window() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-486 (M7) — T2 cert-swap tests.
+// implementation-note-389 (M7) — T2 cert-swap tests.
 //
 // Anchor: `emberlink_mcp_cert_swap_landed`. These cases exercise the
 // hot-update path for the in-container `rustls::ClientConfig`:
@@ -699,10 +699,10 @@ fn cert_swap_to_untrusted_ca_causes_handshake_failure() {
 fn swap_client_config_visible_across_cloned_bridge_configs() {
     // emberlink_mcp_cert_swap_landed (unit). `MtlsBridgeConfig` is
     // `Clone`; the outer `Arc<RwLock<Arc<ClientConfig>>>` is what
-    // propagates a swap to every clone (production has the DaemonClient
-    // adapter + the McpServer receipt transport each cloning the same
-    // bridge_config in main.rs). This unit-shape test stages two clones
-    // and verifies a swap on one is visible from the other.
+    // propagates a swap to every clone (production has the bridge refresh
+    // client and the McpServer transport each cloning the same bridge_config
+    // in main.rs). This unit-shape test stages two clones and verifies a swap
+    // on one is visible from the other.
     let ca = mint_test_ca("clone-visibility-ca");
     let leaf_a = mint_leaf_cert(&ca, "client-a", false, Vec::new());
     let leaf_b = mint_leaf_cert(&ca, "client-b", false, Vec::new());

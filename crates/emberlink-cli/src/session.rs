@@ -29,6 +29,8 @@ pub enum OpenSurface {
     Codex,
     #[value(name = "cursor")]
     Cursor,
+    #[value(name = "gemini")]
+    Gemini,
 }
 
 // ===========================================================================
@@ -120,6 +122,18 @@ pub const HARNESSES: &[HarnessSpec] = &[
         open: cmd_session_open_cursor,
         launch_host: cursor_launch_host_for_worktree,
         launch_sandvault: cursor_launch_sandvault_for_worktree,
+    },
+    HarnessSpec {
+        surface: OpenSurface::Gemini,
+        command: "ember gemini",
+        display_name: "Gemini",
+        label: "gemini",
+        example: "ember gemini --worktree archie --purpose \"GitHub setup friction\" -- --help",
+        harness_kind: HarnessKind::Gemini,
+        known_subcommand: None,
+        open: cmd_session_open_gemini,
+        launch_host: gemini_launch_host_for_worktree,
+        launch_sandvault: gemini_launch_sandvault_for_worktree,
     },
 ];
 
@@ -217,6 +231,34 @@ fn cursor_launch_sandvault_for_worktree(
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "`ember cursor --sandbox sandvault` is not wired yet; baseline Cursor launch is host-only until a governed loopback-projector mediation lane is designed"
+            .into(),
+    )
+}
+
+fn gemini_launch_host_for_worktree(
+    request: &OpenRequest,
+    workspace_ref: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    launch_gemini_host(
+        request.lane,
+        request.authority_strict,
+        request.delegated_template.as_deref(),
+        request.attach_runtime_persona_id.as_deref(),
+        &request.extra_args,
+        Some(workspace_ref),
+    )
+}
+
+fn gemini_launch_sandvault_for_worktree(
+    _request: &OpenRequest,
+    _prepared_path: &std::path::Path,
+    _workspace_ref: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // design §2: the gemini Code Assist loopback proxy is HOST-only (the daemon
+    // returns no per-session proxy URL for container sessions yet), so sandvault
+    // placement fails closed rather than launching without credential brokering.
+    Err(
+        "`ember gemini --sandbox sandvault` is not wired yet; the brokered Gemini Code Assist lane is host-only until a container-side loopback-projector mediation lane is designed"
             .into(),
     )
 }
@@ -733,6 +775,43 @@ pub fn cursor_alias_request_with_sandvault(
 ) -> Result<OpenRequest, String> {
     build_open_request_with_sandvault(
         OpenSurface::Cursor,
+        dev,
+        host,
+        isolated,
+        sandvault,
+        authority_strict,
+        delegated_template,
+        attach_runtime_persona_id,
+        fork_runtime,
+        backend_hint,
+        preset,
+        worktree,
+        branch,
+        purpose,
+        extra_args.to_vec(),
+    )
+}
+
+// RPC/plumbing signature — threads CLI flags to the constructor; structurally many params.
+#[allow(clippy::too_many_arguments)]
+pub fn gemini_alias_request(
+    dev: bool,
+    host: bool,
+    isolated: bool,
+    sandvault: bool,
+    authority_strict: bool,
+    delegated_template: Option<String>,
+    attach_runtime_persona_id: Option<String>,
+    fork_runtime: bool,
+    backend_hint: Option<String>,
+    preset: Option<String>,
+    worktree: Option<String>,
+    branch: Option<String>,
+    purpose: Option<String>,
+    extra_args: &[String],
+) -> Result<OpenRequest, String> {
+    build_open_request_with_sandvault(
+        OpenSurface::Gemini,
         dev,
         host,
         isolated,
@@ -1718,6 +1797,96 @@ fn launch_cursor_host(
         crate::claude_code_launcher::child_workspace_ref_for_launch(&env, workspace_ref);
     let code =
         crate::launcher::cursor::launch_cursor_with_shadow_dir_and_constructs_with_workspace_ref(
+            extra_args,
+            &env.ember_daemon_socket,
+            &env.shadow_root,
+            &bin,
+            &persona,
+            &construct_specs,
+            authority_strict,
+            delegated_template,
+            attach_runtime_persona_id,
+            child_workspace_ref.as_deref(),
+        )?;
+    std::process::exit(code);
+}
+
+fn cmd_session_open_gemini(request: &OpenRequest) -> Result<(), Box<dyn std::error::Error>> {
+    // design §2: the brokered Gemini Code Assist lane is host-only (the daemon's
+    // per-session loopback proxy is host-bound). Isolated/sandvault fail closed.
+    match request.lane {
+        OpenLane::Dev => {
+            maybe_reexec_via_dev_cli()?;
+            match request.placement {
+                OpenPlacement::Host | OpenPlacement::Auto => launch_gemini_host(
+                    request.lane,
+                    request.authority_strict,
+                    request.delegated_template.as_deref(),
+                    request.attach_runtime_persona_id.as_deref(),
+                    &request.extra_args,
+                    None,
+                ),
+                OpenPlacement::Isolated => Err(
+                    "isolated `session open gemini --dev` is not wired yet; the brokered Gemini Code Assist lane is host-only"
+                        .into(),
+                ),
+                OpenPlacement::Sandvault => Err(
+                    "`ember gemini --sandbox sandvault --dev` is not wired yet; the brokered Gemini Code Assist lane is host-only"
+                        .into(),
+                ),
+            }
+        }
+        OpenLane::Prod => match request.placement {
+            OpenPlacement::Host | OpenPlacement::Auto => launch_gemini_host(
+                request.lane,
+                request.authority_strict,
+                request.delegated_template.as_deref(),
+                request.attach_runtime_persona_id.as_deref(),
+                &request.extra_args,
+                None,
+            ),
+            OpenPlacement::Isolated => Err(
+                "isolated `ember gemini` is not wired yet; the brokered Gemini Code Assist lane is host-only until a container-side mediation lane is designed"
+                    .into(),
+            ),
+            OpenPlacement::Sandvault => Err(
+                "`ember gemini --sandbox sandvault` is not wired yet; the brokered Gemini Code Assist lane is host-only until a container-side mediation lane is designed"
+                    .into(),
+            ),
+        },
+    }
+}
+
+fn launch_gemini_host(
+    lane: OpenLane,
+    authority_strict: bool,
+    delegated_template: Option<&str>,
+    attach_runtime_persona_id: Option<&str>,
+    extra_args: &[String],
+    workspace_ref: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let flavor = match lane {
+        OpenLane::Prod => crate::claude_code_launcher::Flavor::Prod,
+        OpenLane::Dev => crate::claude_code_launcher::Flavor::Dev,
+    };
+    let env = crate::claude_code_launcher::build_launch_env(flavor)?;
+    crate::claude_code_launcher::ping_daemon(&env, flavor)?;
+    if let Some(message) = env.runtime_banner.as_deref() {
+        eprintln!("{message}");
+    }
+
+    let bin = crate::launcher::gemini::resolve_gemini_bin_path()?
+        .to_string_lossy()
+        .into_owned();
+    let persona = crate::launcher::gemini::resolve_persona_name();
+    let construct_specs = match lane {
+        OpenLane::Prod => crate::launcher::gemini::prod_construct_specs_or_error()?,
+        OpenLane::Dev => crate::launcher::claude_code::cohort_a_construct_specs(),
+    };
+    let child_workspace_ref =
+        crate::claude_code_launcher::child_workspace_ref_for_launch(&env, workspace_ref);
+    let code =
+        crate::launcher::gemini::launch_gemini_with_shadow_dir_and_constructs_with_workspace_ref(
             extra_args,
             &env.ember_daemon_socket,
             &env.shadow_root,

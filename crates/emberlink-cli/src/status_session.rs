@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-438 — `ember status --session`
+//! implementation-note-342 — `ember status --session`
 //! operator attestation that the current shell session IS brokered.
 //!
 //! design follow-up: today the only way to confirm a Claude Code session is
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn dev_prod_parity_attestation_surface_landed() {
         // Marker test — the function name itself is the checkpoint.
-        // implementation-note-438 landed when this test
+        // implementation-note-342 landed when this test
         // exists alongside the renderer + dispatch wiring.
     }
 }

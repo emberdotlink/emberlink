@@ -3,7 +3,7 @@
 //! test-substrate leaking into release artifacts.
 //!
 //! CLI-VERSION-FLAG: the daemon startup log line records both so a stale
-//! binary running against a newer codebase (the implementation-note-117
+//! binary running against a newer codebase (the implementation-note-100
 //! root cause) is identifiable in seconds.
 //!
 //! See `crates/emberlink-cli/build.rs` for the same algorithm — duplicated
@@ -20,7 +20,7 @@
 //!    artifacts. Triggered when `CARGO_FEATURE_QA_MOCK` is set AND
 //!    `EMBER_RELEASE=1`.
 //!
-//! 2. **`implementation-note-118`** (Tier A §A3,
+//! 2. **`implementation-note-101`** (Tier A §A3,
 //!    audit 2026-06-14) — refuses a release build whose source
 //!    tree still carries live (i.e. not-`cfg(test)`-gated, not-doc,
 //!    not-deprecation-warn) runtime checks for the test-mode env vars
@@ -66,7 +66,7 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=EMBER_RELEASE");
 
-    // === implementation-note-118 ==========================
+    // === implementation-note-101 ==========================
     // Anchor: EMBER_BUILD_PROFILE. Closes Tier A §A3.
     //
     // Refuses a release build whose source tree still carries live runtime
@@ -90,7 +90,7 @@ fn main() {
         let violations = scan_for_unguarded_test_mode_env_vars(&crate_src);
         if !violations.is_empty() {
             let mut msg = String::from(
-                "implementation-note-118: refusing to \
+                "implementation-note-101: refusing to \
                  build ember-daemon with EMBER_BUILD_PROFILE=release while \
                  the source tree still carries live runtime checks for the \
                  test-mode env vars EMBER_VAULT_MOCK / EMBER_VAULT_DEV_MODE.\n\
@@ -133,6 +133,150 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
     println!("cargo:rerun-if-changed=src");
+
+    // === Warden Console single-origin SPA embed (design §D5) =================
+    // SECURITY-LANE. Generate a compile-time table of the built SvelteKit SPA
+    // (`crates/emberlink-gui/build/`) so the daemon can serve it in-memory from
+    // its own Hyper handler at :3141 — same origin as the authority API. Embed
+    // at compile time (not runtime FS serving) so the assets travel inside the
+    // signed binary and there is NO runtime filesystem path to traverse. When
+    // the build output is absent (fresh checkout / CI without a frontend build),
+    // an EMPTY table is generated and the daemon keeps serving its legacy
+    // dashboard — zero regression, the build never fails for lack of the SPA.
+    emit_spa_assets();
+}
+
+/// MIME type for a built SPA asset, by extension. Explicit allowlist; anything
+/// unrecognised is served as opaque bytes (never sniffed).
+fn spa_content_type(ext: &str) -> &'static str {
+    match ext {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "map" => "application/json; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "webmanifest" => "application/manifest+json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Recursively collect every regular file under `dir`, NEVER following
+/// symlinks. `DirEntry::file_type()` reports the entry's own type without a
+/// `stat` follow (unlike `Path::is_dir`/`is_file`, which call `metadata` and DO
+/// resolve symlinks). A symlink planted in the build dir by a compromised
+/// frontend toolchain (malicious npm/pnpm postinstall) must NOT be followed —
+/// otherwise `include_bytes!` would bake an arbitrary host file (vault, private
+/// key, ...) into the codesigned binary and serve it at :3141.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            println!(
+                "cargo:warning=ember-daemon SPA embed: skipping symlink {}",
+                entry.path().display()
+            );
+            continue;
+        }
+        let p = entry.path();
+        if ft.is_dir() {
+            collect_files(&p, out);
+        } else if ft.is_file() {
+            out.push(p);
+        }
+    }
+}
+
+/// Generate `${OUT_DIR}/spa_assets.rs` — a static table of
+/// `(url_path, &[u8] bytes, content_type)` produced via `include_bytes!` so the
+/// asset bytes live in the binary, referenced (not duplicated) from their build
+/// paths. The generated paths are our own build output; no external input
+/// reaches this, so there is no traversal surface. Absent build dir ⇒ empty
+/// table.
+fn emit_spa_assets() {
+    let manifest = PathBuf::from(env_or("CARGO_MANIFEST_DIR", "."));
+    // `crates/ember-daemon` → `crates/emberlink-gui/build`.
+    let build_dir = manifest
+        .parent()
+        .map(|p| p.join("emberlink-gui").join("build"))
+        .unwrap_or_else(|| PathBuf::from("../emberlink-gui/build"));
+
+    // Rebuild the table whenever the SPA output changes.
+    println!("cargo:rerun-if-changed={}", build_dir.display());
+
+    let out_dir = env_or("OUT_DIR", ".");
+    let dest = PathBuf::from(&out_dir).join("spa_assets.rs");
+
+    let mut files = Vec::new();
+    if build_dir.is_dir() {
+        let index = build_dir.join("index.html");
+        let index_has_csrf_placeholder = std::fs::read(&index)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).contains("{{CSRF_TOKEN}}"))
+            .unwrap_or(false);
+        if index_has_csrf_placeholder {
+            collect_files(&build_dir, &mut files);
+        } else {
+            println!(
+                "cargo:warning=ember-daemon SPA embed: ignoring {} because index.html is missing CSRF placeholder",
+                build_dir.display()
+            );
+        }
+    }
+    files.sort();
+
+    // Defense in depth on top of the symlink skip in `collect_files`: drop any
+    // collected path whose canonical form escapes the canonical build dir, so a
+    // path can never resolve outside the intended SPA tree before `include_bytes!`.
+    if let Ok(canon_root) = build_dir.canonicalize() {
+        files.retain(|p| match p.canonicalize() {
+            Ok(c) => c.starts_with(&canon_root),
+            Err(_) => false,
+        });
+    }
+
+    let mut src = String::new();
+    src.push_str("// @generated by build.rs — Warden Console SPA embed (design §D5).\n");
+    src.push_str("pub static SPA_ASSETS: &[(&str, &[u8], &str)] = &[\n");
+    for path in &files {
+        let Ok(rel) = path.strip_prefix(&build_dir) else {
+            continue;
+        };
+        // URL path is the build-relative path with forward slashes, leading `/`.
+        let url = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let ctype = spa_content_type(&ext);
+        let abs = path.to_string_lossy();
+        // `{:?}` emits a valid escaped Rust string literal for each path.
+        src.push_str(&format!(
+            "    ({:?}, include_bytes!({:?}), {:?}),\n",
+            url,
+            abs.as_ref(),
+            ctype
+        ));
+    }
+    src.push_str("];\n");
+
+    if let Err(e) = std::fs::write(&dest, src) {
+        panic!("build.rs: failed to write {}: {e}", dest.display());
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -162,8 +306,9 @@ const FORBIDDEN_NEEDLES: &[&str] = &[
 /// Recursively scan `dir` for `*.rs` files that contain `env::var("FOO")`
 /// where FOO is one of the forbidden test-mode env vars and the surrounding
 /// context is not one of the allowed safe contexts (doc comments,
-/// `#[cfg(test)]` blocks, `tracing::warn!` deprecation arms, or test
-/// modules nested under a `mod tests` heading).
+/// `#[cfg(test)]` blocks, `#[cfg(not(ember_release))]` blocks,
+/// `tracing::warn!` deprecation arms, or test modules nested under a
+/// `mod tests` heading).
 fn scan_for_unguarded_test_mode_env_vars(dir: &Path) -> Vec<Violation> {
     let mut out = Vec::new();
     let files = collect_rs_files(dir);
@@ -205,6 +350,7 @@ fn scan_file(rel_path: &str, text: &str, out: &mut Vec<Violation>) {
     // patterns currently in the ember-daemon source tree.
     let lines: Vec<&str> = text.lines().collect();
     let cfg_test_depths = compute_cfg_test_module_depths(&lines);
+    let cfg_not_ember_release_depths = compute_cfg_not_ember_release_depths(&lines);
     let warn_arm_ranges = compute_tracing_warn_ranges(&lines);
 
     for (idx, raw_line) in lines.iter().enumerate() {
@@ -228,6 +374,10 @@ fn scan_file(rel_path: &str, text: &str, out: &mut Vec<Violation>) {
         if cfg_test_depths[idx] {
             continue;
         }
+        // Allow helpers that are structurally absent from release builds.
+        if cfg_not_ember_release_depths[idx] {
+            continue;
+        }
         // Allow `tracing::warn!` deprecation arms (the v0.3 deprecation
         // warnings in `runtime.rs` mention the env-var name but do not
         // act on the value — they fire as soon as the var is set, with
@@ -248,6 +398,53 @@ fn scan_file(rel_path: &str, text: &str, out: &mut Vec<Violation>) {
             snippet: line.trim().to_string(),
         });
     }
+}
+
+/// For each line, return `true` if that line sits inside an item/block guarded
+/// by `#[cfg(not(ember_release))]`. The release-profile gate tells developers
+/// to use this shape when test/dev env-var behaviour must stay available in
+/// tests and local builds while being structurally absent from signed releases.
+fn compute_cfg_not_ember_release_depths(lines: &[&str]) -> Vec<bool> {
+    let mut out = vec![false; lines.len()];
+    let mut depth: i32 = 0;
+    let mut active: Vec<(i32, bool)> = Vec::new();
+    let mut pending = false;
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        let inside_cfg = active.iter().any(|(_d, t)| *t);
+        out[idx] = inside_cfg;
+
+        if line.starts_with("#[cfg(not(ember_release))") {
+            pending = true;
+        }
+
+        let opens = raw.chars().filter(|c| *c == '{').count() as i32;
+        let closes = raw.chars().filter(|c| *c == '}').count() as i32;
+
+        for open_idx in 0..opens {
+            depth += 1;
+            let is_cfg_scope = pending && open_idx == 0;
+            active.push((depth, is_cfg_scope));
+            if is_cfg_scope {
+                pending = false;
+            }
+        }
+        for _ in 0..closes {
+            if let Some((open_depth, _)) = active.last()
+                && *open_depth == depth
+            {
+                active.pop();
+            }
+            depth -= 1;
+        }
+
+        if pending && line.ends_with(';') {
+            pending = false;
+        }
+    }
+
+    out
 }
 
 /// For each line, return `true` if that line sits inside a module that

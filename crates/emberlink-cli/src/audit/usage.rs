@@ -41,7 +41,7 @@
 //! Cohort-aware ceilings require persona-class lookup which isn't wired
 //! into this MVP; we apply the dev0 default (5 GiB) universally and note
 //! the assumption in the output. The follow-up
-//! `implementation-note-401` covers the real
+//! `implementation-note-306` covers the real
 //! per-daemon ceiling resolution once the persona-class predicate lands.
 
 use std::fs;
@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 /// Default ceiling per design §C2 + cohort-defaults Knob 14 dev0 row.
 /// Cohort-tier ceilings (team0 50 GiB, ent0 per-policy) wire in once the
 /// operator-class predicate lands; tracking task
-/// `implementation-note-401`.
+/// `implementation-note-306`.
 const DEFAULT_CEILING_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 const WARN_THRESHOLD_PCT: u8 = 80;

@@ -1,26 +1,23 @@
 //! `ember binary list`
 //!
-//! Reads `~/.ember/binaries/manifest.toml` and prints a table of registered
-//! binaries.
+//! Reads the bundled system manifest, or an explicit `--manifest-path`, and
+//! prints a table of registered binaries.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ember_daemon::binary_manifest::load_manifest;
 
-fn manifest_path() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".ember")
-            .join("binaries")
-            .join("manifest.toml")
-    } else {
-        PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
-    }
+fn default_manifest_path() -> PathBuf {
+    ember_daemon::binary_manifest::bundled_install_dir().join("manifest.toml")
 }
 
-pub fn binary_list() -> Result<(), Box<dyn std::error::Error>> {
-    let path = manifest_path();
-    let manifest = load_manifest(&path)?;
+pub fn binary_list(manifest_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = manifest_path.unwrap_or_else(default_manifest_path);
+    binary_list_at(&manifest_path)
+}
+
+pub fn binary_list_at(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = load_manifest(path)?;
 
     if manifest.entries.is_empty() {
         println!("No binaries registered. Use 'ember binary install' to add one.");
@@ -80,13 +77,15 @@ mod tests {
         let toml_out = toml::to_string_pretty(&manifest).unwrap();
         std::fs::write(&manifest_path, toml_out).unwrap();
 
-        // SAFETY: test sets HOME to a tempdir before invoking binary_list.
-        // Single-threaded test; no concurrent env access.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        // binary_list_at writes to stdout; verify it doesn't error.
+        binary_list_at(&manifest_path).expect("list should succeed");
+    }
 
-        // binary_list writes to stdout; verify it doesn't error.
-        binary_list().expect("list should succeed");
+    #[test]
+    fn default_manifest_path_lands_in_bundled_system_dir() {
+        assert_eq!(
+            default_manifest_path(),
+            PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
+        );
     }
 }

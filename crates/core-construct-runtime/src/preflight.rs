@@ -4,14 +4,14 @@
 //! queued task that declares which Constructs (per design) it invokes,
 //! resolve the union of action permissions those Constructs require,
 //! cross-reference against the enrolled persona template, and report any
-//! gaps. Surface BEFORE automation runs the task, not after — predictive
+//! gaps. Surface BEFORE headless runs the task, not after — predictive
 //! layer atop the historical Layer 2 reader (already shipped at
 //! `crate::permission_gaps::recent_gaps_for_persona`).
 //!
 //! ## Phase 2 slice B (this slice) — manifest-backed resolver
 //!
 //! [`resolve_queued_task_permissions`] now consumes each task's
-//! `constructs` field (implementation-note-25) and a
+//! `constructs` field (implementation note) and a
 //! registry of parsed `construct.toml` manifests
 //! ([`crate::manifest::ConstructManifest`]). For every
 //! `"<construct>.<action>"` declaration the task carries, the resolver
@@ -30,7 +30,7 @@
 //! matches `kubectl.toml`'s `key = "kubectl.apply"` when the construct
 //! is `ember-kubectl`).
 //!
-//! implementation-note-26 — checkpoint for stale_check; do not remove.
+//! implementation note — checkpoint for stale_check; do not remove.
 //!
 //! CLASSIFICATION: PUBLIC
 
@@ -123,7 +123,7 @@ pub struct ResolvedActionIdentity {
 ///
 /// **Pre:** every entry in `tasks` is a `(task_id, task.constructs)` pair
 /// where each construct declaration is the
-/// implementation-note-25 shape
+/// implementation note shape
 /// `"<construct>.<action>"` (e.g. `"ember-gh.pr_merge"`,
 /// `"ember-kubectl.apply"`). `registry` maps a manifest's `[meta] name`
 /// (e.g. `"ember-gh"`) to its parsed [`ConstructManifest`].

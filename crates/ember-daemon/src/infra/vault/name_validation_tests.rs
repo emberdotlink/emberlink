@@ -56,7 +56,7 @@ fn accepts_max_depth() {
     assert!(validate_credential_name("a/b/c/d/e/f/g").is_ok());
 }
 
-/// implementation-note-318 Phase 1 — the v2 path grammar
+/// implementation-note-222 Phase 1 — the v2 path grammar
 /// (design §5.3) introduces credential-type intermediate segments like
 /// `github/apps/<slug>/install-<id>/private-key` which are 5 segments
 /// deep. The previous `> 4` cap rejected these; the lifted `> 7` cap

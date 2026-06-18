@@ -12,6 +12,7 @@ sha2.workspace = true
 hex = "0.4"
 
 [dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true

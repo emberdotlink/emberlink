@@ -2,7 +2,7 @@
 //! .B: Tier 1/2 approvals consult an attester before flipping
 //! approved state. Real macOS SE wiring deferred to .B-SE-WIRE.
 //!
-//! implementation-note-38 (design note D2):
+//! implementation-note-25 (design note D2):
 //! [`bind_presence_challenge`] (a.k.a. `presence_challenge_bind`) computes the
 //! per-request challenge that the browser presence prompter signs. The challenge
 //! is `SHA-256` over the length-prefixed canonical encoding of
@@ -270,7 +270,7 @@ fn write_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// implementation-note-39
+// implementation-note-26
 // (design note D2)
 // ---------------------------------------------------------------------------
 //
@@ -566,7 +566,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-39 tests — wire-format
+    // implementation-note-26 tests — wire-format
     // round-trip + ChallengeBinding determinism.
     // -----------------------------------------------------------------
 

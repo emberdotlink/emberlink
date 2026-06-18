@@ -95,7 +95,7 @@ fn resolve_home_dir() -> Option<PathBuf> {
         .or_else(dirs_next::home_dir)
 }
 
-/// implementation-note-396 — container runtime engines `ember up`
+/// implementation-note-301 — container runtime engines `ember up`
 /// detects on the host. Order tracks design review 2026-05-15 compose-
 /// topology D7 (Docker first, then OrbStack on macOS, then Podman, then
 /// the SCION ephemeral runtime).
@@ -456,7 +456,7 @@ pub enum AutoUpdateOutcome {
 
 /// Auto-update check before container start
 /// (`ember_up_auto_update_b_launcher_integration` — subtask B of
-/// `implementation-note-467`).
+/// `implementation-note-370`).
 ///
 /// Pure orchestration over the existing `ember_update::auto_update::decide_update`
 /// decision function. Network fetching of the channel pointer + the
@@ -583,7 +583,7 @@ pub fn open_claude_code_isolated(
     }
 
     eprintln!(
-        "note: bridge cert provisioning + `bridge-cli ping` healthcheck land once implementation-note-468 wires the daemon presence RPC. The compose stack is up; the trust handshake is not yet enforced from this verb."
+        "note: bridge cert provisioning + `bridge-cli ping` healthcheck land once implementation-note-371 wires the daemon presence RPC. The compose stack is up; the trust handshake is not yet enforced from this verb."
     );
     println!("\nember up: session ready (profile={})", prepared.profile);
     Ok(())
@@ -792,7 +792,7 @@ pub fn launch_harness_isolated(request: IsolatedHarnessLaunch) -> io::Result<i32
     let binary = match request.harness {
         HarnessKind::Claude => claude_container_binary_path()?,
         HarnessKind::Codex => codex_container_binary_path(&request)?,
-        HarnessKind::Cursor | HarnessKind::Other => {
+        HarnessKind::Cursor | HarnessKind::Gemini | HarnessKind::Other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "isolated launcher only supports Claude and Codex",
@@ -1556,7 +1556,7 @@ fn resolve_workspace_repo_root(workspace_root: &Path) -> io::Result<PathBuf> {
 /// with the supplied per-run context variables. Returns the rendered
 /// YAML as a UTF-8 string.
 ///
-/// implementation-note-396: uses minijinja's strict-undefined mode so
+/// implementation-note-301: uses minijinja's strict-undefined mode so
 /// missing required variables surface as render errors at boot time
 /// rather than silently leaving the template with `{{ var }}` markers
 /// that `docker compose` would refuse to parse later.
@@ -1646,7 +1646,7 @@ pub struct ComposeRenderContext {
     /// process's effective GID. Distinct from `host_uid`: on macOS the
     /// typical user has uid=501 / gid=20 (staff), so defaulting GID to
     /// UID silently miswrites container ownership.
-    /// Per implementation-note-469.
+    /// Per implementation-note-372.
     pub host_gid: u32,
     /// Stable agent identifier used in compose volume names so
     /// build-cache volumes are per-agent. Empty string suppresses the
@@ -2373,7 +2373,7 @@ k3d-tz-dev\tk3d-tz-dev\n";
 
     #[test]
     fn render_compose_template_substitutes_context() {
-        // implementation-note-396 — minimal smoke against a one-line
+        // implementation-note-301 — minimal smoke against a one-line
         // Jinja fragment so the renderer wiring is exercised without
         // depending on the bundled compose.yml.j2's full surface.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2391,7 +2391,7 @@ k3d-tz-dev\tk3d-tz-dev\n";
 
     #[test]
     fn render_compose_template_uses_host_gid_distinct_from_host_uid() {
-        // implementation-note-469: prior to this fix the
+        // implementation-note-372: prior to this fix the
         // template defaulted host_gid to host_uid, silently miswriting
         // container ownership on macOS (uid=501, gid=20). The fix gives
         // host_gid its own default. Property: rendering with mismatched
@@ -2420,7 +2420,7 @@ k3d-tz-dev\tk3d-tz-dev\n";
 
     #[test]
     fn render_compose_template_strict_undefined_refuses_missing_var() {
-        // implementation-note-396 — UndefinedBehavior::Strict means a
+        // implementation-note-301 — UndefinedBehavior::Strict means a
         // template referencing an unset variable surfaces as an error
         // at boot time rather than silently rendering "" into the YAML.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2550,7 +2550,9 @@ k3d-tz-dev\tk3d-tz-dev\n";
             anthropic_base_url: Some("http://localhost:62735".to_string()),
             anthropic_custom_headers: Some("X-Test: one".to_string()),
             git_proxy_url: Some("https://127.0.0.1:62727".to_string()),
+            cursor_egress_proxy_url: None,
             codex_responses_proxy_url: None,
+            gemini_proxy_url: None,
             ssh_auth_sock: None,
             delegation_id: None,
             delegation_template: None,

@@ -45,7 +45,9 @@ use core_proxy_forward::r#match::{
     effective_scope_uri, extract_github_branch, extract_host_from_url, glob_match_branch,
     host_matches_domain, is_git_smart_http_path, request_to_action_resource,
 };
-use core_proxy_forward::{PolicyBackend, ThresholdAxis, ThresholdBand};
+use core_proxy_forward::{
+    PolicyBackend, ProxyCallReceiptRequest, ResolvedGrant, ThresholdAxis, ThresholdBand,
+};
 use hyper::http;
 
 use crate::pricing;
@@ -423,6 +425,26 @@ pub enum CredentialInjection {
     /// [`core_proxy_forward::PolicyBackend::resolve_chatgpt_plan_auth`] and
     /// inject it with [`inject_chatgpt_plan_auth`].
     ChatgptPlan,
+    /// gemini GATEWAY: resolve a single opaque brokered API key via
+    /// [`core_proxy_forward::PolicyBackend::get_credential`] and inject
+    /// it under the named request header with [`inject_api_key_header`]. The
+    /// tuple holds the header name (a lowercase `&'static str` safe for
+    /// [`hyper::header::HeaderName::from_static`], e.g. `"x-goog-api-key"`). The
+    /// gemini-cli GATEWAY client emits an empty `x-goog-api-key: ''` and holds
+    /// no key itself; the daemon fills it server-side (structural credential
+    /// absence).
+    ApiKeyHeader(&'static str),
+    /// gemini Code Assist ("Sign in with Google"): resolve a short-window OAuth
+    /// Bearer access token (refreshed daemon-side from the vault-held
+    /// `oauth_creds` blob) via
+    /// [`core_proxy_forward::PolicyBackend::resolve_oauth_bearer`] and inject it
+    /// as `Authorization: Bearer <token>` with [`inject_oauth_bearer`]. The
+    /// gemini-cli signs Code Assist requests client-side with google-auth-library,
+    /// so the projector STRIPS whatever it signed and replaces it with the
+    /// broker token — the durable `refresh_token` stays daemon-only (the same
+    /// strip-and-inject shape as codex's [`ChatgptPlan`], not a bearer-less
+    /// client mode).
+    OAuthBearer,
 }
 
 /// A session-bound loopback projector: a third-party CLI redirected to a
@@ -463,6 +485,16 @@ pub struct LoopbackProjector {
 /// One variant per [`CredentialInjection`] strategy.
 enum ResolvedInjection {
     ChatgptPlan(core_proxy_forward::ChatgptPlanAuth),
+    /// gemini GATEWAY: the brokered API key + the header it injects under.
+    /// `value` is `Zeroizing` so the secret is wiped on drop.
+    ApiKeyHeader {
+        header_name: &'static str,
+        value: zeroize::Zeroizing<String>,
+    },
+    /// gemini Code Assist: the broker-resolved OAuth Bearer access token,
+    /// injected as `Authorization: Bearer <value>`. `Zeroizing` so the secret
+    /// is wiped on drop.
+    OAuthBearer { value: zeroize::Zeroizing<String> },
 }
 
 /// Strict gate for the codex responses lane: only `POST /v1/responses` with no
@@ -497,6 +529,232 @@ pub const CODEX_PROJECTOR: LoopbackProjector = LoopbackProjector {
 // enforcement would silently let a budgeted stream overrun its cap — so it
 // breaks the BUILD, not just a test.
 const _: () = assert!(!CODEX_PROJECTOR.streaming_budget_enforceable);
+
+/// The pinned upstream host for the gemini GATEWAY lane (Google's Generative
+/// Language API). The lane forwards the client-provided path+query (gemini has
+/// many `/v1beta/models/{model}:{method}` endpoints) but pins the HOST
+/// server-side — the client never supplies a target host, only a path.
+pub const GEMINI_UPSTREAM_HOST: &str = "generativelanguage.googleapis.com";
+
+/// Operator-only env override for the pinned gemini upstream host.
+///
+/// Mirrors [`CODEX_UPSTREAM_URL_OVERRIDE_ENV`] but is a HOST (not a full URL):
+/// the gemini lane builds the URL from this host + the client's path+query, so
+/// only the host is operator-repinnable. Operator-controlled (daemon-process
+/// env), NOT session/model controllable, so it does not weaken the server-side
+/// host pin.
+pub const GEMINI_UPSTREAM_HOST_OVERRIDE_ENV: &str = "EMBER_GEMINI_UPSTREAM_HOST";
+
+/// The pinned gemini upstream host, honouring [`GEMINI_UPSTREAM_HOST_OVERRIDE_ENV`].
+pub fn gemini_upstream_host() -> String {
+    match std::env::var(GEMINI_UPSTREAM_HOST_OVERRIDE_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => GEMINI_UPSTREAM_HOST.to_string(),
+    }
+}
+
+/// Strict gate for the gemini GATEWAY lane: only `POST` to a
+/// `/v1beta/models/{model}:{method}` generate/embed/count endpoint.
+///
+/// Unlike codex (which pins a single URL and forbids queries), gemini has many
+/// model+method paths and its streaming method carries a `?alt=sse` query, so
+/// this gate ALLOWS a query string. Defence-in-depth: a legitimate loopback
+/// request is origin-form (path + optional query only); we reject any inbound
+/// URI carrying a scheme or authority so a client cannot smuggle a host change
+/// that could survive upstream construction. (Belt-and-braces — the upstream
+/// resolver forwards only `path_and_query()`, which structurally drops any
+/// authority, and the Host header is reconstructed server-side.)
+fn gemini_accepts(method: &hyper::Method, uri: &http::Uri) -> bool {
+    if method != hyper::Method::POST {
+        return false;
+    }
+    // Origin-form only: no scheme, no authority. A network-path reference like
+    // `//evil.example/v1beta/...` parses `evil.example` as the authority; reject
+    // it here rather than rely solely on `path_and_query()` dropping it.
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return false;
+    }
+    let path = uri.path();
+    // Reject empty segments (`//`), dot-segments (`.`/`..`), and ANY
+    // percent-encoding (`%`): keep the client on the intended
+    // `/v1beta/models/{model}:{method}` endpoints rather than letting a literal
+    // OR percent-encoded traversal (`%2e%2e`, `%2f`, `%5c`) normalise elsewhere
+    // on the pinned host once the upstream server decodes it. `gemini_accepts`
+    // matches the RAW, un-decoded `uri.path()`, so a `%2e%2e` segment would slip
+    // a bare `seg == ".."` check; rejecting `%` outright closes the whole
+    // encoded-traversal / encoded-separator class in one cut. The
+    // `@google/genai` SDK only ever builds clean ASCII-slug paths (no `%`, no
+    // dot-segments — the `:method` colon is literal), so this never rejects
+    // legitimate gemini traffic.
+    if path.contains("//")
+        || path.contains('%')
+        || path.split('/').any(|seg| seg == ".." || seg == ".")
+    {
+        return false;
+    }
+    path.starts_with("/v1beta/models/")
+        && (path.ends_with(":generateContent")
+            || path.ends_with(":streamGenerateContent")
+            || path.ends_with(":countTokens")
+            || path.ends_with(":embedContent"))
+}
+
+/// Upstream resolver for gemini: pin the host server-side ([`gemini_upstream_host`])
+/// and forward the client-provided path+query verbatim. `path_and_query()` from
+/// a parsed request carries no authority, so the host cannot be forged through
+/// the path; the gate above additionally rejects any authority-bearing URI.
+fn gemini_upstream_for(uri: &http::Uri) -> (String, String) {
+    let host = gemini_upstream_host();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    (format!("https://{host}{path_and_query}"), host)
+}
+
+/// The gemini GATEWAY loopback projector. Transport remains the documented
+/// loopback-TCP exception shared with codex. Brokers a
+/// `google/gemini-api-key` and injects it as `x-goog-api-key` server-side.
+pub const GEMINI_PROJECTOR: LoopbackProjector = LoopbackProjector {
+    name: "gemini",
+    accepts: gemini_accepts,
+    provider_prefix: "google/",
+    upstream: gemini_upstream_for,
+    streaming_budget_enforceable: false,
+    injection: CredentialInjection::ApiKeyHeader("x-goog-api-key"),
+    prepare_headers: passthrough_gemini_request_headers,
+    access_detail: "gemini-generate",
+};
+
+// Compile-time guard: gemini `:streamGenerateContent?alt=sse` streams SSE the
+// same way codex does — usage is metered post-flight, too late to cap an
+// in-flight stream — so budgeted grants fail closed (see the streaming-budget
+// gate in `handle_loopback_projector_request`). Flipping this to `true` without
+// first wiring in-stream budget enforcement (tracked:
+// ADR215-LOOPBACK-STREAMING-BUDGET-ENFORCE) would silently let a budgeted
+// stream overrun — so it breaks the BUILD, not just a test.
+const _: () = assert!(!GEMINI_PROJECTOR.streaming_budget_enforceable);
+
+/// The pinned upstream host for the gemini Code Assist ("Sign in with Google")
+/// lane — Google's Cloud Code / Code Assist API. The free "Login with Google"
+/// tier is served here (NOT the API-key `generativelanguage.googleapis.com`
+/// host the GATEWAY lane uses).
+pub const GEMINI_CODE_ASSIST_HOST: &str = "cloudcode-pa.googleapis.com";
+
+/// Operator-only env override for the pinned Code Assist upstream host. Mirrors
+/// [`GEMINI_UPSTREAM_HOST_OVERRIDE_ENV`]; daemon-process env, not
+/// session/model-controllable.
+pub const GEMINI_CODE_ASSIST_HOST_OVERRIDE_ENV: &str = "EMBER_GEMINI_CODE_ASSIST_HOST";
+
+/// The pinned Code Assist upstream host, honouring [`GEMINI_CODE_ASSIST_HOST_OVERRIDE_ENV`].
+pub fn gemini_code_assist_host() -> String {
+    match std::env::var(GEMINI_CODE_ASSIST_HOST_OVERRIDE_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => GEMINI_CODE_ASSIST_HOST.to_string(),
+    }
+}
+
+/// Strict gate for the gemini Code Assist lane: `GET`/`POST` to the
+/// `v1internal` custom-verb endpoints the gemini-cli `CodeAssistServer` calls
+/// (`{base}/v1internal:<method>`, e.g. `:generateContent`,
+/// `:streamGenerateContent`, `:loadCodeAssist`, `:onboardUser`, `:countTokens`)
+/// or a GET long-running-operation poll
+/// (`{base}/v1internal/operations/<name>`).
+///
+/// Unlike the GATEWAY lane this admits BOTH methods (the CLI does GET reads +
+/// POST writes) and is version-resilient on the `:<method>` token (gemini-cli
+/// adds Code Assist methods across releases). It does NOT enumerate the method
+/// names: the OAuth Bearer's audience is the entire Code Assist API on the
+/// pinned host, so any `v1internal` method is within that single audience —
+/// the security boundary is the host pin + the `/v1internal` prefix + the
+/// Bearer audience, not a per-method allowlist (same reasoning as the GATEWAY
+/// host pin). Defence-in-depth: origin-form only (no scheme/authority), and no
+/// `//` / `.` / `..` / percent-encoded traversal.
+///
+/// SCOPE BREADTH (adversarial M2 — accepted): admitting any `:<method>` means a
+/// grant scoped to `llm:generate google/*` authorizes the WHOLE Code Assist API
+/// surface on the pinned host — generation, the `loadCodeAssist`/`onboardUser`
+/// handshake, AND settings-style methods (e.g. `:setCodeAssistGlobalUserSetting`).
+/// The verb (`llm:generate`) does not distinguish generate-from-administer on
+/// this lane. This is same-host / same-OAuth-audience reachability (no
+/// cross-tenant or cross-host escalation; the Bearer can only do what that one
+/// Google account is entitled to), chosen for version-resilience (gemini-cli
+/// adds Code Assist methods across releases). If finer scoping is wanted later,
+/// the matched resource slug already carries the method name
+/// (`google/v1internal:<method>`), so a tighter statement glob
+/// (e.g. `google/v1internal:*GenerateContent`) can clamp it WITHOUT changing
+/// this gate.
+fn gemini_code_assist_accepts(method: &hyper::Method, uri: &http::Uri) -> bool {
+    if method != hyper::Method::GET && method != hyper::Method::POST {
+        return false;
+    }
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return false;
+    }
+    let path = uri.path();
+    if path.contains("//")
+        || path.contains('%')
+        || path.split('/').any(|seg| seg == ".." || seg == ".")
+    {
+        return false;
+    }
+    // Custom-verb form `/v1internal:<method>` — a single colon-method token
+    // with no further path segments.
+    if let Some(rest) = path.strip_prefix("/v1internal:") {
+        return !rest.is_empty() && !rest.contains('/');
+    }
+    // Long-running-operation poll `/v1internal/operations/<name>` — GET only,
+    // with a bare
+    // operation name only: no `/` sub-path and no `:` sub-verb. The CLI only
+    // GETs the operation to poll it; a colon sub-verb (e.g. `operations/x:cancel`)
+    // is a mutation we do not admit (adversarial M1), mirroring the single-token
+    // discipline of the `:<method>` branch above.
+    if let Some(op) = path.strip_prefix("/v1internal/operations/") {
+        return method == hyper::Method::GET
+            && !op.is_empty()
+            && !op.contains('/')
+            && !op.contains(':');
+    }
+    false
+}
+
+/// Upstream resolver for the gemini Code Assist lane: pin the host server-side
+/// ([`gemini_code_assist_host`]) and forward the client path+query verbatim
+/// (`path_and_query()` carries no authority; the gate rejects authority-bearing
+/// URIs).
+fn gemini_code_assist_upstream_for(uri: &http::Uri) -> (String, String) {
+    let host = gemini_code_assist_host();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    (format!("https://{host}{path_and_query}"), host)
+}
+
+/// The gemini Code Assist OAuth loopback projector (design slice 2). Brokers a
+/// `google/`-prefixed OAuth credential (`oauth_creds` blob) and injects a
+/// daemon-refreshed `Authorization: Bearer <access_token>` server-side; the
+/// gemini-cli's own client-side Bearer is stripped first. Transport remains the
+/// documented loopback-TCP exception shared with codex + the GATEWAY lane.
+/// Reuses [`passthrough_gemini_request_headers`] — its strip list already drops
+/// `authorization` (the CLI's signed Bearer) plus host/accept-encoding/etc.
+pub const GEMINI_CODE_ASSIST_PROJECTOR: LoopbackProjector = LoopbackProjector {
+    name: "gemini-code-assist",
+    accepts: gemini_code_assist_accepts,
+    provider_prefix: "google/",
+    upstream: gemini_code_assist_upstream_for,
+    streaming_budget_enforceable: false,
+    injection: CredentialInjection::OAuthBearer,
+    prepare_headers: passthrough_gemini_request_headers,
+    access_detail: "gemini-code-assist",
+};
+
+// Compile-time guard: Code Assist `:streamGenerateContent?alt=sse` streams SSE,
+// metered post-flight (too late to cap), so budgeted grants fail closed — same
+// rationale + tracking (ADR215-LOOPBACK-STREAMING-BUDGET-ENFORCE) as the codex
+// and gemini GATEWAY lanes. Flipping to `true` without in-stream enforcement
+// breaks the BUILD.
+const _: () = assert!(!GEMINI_CODE_ASSIST_PROJECTOR.streaming_budget_enforceable);
 
 /// Strict, credential-safe handler for a session-bound loopback-TCP projector
 /// (design §2). [`CODEX_PROJECTOR`] is the first; the engine is shared and the
@@ -599,6 +857,13 @@ where
         )));
     }
 
+    // Preserve the client's HTTP method end-to-end. codex + the gemini GATEWAY
+    // lane only ever POST, but the gemini Code Assist lane also issues GETs
+    // (long-running-operation polls + `getCodeAssistGlobalUserSetting`) during
+    // its `loadCodeAssist`/`onboardUser` handshake; hardcoding POST would break
+    // those. The strict gate already constrains which methods each lane admits.
+    let req_method = req.method().clone();
+
     // Upstream is pinned server-side; the client never supplies a target.
     let (upstream_url, upstream_host) = (projector.upstream)(req.uri());
     let effective_uri_http: http::Uri = upstream_url
@@ -606,14 +871,15 @@ where
         .unwrap_or_else(|_| http::Uri::default());
 
     // 3. AUTHORIZE — same boundary as the LLM lane: resolve the grant +
-    //    applicable statement for POST against the pinned ChatGPT endpoint.
+    //    applicable statement for the request's method against the pinned
+    //    upstream endpoint.
     let resolved = match backend
         .resolve_grant(
             &persona_id,
             &credential_name,
             Some(authority.grant_id.as_str()),
             &effective_uri_http,
-            "POST",
+            req_method.as_str(),
         )
         .await
     {
@@ -737,6 +1003,54 @@ where
                 }
             }
         }
+        CredentialInjection::ApiKeyHeader(header_name) => {
+            // gemini GATEWAY: a single opaque brokered API key, decrypted from
+            // vault and returned `Zeroizing`. Injected as a header below; it
+            // never crosses back to the client.
+            match backend.get_credential(&credential_name).await {
+                Ok(value) => ResolvedInjection::ApiKeyHeader { header_name, value },
+                Err(core_proxy_forward::PolicyError::NotFound(_)) => {
+                    return Ok(internal_error("credential not found in vault"));
+                }
+                Err(core_proxy_forward::PolicyError::Forbidden(msg)) => {
+                    tracing::warn!(lane = projector.name, persona_id = %persona_id, reason = %msg, "loopback projector lane: api-key credential forbidden");
+                    return Ok(forbidden(&format!(
+                        "{} lane: credential access denied ({msg})",
+                        projector.name
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(lane = projector.name, error = ?e, persona_id = %persona_id, "loopback projector lane: api-key credential resolution failed");
+                    return Err(ForwardError::PolicyBackend(e));
+                }
+            }
+        }
+        CredentialInjection::OAuthBearer => {
+            // gemini Code Assist: a short-window OAuth Bearer access token,
+            // refreshed daemon-side from the vault-held `oauth_creds` blob. The
+            // `refresh_token` never crosses this boundary (daemon-only). Injected
+            // as `Authorization: Bearer` below.
+            match backend.resolve_oauth_bearer(&credential_name).await {
+                Ok(value) => ResolvedInjection::OAuthBearer { value },
+                Err(core_proxy_forward::PolicyError::NotFound(_)) => {
+                    return Ok(internal_error("credential not found in vault"));
+                }
+                Err(core_proxy_forward::PolicyError::Forbidden(msg)) => {
+                    // Refresh token expired/reused/revoked → operator must
+                    // re-run the gemini "Sign in with Google" flow + re-add the
+                    // credential. Recoverable 403, not a flat 500.
+                    tracing::warn!(lane = projector.name, persona_id = %persona_id, reason = %msg, "loopback projector lane: oauth bearer lapsed — re-auth required");
+                    return Ok(forbidden(&format!(
+                        "{} lane: oauth credential lapsed ({msg}): re-run the gemini Sign-in-with-Google flow and re-add the credential to the vault",
+                        projector.name
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(lane = projector.name, error = ?e, persona_id = %persona_id, "loopback projector lane: oauth bearer resolution failed");
+                    return Err(ForwardError::PolicyBackend(e));
+                }
+            }
+        }
     };
 
     if let Err(e) = backend
@@ -760,9 +1074,11 @@ where
     //    headers — `OpenAI-Beta`, `session_id`, `originator`, `x-codex-*`,
     //    attestation — so the upstream sees first-party codex traffic; only auth
     //    + host + hop-by-hop + accept-encoding are stripped). We then inject the
-    //    broker auth per the lane's injection strategy and pin Host server-side.
+    //    broker auth per the lane's injection strategy; the upstream authority
+    //    comes from the server-pinned absolute `upstream_url` (hyper derives the
+    //    `Host`/`:authority` from it — we do not set an explicit `Host`).
     let mut outgoing = Request::builder()
-        .method(hyper::Method::POST)
+        .method(req_method)
         .uri(upstream_url.as_str());
     outgoing = (projector.prepare_headers)(outgoing, &parts.headers);
 
@@ -784,16 +1100,42 @@ where
                 ));
             }
         }
+        ResolvedInjection::ApiKeyHeader { header_name, value } => {
+            // gemini GATEWAY: strip any client-supplied `authorization`/
+            // `x-api-key`/`x-goog-api-key` and insert the broker-resolved key
+            // under `header_name`. The client emits an empty `x-goog-api-key`;
+            // the broker value replaces it.
+            if inject_api_key_header(outgoing_req.headers_mut(), header_name, &value).is_err() {
+                tracing::warn!(lane = projector.name, persona_id = %persona_id, "loopback projector lane: api key not representable as a header value");
+                return Ok(internal_error(
+                    "credential not representable as a header value",
+                ));
+            }
+        }
+        ResolvedInjection::OAuthBearer { value } => {
+            // gemini Code Assist: strip the client's signed `Authorization`
+            // (+ `x-api-key`/`x-goog-api-key`) and inject the broker-resolved,
+            // daemon-refreshed `Authorization: Bearer <token>`.
+            if inject_oauth_bearer(outgoing_req.headers_mut(), &value).is_err() {
+                tracing::warn!(lane = projector.name, persona_id = %persona_id, "loopback projector lane: oauth bearer not representable as a header value");
+                return Ok(internal_error(
+                    "credential not representable as a header value",
+                ));
+            }
+        }
     }
 
-    // Reconstruct Host from the pinned upstream (defense-in-depth; the
-    // prepare-headers step already dropped the client Host).
-    if let Ok(host_value) = hyper::header::HeaderValue::from_str(&upstream_host) {
-        outgoing_req
-            .headers_mut()
-            .insert(hyper::header::HOST, host_value);
-    }
-
+    // Do NOT set an explicit `Host` header. The outgoing request carries the
+    // server-pinned absolute `upstream_url`, so hyper derives the authority from
+    // it: `Host` for HTTP/1.1, the `:authority` pseudo-header for HTTP/2. The
+    // `prepare_headers` step already stripped the client's `Host`, so nothing
+    // client-controlled leaks regardless. Inserting an explicit `Host` here is
+    // not just redundant — over HTTP/2 it ships a `host` header ALONGSIDE the
+    // derived `:authority`, which strict upstream GFEs (verified against
+    // `generativelanguage.googleapis.com`, and the same class as
+    // `chatgpt.com`) reset with `PROTOCOL_ERROR`. The pinned URI is the single
+    // source of the upstream authority. (`upstream_host` is still used below for
+    // post-flight metering — provider lookup is by host.)
     let upstream_resp = client.request(outgoing_req).await.map_err(|e| {
         tracing::warn!(lane = projector.name, error = %e, "loopback projector lane: upstream request failed");
         ForwardError::Client(e)
@@ -1446,7 +1788,8 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// and all legitimate header names are ASCII.
 pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "accept",
-    // `accept-encoding` deliberately omitted — implementation-note-65.
+    // `accept-encoding` deliberately omitted so the post-flight meter can
+    // parse JSON usage blocks.
     // Passing the client's `Accept-Encoding: gzip` through to upstream
     // returns a gzip-compressed response body, which `parse_usage` cannot
     // recognize as JSON (`looks_like_json` checks for a leading `{` or
@@ -1500,7 +1843,10 @@ pub fn filter_request_headers(
 /// - auth headers (`authorization`, `x-api-key`, `chatgpt-account-id`): the
 ///   broker injects its own via [`inject_chatgpt_plan_auth`]; a client-supplied
 ///   value must never ride through.
-/// - `host`: reconstructed server-side to the pinned upstream.
+/// - `host`: stripped; hyper re-derives the authority from the server-pinned
+///   absolute `upstream_url` (`Host` for HTTP/1.1, `:authority` for HTTP/2). We
+///   deliberately do NOT set an explicit `Host` — over HTTP/2 it duplicates the
+///   derived `:authority` and strict upstream GFEs reset with `PROTOCOL_ERROR`.
 /// - `accept-encoding`: forced to `identity` below so the post-flight meter sees
 ///   plain JSON (same rationale as `ALLOWED_REQUEST_HEADERS`'s omission).
 /// - `content-length`: hyper recomputes it from the forwarded body.
@@ -1532,6 +1878,54 @@ pub fn passthrough_codex_request_headers(
     for (name, value) in src {
         let lower = name.as_str().to_ascii_lowercase();
         if CODEX_STRIPPED_REQUEST_HEADERS.contains(&lower.as_str())
+            || HOP_BY_HOP_HEADERS.contains(&lower.as_str())
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    // Force identity so upstream returns plain JSON the meter can parse.
+    builder = builder.header(hyper::header::ACCEPT_ENCODING, "identity");
+    builder
+}
+
+/// Request headers stripped on the gemini GATEWAY lane before forwarding.
+///
+/// Mirrors [`CODEX_STRIPPED_REQUEST_HEADERS`]; the only delta is the auth header
+/// (`x-goog-api-key` instead of codex's `chatgpt-account-id`):
+/// - auth headers (`authorization`, `x-api-key`, `x-goog-api-key`): the broker
+///   injects its own via [`inject_api_key_header`]; a client value (the GATEWAY
+///   client emits an empty `x-goog-api-key`) must never ride through.
+/// - `host`: stripped; hyper re-derives the authority from the server-pinned
+///   absolute `upstream_url` (`Host` for HTTP/1.1, `:authority` for HTTP/2). We
+///   deliberately do NOT set an explicit `Host` — over HTTP/2 it duplicates the
+///   derived `:authority` and strict upstream GFEs reset with `PROTOCOL_ERROR`.
+/// - `accept-encoding`: forced to `identity` below so the post-flight meter sees
+///   plain JSON.
+/// - `content-length`: hyper recomputes it from the forwarded body.
+/// - hop-by-hop headers are stripped separately ([`HOP_BY_HOP_HEADERS`]).
+const GEMINI_STRIPPED_REQUEST_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "x-goog-api-key",
+    "host",
+    "accept-encoding",
+    "content-length",
+];
+
+/// Build the outbound request headers for the gemini GATEWAY lane by PASSING
+/// THROUGH gemini-cli's authentic non-auth headers (`User-Agent`,
+/// `content-type`, the `@google/genai` SDK's own signalling), dropping only the
+/// set in [`GEMINI_STRIPPED_REQUEST_HEADERS`] + hop-by-hop headers, then forcing
+/// `accept-encoding: identity`. Same shape as [`passthrough_codex_request_headers`];
+/// the broker key is injected afterwards by [`inject_api_key_header`].
+pub fn passthrough_gemini_request_headers(
+    mut builder: hyper::http::request::Builder,
+    src: &hyper::HeaderMap,
+) -> hyper::http::request::Builder {
+    for (name, value) in src {
+        let lower = name.as_str().to_ascii_lowercase();
+        if GEMINI_STRIPPED_REQUEST_HEADERS.contains(&lower.as_str())
             || HOP_BY_HOP_HEADERS.contains(&lower.as_str())
         {
             continue;
@@ -1603,6 +1997,57 @@ pub fn inject_chatgpt_plan_auth(
         );
     }
 
+    Ok(())
+}
+
+/// Inject a single opaque brokered API key onto an outbound request under a
+/// named header (gemini GATEWAY lane: `x-goog-api-key`).
+///
+/// Strips any client-supplied `authorization`/`x-api-key`/`<header_name>`
+/// (defence-in-depth: the GATEWAY client emits an empty `x-goog-api-key`, and a
+/// malicious client must not be able to smuggle its own auth past the broker)
+/// then inserts the broker value. `header_name` is a lowercase `&'static str`
+/// safe for [`hyper::header::HeaderName::from_static`] (which PANICS on a
+/// non-lowercase / invalid name — kept `&'static str` so it is compile-time
+/// constrained to the projector's pinned constant, never caller input).
+///
+/// Returns `Err(())` if the key is not a valid header value.
+// () error is intentional; richer error type is out of scope for the lint-clear.
+#[allow(clippy::result_unit_err)]
+pub fn inject_api_key_header(
+    headers: &mut hyper::HeaderMap,
+    header_name: &'static str,
+    value: &str,
+) -> Result<(), ()> {
+    headers.remove("authorization");
+    headers.remove("x-api-key");
+    headers.remove(header_name);
+    let v = hyper::header::HeaderValue::from_str(value.trim_end_matches(['\r', '\n']))
+        .map_err(|_| ())?;
+    headers.insert(hyper::header::HeaderName::from_static(header_name), v);
+    Ok(())
+}
+
+/// Inject a broker-resolved OAuth Bearer access token as `Authorization: Bearer
+/// <token>` (gemini Code Assist lane).
+///
+/// Strips any client-supplied `authorization` (the gemini-cli signs Code Assist
+/// requests client-side with google-auth-library — that Bearer must never ride
+/// through) plus `x-api-key`/`x-goog-api-key` (defence-in-depth), then inserts
+/// the broker Bearer. The durable `refresh_token` never reaches this layer; the
+/// daemon refreshes server-side and passes only the short-window access token.
+///
+/// Returns `Err(())` if the token is not a valid header value.
+// () error is intentional; richer error type is out of scope for the lint-clear.
+#[allow(clippy::result_unit_err)]
+pub fn inject_oauth_bearer(headers: &mut hyper::HeaderMap, access_token: &str) -> Result<(), ()> {
+    headers.remove("authorization");
+    headers.remove("x-api-key");
+    headers.remove("x-goog-api-key");
+    let token = access_token.trim_end_matches(['\r', '\n']);
+    let bearer = format!("Bearer {token}");
+    let value = hyper::header::HeaderValue::from_str(&bearer).map_err(|_| ())?;
+    headers.insert(hyper::header::AUTHORIZATION, value);
     Ok(())
 }
 
@@ -1855,7 +2300,7 @@ fn build_guarded_forward_client()
 // design seam 8B — grant-glob target tightness verification + storage/parse
 // encoding reconciliation follow-up.
 //
-// anchor: allowed_targets_storage_and_parse_one_encoding
+// implementation marker
 //
 // Storage at the `create_grant` write site is a JSON-array string
 // (`serde_json::to_string(arr)`); the parser routes through the shared
@@ -2502,8 +2947,7 @@ async fn handle_request_inner<B: PolicyBackend>(
     // Three branches, picked by upstream identity:
     //  1. Anthropic (`api.anthropic.com` and any subdomain) requires
     //     `x-api-key: <token>` and rejects `Authorization: Bearer ...` with
-    //     401. implementation-note-196 — FINDING B from the brief: the
-    //     prior unconditional Bearer injection broke every Beat 4 Anthropic
+    //     401. Prior unconditional Bearer injection broke every Anthropic
     //     SDK call.
     //  2. Git smart-HTTP (`/info/refs?service=git-*-pack`,
     //     `/{repo}.git/git-{receive,upload}-pack`) requires
@@ -2551,7 +2995,7 @@ async fn handle_request_inner<B: PolicyBackend>(
         "auth header injected"
     );
 
-    // implementation-note-65: force uncompressed responses upstream
+    // Force uncompressed responses upstream
     // so the post-flight meter can parse JSON usage blocks. Anthropic
     // (and OpenAI) default to `gzip` if Accept-Encoding is absent or
     // permissive; identity is the only encoding `parse_usage` understands
@@ -2676,7 +3120,7 @@ async fn handle_request_inner<B: PolicyBackend>(
         let meter_backend = Arc::clone(&backend);
         let meter_resolved = resolved.clone();
         let meter_host = target_host.clone();
-        // T-implementation-note-286: capture the upstream
+        // Capture the upstream
         // status's 2xx-ness for the meter callback. The closure runs
         // post-flight on the tee thread; `status` itself is moved into
         // the response builder below, so we snapshot the bool here.
@@ -2686,8 +3130,6 @@ async fn handle_request_inner<B: PolicyBackend>(
         // post-flight on the tee thread, so every field that travels in
         // the event must be owned (no borrows of `parts`, `effective_uri`,
         // `status`).
-        let meter_persona_id = persona_id.clone();
-        let meter_grant_id = resolved.grant_id.clone();
         let meter_method = parts.method.as_str().to_string();
         let meter_path = effective_uri
             .path_and_query()
@@ -2703,7 +3145,7 @@ async fn handle_request_inner<B: PolicyBackend>(
                 // pass over the bytes (which we no longer keep). The
                 // downgrade only applies to Anthropic streams; non-SSE
                 // bodies keep the tee-level outcome unchanged.
-                let _outcome = if tee_outcome == StreamOutcome::Complete
+                let outcome = if tee_outcome == StreamOutcome::Complete
                     && pricing::provider_for_host(&meter_host) == Some(pricing::PROVIDER_ANTHROPIC)
                     && summary.saw_any_usage
                     && !summary.saw_message_stop
@@ -2728,15 +3170,14 @@ async fn handle_request_inner<B: PolicyBackend>(
                 // match `folded_usage()` semantics, which is the value
                 // billing uses too.
                 let pu = summary.folded_usage();
-                emit_proxy_call_event(
-                    &meter_persona_id,
-                    &meter_grant_id,
-                    &meter_method,
-                    &meter_path,
-                    meter_status_code,
-                    pu.input_tokens,
-                    pu.output_tokens,
-                );
+                let proxy_call = ProxyCallReceiptRequest {
+                    method: meter_method,
+                    path: meter_path,
+                    status: meter_status_code,
+                    tokens_in: pu.input_tokens,
+                    tokens_out: pu.output_tokens,
+                    outcome: outcome.audit_tag().to_string(),
+                };
 
                 let backend = Arc::clone(&meter_backend);
                 let resolved = meter_resolved.clone();
@@ -2747,6 +3188,11 @@ async fn handle_request_inner<B: PolicyBackend>(
                             grant_id = %resolved.grant_id,
                             "post_flight failed in streaming meter"
                         );
+                    }
+                    if let Some(receipt_id) =
+                        signed_proxy_call_receipt_id(backend.as_ref(), &resolved, &proxy_call).await
+                    {
+                        emit_proxy_call_event(&resolved, &proxy_call, &receipt_id);
                     }
                 });
             },
@@ -2811,7 +3257,7 @@ async fn handle_request_inner<B: PolicyBackend>(
     // provider we have pricing for, `meter_response` returns `None` and
     // we skip the increment — the request still forwards unchanged.
     //
-    // T-implementation-note-286: pass `status.is_success()`
+    // Pass `status.is_success()`
     // so the meter only credits a billable request to the grant when
     // the upstream actually returned 2xx. A 5xx with a usage-shaped
     // body (rare) does not count.
@@ -2825,10 +3271,10 @@ async fn handle_request_inner<B: PolicyBackend>(
 
     // Beat 4 demo observability: emit a per-call event so the orchestrator
     // status tail can render `[proxy <agent>] METHOD /path — 200 — N tokens
-    // — Receipt r-...`. Split input/output tokens via a fresh parse_usage
-    // call — the buffered body is still in scope. Non-LLM hosts (GitHub
-    // etc.) skip token reporting; we still emit a `proxy_call` event so the
-    // call is visible in the stream.
+    // — Receipt <signed-receipt-id>`. Split input/output tokens via a fresh
+    // parse_usage call — the buffered body is still in scope. Non-LLM hosts
+    // (GitHub etc.) skip token reporting; we still emit a `proxy_call` event
+    // when the backend receipt subsystem can mint a signed call receipt.
     {
         let (tin, tout) = pricing::provider_for_host(&target_host)
             .and_then(|provider| pricing::parse_usage(provider, resp_body.as_ref()))
@@ -2838,15 +3284,19 @@ async fn handle_request_inner<B: PolicyBackend>(
             .path_and_query()
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| effective_uri.path().to_string());
-        emit_proxy_call_event(
-            &persona_id,
-            &resolved.grant_id,
-            parts.method.as_str(),
-            &path,
-            status.as_u16(),
-            tin,
-            tout,
-        );
+        let proxy_call = ProxyCallReceiptRequest {
+            method: parts.method.as_str().to_string(),
+            path,
+            status: status.as_u16(),
+            tokens_in: tin,
+            tokens_out: tout,
+            outcome: StreamOutcome::Complete.audit_tag().to_string(),
+        };
+        if let Some(receipt_id) =
+            signed_proxy_call_receipt_id(backend.as_ref(), &resolved, &proxy_call).await
+        {
+            emit_proxy_call_event(&resolved, &proxy_call, &receipt_id);
+        }
     }
 
     let mut builder = Response::builder().status(status);
@@ -2914,13 +3364,45 @@ impl StreamOutcome {
     }
 }
 
+async fn signed_proxy_call_receipt_id<B: PolicyBackend>(
+    backend: &B,
+    resolved: &ResolvedGrant,
+    call: &ProxyCallReceiptRequest,
+) -> Option<String> {
+    match backend.issue_proxy_call_receipt(resolved, call).await {
+        Ok(Some(receipt_id)) if !receipt_id.trim().is_empty() => Some(receipt_id),
+        Ok(Some(_)) => {
+            tracing::warn!(
+                grant_id = %resolved.grant_id,
+                "proxy_call receipt emission returned an empty receipt_id"
+            );
+            None
+        }
+        Ok(None) => {
+            tracing::warn!(
+                grant_id = %resolved.grant_id,
+                "proxy_call event omitted because backend did not mint a signed receipt"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                grant_id = %resolved.grant_id,
+                error = ?error,
+                "proxy_call receipt emission failed"
+            );
+            None
+        }
+    }
+}
+
 // ===== moved from proxy.rs lines 2248-2337 =====
 /// Beat 4 (SCION × Emberlink demo 2026-05-15) — emit a `proxy_call` event
 /// into `.ember/runtime/events.jsonl` so the orchestrator status tail can
 /// render one log line per upstream call:
 ///
 /// ```text
-///   [proxy <agent>] POST /v1/messages — 200 — 312 tokens — Receipt r-7a3f...
+///   [proxy <agent>] POST /v1/messages — 200 — 312 tokens — Receipt <receipt-id>
 /// ```
 ///
 /// The event sits alongside the existing `proxy.meter` audit row (which is
@@ -2928,22 +3410,14 @@ impl StreamOutcome {
 /// observability during the demo and is best-effort: errors are swallowed
 /// so an unwritable `.ember/runtime/` directory can never wedge the proxy.
 ///
-/// Receipt ID is a demo-grade short hex derived from a sha256 over the
-/// call's identifying fields. Beat 8 replaces this with a signed Receipt
-/// minted by the receipt subsystem; until then the ID is stable per call
-/// but not cryptographically bound. See implementation-note-494
-/// (release-checklist) for the follow-up.
-#[allow(clippy::too_many_arguments)]
+/// proxy_call_receipt_id_is_signed: the receipt ID is supplied by
+/// [`PolicyBackend::issue_proxy_call_receipt`], whose daemon implementation
+/// signs and persists a ReceiptEnvelope before this JSONL event is appended.
 pub fn emit_proxy_call_event(
-    persona_id: &str,
-    grant_id: &str,
-    method: &str,
-    path: &str,
-    status: u16,
-    tokens_in: u64,
-    tokens_out: u64,
+    resolved: &ResolvedGrant,
+    call: &ProxyCallReceiptRequest,
+    receipt_id: &str,
 ) {
-    use sha2::{Digest, Sha256};
     // Resolve the primary worktree root + engine event-log path via the shared
     // layout contract (core-construct-runtime, below both this forwarding core
     // and the engine per design). Fall back to cwd on failure — the daemon
@@ -2953,43 +3427,20 @@ pub fn emit_proxy_call_event(
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let events_path = root.join(core_construct_runtime::layout::ENGINE_EVENTS_FILE);
 
-    // Receipt ID: short hex from sha256 of (persona, grant, method, path,
-    // status, tokens, now_ns). Enough entropy to avoid collisions inside a
-    // single agent run; not a substitute for a signed Receipt.
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut hasher = Sha256::new();
-    hasher.update(persona_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(grant_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(method.as_bytes());
-    hasher.update(b"|");
-    hasher.update(path.as_bytes());
-    hasher.update(b"|");
-    hasher.update(status.to_string().as_bytes());
-    hasher.update(b"|");
-    hasher.update(tokens_in.to_le_bytes());
-    hasher.update(tokens_out.to_le_bytes());
-    hasher.update(b"|");
-    hasher.update(now_ns.to_le_bytes());
-    let digest = hasher.finalize();
-    let receipt_id = format!("r-{}", hex::encode(&digest[..6]));
-
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let line = serde_json::json!({
         "event": "proxy_call",
         "ts": ts,
-        "agent_id": persona_id,
-        "persona_id": persona_id,
-        "grant_id": grant_id,
-        "method": method,
-        "path": path,
-        "status": status,
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
+        "agent_id": &resolved.persona_id,
+        "persona_id": &resolved.persona_id,
+        "grant_id": &resolved.grant_id,
+        "statement_sid": &resolved.statement_sid,
+        "method": &call.method,
+        "path": &call.path,
+        "status": call.status,
+        "tokens_in": call.tokens_in,
+        "tokens_out": call.tokens_out,
+        "outcome": &call.outcome,
         "receipt_id": receipt_id,
     });
     let serialized = match serde_json::to_string(&line) {
@@ -3013,7 +3464,7 @@ pub fn emit_proxy_call_event(
 /// all — matches the byte-slice `meter_response` semantics so the audit
 /// trail and budget machinery behave identically across the two paths.
 ///
-/// T-implementation-note-286: `requests` is left at 0 here.
+/// `requests` is left at 0 here.
 /// Callers add the upstream-confirmed request count via
 /// `record_upstream_request` so a network failure / 5xx doesn't inflate
 /// the receipt's request tally.
@@ -3027,7 +3478,7 @@ pub fn usage_from_summary(
     }
     let folded = summary.folded_usage();
     let model = summary.model.clone().unwrap_or_default();
-    // implementation-note-65: micro-cent precision. See meter_response
+    // Micro-cent precision. See meter_response
     // for the full rationale; the SSE path mirrors the buffered path so
     // both metering routes accumulate budget identically.
     let cents_micro =
@@ -3036,7 +3487,7 @@ pub fn usage_from_summary(
         tokens: folded.input_tokens.saturating_add(folded.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        // T-implementation-note-286: filled in by the caller
+        // Filled in by the caller
         // via `record_upstream_request` once upstream confirmation is
         // known. Leaving this at 0 here means a path that observes
         // tokens but not a confirmed upstream response (none of the
@@ -3257,9 +3708,8 @@ where
 /// transport upstream is an integrity failure of the vault, not a request
 /// problem.
 ///
-/// implementation-note-196 — FINDING B from the brief: prior code
-/// unconditionally injected `Authorization: Bearer ...`, which broke every
-/// Beat 4 Anthropic SDK call.
+/// Prior code unconditionally injected `Authorization: Bearer ...`, which
+/// broke every Anthropic SDK call.
 // () error is intentional; richer error type is out of scope for the lint-clear.
 #[allow(clippy::result_unit_err)]
 pub fn inject_provider_auth(
@@ -3710,7 +4160,7 @@ pub fn preflight_budget_check(
     // the cents cap (post-flight cents tick can nudge usage over budget
     // between calls). We don't estimate cents up front — see doc above.
     //
-    // implementation-note-65: compare against the micro-cent
+    // Compare against the micro-cent
     // accumulator so sub-cent calls aggregate honestly. Fall back to the
     // legacy `cents` axis when cents_micro is unset (zero) so pre-fix
     // grants stored under the old representation still gate correctly.
@@ -3820,7 +4270,7 @@ pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_gr
         return None;
     };
     let model = pricing::extract_model(provider, response_body).unwrap_or_default();
-    // implementation-note-65: compute micro-cents (cents × 10⁶) and
+    // Compute micro-cents (cents × 10⁶) and
     // derive whole cents from it. Without micro-cent precision, sub-cent
     // calls (~0.1¢ on Haiku-4.5) round to 0 per call and the budget cap
     // can never accumulate enough to trip.
@@ -3830,7 +4280,7 @@ pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_gr
         tokens: parsed.input_tokens.saturating_add(parsed.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        // T-implementation-note-286: leave `requests` at 0
+        // Leave `requests` at 0
         // here. The caller folds in `record_upstream_request` once the
         // upstream's confirmation status is known, so a 5xx body that
         // happens to carry a usage block doesn't get counted as a
@@ -3844,10 +4294,10 @@ pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_gr
 
 /// Record a single upstream-confirmed request against the proxy meter.
 ///
-/// T-implementation-note-286: `usage.requests` historically
+/// `usage.requests` historically
 /// incremented by 1 for every proxy invocation that produced a parseable
 /// usage block, regardless of whether the upstream's HTTP response was
-/// itself a success. Per implementation-note-495 Decision 2 #2, the
+/// itself a success. The
 /// receipt should reflect what actually happened upstream — Anthropic /
 /// OpenAI confirmed receiving the request — not what we tried to send.
 /// A request counted but rejected by the upstream is a false-positive.
@@ -4400,7 +4850,7 @@ mod smoke_tests {
     fn allowed_targets_json_array_roundtrips_through_authorize_forward_host() {
         // design SEAM-8B follow-up — write site is
         // `serde_json::to_string(arr)`; parser must accept that encoding.
-        // Anchor: allowed_targets_storage_and_parse_one_encoding.
+        // implementation marker.
         let stored = serde_json::to_string(&vec!["api.acme.com".to_string()]).expect("encode");
         assert_eq!(
             authorize_forward_host(true, Some(stored.as_str()), Some("api.acme.com")),
@@ -4901,7 +5351,7 @@ mod smoke_tests {
             &mut headers,
             "api.anthropic.com",
             false,
-            "example/credential",
+            "anthropic/key",
             "sk-ant-api03-REAL",
         )
         .unwrap();
@@ -5687,5 +6137,853 @@ mod codex_responses_tests {
         assert_eq!(host_a, host_b);
         assert_eq!(url_a, codex_upstream_url().into_owned());
         assert_eq!(host_a, codex_upstream_host());
+    }
+}
+
+#[cfg(test)]
+mod gemini_responses_tests {
+    //! Unit coverage for the gemini GATEWAY loopback-TCP lane.
+    //! Network-free, mirroring `codex_responses_tests`: the strict-gate,
+    //! fail-closed (no-session / non-google / budgeted) paths all return BEFORE
+    //! any upstream call, and the strip/inject/pin invariants are exercised
+    //! directly against `gemini_accepts` / `gemini_upstream_for` /
+    //! `passthrough_gemini_request_headers` / `inject_api_key_header`. The full
+    //! end-to-end forward against a live Google upstream is a operator
+    //! live-verify item + the daemon session-wiring slice (the guarded forward
+    //! client pins `https://` and trusts only webpki roots, so a self-signed
+    //! mock cannot complete the round trip in a unit test — same boundary codex
+    //! draws).
+    use super::*;
+    use async_trait::async_trait;
+    use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+    use core_proxy_forward::{
+        PolicyError, PreflightDecision, ResolvedGrant, SessionGatewayAuthority,
+    };
+    use std::sync::Arc as StdArc;
+    use zeroize::Zeroizing;
+
+    /// The fixed broker key the test backend returns from `get_credential`.
+    const BROKER_KEY: &str = "AIzaBrokerKeyValue";
+
+    struct GeminiTestBackend {
+        authority: Option<SessionGatewayAuthority>,
+        statement_budget: Option<Budget>,
+    }
+
+    impl GeminiTestBackend {
+        fn with_authority() -> Self {
+            Self {
+                authority: Some(SessionGatewayAuthority {
+                    session_id: "sess_gemini".into(),
+                    persona_id: "alice".into(),
+                    grant_id: "g-gemini".into(),
+                    credential_name: "google/gemini-api-key".into(),
+                }),
+                statement_budget: None,
+            }
+        }
+        fn with_budgeted_authority() -> Self {
+            let mut backend = Self::with_authority();
+            backend.statement_budget = Some(Budget {
+                tokens: Some(10_000),
+                cents: None,
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            });
+            backend
+        }
+        fn no_authority() -> Self {
+            Self {
+                authority: None,
+                statement_budget: None,
+            }
+        }
+        /// Session bound to a NON-google credential — the provider gate must
+        /// fail closed (no cross-provider leak to the pinned Google upstream).
+        fn with_credential(credential_name: &str) -> Self {
+            Self {
+                authority: Some(SessionGatewayAuthority {
+                    session_id: "sess_gemini".into(),
+                    persona_id: "alice".into(),
+                    grant_id: "g-gemini".into(),
+                    credential_name: credential_name.into(),
+                }),
+                statement_budget: None,
+            }
+        }
+    }
+
+    fn google_statement(budget: Option<Budget>) -> Statement {
+        Statement {
+            sid: "stmt-gemini".into(),
+            resource_type: ResourceType::Session,
+            actions: vec!["POST".into()],
+            resource: ResourceSelector::Glob {
+                pattern: "https://generativelanguage.googleapis.com/*".into(),
+            },
+            budget,
+            usage: Usage::default(),
+            conditions: vec![],
+            can_delegate: None,
+        }
+    }
+
+    #[async_trait]
+    impl PolicyBackend for GeminiTestBackend {
+        async fn resolve_session_authority(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<SessionGatewayAuthority>, PolicyError> {
+            Ok(self.authority.clone())
+        }
+
+        async fn resolve_grant(
+            &self,
+            persona_id: &str,
+            credential_name: &str,
+            _resolved_grant_id: Option<&str>,
+            _effective_uri: &http::Uri,
+            _method: &str,
+        ) -> Result<ResolvedGrant, PolicyError> {
+            Ok(ResolvedGrant {
+                grant_id: "g-gemini".into(),
+                persona_id: persona_id.into(),
+                credential_name: credential_name.into(),
+                statement_sid: "stmt-gemini".into(),
+                statement: google_statement(self.statement_budget.clone()),
+                grant_scope: "*".into(),
+                allowed_targets: None,
+            })
+        }
+
+        async fn preflight_budget(
+            &self,
+            _resolved: &ResolvedGrant,
+            _body_bytes: &[u8],
+        ) -> Result<PreflightDecision, PolicyError> {
+            Ok(PreflightDecision::Allowed)
+        }
+
+        async fn get_credential(
+            &self,
+            _credential_name: &str,
+        ) -> Result<Zeroizing<String>, PolicyError> {
+            Ok(Zeroizing::new(BROKER_KEY.into()))
+        }
+
+        async fn post_flight(
+            &self,
+            _resolved: &ResolvedGrant,
+            _usage: Option<core_grant_types::Usage>,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+
+        async fn post_flight_meter(
+            &self,
+            _resolved: &ResolvedGrant,
+            _usage: Option<core_grant_types::Usage>,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+
+        async fn log_event(
+            &self,
+            _persona_id: &str,
+            _event_kind: &str,
+            _credential_name: Option<&str>,
+            _outcome: &str,
+            _detail: Option<&str>,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    fn req(method: hyper::Method, uri: &str) -> Request<http_body_util::Empty<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap()
+    }
+
+    const GEN_PATH: &str = "/v1beta/models/gemini-3-flash:generateContent";
+
+    #[test]
+    fn gemini_projector_contract_is_pinned() {
+        // Pin the data half of the loopback engine so an accidental edit (a
+        // `provider_prefix` typo that would ship a non-google secret to Google,
+        // flipping `streaming_budget_enforceable`, or the wrong injected header)
+        // is a RED test rather than a silent behavior change.
+        assert_eq!(GEMINI_PROJECTOR.name, "gemini");
+        assert_eq!(GEMINI_PROJECTOR.provider_prefix, "google/");
+        assert_eq!(GEMINI_PROJECTOR.access_detail, "gemini-generate");
+        // `streaming_budget_enforceable == false` is enforced at compile time by
+        // the `const _: () = assert!(...)` guard next to the const definition.
+        assert!(
+            matches!(
+                GEMINI_PROJECTOR.injection,
+                CredentialInjection::ApiKeyHeader("x-goog-api-key")
+            ),
+            "gemini uses the API-key-header injection strategy under x-goog-api-key"
+        );
+    }
+
+    #[test]
+    fn gemini_strict_gate_admits_only_post_v1beta_model_methods() {
+        let accepts = GEMINI_PROJECTOR.accepts;
+        let uri = |s: &str| s.parse::<http::Uri>().unwrap();
+        // The four GATEWAY methods, POST:
+        assert!(accepts(&hyper::Method::POST, &uri(GEN_PATH)));
+        assert!(accepts(
+            &hyper::Method::POST,
+            &uri("/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse")
+        ));
+        assert!(accepts(
+            &hyper::Method::POST,
+            &uri("/v1beta/models/gemini-3-flash:countTokens")
+        ));
+        assert!(accepts(
+            &hyper::Method::POST,
+            &uri("/v1beta/models/text-embedding-004:embedContent")
+        ));
+        // Wrong method:
+        assert!(!accepts(&hyper::Method::GET, &uri(GEN_PATH)));
+        assert!(!accepts(&hyper::Method::PUT, &uri(GEN_PATH)));
+        // Wrong path / method-suffix not in the allowed set:
+        assert!(!accepts(&hyper::Method::POST, &uri("/v1/responses")));
+        assert!(!accepts(
+            &hyper::Method::POST,
+            &uri("/v1beta/models/gemini-3-flash:listModels")
+        ));
+        // Right method-suffix but wrong prefix:
+        assert!(!accepts(
+            &hyper::Method::POST,
+            &uri("/v1beta/tunedModels/x:generateContent")
+        ));
+    }
+
+    #[test]
+    fn gemini_gate_rejects_authority_and_traversal_smuggling() {
+        let accepts = GEMINI_PROJECTOR.accepts;
+        // Authority smuggling: a network-path reference parses `evil.example`
+        // as the authority — rejected (the host is pinned server-side).
+        let smuggled = "//evil.example/v1beta/models/x:generateContent"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert!(
+            !accepts(&hyper::Method::POST, &smuggled),
+            "a `//`-prefixed path must be rejected"
+        );
+        // Absolute-form carrying a genuine scheme + authority is rejected by the
+        // scheme/authority check (independent of the `//`-path check above).
+        let absolute = "https://evil.example/v1beta/models/x:generateContent"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert!(
+            absolute.authority().is_some(),
+            "sanity: this form parses an authority"
+        );
+        assert!(
+            !accepts(&hyper::Method::POST, &absolute),
+            "a URI carrying a scheme/authority must be rejected"
+        );
+        // Dot-segment / double-slash traversal that still ends in a valid
+        // method suffix must not slip past the gate — AND the percent-encoded
+        // variants (`%2e%2e`, `%2f`, `%5c`), which the gate matches raw and the
+        // upstream server would decode (M1).
+        for p in [
+            "/v1beta/models/../../v1beta/tunedModels/x:generateContent",
+            "/v1beta/models//x:generateContent",
+            "/v1beta/models/./x:generateContent",
+            "/v1beta/models/%2e%2e/foo:generateContent",
+            "/v1beta/models/%2e%2e%2ftunedModels/x:generateContent",
+            "/v1beta/models/foo%2fbar:generateContent",
+            "/v1beta/models/foo%5cbar:generateContent",
+        ] {
+            let uri = p.parse::<http::Uri>().unwrap();
+            assert!(
+                !accepts(&hyper::Method::POST, &uri),
+                "traversal path {p} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_upstream_preserves_path_and_query_and_pins_host() {
+        let upstream = GEMINI_PROJECTOR.upstream;
+        let (url, host) = upstream(
+            &"/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse"
+                .parse::<http::Uri>()
+                .unwrap(),
+        );
+        assert_eq!(host, "generativelanguage.googleapis.com");
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse",
+            "the client-supplied path+query is forwarded verbatim under the pinned host"
+        );
+        assert_eq!(host, gemini_upstream_host());
+    }
+
+    #[test]
+    fn gemini_upstream_drops_any_authority_in_the_inbound_uri() {
+        // Belt-and-braces (the gate already rejects scheme/authority-bearing
+        // URIs and `//` paths): even if an absolute-form URI carrying a genuine
+        // authority reached the resolver, `path_and_query()` carries no
+        // authority, so the upstream stays pinned to the Google host.
+        //
+        // (`http::Uri` parses `//evil.example/…` as a *path* beginning `//`, not
+        // an authority — that vector is caught upstream by the gate's `//`
+        // rejection, asserted in `gemini_gate_rejects_authority_and_traversal_smuggling`.)
+        let upstream = GEMINI_PROJECTOR.upstream;
+        let (url, host) = upstream(
+            &"https://evil.example/v1beta/models/x:generateContent"
+                .parse::<http::Uri>()
+                .unwrap(),
+        );
+        assert_eq!(host, "generativelanguage.googleapis.com");
+        let parsed = url.parse::<http::Uri>().unwrap();
+        assert_eq!(
+            parsed.host(),
+            Some("generativelanguage.googleapis.com"),
+            "the upstream host stays pinned regardless of any inbound authority: {url}"
+        );
+        assert!(
+            !url.contains("evil.example"),
+            "the smuggled authority must not appear in the upstream URL: {url}"
+        );
+    }
+
+    #[test]
+    fn gemini_passthrough_strips_auth_and_goog_key_preserves_others() {
+        let mut client_headers = hyper::HeaderMap::new();
+        // Auth the client must NOT smuggle through:
+        client_headers.insert("authorization", "Bearer attacker".parse().unwrap());
+        client_headers.insert("x-api-key", "attacker-key".parse().unwrap());
+        // The GATEWAY client emits an EMPTY x-goog-api-key; an attacker might
+        // try a non-empty one. Either way it must be dropped (broker injects).
+        client_headers.insert("x-goog-api-key", "attacker-goog-key".parse().unwrap());
+        client_headers.insert("host", "evil.example".parse().unwrap());
+        client_headers.insert("connection", "keep-alive".parse().unwrap());
+        client_headers.insert("accept-encoding", "gzip".parse().unwrap());
+        // gemini-cli's authentic headers that MUST survive:
+        client_headers.insert("user-agent", "GeminiCLI/1.2.3".parse().unwrap());
+        client_headers.insert("content-type", "application/json".parse().unwrap());
+
+        let builder = Request::builder().method(hyper::Method::POST).uri(GEN_PATH);
+        let builder = passthrough_gemini_request_headers(builder, &client_headers);
+        let outgoing = builder.body(()).unwrap();
+        let h = outgoing.headers();
+
+        assert!(h.get("authorization").is_none(), "client auth dropped");
+        assert!(h.get("x-api-key").is_none(), "client x-api-key dropped");
+        assert!(
+            h.get("x-goog-api-key").is_none(),
+            "client x-goog-api-key dropped (broker injects it)"
+        );
+        assert!(h.get("host").is_none(), "client Host dropped");
+        assert!(h.get("connection").is_none(), "hop-by-hop dropped");
+        assert_eq!(
+            h.get("accept-encoding").and_then(|v| v.to_str().ok()),
+            Some("identity")
+        );
+        assert_eq!(
+            h.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("GeminiCLI/1.2.3")
+        );
+        assert_eq!(
+            h.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn gemini_inject_api_key_header_strips_client_auth_and_inserts_broker_value() {
+        let mut headers = hyper::HeaderMap::new();
+        // Stale client values that must be replaced/removed:
+        headers.insert("authorization", "Bearer attacker".parse().unwrap());
+        headers.insert("x-api-key", "attacker-key".parse().unwrap());
+        headers.insert("x-goog-api-key", "".parse().unwrap()); // the GATEWAY empty placeholder
+        inject_api_key_header(&mut headers, "x-goog-api-key", BROKER_KEY).expect("inject");
+        assert_eq!(
+            headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()),
+            Some(BROKER_KEY),
+            "broker key replaces the client's placeholder"
+        );
+        assert!(
+            headers.get("authorization").is_none(),
+            "client authorization stripped"
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "client x-api-key stripped"
+        );
+    }
+
+    #[test]
+    fn gemini_inject_trims_trailing_newline() {
+        let mut headers = hyper::HeaderMap::new();
+        inject_api_key_header(&mut headers, "x-goog-api-key", "AIzaKey\n").expect("inject");
+        assert_eq!(
+            headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()),
+            Some("AIzaKey"),
+            "a trailing newline in the vault value is trimmed (not a header-injection vector)"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_fail_closed_no_session_authority() {
+        // POST a valid gemini path passes the gate, but the session resolves to
+        // no authority => 403, BEFORE any credential read or forwarding.
+        let backend = StdArc::new(GeminiTestBackend::no_authority());
+        let resp = handle_loopback_projector_request(
+            &GEMINI_PROJECTOR,
+            backend,
+            req(hyper::Method::POST, GEN_PATH),
+            "sess_unknown".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn gemini_fail_closed_non_google_credential() {
+        // A gemini session bound to a NON-google grant must FAIL CLOSED at the
+        // provider gate — never inject that secret to the pinned Google
+        // upstream. POST a valid path passes the strict gate; the provider gate
+        // then denies before `get_credential` is ever called.
+        for cred in ["anthropic/oauth-token", "openai/session-key", "github/pat"] {
+            let backend = StdArc::new(GeminiTestBackend::with_credential(cred));
+            let resp = handle_loopback_projector_request(
+                &GEMINI_PROJECTOR,
+                backend,
+                req(hyper::Method::POST, GEN_PATH),
+                "sess_gemini".into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "non-google credential {cred} must be refused (no cross-provider leak to Google)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_rejected_by_strict_gate_before_authority() {
+        // GET / wrong path are refused by the strict gate even with a valid
+        // session authority bound.
+        for (method, path) in [
+            (hyper::Method::GET, GEN_PATH),
+            (hyper::Method::POST, "/v1/responses"),
+            (hyper::Method::POST, "/v1beta/models/x:listModels"),
+        ] {
+            let backend = StdArc::new(GeminiTestBackend::with_authority());
+            let resp = handle_loopback_projector_request(
+                &GEMINI_PROJECTOR,
+                backend,
+                req(method.clone(), path),
+                "sess_gemini".into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} must be rejected by the strict gate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_budgeted_grant_blocks_streaming_before_key_read() {
+        // gemini `:streamGenerateContent?alt=sse` streams SSE the same way codex
+        // does; until in-stream metering exists a budgeted grant must fail closed
+        // BEFORE the broker key is read or injected.
+        let backend = StdArc::new(GeminiTestBackend::with_budgeted_authority());
+        let resp = handle_loopback_projector_request(
+            &GEMINI_PROJECTOR,
+            backend,
+            req(hyper::Method::POST, GEN_PATH),
+            "sess_gemini".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn gemini_upstream_host_default_when_env_unset() {
+        // Default (no operator override) resolves to the pinned const.
+        // (No env mutation here to avoid cross-test races; the override path is
+        // documented + operator-only.)
+        if std::env::var(GEMINI_UPSTREAM_HOST_OVERRIDE_ENV).is_err() {
+            assert_eq!(gemini_upstream_host(), GEMINI_UPSTREAM_HOST);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemini_code_assist_tests {
+    //! Unit coverage for the gemini Code Assist ("Sign in with Google")
+    //! loopback lane (design slice 2). Network-free, mirroring
+    //! `gemini_responses_tests`: gate + fail-closed paths return before any
+    //! upstream call; the strip/inject invariant is exercised directly against
+    //! `inject_oauth_bearer`. The full forward against the live Code Assist API
+    //! is a operator live-verify item + the daemon session-wiring slice.
+    use super::*;
+    use async_trait::async_trait;
+    use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+    use core_proxy_forward::{
+        PolicyError, PreflightDecision, ResolvedGrant, SessionGatewayAuthority,
+    };
+    use std::sync::Arc as StdArc;
+    use zeroize::Zeroizing;
+
+    const BROKER_TOKEN: &str = "ya29.BrokerAccessToken";
+
+    struct CodeAssistTestBackend {
+        authority: Option<SessionGatewayAuthority>,
+        statement_budget: Option<Budget>,
+    }
+
+    impl CodeAssistTestBackend {
+        fn with_authority() -> Self {
+            Self {
+                authority: Some(SessionGatewayAuthority {
+                    session_id: "sess_gca".into(),
+                    persona_id: "alice".into(),
+                    grant_id: "g-gca".into(),
+                    credential_name: "google/code-assist-oauth".into(),
+                }),
+                statement_budget: None,
+            }
+        }
+        fn with_budgeted_authority() -> Self {
+            let mut b = Self::with_authority();
+            b.statement_budget = Some(Budget {
+                tokens: Some(10_000),
+                cents: None,
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            });
+            b
+        }
+        fn no_authority() -> Self {
+            Self {
+                authority: None,
+                statement_budget: None,
+            }
+        }
+        fn with_credential(credential_name: &str) -> Self {
+            Self {
+                authority: Some(SessionGatewayAuthority {
+                    session_id: "sess_gca".into(),
+                    persona_id: "alice".into(),
+                    grant_id: "g-gca".into(),
+                    credential_name: credential_name.into(),
+                }),
+                statement_budget: None,
+            }
+        }
+    }
+
+    fn google_statement(budget: Option<Budget>) -> Statement {
+        Statement {
+            sid: "stmt-gca".into(),
+            resource_type: ResourceType::Session,
+            actions: vec!["llm:generate".into()],
+            resource: ResourceSelector::Glob {
+                pattern: "google/*".into(),
+            },
+            budget,
+            usage: Usage::default(),
+            conditions: vec![],
+            can_delegate: None,
+        }
+    }
+
+    #[async_trait]
+    impl PolicyBackend for CodeAssistTestBackend {
+        async fn resolve_session_authority(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<SessionGatewayAuthority>, PolicyError> {
+            Ok(self.authority.clone())
+        }
+        async fn resolve_grant(
+            &self,
+            persona_id: &str,
+            credential_name: &str,
+            _resolved_grant_id: Option<&str>,
+            _effective_uri: &http::Uri,
+            _method: &str,
+        ) -> Result<ResolvedGrant, PolicyError> {
+            Ok(ResolvedGrant {
+                grant_id: "g-gca".into(),
+                persona_id: persona_id.into(),
+                credential_name: credential_name.into(),
+                statement_sid: "stmt-gca".into(),
+                statement: google_statement(self.statement_budget.clone()),
+                grant_scope: "*".into(),
+                allowed_targets: None,
+            })
+        }
+        async fn preflight_budget(
+            &self,
+            _resolved: &ResolvedGrant,
+            _body_bytes: &[u8],
+        ) -> Result<PreflightDecision, PolicyError> {
+            Ok(PreflightDecision::Allowed)
+        }
+        async fn get_credential(
+            &self,
+            _credential_name: &str,
+        ) -> Result<Zeroizing<String>, PolicyError> {
+            // Code Assist resolves via resolve_oauth_bearer, not get_credential.
+            Err(PolicyError::Other("unused".into()))
+        }
+        async fn resolve_oauth_bearer(
+            &self,
+            _credential_name: &str,
+        ) -> Result<Zeroizing<String>, PolicyError> {
+            Ok(Zeroizing::new(BROKER_TOKEN.into()))
+        }
+        async fn post_flight(
+            &self,
+            _resolved: &ResolvedGrant,
+            _usage: Option<core_grant_types::Usage>,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+        async fn post_flight_meter(
+            &self,
+            _resolved: &ResolvedGrant,
+            _usage: Option<core_grant_types::Usage>,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+        async fn log_event(
+            &self,
+            _persona_id: &str,
+            _event_kind: &str,
+            _credential_name: Option<&str>,
+            _outcome: &str,
+            _detail: Option<&str>,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    fn req(method: hyper::Method, uri: &str) -> Request<http_body_util::Empty<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap()
+    }
+
+    const GEN_PATH: &str = "/v1internal:generateContent";
+
+    #[test]
+    fn code_assist_projector_contract_is_pinned() {
+        assert_eq!(GEMINI_CODE_ASSIST_PROJECTOR.name, "gemini-code-assist");
+        assert_eq!(GEMINI_CODE_ASSIST_PROJECTOR.provider_prefix, "google/");
+        assert_eq!(GEMINI_CODE_ASSIST_PROJECTOR.access_detail, "gemini-code-assist");
+        assert!(
+            matches!(
+                GEMINI_CODE_ASSIST_PROJECTOR.injection,
+                CredentialInjection::OAuthBearer
+            ),
+            "code assist uses the OAuth Bearer injection strategy"
+        );
+    }
+
+    #[test]
+    fn code_assist_gate_admits_v1internal_methods_and_operations() {
+        let accepts = GEMINI_CODE_ASSIST_PROJECTOR.accepts;
+        let uri = |s: &str| s.parse::<http::Uri>().unwrap();
+        // POST custom-verb methods:
+        assert!(accepts(&hyper::Method::POST, &uri(GEN_PATH)));
+        assert!(accepts(
+            &hyper::Method::POST,
+            &uri("/v1internal:streamGenerateContent?alt=sse")
+        ));
+        assert!(accepts(&hyper::Method::POST, &uri("/v1internal:loadCodeAssist")));
+        assert!(accepts(&hyper::Method::POST, &uri("/v1internal:onboardUser")));
+        // GET reads + operation polls (the handshake needs these):
+        assert!(accepts(
+            &hyper::Method::GET,
+            &uri("/v1internal:getCodeAssistGlobalUserSetting")
+        ));
+        assert!(accepts(
+            &hyper::Method::GET,
+            &uri("/v1internal/operations/op-123")
+        ));
+        assert!(!accepts(
+            &hyper::Method::POST,
+            &uri("/v1internal/operations/op-123")
+        ));
+        // Rejected methods:
+        assert!(!accepts(&hyper::Method::PUT, &uri(GEN_PATH)));
+        assert!(!accepts(&hyper::Method::DELETE, &uri(GEN_PATH)));
+        // Wrong prefix / shape:
+        assert!(!accepts(
+            &hyper::Method::POST,
+            &uri("/v1beta/models/gemini-3-flash:generateContent")
+        ));
+        assert!(!accepts(&hyper::Method::POST, &uri("/v1internal")));
+        assert!(!accepts(&hyper::Method::POST, &uri("/v1internal:")));
+        // A colon-method must be a single token (no further path segments):
+        assert!(!accepts(
+            &hyper::Method::POST,
+            &uri("/v1internal:generateContent/extra")
+        ));
+    }
+
+    #[test]
+    fn code_assist_gate_rejects_authority_and_traversal() {
+        let accepts = GEMINI_CODE_ASSIST_PROJECTOR.accepts;
+        let smuggled = "//evil.example/v1internal:generateContent"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert!(!accepts(&hyper::Method::POST, &smuggled));
+        let absolute = "https://evil.example/v1internal:generateContent"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert!(!accepts(&hyper::Method::POST, &absolute));
+        for p in [
+            "/v1internal/operations/../../v1internal:generateContent",
+            "/v1internal:%2e%2egenerateContent",
+            "/v1internal/operations//x",
+            // M1: an operation sub-verb (mutation, e.g. cancel) or sub-path is
+            // NOT a bare poll and must be rejected.
+            "/v1internal/operations/op-123:cancel",
+            "/v1internal/operations/op-123/sub",
+        ] {
+            let uri = p.parse::<http::Uri>().unwrap();
+            assert!(!accepts(&hyper::Method::POST, &uri), "must reject {p}");
+        }
+    }
+
+    #[test]
+    fn code_assist_upstream_pins_cloudcode_pa_and_preserves_path_query() {
+        let upstream = GEMINI_CODE_ASSIST_PROJECTOR.upstream;
+        let (url, host) = upstream(
+            &"/v1internal:streamGenerateContent?alt=sse"
+                .parse::<http::Uri>()
+                .unwrap(),
+        );
+        assert_eq!(host, "cloudcode-pa.googleapis.com");
+        assert_eq!(
+            url,
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(host, gemini_code_assist_host());
+    }
+
+    #[test]
+    fn code_assist_inject_oauth_bearer_strips_client_auth_and_sets_bearer() {
+        let mut headers = hyper::HeaderMap::new();
+        // The CLI signs client-side with google-auth-library; that Bearer must
+        // be replaced, not pass through.
+        headers.insert("authorization", "Bearer client-signed".parse().unwrap());
+        headers.insert("x-api-key", "attacker".parse().unwrap());
+        headers.insert("x-goog-api-key", "attacker".parse().unwrap());
+        inject_oauth_bearer(&mut headers, BROKER_TOKEN).expect("inject");
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {BROKER_TOKEN}").as_str()),
+            "broker Bearer replaces the client's signed one"
+        );
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("x-goog-api-key").is_none());
+    }
+
+    #[test]
+    fn code_assist_inject_trims_trailing_newline() {
+        let mut headers = hyper::HeaderMap::new();
+        inject_oauth_bearer(&mut headers, "ya29.tok\n").expect("inject");
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer ya29.tok")
+        );
+    }
+
+    #[tokio::test]
+    async fn code_assist_fail_closed_no_session_authority() {
+        let backend = StdArc::new(CodeAssistTestBackend::no_authority());
+        let resp = handle_loopback_projector_request(
+            &GEMINI_CODE_ASSIST_PROJECTOR,
+            backend,
+            req(hyper::Method::POST, GEN_PATH),
+            "sess_unknown".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn code_assist_fail_closed_non_google_credential() {
+        for cred in ["anthropic/oauth-token", "openai/session-key", "github/pat"] {
+            let backend = StdArc::new(CodeAssistTestBackend::with_credential(cred));
+            let resp = handle_loopback_projector_request(
+                &GEMINI_CODE_ASSIST_PROJECTOR,
+                backend,
+                req(hyper::Method::POST, GEN_PATH),
+                "sess_gca".into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "non-google credential {cred} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn code_assist_budgeted_grant_blocks_streaming_before_token_read() {
+        let backend = StdArc::new(CodeAssistTestBackend::with_budgeted_authority());
+        let resp = handle_loopback_projector_request(
+            &GEMINI_CODE_ASSIST_PROJECTOR,
+            backend,
+            req(hyper::Method::POST, "/v1internal:streamGenerateContent?alt=sse"),
+            "sess_gca".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn code_assist_strict_gate_rejects_before_authority() {
+        for (method, path) in [
+            (hyper::Method::PUT, GEN_PATH),
+            (hyper::Method::POST, "/v1beta/models/x:generateContent"),
+            (hyper::Method::POST, "/v1internal:gen/erate"),
+        ] {
+            let backend = StdArc::new(CodeAssistTestBackend::with_authority());
+            let resp = handle_loopback_projector_request(
+                &GEMINI_CODE_ASSIST_PROJECTOR,
+                backend,
+                req(method.clone(), path),
+                "sess_gca".into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} must be rejected by the strict gate"
+            );
+        }
     }
 }

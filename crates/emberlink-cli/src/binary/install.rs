@@ -1,9 +1,10 @@
 //! `ember binary install <tool>@<version> --from-path <path> [--publisher <DID>]`
 //!
 //! For v1: reads the binary at `--from-path`, computes blake3, writes a new
-//! manifest entry to `~/.ember/binaries/manifest.toml`.
+//! manifest entry to the bundled system manifest unless `--manifest-path` is
+//! provided explicitly.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -23,18 +24,27 @@ pub struct BinaryInstallArgs {
     /// Publisher DID (defaults to "did:unknown").
     #[arg(long, default_value = "did:unknown")]
     pub publisher: String,
+
+    /// Destination TOML path. Defaults to `/usr/local/lib/ember/binaries/manifest.toml`.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
 }
 
-fn manifest_path(home_dir: &std::path::Path) -> PathBuf {
-    home_dir
-        .join(".ember")
-        .join("binaries")
-        .join("manifest.toml")
+fn default_manifest_path() -> PathBuf {
+    ember_daemon::binary_manifest::bundled_install_dir().join("manifest.toml")
 }
 
-pub fn binary_install(
+pub fn binary_install(args: &BinaryInstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = args
+        .manifest_path
+        .clone()
+        .unwrap_or_else(default_manifest_path);
+    binary_install_at(args, &manifest_path)
+}
+
+pub fn binary_install_at(
     args: &BinaryInstallArgs,
-    home_dir: &std::path::Path,
+    path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tool_name, version) = args
         .tool_at_version
@@ -57,7 +67,6 @@ pub fn binary_install(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let path = manifest_path(home_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -110,15 +119,15 @@ mod tests {
             tool_at_version: "ember-gh@1.0.0".to_string(),
             from_path: bin_path.clone(),
             publisher: "did:emberlink".to_string(),
+            manifest_path: None,
         };
-
-        binary_install(&args, home_dir.path()).expect("install should succeed");
 
         let manifest_path = home_dir
             .path()
             .join(".ember")
             .join("binaries")
             .join("manifest.toml");
+        binary_install_at(&args, &manifest_path).expect("install should succeed");
         assert!(manifest_path.exists(), "manifest.toml must be created");
 
         let manifest = load_manifest(&manifest_path).expect("manifest must parse");
@@ -137,5 +146,13 @@ mod tests {
             hex::encode(blake3::hash(b"fake-binary").as_bytes())
         );
         assert_eq!(entry.content_hash, expected);
+    }
+
+    #[test]
+    fn default_manifest_path_lands_in_bundled_system_dir() {
+        assert_eq!(
+            default_manifest_path(),
+            PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
+        );
     }
 }

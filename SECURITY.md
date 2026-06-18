@@ -1,6 +1,5 @@
 # Security Policy
 
-
 ## Supported versions
 
 | Release line | Status | Security fixes |

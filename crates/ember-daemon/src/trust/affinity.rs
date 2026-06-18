@@ -10,7 +10,7 @@
 //! `historical_revision` shipped the map declaratively (565 LOC); until this module
 //! landed, the map had ZERO production read sites and therefore provided
 //! ZERO runtime protection. The container-split heuristic in
-//! `implementation-note-64` consumes this module's
+//! `implementation note` consumes this module's
 //! [`decide_container_split`] to choose between `SharedTrustDomain`
 //! (in-broker-process) and `ContainerIsolated` (separate container boundary)
 //! at child-spawn time.
@@ -38,7 +38,7 @@
 //! capability in the request that needs isolation MUST get isolation, even
 //! if its siblings would otherwise have stayed in-process.
 //!
-//! Per design (implementation-note-274 consumer wiring); refines implementation-note-353-
+//! Per design (implementation note consumer wiring); refines implementation note-
 //! ISOLATION-MAPPING. Trust-boundary crate — CODEOWNERS protected.
 
 use core_grant_types::capabilities::lookup_capability_spec;

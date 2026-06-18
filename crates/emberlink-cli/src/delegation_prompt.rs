@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! Delegation template listing + interactive selector (implementation-note-415).
+//! Delegation template listing + interactive selector (implementation-note-322).
 //!
 //! `ember claude` is the canonical launcher (design §Component 6;
 //! design §Component 1). When the operator runs the launcher without an

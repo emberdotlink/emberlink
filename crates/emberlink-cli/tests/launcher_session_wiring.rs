@@ -2,7 +2,7 @@
 //!
 //! CLASSIFICATION: PUBLIC
 //!
-//! Verifies implementation-note-478 acceptance criteria:
+//! Verifies implementation-note-381 acceptance criteria:
 //! - `EMBER_SESSION_ID` is injected into the child env from the daemon RPC response.
 //! - Child `PATH` starts with the shadow directory.
 //! - `close_session` is called with the same session_id on child exit.
@@ -87,7 +87,7 @@ fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
 
     std::thread::spawn(move || {
         let listener = UnixListener::bind(&socket_path).expect("bind mock socket");
-        // implementation-note-407: nonblocking
+        // implementation-note-314: nonblocking
         // + per-iteration deadline so the for-loop exits cleanly when a test
         // path makes fewer than the maximum 4 connections, instead of hanging
         // the test-runner indefinitely on the unused-accept.
@@ -387,7 +387,9 @@ fn run_with_registration_injects_session_id_and_shadow_path() {
         attachment_endpoint_token: Some("ep_mock".to_string()),
         anthropic_unix_socket: None,
         leaf_report_nonce: None,
+        cursor_egress_proxy_url: None,
         codex_responses_proxy_url: None,
+        gemini_proxy_url: None,
     };
 
     // Use a shell snippet as the child binary: write $PATH to a temp file
@@ -506,7 +508,9 @@ fn child_env_contains_ember_session_id() {
         attachment_endpoint_token: Some("ep_mock".to_string()),
         anthropic_unix_socket: None,
         leaf_report_nonce: None,
+        cursor_egress_proxy_url: None,
         codex_responses_proxy_url: None,
+        gemini_proxy_url: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();
@@ -804,7 +808,7 @@ fn launch_claude_code_closes_session_when_child_spawn_fails() {
     );
 }
 
-// implementation-note-479: the `--dev` flow
+// implementation-note-382: the `--dev` flow
 // gate-checks `~/.ember-dev/envs/<worktree-id>/binaries/ember` exists
 // and would re-exec into it via `maybe_reexec_via_dev_cli` if the
 // current binary doesn't canonicalize to that path. The fixture below
@@ -960,7 +964,9 @@ fn child_env_contains_anthropic_gateway_bundle_when_present() {
         attachment_endpoint_token: Some("ep_mock".to_string()),
         anthropic_unix_socket: None,
         leaf_report_nonce: None,
+        cursor_egress_proxy_url: None,
         codex_responses_proxy_url: None,
+        gemini_proxy_url: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();
@@ -1058,7 +1064,9 @@ fn child_env_scrubs_ambient_anthropic_auth_when_gateway_bundle_present() {
         attachment_endpoint_token: Some("ep_mock".to_string()),
         anthropic_unix_socket: None,
         leaf_report_nonce: None,
+        cursor_egress_proxy_url: None,
         codex_responses_proxy_url: None,
+        gemini_proxy_url: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();
@@ -1176,7 +1184,9 @@ fn child_env_contains_ssh_auth_sock_when_present() {
         attachment_endpoint_token: Some("ep_mock".to_string()),
         anthropic_unix_socket: None,
         leaf_report_nonce: None,
+        cursor_egress_proxy_url: None,
         codex_responses_proxy_url: None,
+        gemini_proxy_url: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();

@@ -1476,7 +1476,7 @@ fn format_checkpoint_line(v: &Value) -> Option<String> {
 ///
 /// Output shape (Beat 4 SCION × Emberlink demo 2026-05-15):
 /// ```text
-///   [proxy worker-a] POST /v1/messages — 200 — 312 tokens — Receipt r-7a3f...
+///   [proxy worker-a] POST /v1/messages — 200 — 312 tokens — Receipt <receipt-id>
 /// ```
 ///
 /// The short tag inside `[proxy ...]` is the persona's prefix (everything
@@ -1490,7 +1490,10 @@ fn format_proxy_call_line(v: &Value) -> Option<String> {
     let tokens_in = v.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
     let tokens_out = v.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
     let tokens_total = tokens_in.saturating_add(tokens_out);
-    let receipt_id = v.get("receipt_id").and_then(Value::as_str).unwrap_or("r-?");
+    let receipt_id = v
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .unwrap_or("receipt-?");
     let persona_id = v.get("agent_id").and_then(Value::as_str).unwrap_or("?");
     // Short tag: persona prefix up to first `-`, or the full string if
     // no `-` separator. Keeps demo lines readable when persona IDs are
@@ -1894,6 +1897,8 @@ mod tests {
     /// "agent talked to Anthropic" without a separate dashboard.
     #[test]
     fn cmd_orchestrator_status_renders_proxy_call_lines() {
+        let receipt_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other_receipt_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let events = vec![
             serde_json::json!({
                 "event": "spawn_checkpoint",
@@ -1913,7 +1918,7 @@ mod tests {
                 "status": 200,
                 "tokens_in": 120,
                 "tokens_out": 192,
-                "receipt_id": "r-7a3f0c",
+                "receipt_id": receipt_id,
                 "ts": "2026-05-15T10:00:03Z"
             }),
             // Different agent — must be excluded from worker-a's view.
@@ -1927,7 +1932,7 @@ mod tests {
                 "status": 200,
                 "tokens_in": 10,
                 "tokens_out": 20,
-                "receipt_id": "r-deadbe",
+                "receipt_id": other_receipt_id,
                 "ts": "2026-05-15T10:00:04Z"
             }),
         ];
@@ -1941,12 +1946,13 @@ mod tests {
             lines[0]
         );
         // 120+192 = 312 tokens; demo display string from the brief.
+        let expected_receipt = format!("Receipt {receipt_id}");
         assert!(
             lines[1].contains("[proxy worker]")
                 && lines[1].contains("POST /v1/messages")
                 && lines[1].contains("200")
                 && lines[1].contains("312 tokens")
-                && lines[1].contains("Receipt r-7a3f0c"),
+                && lines[1].contains(&expected_receipt),
             "proxy_call line: {}",
             lines[1]
         );

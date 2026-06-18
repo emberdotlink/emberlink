@@ -152,7 +152,7 @@ pub struct ApprovalResponse {
     pub granted_duration_secs: Option<u64>,
 }
 
-/// implementation-note-62 — block-and-poll RPC request shape.
+/// implementation-note-43 — block-and-poll RPC request shape.
 ///
 /// Sent by a caller awaiting resolution of an approval `request_id` minted by
 /// an escalation path (e.g. the design payment lane's `evaluate_tool_call`
@@ -172,7 +172,7 @@ pub struct AwaitApprovalRequest {
     pub timeout_secs: u64,
 }
 
-/// implementation-note-62 — block-and-poll RPC response.
+/// implementation-note-43 — block-and-poll RPC response.
 ///
 /// Wraps the resolved [`ApprovalDecision`] for the awaited request. A
 /// dedicated wrapper rather than returning `ApprovalDecision` directly
@@ -399,7 +399,7 @@ mod tests {
         assert!(back.denial_reason.is_some());
     }
 
-    // ---- implementation-note-62: await_approval RPC types -----------------------
+    // ---- implementation-note-43: await_approval RPC types -----------------------
 
     #[test]
     fn await_approval_request_roundtrip() {

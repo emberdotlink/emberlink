@@ -13,7 +13,7 @@
 //! - `broker_list`   → [`handle_broker_list`]
 //!
 //! Marker for headless ranker grep: **`BrokerIssue`** (this module path is
-//! `broker_handler`, satisfying the marker contract from implementation-note-148.)
+//! `broker_handler`, satisfying the marker contract.)
 //!
 //! ## Object-safety adapter
 //!
@@ -45,12 +45,13 @@ use core_crypto::Signer as _;
 use serde_json::{Value, json};
 
 use crate::infra::audit::AuditFilter;
-use crate::infra::handler::{RequestContext, current_dispatch_deployment_tier};
+use crate::infra::handler::{DispatchSource, RequestContext, current_dispatch_deployment_tier};
 use crate::infra::rpc_error::RpcError;
 use crate::infra::store::DaemonStore;
 use crate::infra::store::StoreError;
 
 mod exec;
+mod exec_admission;
 mod exec_credentials;
 mod exec_policy;
 #[cfg(test)]
@@ -128,7 +129,7 @@ pub(super) fn now_rfc3339_at(t: SystemTime) -> String {
 // ---------------------------------------------------------------------------
 
 // `-32010` is reserved for `ERR_GRANT_SCHEMA_VERSION_MISMATCH`
-// (implementation-note-71) — see [`check_grant_schema_version`].
+// — see [`check_grant_schema_version`].
 // ERR_NO_REGISTRY moved to `-32011` to free up `-32010` for the
 // schema-version gate.
 const ERR_NO_REGISTRY: (i32, &str) = (
@@ -146,6 +147,81 @@ fn optional_param_string<'a>(params: &'a Value, names: &[&str]) -> Option<&'a st
         .find_map(|name| params.get(*name).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn approval_resolve_params(params: &Value) -> Result<Value, (i32, String)> {
+    let mut normalized = params.as_object().cloned().ok_or_else(|| {
+        (
+            -32602,
+            "approval.resolve params must be an object".to_string(),
+        )
+    })?;
+    if !normalized.contains_key("id")
+        && let Some(approval_id) = normalized.get("approval_id").cloned()
+    {
+        normalized.insert("id".to_string(), approval_id);
+    }
+    normalized
+        .entry("decision".to_string())
+        .or_insert_with(|| Value::String("approve".to_string()));
+    Ok(Value::Object(normalized))
+}
+
+fn approval_narrow_params(params: &Value) -> Result<Value, (i32, String)> {
+    let mut normalized = params.as_object().cloned().ok_or_else(|| {
+        (
+            -32602,
+            "approval.narrow params must be an object".to_string(),
+        )
+    })?;
+    if !normalized.contains_key("id")
+        && let Some(approval_id) = normalized.get("approval_id").cloned()
+    {
+        normalized.insert("id".to_string(), approval_id);
+    }
+    if !normalized.contains_key("scope") {
+        if let Some(scope) = normalized.get("new_scope").cloned() {
+            normalized.insert("scope".to_string(), scope);
+        } else if let Some(scope) = normalized.get("narrow").cloned() {
+            normalized.insert("scope".to_string(), scope);
+        }
+    }
+    if let Some(decision) = normalized.get("decision").and_then(Value::as_str)
+        && decision != "narrow"
+    {
+        return Err((
+            -32602,
+            format!("approval.narrow requires decision 'narrow', got {decision}"),
+        ));
+    }
+    normalized.insert("decision".to_string(), Value::String("narrow".to_string()));
+    Ok(Value::Object(normalized))
+}
+
+/// approval_resolve_rpc_landed — expose the open-store approval resolver as
+/// daemon RPC aliases while preserving the existing approval two-party and
+/// presence checks in `infra::handlers::approval::handle_resolve`.
+pub(crate) async fn handle_approval_resolve(
+    store: &DaemonStore,
+    ctx: &RequestContext,
+    source: &DispatchSource,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let normalized = approval_resolve_params(params)?;
+    crate::infra::handlers::approval::handle_resolve(store, ctx, source, &normalized).await
+}
+
+/// approval_resolve_rpc_landed — `approval.narrow` is a narrower spelling of
+/// the same resolver with `decision = narrow` and accepted `approval_id` /
+/// `new_scope` aliases for the open-store migration caller.
+pub(crate) async fn handle_approval_narrow(
+    store: &DaemonStore,
+    ctx: &RequestContext,
+    source: &DispatchSource,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let normalized = approval_narrow_params(params)?;
+    crate::infra::handlers::approval::handle_resolve(store, ctx, source, &normalized).await
 }
 
 fn receipt_persona_scope(
@@ -322,7 +398,7 @@ pub fn handle_receipt_get(
 ///
 /// Response: `{ token, materialization_id, expires_at, provider }`.
 ///
-/// implementation-note-153: when `principal` is
+/// Peercred principal binding: when `principal` is
 /// supplied, the kernel-attested uid is compared against the uid
 /// bound to the payload's `caller_persona` field. A mismatch is
 /// refused with `-32004` before any provider IO.
@@ -331,29 +407,29 @@ pub async fn handle_broker_issue(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-71 — refuse before any other gate
+    // Schema-version pin — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-140 — refuse when the peer's
+    // Linux namespace-tuple gate — refuse when the peer's
     // kernel-observable namespace inodes drifted from the
     // agent_socket_enrollments row recorded at spawn-completion.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    // implementation-note-141 —
+    // Persona-registry-to-enrollments collapse (step B) —
     // classify the shared-socket caller against the per-agent UDS
     // enrollment surface before the legacy peercred-uid gate fires.
-    // Resolution is observability-only at Step B; the gate downstream
-    // still enforces uid binding. Step C will retire the legacy
+    // Resolution is observability-only at this step; the gate downstream
+    // still enforces uid binding. A later step will retire the legacy
     // thread-local registry fallback now that the enrollment surface
     // is the documented source of truth.
     log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_issue");
     check_principal_against_persona(principal, store, params, "caller_persona")?;
-    // implementation-note-159: refuse unenrolled
+    // Fail-closed per-RPC rollout: refuse unenrolled
     // personas with -32401 (fail_closed_broker_issue). Other broker
     // RPCs still operate under the fail-open legacy gate until their
-    // rollout step (D) lands.
+    // rollout step lands.
     check_principal_enrollment_strict(principal, store, params, "caller_persona")?;
     let registry = current_registry().ok_or_else(err_no_registry)?;
 
@@ -411,7 +487,7 @@ pub async fn handle_broker_issue(
 ///
 /// Response: `{ revoked: true, materialization_id: <string> }`.
 ///
-/// implementation-note-153: when `principal` is
+/// Peercred principal binding: when `principal` is
 /// supplied AND the payload names `caller_persona`, the peercred uid
 /// is matched against the persona's bound uid. Revoke is a
 /// privileged op (drops daemon-held plaintext); only the persona that
@@ -421,19 +497,19 @@ pub async fn handle_broker_revoke(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-71 — refuse before any other gate
+    // Schema-version pin — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-140 — refuse on namespace drift.
+    // Linux namespace-tuple gate — refuse on namespace drift.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    // implementation-note-141 —
+    // Persona-registry-to-enrollments collapse (step B) —
     // classify shared-socket caller against the enrollment surface.
     log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_revoke");
     check_principal_against_persona(principal, store, params, "caller_persona")?;
-    // implementation-note-160: refuse unenrolled
+    // Fail-closed per-RPC rollout: refuse unenrolled
     // personas with -32401 (fail_closed_broker_revoke_list). This is
     // the final flip in the A/B/C/D rollout — every broker RPC now
     // refuses unenrolled callers.
@@ -472,6 +548,100 @@ pub fn handle_list_all_grants(store: &DaemonStore, params: &Value) -> Result<Val
         })
         .collect();
     Ok(json!(list))
+}
+
+/// status_aggregated_rpc_landed — daemon-owned status projection for the
+/// installed CLI path. This consolidates the historical multi-RPC status read
+/// into one read-only `StatusSummary` while preserving Team0 persona scoping.
+pub fn handle_status(store: &DaemonStore, ctx: &RequestContext) -> Result<Value, (i32, String)> {
+    let persona_scope =
+        crate::infra::handlers::principal::team0_connect_only_persona_scope(ctx, "status")?;
+    let personas = store.list_personas().map_err(|e| (-32000, e.to_string()))?;
+    let grants = store
+        .list_active_grants()
+        .map_err(|e| (-32000, e.to_string()))?;
+    let sandboxes = store
+        .list_sandboxes()
+        .map_err(|e| (-32000, e.to_string()))?;
+    let approvals = store
+        .list_pending_approvals()
+        .map_err(|e| (-32000, e.to_string()))?;
+    let recent_activity_filter = AuditFilter {
+        persona_id: persona_scope.clone(),
+        limit: Some(5),
+        ..Default::default()
+    };
+    let recent_activity = store
+        .query_audit(&recent_activity_filter)
+        .map_err(|e| (-32000, e.to_string()))?;
+    let standing_grants = store
+        .list_standing_grants()
+        .map_err(|e| (-32000, e.to_string()))?
+        .into_iter()
+        .filter(|grant| match persona_scope.as_deref() {
+            Some(persona_id) => grant.persona_id == persona_id,
+            None => true,
+        })
+        .count();
+    let audit_events_total = if let Some(persona_id) = persona_scope.as_deref() {
+        store
+            .query_audit(&AuditFilter {
+                persona_id: Some(persona_id.to_string()),
+                ..Default::default()
+            })
+            .map_err(|e| (-32000, e.to_string()))?
+            .len() as u64
+    } else {
+        store.audit_count().map_err(|e| (-32000, e.to_string()))?
+    };
+    let grants = grants
+        .into_iter()
+        .filter(|grant| match persona_scope.as_deref() {
+            Some(persona_id) => grant.persona_id == persona_id,
+            None => true,
+        })
+        .collect::<Vec<_>>();
+    let grant_live_leases = grants
+        .iter()
+        .filter(|grant| store.leases().has_live_lease(&grant.id, chrono::Utc::now()))
+        .map(|grant| grant.id.clone())
+        .collect();
+
+    serde_json::to_value(crate::infra::status::StatusSummary {
+        personas: personas
+            .into_iter()
+            .filter(|persona| match persona_scope.as_deref() {
+                Some(persona_id) => persona.id == persona_id,
+                None => true,
+            })
+            .collect(),
+        grants,
+        grant_live_leases,
+        sandboxes: sandboxes
+            .into_iter()
+            .filter(|sandbox| match persona_scope.as_deref() {
+                Some(persona_id) => {
+                    sandbox.persona_id == persona_id
+                        || sandbox.owner_persona_id.as_deref() == Some(persona_id)
+                }
+                None => true,
+            })
+            .collect(),
+        approvals: approvals
+            .into_iter()
+            .filter(|approval| match persona_scope.as_deref() {
+                Some(persona_id) => approval.persona_id == persona_id,
+                None => true,
+            })
+            .collect(),
+        recent_activity,
+        standing_grants,
+        audit_events_total,
+        quarantined: crate::infra::handler::is_quarantined(),
+        quarantine_authority: crate::infra::handler::quarantine_authority()
+            .map(|authority| authority.as_str().to_string()),
+    })
+    .map_err(|e| (-32000, format!("serialize status summary: {e}")))
 }
 
 /// Handle the `persona_signer` socket RPC.
@@ -595,26 +765,26 @@ pub fn handle_audit_query(
 /// Response: array of [`MaterializationSummary`] sorted by `issued_at`
 /// ascending. Empty when nothing has been issued.
 ///
-/// implementation-note-153: same gate as issue/revoke
+/// Peercred principal binding: same gate as issue/revoke
 /// when `caller_persona` is present.
 pub async fn handle_broker_list(
     principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-71 — refuse before any other gate
+    // Schema-version pin — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-140 — refuse on namespace drift.
+    // Linux namespace-tuple gate — refuse on namespace drift.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    // implementation-note-141 —
+    // Persona-registry-to-enrollments collapse (step B) —
     // classify shared-socket caller against the enrollment surface.
     log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_list");
     check_principal_against_persona(principal, store, params, "caller_persona")?;
-    // implementation-note-160: refuse unenrolled
+    // Fail-closed per-RPC rollout: refuse unenrolled
     // personas with -32401 (fail_closed_broker_revoke_list).
     check_principal_enrollment_strict(principal, store, params, "caller_persona")?;
     let registry = current_registry().ok_or_else(err_no_registry)?;
@@ -679,10 +849,9 @@ pub async fn handle_broker_mint_gh_token(
 /// ## Implementation status
 ///
 /// The inner `crate::infra::persona::mint_sub_persona` call is a scaffold
-/// stub — the real two-phase commit + spawn wiring is tracked in
-/// implementation-note-161. Until that lands, otherwise-valid
-/// requests fail closed with a structured RPC error rather than panicking
-/// the daemon.
+/// stub — the real two-phase commit + spawn wiring lands later. Until
+/// then, otherwise-valid requests fail closed with a structured RPC error
+/// rather than panicking the daemon.
 pub async fn handle_broker_mint_sub_persona(
     _store: &DaemonStore,
     params: &Value,
@@ -707,7 +876,7 @@ pub async fn handle_broker_mint_sub_persona(
     let scope = params.get("scope").and_then(|v| v.as_str()).unwrap_or("*");
 
     // -----------------------------------------------------------------
-    // implementation-note-162 — fail-closed gate.
+    // Capability-isolation-map consumer — fail-closed gate.
     // Anchor: `capability_isolation_map_consumed`.
     //
     // PR historical_revision shipped `core_grant_types::capabilities::
@@ -734,9 +903,7 @@ pub async fn handle_broker_mint_sub_persona(
                 let s = v.as_str().ok_or_else(|| {
                     (
                         -32602,
-                        format!(
-                            "capabilities[{i}] must be a string (wire-form capability name)"
-                        ),
+                        format!("capabilities[{i}] must be a string (wire-form capability name)"),
                     )
                 })?;
                 out.push(s);
@@ -769,7 +936,7 @@ pub async fn handle_broker_mint_sub_persona(
 //
 // The former `evaluate_spawn_attenuation` / `SpawnGrant` / `ChildSpawnSpec` /
 // `AttenuatedChildGrant` / `SpawnDenialReason` parallel algebra
-// (implementation-note-163) was a test-only re-implementation with zero
+// was a test-only re-implementation with zero
 // production callers. Per design §6 + design §3 there is ONE attenuation
 // algebra; spawn delegation rides it like any other downhill hop:
 //   * capability + scope-subset + conditions → `core_grants::check_statement_attenuation`
@@ -781,11 +948,11 @@ pub async fn handle_broker_mint_sub_persona(
 //     `per_stmt_attenuation_{rejects,accepts}_child_delegation_*`.
 // `Capability::SpawnSubagent` remains only as a routing/isolation marker; it
 // carries no parallel authority math.
-// Anchor: spawn_attenuation_folded_into_check_statement_attenuation
+// implementation marker
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// RPC panic-recovery middleware (implementation-note-164)
+// RPC panic-recovery middleware
 // design §Component 9 (T2).
 // ---------------------------------------------------------------------------
 //
@@ -796,7 +963,7 @@ pub async fn handle_broker_mint_sub_persona(
 // connection's dispatch is its own catch_unwind boundary.
 //
 // catch_unwind dispatch_method — checkpoint for the target_state_anchor gate
-// of implementation-note-164. Although the production
+// of the panic-recovery middleware. Although the production
 // async dispatch lives in `infra/handler.rs::dispatch_method` /
 // `dispatch_method_with_context`, this helper is the panic-recovery
 // primitive that the dispatch site composes with; the checkpoint records
@@ -1062,7 +1229,7 @@ mod tests {
     use crate::infra::credential_store::CredentialStore;
 
     // -----------------------------------------------------------------------
-    // implementation-note-164 tests
+    // RPC panic-recovery middleware tests
     // -----------------------------------------------------------------------
 
     /// T1: panic→typed-error. A handler closure that deliberately panics
@@ -1187,7 +1354,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-153 — kernel-attested principal
+    // Peercred principal binding — kernel-attested principal
     // binding gate. The broker handlers check the request payload's
     // `caller_persona` against the kernel-attested `PeerCredPrincipal.uid`
     // via the persona→uid binding registry; mismatch returns -32004.
@@ -1197,8 +1364,8 @@ mod tests {
     use std::path::PathBuf;
 
     /// Test helper: seed the agent_socket_enrollments table with a (persona, uid) binding.
-    /// Replaces the legacy `bind_persona_uid` thread-local writer (retired in
-    /// implementation-note-165).
+    /// Replaces the legacy `bind_persona_uid` thread-local writer (since
+    /// retired in favor of the enrollment surface).
     fn seed_persona_uid_via_enrollments(store: &DaemonStore, persona_id: &str, uid: u32) {
         let socket_path = format!("/run/emberd/test-agent-{persona_id}.sock");
         store
@@ -1351,7 +1518,7 @@ mod tests {
         assert_eq!(code, -32004);
     }
 
-    /// implementation-note-154 acceptance test.
+    /// Fail-closed per-RPC rollout (step A) acceptance test.
     /// broker_resolve must refuse an unenrolled persona with -32401
     /// (PrincipalNotEnrolled / fail_closed_broker_resolve checkpoint).
     #[tokio::test]
@@ -1378,7 +1545,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-142 acceptance test.
+    /// Fail-closed per-RPC rollout (step B) acceptance test.
     /// broker_exec must refuse an unenrolled caller_persona with -32401
     /// (PrincipalNotEnrolled / fail_closed_broker_exec checkpoint).
     #[tokio::test]
@@ -1406,7 +1573,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-159 acceptance test.
+    /// Fail-closed per-RPC rollout (step C) acceptance test.
     /// broker_issue must refuse an unenrolled caller_persona with -32401
     /// (PrincipalNotEnrolled / fail_closed_broker_issue checkpoint).
     #[tokio::test]
@@ -1435,7 +1602,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-160 acceptance test (revoke half).
+    /// Fail-closed per-RPC rollout (step D) acceptance test (revoke half).
     /// broker_revoke must refuse an unenrolled caller_persona with -32401
     /// (PrincipalNotEnrolled / fail_closed_broker_revoke_list checkpoint).
     #[tokio::test]
@@ -1460,7 +1627,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-160 acceptance test (list half).
+    /// Fail-closed per-RPC rollout (step D) acceptance test (list half).
     /// broker_list must refuse an unenrolled caller_persona with -32401
     /// (PrincipalNotEnrolled / fail_closed_broker_revoke_list checkpoint).
     #[tokio::test]
@@ -1494,7 +1661,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-152 — pidfd-backed reuse-immune liveness gate.
+    // pidfd binding — pidfd-backed reuse-immune liveness gate.
     // `handle_broker_issue` (and the other broker RPCs) refuse a request
     // whose pidfd reports the bound peer process has been reaped.
     // -----------------------------------------------------------------------
@@ -1591,7 +1758,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-161 — broker.mint_sub_persona input
+    // broker.mint_sub_persona input
     // validation tests. These exercise the -32602 gate that runs BEFORE
     // the unsupported scaffold path, so they must pass.
     // ------------------------------------------------------------------
@@ -1663,7 +1830,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-150 — spawn handle expiry gate
+    // Spawn handle TTL — spawn handle expiry gate
     // -----------------------------------------------------------------------
 
     #[test]

@@ -2,7 +2,7 @@
 //! drives (design §Component 1).
 //!
 //! Stages 0-4 themselves are **out of scope for this umbrella PR** —
-//! implementation-note-427-{0,1,2,3,4}-* are `human_only=true` in
+//! implementation-note-334-{0,1,2,3,4}-* are `human_only=true` in
 //! `release-checklist` and the operator will execute them by hand on day 2 of the
 //! v0.3.0 push. This module wires the umbrella that calls into them and
 //! keeps a `NoopStageHandler` test stub so the machine mechanics can run
@@ -116,7 +116,7 @@ impl StageError {
 }
 
 /// The contract the state machine drives. Each stage is a separate
-/// trait impl in a sibling task (`implementation-note-427-*`).
+/// trait impl in a sibling task (`implementation-note-334-*`).
 ///
 /// Implementations should be idempotent — the umbrella may call `run`
 /// again on a stage whose previous run failed, and the operator may
@@ -139,7 +139,7 @@ pub struct PendingStageHandler;
 impl StageHandler for PendingStageHandler {
     fn run(&self, stage: Stage) -> Result<StageOutcome, StageError> {
         Err(StageError::new(format!(
-            "{} is not implemented yet; implementation-note-426 must wire real design stage bodies before `ember dev install` can complete",
+            "{} is not implemented yet; implementation-note-333 must wire real design stage bodies before `ember dev install` can complete",
             stage.label()
         )))
     }
@@ -148,7 +148,7 @@ impl StageHandler for PendingStageHandler {
 /// Test stub `StageHandler`. Returns
 /// `StageOutcome::Complete` for every stage without doing any work.
 ///
-/// **Why this exists:** per the implementation-note-427-{0..4}-* tasks,
+/// **Why this exists:** per the implementation-note-334-{0..4}-* tasks,
 /// the real stage bodies are not fully wired. The production entrypoint
 /// uses [`PendingStageHandler`] so missing stage bodies fail closed; tests
 /// use this stub to exercise resume, state persistence, and `--redo`.

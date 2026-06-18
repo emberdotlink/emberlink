@@ -35,7 +35,7 @@ pub(super) fn handle_use_credential(
         String,
         Option<crate::trust::grant::GrantInfo>,
     ) = if let Some(grant_id) = params["grant_id"].as_str() {
-        // Load core_grants::Grant for state-machine checks (implementation-note-237).
+        // Load core_grants::Grant for state-machine checks (implementation-note-172).
         let core_grant = store
             .grant_store()
             .load_grant(grant_id)
@@ -67,7 +67,7 @@ pub(super) fn handle_use_credential(
             other => RpcError::Internal(other.to_string()),
         })?;
 
-        // implementation-note-239: when the caller passes
+        // implementation-note-174: when the caller passes
         // both grant_id AND credential_name, honor the caller's
         // value if it's bound to a Credential Statement on the
         // grant's chain. Composite grants carry multiple
@@ -119,7 +119,7 @@ pub(super) fn handle_use_credential(
             .map_err(|e| RpcError::Internal(format!("no active grant: {e}")))?
     };
 
-    // implementation-note-238: block credential reads
+    // implementation-note-173: block credential reads
     // when the Credential Statement that authorizes this specific
     // credential_name has been revoked. The previous shape blocked
     // all credential reads if any credential statement was revoked,

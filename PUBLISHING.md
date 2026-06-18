@@ -1,6 +1,5 @@
 # Publishing
 
-
 This repository is a curated public downstream of an active development
 monorepo. Public `main` is a publication surface, not the primary maintainer
 work branch.

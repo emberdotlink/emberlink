@@ -46,9 +46,9 @@
 //! the residual same-uid ephemeral-port spend risk; it retires the unnamed
 //! no-gate exception.
 //!
-//! # Composition with `implementation-note-214`
+//! # Composition with `implementation-note-167`
 //!
-//! `implementation-note-214` makes `ember-proxy` the default egress
+//! `implementation-note-167` makes `ember-proxy` the default egress
 //! gate for in-container agents. That gate's host edge is **one per-session
 //! endpoint** in the §1 design sense, so it rides the same admission
 //! framework — for the container case the policy is

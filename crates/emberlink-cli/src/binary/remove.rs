@@ -3,7 +3,7 @@
 //! Removes a manifest entry by (tool_name, version). Does not check for
 //! construct.toml pins (deferred follow-up).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use ember_daemon::binary_manifest::load_manifest;
@@ -12,32 +12,30 @@ use ember_daemon::binary_manifest::load_manifest;
 pub struct BinaryRemoveArgs {
     /// Tool name and version in `<name>@<version>` format (e.g. `ember-gh@1.0.0`).
     pub tool_at_version: String,
+
+    /// Manifest TOML path. Defaults to `/usr/local/lib/ember/binaries/manifest.toml`.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
 }
 
-fn manifest_path() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".ember")
-            .join("binaries")
-            .join("manifest.toml")
-    } else {
-        PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
-    }
+fn default_manifest_path() -> PathBuf {
+    ember_daemon::binary_manifest::bundled_install_dir().join("manifest.toml")
 }
 
 pub fn binary_remove(args: &BinaryRemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
-    binary_remove_at(args, &manifest_path())
+    let manifest_path = args
+        .manifest_path
+        .clone()
+        .unwrap_or_else(default_manifest_path);
+    binary_remove_at(args, &manifest_path)
 }
 
 /// Variant of [`binary_remove`] that takes the manifest path explicitly
-/// rather than deriving it from `$HOME`. Production code uses
-/// [`binary_remove`]; tests use this entry point with a tempdir-rooted
-/// path so they don't have to mutate the process-global `HOME` env var
-/// (which races with every test that reads HOME-derived state under the
-/// cargo parallel runner).
+/// rather than deriving it from the production default. Tests use this entry
+/// point with a tempdir-rooted path so they don't need privileged system paths.
 pub fn binary_remove_at(
     args: &BinaryRemoveArgs,
-    path: &std::path::Path,
+    path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tool_name, version) = args
         .tool_at_version
@@ -104,19 +102,23 @@ mod tests {
 
         let args = BinaryRemoveArgs {
             tool_at_version: "ember-gh@1.0.0".to_string(),
+            manifest_path: None,
         };
 
-        // Use the path-explicit variant so the test doesn't mutate
-        // the process-global HOME env var. Mutating HOME would race
-        // every test that reads HOME-derived state under the cargo
-        // parallel runner (the previous version of this test
-        // intermittently failed in workspace test sweeps).
         binary_remove_at(&args, &manifest_toml).expect("remove should succeed");
 
         let updated = load_manifest(&manifest_toml).expect("manifest must parse after remove");
         assert!(
             updated.entries.is_empty(),
             "manifest must be empty after removing the only entry"
+        );
+    }
+
+    #[test]
+    fn default_manifest_path_lands_in_bundled_system_dir() {
+        assert_eq!(
+            default_manifest_path(),
+            PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
         );
     }
 }

@@ -6,6 +6,7 @@ use core_events::receipt::TerminationAuthority;
 use crate::infra::handler::{RequestContext, peercred_principal};
 use crate::infra::receipt::current_identity;
 use crate::infra::receipt::issue::{TerminationMeta, issue_cohort_a_receipt};
+use crate::infra::rpc_error::RpcError;
 
 /// Resolve the calling principal from the request context and params.
 ///
@@ -64,6 +65,22 @@ pub async fn resolve_caller_principal(
          and no caller_persona_id param supplied"
             .to_string(),
     ))
+}
+
+/// Allow-listed caller -> vault namespace for the per-caller local-state
+/// content key. Restricts `local_state_key_*` and binary-pin socket methods to
+/// the known Ember binaries; a malicious caller cannot pollute the namespace
+/// with arbitrary keys.
+///
+/// Per KEYCHAIN-CONSOLIDATE-CLI adversarial-review HIGH-1.
+pub(crate) fn local_state_vault_name(caller: &str) -> Result<String, (i32, String)> {
+    match caller {
+        "cli" | "gui" | "native-host" => Ok(format!("local-state/{caller}")),
+        other => Err(RpcError::InvalidParams(format!(
+            "invalid 'caller' {other:?}: expected one of cli, gui, native-host"
+        ))
+        .into()),
+    }
 }
 
 // NB: `emit_local_state_v2_receipt` was removed here per design §76-78 —

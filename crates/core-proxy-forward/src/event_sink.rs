@@ -1,7 +1,7 @@
 //! CLASSIFICATION: PUBLIC
 //!
 //! EventSink trait + GrantEvent types — extracted from ember-daemon
-//! per design (implementation-note-77 Slice A). ember-daemon's
+//! per design (implementation-note-58 Slice A). ember-daemon's
 //! infra/events.rs gets a re-export in Slice B so existing callers
 //! don't break.
 //!
@@ -100,7 +100,7 @@ impl std::error::Error for EventError {}
 /// SQLite audit table and the `tokio::sync::broadcast` channel. A
 /// remote implementation (Slice C) will RPC over a Unix-domain socket
 /// instead.
-// pub trait EventSink — implementation-note-78
+// pub trait EventSink — implementation-note-59
 #[async_trait]
 pub trait EventSink: Send + Sync + 'static {
     /// Append an audit-log entry.

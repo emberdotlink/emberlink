@@ -34,21 +34,6 @@ impl From<crate::infra::socket::PeerIdentity> for PeerCred {
     }
 }
 
-pub(super) fn broker_peercred_principal_for_handler(
-    ctx: &RequestContext,
-) -> Option<&crate::infra::runtime::PeerCredPrincipal> {
-    // Bridge-authenticated callers reach the daemon over the local
-    // ember-rpc sibling socket. On that lane, `peer_cred_principal`
-    // describes the sibling service rather than the workload identity that
-    // was already authenticated via mTLS and stamped into
-    // the `Bridge` source's principal (`ctx.mtls_principal()`).
-    if ctx.mtls_principal().is_some() {
-        None
-    } else {
-        ctx.peer_cred_principal.as_ref()
-    }
-}
-
 /// Errors returned by the principal-binding layer.
 ///
 /// These are converted to JSON-RPC error tuples by the dispatch layer:
@@ -125,18 +110,18 @@ pub struct RequestContext {
     /// `SessionMeta` + `receipt.json`. `None` for internal callers and test
     /// contexts that don't exercise the session lifecycle.
     pub sessions_dir: Option<std::path::PathBuf>,
-    /// implementation-note-229: bound LLM proxy
+    /// Bound LLM proxy
     /// URL plumbed from the runtime after the proxy listener binds. Populated
     /// by `SocketListener::with_llm_proxy_url` and consumed by
     /// `register_session` instead of reading `EMBER_PROXY_URL` from the
     /// environment, which is unreliable across tokio worker threads (Rust
     /// 2024 `set_var` cross-thread visibility hazard).
     pub llm_proxy_url: Option<String>,
-    /// implementation-note-229: bound git proxy
+    /// Bound git proxy
     /// URL plumbed from the runtime after the git proxy listener binds.
     /// Matches the pattern of `llm_proxy_url` above.
     pub git_proxy_url: Option<String>,
-    /// implementation-note-153 — kernel-attested
+    /// Kernel-attested
     /// (uid, pid, socket_path) triple captured at connection accept
     /// time. Threaded through to broker_issue / broker_revoke /
     /// broker_list / broker_exec / session.lookup_or_open so per-call
@@ -147,7 +132,6 @@ pub struct RequestContext {
     /// flows) and pre-migration socket entry points; broker handlers
     /// fall back to the legacy "warn but allow" path in that case.
     pub peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal>,
-    /// implementation-note-230 —
     /// Phase D presence-token, attached by the JSON-RPC parser slice
     /// (D-3) from the `_presence_token` request parameter. When the
     /// dispatched method's authority class is `OperatorPresence`, the
@@ -156,7 +140,7 @@ pub struct RequestContext {
     /// methods, internal callers, and pre-D callers that have not yet
     /// been retro-fitted with token minting.
     pub presence_token: Option<crate::auth::presence_token::PresenceToken>,
-    /// implementation-note-231 — when set,
+    /// When set,
     /// `enforce_local_state_gate` short-circuits with a synthetic peer
     /// (mirroring the existing `#[cfg(test)]` bypass arm). Only set by
     /// [`RequestContext::socket_for_test`], which is reachable only from
@@ -257,7 +241,7 @@ impl RequestContext {
     /// [`RequestContext::socket`] is unreachable from integration tests
     /// in `tests/` by Rust language semantics — integration tests link
     /// against the lib as if external and don't see cfg(test) blocks.
-    /// implementation-note-231.
+    /// Test-only synthetic-peer entry point for integration tests.
     pub fn socket_for_test(peer: PeerCred) -> Self {
         use crate::auth::presence_token::{ScopeKey, mint};
         use std::time::Duration;
@@ -288,7 +272,7 @@ impl RequestContext {
     /// (`socket::handle_connection`) once it has extracted the
     /// `(uid, pid, socket_path)` triple from the accepted stream.
     ///
-    /// implementation-note-153 — builder helper so the
+    /// Builder helper so the
     /// socket layer can stamp the principal without touching every
     /// constructor variant.
     pub fn with_peer_cred_principal(
@@ -345,8 +329,7 @@ impl RequestContext {
     /// Called by the JSON-RPC parser (Phase D Slice 3) when the request
     /// payload carries an `_presence_token` field.
     ///
-    /// `request_context_presence_token_builder`
-    /// (implementation-note-230) —
+    /// `request_context_presence_token_builder` —
     /// additive builder so existing constructors don't need updating.
     ///
     /// `None` is treated as no-op so this method composes cleanly with
@@ -356,8 +339,7 @@ impl RequestContext {
     /// (after `take_presence_token` returned None because the CLI request
     /// didn't carry one) would clobber the synthetic token and re-introduce
     /// the cross-crate "OperatorPresence missing presence_token" failure
-    /// mode that implementation-note-231
-    /// was filed to close.
+    /// mode in the integration-test suite.
     pub fn with_presence_token(
         mut self,
         token: Option<crate::auth::presence_token::PresenceToken>,
@@ -438,7 +420,7 @@ pub(crate) fn mint_operator_presence_token(
 ///
 /// Anchor: presence_signer_ed25519_wired
 ///
-/// Anchors implementation-note-232: the stub
+/// The presence-stub signer has been replaced: the stub
 /// primitive is gone — every presence-token signature this daemon
 /// emits is the same Ed25519 key surface that signs Receipts. See
 /// `crate::infra::receipt::DaemonPersona` for the Ed25519 key
@@ -603,11 +585,6 @@ pub fn clear_pid_persona_registry() {
     PID_PERSONA_REGISTRY.with(|reg| reg.borrow_mut().clear());
 }
 
-// implementation-note-165 — checkpoint.
-//
-// PERSONA_UID_REGISTRY retired — consult agent_socket_enrollments via
-// lookup_persona_uid_from_enrollments. See
-// implementation-note-233 for context.
 
 /// Resolve the calling persona for a peer credential.
 ///
@@ -625,11 +602,10 @@ pub fn peercred_principal(peer: &PeerCred) -> Result<String, HandlerError> {
     })
 }
 
-// implementation-note-234 — checkpoint for
-// target_state_anchor. This block extends the per-socket Persona
+// This block extends the per-socket Persona
 // enrollment doctrine of design to the in-container case: agents
 // inside containers connect via per-agent UDS sockets at
-// `/run/emberd/agent-<uuid>.sock` (per implementation-note-235).
+// `/run/emberd/agent-<uuid>.sock`.
 // emberd records `(socket_path, persona_id, grant_id, brief_content_hash)`
 // at spawn time; every RPC on that socket has identity resolved from
 // the enrollment table, NOT from wire-claimed `caller_persona_id` /
@@ -637,7 +613,7 @@ pub fn peercred_principal(peer: &PeerCred) -> Result<String, HandlerError> {
 // impersonate the orchestrator just by sending the orchestrator's
 // grant_id over its own socket.
 
-/// implementation-note-236 (design §"In-container
+/// Per-socket persona enrollment in container (design §"In-container
 /// extension") — the kernel-attested-equivalent identity surfaced by
 /// the per-socket enrollment table when an RPC arrives on a per-agent
 /// UDS socket.
@@ -654,7 +630,7 @@ pub struct EnrolledPrincipal {
     pub brief_content_hash: String,
 }
 
-/// implementation-note-236 — directory prefix for
+/// Directory prefix for
 /// per-agent UDS sockets.
 ///
 /// Mirrors `crate::infra::socket::PER_AGENT_SOCKET_PARENT`. Kept as a
@@ -662,7 +638,7 @@ pub struct EnrolledPrincipal {
 /// operation and does not pull in the socket module's full surface.
 const PER_AGENT_SOCKET_DIR: &str = "/run/emberd/";
 
-/// implementation-note-236 — true when the supplied
+/// True when the supplied
 /// socket path matches the per-agent UDS shape
 /// (`/run/emberd/agent-*.sock`).
 ///
@@ -698,7 +674,7 @@ pub fn is_per_agent_socket_path(socket_path: &std::path::Path) -> bool {
     true
 }
 
-/// implementation-note-236 — resolve the
+/// Resolve the
 /// kernel-attested-equivalent principal for a per-agent UDS socket.
 ///
 /// Reads the `agent_socket_enrollments` row keyed by `socket_path`
@@ -712,7 +688,6 @@ pub fn is_per_agent_socket_path(socket_path: &std::path::Path) -> bool {
 /// Returns `HandlerError::PrincipalNotEnrolled` when no `active`
 /// row exists for the supplied path (revoked rows count as missing —
 /// the store helper filters them).
-// implementation-note-234 — checkpoint for target_state_anchor
 pub fn enroll_container_persona(
     store: &DaemonStore,
     socket_path: &std::path::Path,

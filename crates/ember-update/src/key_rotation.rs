@@ -58,7 +58,7 @@ pub const BUILDER_ROTATION_GRACE_DAYS: i64 = 180;
 /// The `root_signature` covers the canonical encoding of all other fields. The
 /// canonical encoding is intentionally left unspecified at this scaffold layer
 /// and will be defined when the delegation is wired into the image manifest
-/// verifier (see update-policy).
+/// verifier (see design note).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationDelegation {
     /// Ed25519 public key of the root that issued this delegation.

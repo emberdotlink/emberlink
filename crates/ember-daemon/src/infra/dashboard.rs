@@ -1,4 +1,3 @@
-// implementation-note-205
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,7 +14,7 @@ use tokio::sync::{oneshot, watch};
 use crate::infra::store::{DaemonStore, LiveVaultSlot};
 use crate::trust::approval::ApprovalOutcome;
 
-/// implementation-note-172 — actions hidden from the operator audit timeline by
+/// Actions hidden from the operator audit timeline by
 /// default. Internal bookkeeping events (vault unseal, lifecycle plumbing)
 /// leak implementation detail and clutter screenshots; the dashboard exposes
 /// a `[show internal events]` toggle that re-fetches with `?include_internal=1`
@@ -37,7 +36,7 @@ fn is_internal_audit_action(action: &str) -> bool {
 
 /// Build a `persona_id -> persona.name` map from the store. Used by the
 /// dashboard JSON endpoints to surface real display names alongside the
-/// raw persona id (implementation-note-172). Falls back to an empty map on
+/// raw persona id. Falls back to an empty map on
 /// store error so endpoints stay live; consumers must treat missing keys
 /// as "no name available" and render the id instead.
 fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
@@ -49,7 +48,7 @@ fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
         .collect()
 }
 
-/// implementation-note-107: default persona for the dashboard's
+/// Default persona for the dashboard's
 /// single-tenant flows (passkey enrollment, credential listing).
 /// Returns the first persona ordered by `list_personas()` — the QA
 /// daemon ships exactly one, so this is unambiguous; production
@@ -67,7 +66,7 @@ pub(crate) fn default_persona_id(store: &DaemonStore) -> Option<String> {
 /// 69K.7: live budget gauge + pause/extend buttons + receipt viewer.
 const CSRF_HEADER: &str = "X-Ember-CSRF-Token";
 
-// implementation-note-107: the legacy `base64url_encode` helper used by
+// The legacy `base64url_encode` helper used by
 // the now-deleted `/api/webauthn/challenge` stub was removed. The
 // new flow returns webauthn-rs's `CreationChallengeResponse` /
 // `RequestChallengeResponse` types directly via `serde_json::to_value`,
@@ -169,8 +168,8 @@ fn origin_ok(headers: &hyper::HeaderMap, expected_origin: &str) -> bool {
 /// `vault` is the master key the main daemon already opened (via keyring auto-unseal
 /// or fallback `Vault::open_from_config`). The dashboard's separate store needs the
 /// same vault attached so the biometric-attested approve path can read vault-sealed
-/// persona secrets when minting composite-grant chains. Pre implementation-note-107 the
-/// dashboard approve path never touched persona secrets, so the omission was
+/// persona secrets when minting composite-grant chains. Before the real-biometric
+/// path landed, the dashboard approve path never touched persona secrets, so the omission was
 /// invisible; the WebAuthn-attested path triggers `mint_composite_chain_for_grant`
 /// which reads the persona signing key. Mirrors the git-echo proxy pattern in
 /// `runtime.rs`. `None` is the test-only escape hatch.
@@ -187,7 +186,7 @@ pub async fn run_dashboard(
     addr: SocketAddr,
     db_path: PathBuf,
     version: String,
-    // implementation-note-184: the dashboard shares the daemon's
+    // The dashboard shares the daemon's
     // live-vault slot instead of owning a private `Rc<Vault>`. Explicit
     // lock can therefore cut off dashboard-side persona-secret access
     // without restarting the dashboard task.
@@ -246,7 +245,7 @@ pub async fn run_dashboard(
         }
     };
 
-    // implementation-note-107 follow-up: attach the same vault the main daemon
+    // Attach the same vault the main daemon
     // opened so the WebAuthn-attested approve path can read vault-sealed
     // persona secrets when minting composite chains. Pre-WebAuthn the
     // dashboard approve path never touched persona secrets, so the omission
@@ -258,7 +257,7 @@ pub async fn run_dashboard(
         store.replace_vault_slot(slot);
     }
 
-    // implementation-note-107: build the WebAuthn relying-party gate.
+    // Build the WebAuthn relying-party gate.
     // `None` is the documented escape hatch for unit tests that
     // construct DashboardState directly; in the production daemon
     // path we always have a configured gate so the dashboard
@@ -296,15 +295,15 @@ pub async fn run_dashboard(
                             csrf_token: csrf_token.clone(),
                             started_at,
                             expected_origin: expected_origin.clone(),
-                            // implementation-note-198: the listener
+                            // The listener
                             // is alive at this point — propagate the resolved
                             // local_addr so `/api/status` reports it instead
                             // of relying on the configured (pre-bind) port.
                             dashboard_actual_addr: Some(local_addr),
-                            // implementation-note-206: derive data_dir from
+                            // Derive data_dir from
                             // db_path parent so snapshot blobs can be served.
                             data_dir: db_path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-                            // implementation-note-107: per-connection clone of
+                            // Per-connection clone of
                             // the gate handle. Cheap (Arc bump). The gate
                             // itself owns the Webauthn config + Store ref.
                             #[cfg(feature = "webauthn")]
@@ -349,11 +348,11 @@ pub fn display_action_key(action: &str) -> String {
 }
 
 mod assets;
+mod spa;
 
 use assets::PASSKEYS_SETTINGS_HTML;
 pub use assets::{APPROVAL_HTML_TEMPLATE, COMPOSITE_STATEMENTS_JS, DASHBOARD_HTML};
 
-// implementation-note-207: shipped
 /// Compute the ETag for the dashboard HTML using the compile-time git SHA.
 /// Returns the ETag value in the form `"<sha>"` (with surrounding quotes as
 /// required by RFC 7232). If `if_none_match` equals the current ETag the
@@ -419,7 +418,7 @@ pub struct DashboardState {
     /// Defaults to `"http://127.0.0.1:3141"` for backwards-compat with tests
     /// that construct `DashboardState` without an explicit origin.
     pub expected_origin: String,
-    /// implementation-note-198: the address the dashboard actually
+    /// The address the dashboard actually
     /// bound to, surfaced via `/api/status` as `dashboard_addr_bound`. Always
     /// `Some` when the dashboard is serving traffic (you can't reach this
     /// state otherwise) but the field is `Option<>` so test fixtures can
@@ -427,10 +426,10 @@ pub struct DashboardState {
     /// Resolved from `TcpListener::local_addr()` after a successful bind so
     /// port-0 ephemeral assignments are reflected truthfully.
     pub dashboard_actual_addr: Option<SocketAddr>,
-    /// implementation-note-206: daemon data directory — used to serve
+    /// Daemon data directory — used to serve
     /// cluster-snapshot blobs from `<data_dir>/snapshots/`.
     pub data_dir: std::path::PathBuf,
-    /// implementation-note-107: server-side WebAuthn relying party.
+    /// Server-side WebAuthn relying party.
     ///
     /// `Some` when the daemon's `webauthn` cargo feature is on AND
     /// the gate initialized successfully. The dashboard's
@@ -455,9 +454,6 @@ pub async fn handle_dashboard_request(
 
     let resp = match (method.clone(), path.as_str()) {
         (Method::GET, "/") | (Method::GET, "/index.html") => {
-            let html = DASHBOARD_HTML
-                .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
-                .replace("{{CSRF_TOKEN}}", &state.csrf_token);
             // ETag-based revalidation: the ETag is the compile-time git SHA so
             // any rebuilt binary serves a new ETag, invalidating browser caches
             // on upgrade. `Cache-Control: no-cache` (NOT `no-store`) lets the
@@ -465,7 +461,18 @@ pub async fn handle_dashboard_request(
             // a 304 path avoids re-transmitting the full HTML on every load
             // while still guaranteeing staleness never survives a daemon upgrade.
             let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
-            dashboard_etag_response(if_none_match, html)
+            // design §D5: when the Warden Console SPA is embedded in this
+            // binary it IS the dashboard at this origin; otherwise serve the
+            // legacy hand-written HTML (zero regression on builds without a
+            // frontend bundle).
+            if let Some(resp) = spa::serve(path.as_str(), &state.csrf_token) {
+                resp
+            } else {
+                let html = DASHBOARD_HTML
+                    .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
+                    .replace("{{CSRF_TOKEN}}", &state.csrf_token);
+                dashboard_etag_response(if_none_match, html)
+            }
         }
 
         (Method::GET, "/api/status") => {
@@ -483,7 +490,7 @@ pub async fn handle_dashboard_request(
                 .iter()
                 .filter(|p| p.status == "active")
                 .count();
-            // implementation-note-198: stringify the bound address
+            // Stringify the bound address
             // (or `null`) so the CLI `status` subcommand stops printing the
             // configured-but-not-bound port. Field shape: `Option<String>` →
             // `null` when the dashboard isn't bound, full `host:port` when it is.
@@ -592,7 +599,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-197 — Server-Sent Events stream feeding the live
+        // Server-Sent Events stream feeding the live
         // receipts panel on the dashboard. Mirrors the single-shot
         // snapshot pattern used by `/sse/grants/{id}`: emit the latest
         // 50 receipt rows as individual `data:` events, set the
@@ -641,7 +648,7 @@ pub async fn handle_dashboard_request(
                 .unwrap()
         }
 
-        // implementation-note-192 — cross-receipt search panel.
+        // Cross-receipt search panel.
         // GET /api/receipts/search — query receipts by persona / scope /
         // grant_id / resource. Empty result is `[]` (200); store error
         // returns 500 with `{"error": "search failed"}`.
@@ -703,7 +710,6 @@ pub async fn handle_dashboard_request(
                             receipt_row_raw_payload(&state.store, r, names.get(&r.actor).cloned())
                         })
                         .collect();
-                    // implementation-note-208: shipped
                     json_response(StatusCode::OK, &serde_json::Value::Array(body))
                 }
             }
@@ -728,7 +734,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/grants") => {
             let grants = state.store.list_active_grants().unwrap_or_default();
-            // implementation-note-172 — surface persona.name alongside persona_id
+            // Surface persona.name alongside persona_id
             // so the dashboard can render real display names instead of UUID
             // prefixes. Lookup is rendering-layer only; raw persona_id is
             // unchanged, contract additive.
@@ -775,7 +781,7 @@ pub async fn handle_dashboard_request(
                         serde_json::Value::Object(conds)
                     };
 
-                    // implementation-note-209 (budget_persists_on_simple_grant) —
+                    // (budget_persists_on_simple_grant) —
                     // surface the projected budget + usage so the dashboard's
                     // BUDGET column and live gauge JS can render the operator-
                     // configured ceilings. `g.budget` projects from the signed
@@ -839,7 +845,7 @@ pub async fn handle_dashboard_request(
                             serde_json::to_value(&g.usage).unwrap_or(serde_json::Value::Null),
                         );
                     }
-                    // implementation-note-194 — emit the per-Statement
+                    // Emit the per-Statement
                     // array under `statements` to match `grant_to_json_with_store`
                     // (the canonical serializer used by /api/grants/all and
                     // /api/grants/{id}). Previously this list endpoint emitted
@@ -847,7 +853,7 @@ pub async fn handle_dashboard_request(
                     // callers into `g.statements || g.composite_statements`
                     // fallbacks that cemented the divergence.
                     //
-                    // implementation-note-189 — silently dropping the
+                    // Silently dropping the
                     // get_access_grant error means the dashboard rendered
                     // BUDGET=`—` for fully-valid grants whenever chain
                     // verification failed (or transiently failed during the
@@ -861,8 +867,7 @@ pub async fn handle_dashboard_request(
                             let arr: Vec<serde_json::Value> = chain
                                 .statements()
                                 .map(|(block_index, s)| {
-                                    // implementation-note-194 —
-                                    // per-Statement shape mirrors
+                                    // Per-Statement shape mirrors
                                     // grant_to_json_with_store so the
                                     // list and detail endpoints emit
                                     // the same fields (incl. conditions).
@@ -908,7 +913,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/approvals") => {
             let approvals = state.store.list_pending_approvals().unwrap_or_default();
-            // implementation-note-172 — `persona.name` lookup for the approval card.
+            // `persona.name` lookup for the approval card.
             let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = approvals
                 .iter()
@@ -925,7 +930,7 @@ pub async fn handle_dashboard_request(
                         "status": a.status,
                         "reason": a.reason,
                         "created_at": a.created_at,
-                        // implementation-note-210 — composite envelopes (sandbox-run 3-statement
+                        // Composite envelopes (sandbox-run 3-statement
                         // bundle) surface as a single approval entry whose
                         // statements array drives the per-statement card UI.
                         "composite_statements": a.composite_statements,
@@ -945,7 +950,7 @@ pub async fn handle_dashboard_request(
             let id = path.strip_prefix("/api/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    // implementation-note-172 — additive `persona_name` lookup.
+                    // Additive `persona_name` lookup.
                     let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
                     json_response(
                         StatusCode::OK,
@@ -961,7 +966,7 @@ pub async fn handle_dashboard_request(
                             "status": a.status,
                             "reason": a.reason,
                             "created_at": a.created_at,
-                            // implementation-note-210 — surface composite statements + minted grant ID.
+                            // Surface composite statements + minted grant ID.
                             "composite_statements": a.composite_statements,
                             "result_grant_id": a.result_grant_id,
                             "skill_ref": a.skill_ref,
@@ -973,9 +978,8 @@ pub async fn handle_dashboard_request(
         }
 
         (Method::GET, "/api/audit") => {
-            // implementation-note-211: shipped
             use crate::infra::audit::AuditFilter;
-            // implementation-note-172 — operator audit timeline hides internal
+            // Operator audit timeline hides internal
             // bookkeeping events (vault.auto_unseal_from_keyring + the
             // generic `*.internal.*` namespace) by default. The dashboard
             // toggle re-fetches with `?include_internal=1` so internal
@@ -984,7 +988,7 @@ pub async fn handle_dashboard_request(
             // (e.g. `grant.`, `approval.`, `broker.`). Both are rendering-
             // layer only — store rows are unchanged.
             //
-            // implementation-note-171 — additional query params:
+            // Additional query params:
             //   ?persona_filter=<persona-id> — exact-match agent_id column
             //   ?scope_filter=<prefix>       — credential LIKE prefix%
             //   ?since=<unix-ms>             — inclusive lower-bound timestamp
@@ -1066,7 +1070,6 @@ pub async fn handle_dashboard_request(
         }
 
         (Method::GET, "/api/maturation/candidates") => {
-            // implementation-note-199: shipped
             let conn = state.store.conn();
             let mut stmt = match conn.prepare(
                 "SELECT action, credential, COUNT(*) as freq, MAX(timestamp) as last_seen \
@@ -1095,7 +1098,7 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/revoke-statement") =>
         {
-            // implementation-note-200 — per-statement revoke
+            // Per-statement revoke
             // wired through the dashboard. Body: `{"sid": "S0"}`.
             if !origin_ok(&headers, &state.expected_origin) {
                 error_response(403, "origin or referer header missing or mismatched")
@@ -1170,7 +1173,8 @@ pub async fn handle_dashboard_request(
                     .strip_prefix("/api/approvals/")
                     .unwrap()
                     .strip_suffix("/approve-always")
-                    .unwrap();
+                    .unwrap()
+                    .to_string();
                 // Default 30-day TTL per design spec.
                 // standing_grant_expires_at_capped: emit strict RFC-3339
                 // (with TZ) so `create_standing_grant`'s parser accepts it.
@@ -1181,19 +1185,18 @@ pub async fn handle_dashboard_request(
                     let twenty_nine_days = chrono::Utc::now() + chrono::Duration::days(29);
                     Some(twenty_nine_days.to_rfc3339())
                 };
-                match state.store.resolve_approval(
+                resolve_approval_via_dashboard(
+                    state,
+                    req,
                     id,
-                    &ApprovalOutcome::Always {
+                    ApprovalOutcome::Always {
                         scope: None,
                         expires_at,
                     },
-                ) {
-                    Ok(()) => json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({"approved": true, "standing_grant_created": true}),
-                    ),
-                    Err(e) => error_response(400, &e.to_string()),
-                }
+                    "approved",
+                    true,
+                )
+                .await
             }
         }
 
@@ -1212,7 +1215,15 @@ pub async fn handle_dashboard_request(
                     .strip_suffix("/approve")
                     .unwrap()
                     .to_string();
-                resolve_approval_via_dashboard(state, req, id, /* approve */ true).await
+                resolve_approval_via_dashboard(
+                    state,
+                    req,
+                    id,
+                    ApprovalOutcome::Approved,
+                    "approved",
+                    false,
+                )
+                .await
             }
         }
 
@@ -1231,11 +1242,21 @@ pub async fn handle_dashboard_request(
                     .strip_suffix("/deny")
                     .unwrap()
                     .to_string();
-                resolve_approval_via_dashboard(state, req, id, /* approve */ false).await
+                resolve_approval_via_dashboard(
+                    state,
+                    req,
+                    id,
+                    ApprovalOutcome::Denied {
+                        reason: "denied via dashboard".to_string(),
+                    },
+                    "denied",
+                    false,
+                )
+                .await
             }
         }
 
-        // implementation-note-107: WebAuthn registration ceremony — begin.
+        // WebAuthn registration ceremony — begin.
         //
         // Body: optional `{persona_id}`. Defaults to the daemon's
         // first persona (single-tenant local dashboard). Returns
@@ -1302,7 +1323,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-107: WebAuthn registration ceremony — finish.
+        // WebAuthn registration ceremony — finish.
         //
         // Body: `{challenge_id, credential}` where `credential` is the
         // `RegisterPublicKeyCredential` JSON the browser produced from
@@ -1365,7 +1386,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-107: WebAuthn authentication ceremony — begin.
+        // WebAuthn authentication ceremony — begin.
         //
         // Body: `{approval_id}`. The daemon looks up the approval to
         // determine the persona, loads that persona's enrolled
@@ -1444,7 +1465,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-107: list enrolled credentials for a persona.
+        // List enrolled credentials for a persona.
         // Used by the `/settings/passkeys` page to render the list.
         _ if method == Method::GET && path.starts_with("/api/webauthn/credentials") => {
             #[cfg(feature = "webauthn")]
@@ -1479,7 +1500,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-107: delete an enrolled credential. Body
+        // Delete an enrolled credential. Body
         // `{persona_id, credential_id}`. Used by the settings page's
         // Remove button.
         _ if method == Method::POST && path == "/api/webauthn/credentials/delete" => {
@@ -1549,7 +1570,7 @@ pub async fn handle_dashboard_request(
             None => error_response(503, "telemetry not initialized"),
         },
 
-        // implementation-note-206: GET /api/cluster-snapshot/latest
+        // GET /api/cluster-snapshot/latest
         // Returns the most recent snapshot_id from the local snapshots dir.
         // The puller on the operator's daemon calls this to discover the latest
         // snapshot before fetching the full blob.
@@ -1594,7 +1615,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-206: GET /api/cluster-snapshot/{id}
+        // GET /api/cluster-snapshot/{id}
         // Returns { manifest, encrypted_blob_hex } for the given snapshot_id prefix.
         // The puller fetches this after discovering the latest snapshot_id.
         _ if method == Method::GET && path.starts_with("/api/cluster-snapshot/") => {
@@ -1753,7 +1774,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // POST /api/approvals/{id}/dismiss — implementation-note-195
+        // POST /api/approvals/{id}/dismiss — stale-approval cleanup.
         // Operator-initiated dismiss. Sets status to 'dismissed', records
         // `approval.dismissed` audit event, removes the card from the dashboard.
         _ if method == Method::POST
@@ -2058,12 +2079,12 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-201 — first-run passkey enrollment page.
+        // First-run passkey enrollment page.
         // Explains how to register the operator's platform authenticator
         // (Touch ID on macOS, Windows Hello on Windows) so the dashboard
         // Approve button raises the OS biometric sheet.
         (Method::GET, "/settings/passkeys") => {
-            // implementation-note-107: substitute the per-process CSRF token
+            // Substitute the per-process CSRF token
             // so the page can issue authenticated POSTs to
             // /api/webauthn/{register,credentials/delete}.
             let html = PASSKEYS_SETTINGS_HTML.replace("{{CSRF_TOKEN}}", &state.csrf_token);
@@ -2072,6 +2093,21 @@ pub async fn handle_dashboard_request(
                 .header("content-type", "text/html; charset=utf-8")
                 .body(Full::new(Bytes::from(html)))
                 .unwrap()
+        }
+
+        // design §D5: any other GET is a Warden Console SPA asset or a
+        // client-side route. `spa::serve` returns the embedded asset (or
+        // index.html for extensionless routes), and `None` for `/api`/`/sse`,
+        // a concrete missing file, or when no SPA is embedded → 404 below.
+        _ if method == Method::GET => {
+            match spa::serve(path.as_str(), &state.csrf_token) {
+                Some(resp) => resp,
+                None => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("content-type", "text/plain")
+                    .body(Full::new(Bytes::from("not found")))
+                    .unwrap(),
+            }
         }
 
         _ => Response::builder()
@@ -2168,11 +2204,11 @@ fn grant_to_json_with_store(
         }
     };
 
-    // implementation-note-172 — additive `persona_name` lookup so the dashboard
+    // Additive `persona_name` lookup so the dashboard
     // can render the persona's display name as the primary label.
     let persona_name = store.get_persona(&g.persona_id).ok().map(|p| p.name);
 
-    // dashboard_agent_tree_view_promoted — implementation-note-202
+    // dashboard_agent_tree_view_promoted
     // Slice A (backend). Surface parent persona id+name when this grant was
     // minted via delegate (g.parent_grant_id is Some). The Active Agents
     // tile renders "delegated by <parent_alias>" above the credential list.
@@ -2192,7 +2228,7 @@ fn grant_to_json_with_store(
             None => (None, None),
         };
 
-    // implementation-note-200 — surface seconds-remaining
+    // Surface seconds-remaining
     // alongside the absolute timestamp so the dashboard JS can render a
     // tick-down counter without re-parsing RFC3339 in every browser.
     // `null` when the grant has no TTL or the timestamp is unparseable.
@@ -2359,7 +2395,7 @@ pre{{background:var(--bg-hover);border:1px solid var(--border);border-radius:6px
 .btn:hover{{opacity:.8}}
 .actions{{display:flex;gap:8px;margin-top:14px}}
 table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
-/* implementation-note-190: Signed-by card. Foreground treatment for
+/* implementation-note-149: Signed-by card. Foreground treatment for
    the trust anchor — this is the moment the viewer's eye is on the
    receipt artifact, perfect time to bind pubkey↔receipt visually. */
 .signed-block{{padding:16px 18px;background:rgba(232,93,38,.05);border:1px solid rgba(232,93,38,.22);border-radius:6px;margin-bottom:14px}}
@@ -2785,7 +2821,7 @@ fn receipt_row_raw_payload(
     })
 }
 
-/// implementation-note-190: render a 64-hex Ed25519 pubkey as a
+/// Render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. Decorative only — the full pubkey is the
 /// actual trust anchor. Returns `—` for placeholder / empty inputs so
@@ -2841,11 +2877,11 @@ fn build_receipt_json(g: &crate::trust::grant::GrantInfo) -> serde_json::Value {
 /// no budget show an "unbounded" note.
 ///
 /// Pure function of the statement slice — testable without a running server.
-/// implementation-note-200 — per-Statement gauges with an
+/// Per-Statement gauges with an
 /// inline "Revoke" button per row. `revoked_sids` is the slice of sids that
 /// have already been revoked (struck through, button hidden). Wires to
 /// `POST /api/grants/{id}/revoke-statement` via the page's JS handler.
-// TERMINAL-implementation-note-212: terminal grants suppress per-Statement Revoke
+// Terminal grants suppress per-Statement Revoke
 pub(crate) fn render_statement_gauges_with_revoke(
     grant_id: &str,
     statements: &[(usize, &core_grant_types::Statement)],
@@ -3268,7 +3304,7 @@ document.querySelectorAll('form[action$="/pause"],form[action$="/unpause"],form[
   }});
 }});
 
-// implementation-note-200 — per-statement revoke buttons.
+// implementation-note-165 — per-statement revoke buttons.
 document.querySelectorAll('button[data-revoke-sid]').forEach(btn=>{{
   btn.addEventListener('click',async e=>{{
     e.preventDefault();
@@ -3285,7 +3321,7 @@ document.querySelectorAll('button[data-revoke-sid]').forEach(btn=>{{
   }});
 }});
 
-// implementation-note-200 — live tick-down. Computes
+// implementation-note-165 — live tick-down. Computes
 // time-remaining from `expires_at` once per second; flips the status
 // badge to EXPIRED at the boundary. The server-side `expire_stale_grants`
 // sweep is the source of truth for the audit `grant.expired` event;
@@ -3324,9 +3360,9 @@ setInterval(renderTimeRemaining,1000);
 // Mirrors the summary page connectSSE pattern (sseConnections keyed by
 // grant id). Drops the former /api/grants/{id} poll every 2s.
 //
-// implementation-note-213: wall-clock gauge reads server-computed
+// implementation-note-166: wall-clock gauge reads server-computed
 // usage.wall_clock_secs from SSE events; tickWallClockGauge removed.
-// implementation-note-194 — statements array name is canonical.
+// implementation-note-155 — statements array name is canonical.
 function applyUsageGauges(stmts){{
   if(!Array.isArray(stmts))return;
   document.querySelectorAll('span').forEach(sidSpan=>{{
@@ -3937,14 +3973,14 @@ fn webauthn_auth_complete_not_shipped_response() -> Response<Full<Bytes>> {
 /// Render the dedicated `/approvals/{id}` page HTML for a given approval
 /// record, with all `{{TOKEN}}` placeholders substituted.
 ///
-/// implementation-note-188 — the page leads with the high-level
+/// The page leads with the high-level
 /// Approve/Deny decision; the per-statement breakdown for composite
 /// approvals is rendered client-side from the polled JSON behind a
 /// "Show details" disclosure (collapsed-by-default). Both the dashboard
 /// pending-approvals card and this page share the same
 /// `renderCompositeStatements` helper via `COMPOSITE_STATEMENTS_JS`,
 /// so the two surfaces cannot drift.
-/// implementation-note-107: shared dashboard handler for approve + deny.
+/// Shared dashboard handler for approve + deny.
 ///
 /// Verifies a WebAuthn assertion against the persona's enrolled
 /// credentials before flipping approval state. Refuses the state
@@ -3963,19 +3999,23 @@ fn webauthn_auth_complete_not_shipped_response() -> Response<Full<Bytes>> {
 /// 3. **Tests** (gate absent): legacy path. Only reachable when
 ///    DashboardState is constructed without a gate, which the
 ///    production `run_dashboard` never does.
-async fn resolve_approval_via_dashboard(
+async fn resolve_approval_via_dashboard<B>(
     state: Arc<DashboardState>,
-    req: Request<Incoming>,
+    req: Request<B>,
     approval_id: String,
-    approve: bool,
-) -> Response<Full<Bytes>> {
+    outcome: ApprovalOutcome,
+    success_key: &'static str,
+    standing_grant_created: bool,
+) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body + 'static,
+    B::Data: bytes::Buf,
+{
     use http_body_util::BodyExt as _;
-    let body_bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .unwrap_or_default();
+    let body_bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => Bytes::new(),
+    };
     let params: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
     // Decide which path: real WebAuthn vs legacy claim.
@@ -3983,14 +4023,6 @@ async fn resolve_approval_via_dashboard(
     let use_real_webauthn = state.webauthn.is_some() && std::env::var("EMBER_DISABLE_BIO").is_err();
     #[cfg(not(feature = "webauthn"))]
     let use_real_webauthn = false;
-
-    let outcome = if approve {
-        ApprovalOutcome::Approved
-    } else {
-        ApprovalOutcome::Denied {
-            reason: "denied via dashboard".to_string(),
-        }
-    };
 
     if use_real_webauthn {
         #[cfg(feature = "webauthn")]
@@ -4038,11 +4070,12 @@ async fn resolve_approval_via_dashboard(
             ) {
                 Ok(()) => json_response(
                     StatusCode::OK,
-                    &serde_json::json!({
-                        if approve { "approved" } else { "denied" }: true,
-                        "biometric": true,
-                        "credential_id": verified.credential_id,
-                    }),
+                    &approval_success_body(
+                        success_key,
+                        true,
+                        Some(&verified.credential_id),
+                        standing_grant_created,
+                    ),
                 ),
                 Err(e) => error_response(400, &e.to_string()),
             }
@@ -4061,15 +4094,40 @@ async fn resolve_approval_via_dashboard(
         ) {
             Ok(()) => json_response(
                 StatusCode::OK,
-                &serde_json::json!({
-                    if approve { "approved" } else { "denied" }: true,
-                    "biometric": biometric,
-                    "credential_id": credential_id,
-                }),
+                &approval_success_body(
+                    success_key,
+                    biometric,
+                    credential_id,
+                    standing_grant_created,
+                ),
             ),
             Err(e) => error_response(400, &e.to_string()),
         }
     }
+}
+
+fn approval_success_body(
+    success_key: &'static str,
+    biometric: bool,
+    credential_id: Option<&str>,
+    standing_grant_created: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(success_key.to_string(), serde_json::Value::Bool(true));
+    body.insert("biometric".to_string(), serde_json::Value::Bool(biometric));
+    body.insert(
+        "credential_id".to_string(),
+        credential_id
+            .map(|id| serde_json::Value::String(id.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    if standing_grant_created {
+        body.insert(
+            "standing_grant_created".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    serde_json::Value::Object(body)
 }
 
 pub fn render_approval_page(
@@ -4077,7 +4135,7 @@ pub fn render_approval_page(
     approval: &crate::trust::approval::ApprovalRequestInfo,
     persona_name: Option<&str>,
 ) -> String {
-    // implementation-note-189 — for composite approvals, the row's flat `action`
+    // For composite approvals, the row's flat `action`
     // column is the verb of statement 0; that misrepresents a multi-verb
     // chain on the operator-facing card (e.g. an Anthropic+budget+session
     // bundle showing as "credential.access"). Render an honest summary
@@ -4087,7 +4145,7 @@ pub fn render_approval_page(
     } else {
         approval.action.clone()
     };
-    // implementation-note-189 — show "name <identifier>" so the operator
+    // Show "name <identifier>" so the operator
     // sees both the human-friendly handle (e.g. `qa`) and the unique
     // persona-id suffix used in audit logs and grant chains. The
     // identifier-only fallback covers personas that lack a name.

@@ -12,7 +12,7 @@ use core_grants::GrantState as CoreGrantState;
 
 use super::{current_vault, enforce_fresh_presence_proof_with_audit};
 
-// implementation-note-247 Phase 2: SOPS DEK unwrap RPC.
+// implementation-note-180 Phase 2: SOPS DEK unwrap RPC.
 //
 // Authorisation flow:
 //   1. Caller supplies `persona_id`, `grant_id`, and the hex-encoded
@@ -42,7 +42,7 @@ use super::{current_vault, enforce_fresh_presence_proof_with_audit};
 //      hex string in the JSON is sent to the caller; whoever calls this RPC is
 //      implicitly trusted with the plaintext DEK by the grant flow.
 //
-// Phase 3 (implementation-note-119, orchestrator-only) ships
+// Phase 3 (implementation-note-102, orchestrator-only) ships
 // `.claude/scripts/sops-as-bot.sh` — the only blessed agent path that calls
 // this RPC. Direct callers from the agent harness are out of scope for v0.
 #[cfg(feature = "age")]
@@ -69,7 +69,7 @@ pub fn handle_unwrap_dek(store: &DaemonStore, params: &Value) -> Result<Value, (
         .map_err(|e| RpcError::InvalidParams(format!("invalid 'encrypted_dek_blob' hex: {e}")))?;
 
     // Grant gating: load via DaemonGrantStore to get core_grants::Grant at the
-    // state-machine boundary (implementation-note-237). State and issuer checks use
+    // state-machine boundary (implementation-note-172). State and issuer checks use
     // the core type directly.
     let grant = store
         .grant_store()

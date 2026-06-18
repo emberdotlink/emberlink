@@ -101,14 +101,10 @@ pub fn verify_binary_pin(manifest: &BinaryManifest, tool: &str) -> Result<Pinned
 pub(super) fn lookup_binary_in_manifest(binary_path: &str) -> Option<(String, String)> {
     // Prefer the process-global
     // manifest loaded at startup (runtime.rs PATH-PINNING-STARTUP-VERIFY).
-    // That loader honors both `$HOME/.ember/binaries/manifest.toml` (per-user
-    // install via `ember binary install`) and the system path
-    // `/usr/local/lib/ember/binaries/manifest.toml`; reading from disk here
-    // would silently ignore the per-user manifest and force broker_exec to
-    // refuse credential mints on every host where the bundled-binaries
-    // directory doesn't exist (which is every non-system-install host today).
-    // Fall through to a fresh disk read of the system path only if the
-    // global was never installed (defense-in-depth — same path the legacy
+    // That loader honors an explicit startup manifest path, then the system
+    // path `/usr/local/lib/ember/binaries/manifest.toml`.
+    // Fall through to a fresh disk read of the system path only if the global
+    // was never installed (defense-in-depth — same path the legacy
     // implementation used).
     //
     // Path normalization: `ember binary install` stores the canonical path

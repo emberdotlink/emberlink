@@ -519,10 +519,15 @@ fn presence_chokepoint_refuses_every_minting_arm_without_proof() {
         "create_composite_grant",
         "delegate_grant",
         "extend_grant",
+        "grant.extend",
         "propose_grant",
         "create_standing_grant",
         "save_delegation_template",
         "resolve_approval",
+        "approval.resolve",
+        "approval_resolve",
+        "approval.narrow",
+        "approval_narrow",
         "vault_add",
         "vault_put",
         "vault_migrate_acl",
@@ -1025,6 +1030,10 @@ fn widening_transient_kek_applies_covers_only_the_safe_minting_subset() {
         "propose_grant",
         "save_delegation_template",
         "resolve_approval",
+        "approval.resolve",
+        "approval_resolve",
+        "approval.narrow",
+        "approval_narrow",
         "build_init_first_grant_receipt",
     ] {
         assert!(
@@ -1042,6 +1051,7 @@ fn widening_transient_kek_applies_covers_only_the_safe_minting_subset() {
         "register_session",
         "delegate_grant",
         "extend_grant",
+        "grant.extend",
     ] {
         assert!(
             !widening_transient_kek_applies(m),
@@ -1050,9 +1060,9 @@ fn widening_transient_kek_applies_covers_only_the_safe_minting_subset() {
     }
 }
 
-// ── implementation-note-244 — handler integration ─
+// ── implementation-note-194 — handler integration ─
 
-/// implementation-note-244 (F9.3 LOW): when only ONE
+/// implementation-note-194 (F9.3 LOW): when only ONE
 /// Active `presence`-class Device is enrolled under the operator root,
 /// `identity.device.list` MUST surface `is_last_authority: true` on that
 /// device (and only that device). Computed from the same
@@ -1117,7 +1127,7 @@ async fn identity_device_list_flags_only_presence_device_as_last_authority() {
     );
 }
 
-/// implementation-note-244 (F9.3 LOW): with TWO
+/// implementation-note-194 (F9.3 LOW): with TWO
 /// active presence Devices under the root, NEITHER is the last-authority
 /// (revoking either leaves the other to sign the next widening op). The
 /// flag MUST be `false` for both — never an opportunistic guess based on
@@ -1427,7 +1437,7 @@ async fn identity_device_revoke_refuses_last_presence_device_at_handler() {
     )
     .await
     .unwrap_err();
-    // implementation-note-245: the structural
+    // implementation-note-195: the structural
     // last-presence-device guard surfaces -32032 (split out of the
     // generic -32030 presence-refusal bucket) so the CLI can render a
     // typed "enroll a replacement first" affordance instead of the
@@ -1639,7 +1649,7 @@ async fn identity_device_revoke_concurrent_commits_serialize_via_mutation_lock()
     } else {
         panic!("at least one must be Err — exactly-one check above")
     };
-    // implementation-note-245: the second-to-acquire
+    // implementation-note-195: the second-to-acquire
     // COMMIT hits the structural last-presence-device guard re-run inside
     // `commit_device_revoke` (the mutation lock serialized the window so
     // the second handler call now sees a 1-device authority set). That

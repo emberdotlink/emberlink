@@ -5,8 +5,9 @@
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use crate::infra::handlers::support::local_state_vault_name;
 use crate::infra::{
-    handler::{DispatchSource, PeerCred, RequestContext, current_vault, local_state_vault_name},
+    handler::{DispatchSource, PeerCred, RequestContext, current_vault},
     store::DaemonStore,
     vault::VaultScope,
 };

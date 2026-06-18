@@ -7,13 +7,13 @@ pub(super) fn render_top_level_help() -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Local-first authority, launch, and audit tooling for Claude, Codex, Cursor, and operator work."
+        "Local-first authority, launch, and audit tooling for Claude, Codex, Cursor, Gemini, and operator work."
     );
     let _ = writeln!(out);
     push_row_section(
         &mut out,
         "Start",
-        &[("init", "Set up Ember for Claude or Codex")],
+        &[("init", "Set up Ember for Claude, Codex, Cursor, or Gemini")],
     );
     push_row_section(
         &mut out,
@@ -22,6 +22,7 @@ pub(super) fn render_top_level_help() -> String {
             ("claude", "Launch Claude with Ember wiring"),
             ("codex", "Launch Codex with Ember wiring"),
             ("cursor", "Launch Cursor with Ember wiring"),
+            ("gemini", "Launch the Gemini CLI with Ember wiring"),
         ],
     );
     push_row_section(
@@ -71,20 +72,24 @@ pub(super) fn render_top_level_help() -> String {
 pub(super) fn render_init_help() -> String {
     render_help_card(
         "ember init",
-        "Set up Ember on this machine and wire Claude or Codex into the managed launcher path.",
+        "Set up Ember on this machine and wire Claude, Codex, or Cursor into the managed launcher path.",
         &[
             (
                 "ember init --for claude",
-                "Set up the canonical Claude path",
+                "Set up Claude as the first managed lane",
             ),
-            ("ember init --for codex", "Set up the parallel Codex path"),
+            ("ember init --for codex", "Set up Codex as a managed lane"),
+            (
+                "ember init --for cursor",
+                "Set up the baseline Cursor host path",
+            ),
             (
                 "ember init --for claude --non-interactive",
                 "Refuse prompts and print the repair command instead",
             ),
         ],
         &[
-            ("--for <target>", "Choose `claude` or `codex`"),
+            ("--for <target>", "Choose `claude`, `codex`, or `cursor`"),
             ("--non-interactive", "Skip prompts and guided input"),
             ("--migrate", "Relocate older shadow PATH shims"),
             (
@@ -94,6 +99,10 @@ pub(super) fn render_init_help() -> String {
             (
                 "Codex path",
                 "Patches `~/.codex/hooks.json`; check auth with `codex login status` or `codex login --device-auth`",
+            ),
+            (
+                "Cursor path",
+                "Creates the baseline host persona/grant; Cursor account/model auth stays Cursor-owned",
             ),
         ],
         &[
@@ -107,7 +116,7 @@ pub(super) fn render_init_help() -> String {
 pub(super) fn render_uninstall_help() -> String {
     render_help_card(
         "ember uninstall",
-        "Remove Ember's launcher integration for Claude or Codex without destroying your local authority state.",
+        "Remove Ember's launcher integration for Claude, Codex, or Cursor without destroying your local authority state.",
         &[
             (
                 "ember uninstall --for claude",
@@ -117,9 +126,13 @@ pub(super) fn render_uninstall_help() -> String {
                 "ember uninstall --for codex",
                 "Remove only the Codex hook wiring",
             ),
+            (
+                "ember uninstall --for cursor",
+                "Leave Cursor persona/grant state in place",
+            ),
         ],
         &[
-            ("--for <target>", "Choose `claude` or `codex`"),
+            ("--for <target>", "Choose `claude`, `codex`, or `cursor`"),
             (
                 "what stays",
                 "Personas, grants, receipts, and stored credentials remain in place",
@@ -323,7 +336,7 @@ pub(super) fn render_cursor_help() -> String {
             ),
             (
                 "egress",
-                "HTTPS_PROXY egress control needs a daemon-provided Cursor egress URL before this launcher can inject it",
+                "HTTPS_PROXY is injected only when the daemon returns a Cursor egress URL; ambient proxy env is stripped otherwise",
             ),
             ("--host", "Force the host-resident launcher path"),
             (
@@ -504,7 +517,7 @@ pub(super) fn render_grant_help() -> String {
         ],
         &[
             ("ember explain grant", "Read the deeper grant model"),
-            ("ember receipt show", "Inspect signed grant witnesses"),
+            ("ember receipt list", "Find signed grant witnesses"),
         ],
     )
 }
@@ -756,7 +769,10 @@ pub(super) fn render_receipt_verify_help() -> String {
             ),
         ],
         &[
-            ("ember receipt show", "Inspect the full receipt payload"),
+            (
+                "ember receipt show <id>",
+                "Inspect the full receipt payload",
+            ),
             ("ember explain receipt", "Read the durable witness model"),
         ],
     )
@@ -976,7 +992,7 @@ pub(super) fn render_recover_explain_help() -> String {
             ),
         ],
         &[
-            ("<f-code>", "For example `F-DAEMON-2` or `F-implementation-note-174`"),
+            ("<f-code>", "For example `F-DAEMON-2` or `F-implementation-note-145`"),
             (
                 "source",
                 "Reads the matching section from `docs/runbook/recovery.md`",
@@ -1367,7 +1383,7 @@ pub(super) fn render_explain_topic(topic: &[String]) -> Result<String, String> {
     let key = normalized.join(" ").to_ascii_lowercase();
     let text = match key.as_str() {
         "init" => {
-            "ember explain init\n\nWhat it does\n  Sets up the local daemon, persona wiring, and launcher integration for Claude or Codex.\n\nWhat it may change\n  - local Ember config\n  - daemon install state\n  - ~/.claude/settings.json or ~/.codex/hooks.json\n  - stored provider credentials when you choose to save them\n\nHappy path\n  1. Install or repair the daemon\n  2. Patch the selected launcher integration\n  3. Check GitHub readiness\n  4. End on the launcher command you should run next\n\nCommon commands\n  ember init --for claude\n  ember init --for codex\n\nRecovery\n  ember status\n  ember doctor\n  ember github setup"
+            "ember explain init\n\nWhat it does\n  Sets up the local daemon, persona wiring, and launcher integration for Claude, Codex, or Cursor.\n\nWhat it may change\n  - local Ember config\n  - daemon install state\n  - ~/.claude/settings.json or ~/.codex/hooks.json\n  - stored provider credentials when you choose to save them\n  - Cursor baseline persona/grant state; Cursor account/model auth remains Cursor-owned\n\nHappy path\n  1. Install or repair the daemon\n  2. Patch the selected launcher integration\n  3. Check GitHub readiness\n  4. End on the launcher command you should run next\n\nCommon commands\n  ember init --for claude\n  ember init --for codex\n  ember init --for cursor\n\nRecovery\n  ember status\n  ember doctor\n  ember github setup"
         }
         "status" => {
             "ember explain status\n\nWhat it does\n  Shows the current Ember posture and the most important next action.\n\nHow to read it\n  - Ready: launch work can proceed\n  - Needs attention: one concrete setup or repair step is blocking the happy path\n  - Running (quarantined): write-class work is blocked until audit repair completes\n\nRelated surfaces\n  ember doctor\n  ember status --json\n  ember explain doctor"
@@ -1376,16 +1392,16 @@ pub(super) fn render_explain_topic(topic: &[String]) -> Result<String, String> {
             "ember explain doctor\n\nWhat it does\n  Opens Ember's deep diagnosis lane for the current machine.\n\nWhen to use it\n  - status says the machine needs attention\n  - a launcher or broker command fails and points you here\n  - you want the next repair steps, not just the posture headline\n\nRelated surfaces\n  ember status\n  ember explain error E-DAEMON-NOT-INSTALLED"
         }
         "uninstall" => {
-            "ember explain uninstall\n\nWhat it does\n  Removes Ember's launcher integration for Claude or Codex without deleting persona, grant, receipt, or vault state.\n\nWhat changes\n  - Claude path: removes the managed patch Ember added to `~/.claude/settings.json`\n  - Codex path: removes the managed hook block Ember added to `~/.codex/hooks.json`\n\nRelated surfaces\n  ember uninstall --for claude\n  ember uninstall --for codex\n  ember status"
+            "ember explain uninstall\n\nWhat it does\n  Removes Ember's launcher integration for Claude, Codex, or Cursor without deleting persona, grant, receipt, or vault state.\n\nWhat changes\n  - Claude path: removes the managed patch Ember added to `~/.claude/settings.json`\n  - Codex path: removes the managed hook block Ember added to `~/.codex/hooks.json`\n  - Cursor path: no Cursor config is mutated; persona/grant state stays in place\n\nRelated surfaces\n  ember uninstall --for claude\n  ember uninstall --for codex\n  ember uninstall --for cursor\n  ember status"
         }
         "grant" => {
-            "ember explain grant\n\nWhat it does\n  Grants delegate authority from a persona to a credential and scope for a bounded period of time.\n\nHow to think about it\n  - create: mint a fresh authority envelope\n  - extend: add more time or budget to an active grant\n  - revoke / expire: move a grant to terminal state and emit its witness\n  - delegate: mint a narrower child grant from a standing or active parent\n\nRelated surfaces\n  ember grant create\n  ember grant list\n  ember receipt show"
+            "ember explain grant\n\nWhat it does\n  Grants delegate authority from a persona to a credential and scope for a bounded period of time.\n\nHow to think about it\n  - create: mint a fresh authority envelope\n  - extend: add more time or budget to an active grant\n  - revoke / expire: move a grant to terminal state and emit its witness\n  - delegate: mint a narrower child grant from a standing or active parent\n\nRelated surfaces\n  ember grant create\n  ember grant list\n  ember receipt list"
         }
         "delegation" => {
             "ember explain delegation\n\nWhat it does\n  Delegated authority is a narrower child grant minted from a standing or active parent grant. As of the unified authority model (design §6) it is created, inspected, and revoked through `ember grant` — there is no separate `ember delegation` command.\n\nHow to think about it\n  - delegate: `ember grant` mints a narrower child grant from a parent\n  - inspect: `ember grant list` shows active grants and the authority they delegate\n  - revoke: `ember grant revoke` cuts off a grant and the authority it delegated\n\nRelated surfaces\n  ember grant list\n  ember grant revoke\n  ember explain grant"
         }
         "approval" => {
-            "ember explain approval\n\nWhat it does\n  Approval requests are the human checkpoint between a proposed authority use and the grant that would authorize it.\n\nDecision model\n  - approve: allow exactly what was requested\n  - narrow: allow a reduced authority envelope\n  - deny: refuse the request outright\n  - approve --always: convert repeated friction into a standing grant intentionally\n\nRelated surfaces\n  ember approval list\n  ember grant list\n  ember receipt show"
+            "ember explain approval\n\nWhat it does\n  Approval requests are the human checkpoint between a proposed authority use and the grant that would authorize it.\n\nDecision model\n  - approve: allow exactly what was requested\n  - narrow: allow a reduced authority envelope\n  - deny: refuse the request outright\n  - approve --always: convert repeated friction into a standing grant intentionally\n\nRelated surfaces\n  ember approval list\n  ember grant list\n  ember receipt list"
         }
         "audit" => {
             "ember explain audit\n\nWhat it does\n  Audit surfaces the durable evidence chain behind Ember decisions, grants, and repairs.\n\nWhy verify matters\n  `ember audit verify` checks whether the local audit chain is intact. When verification fails, write-class operations may be quarantined until repair completes.\n\nRelated surfaces\n  ember audit verify\n  ember doctor\n  ember receipt verify"
@@ -1394,7 +1410,7 @@ pub(super) fn render_explain_topic(topic: &[String]) -> Result<String, String> {
             "ember explain recover\n\nWhat it does\n  `ember recover` is the operator recovery surface. Failure-class verbs keep the design runbook bridge live; lifecycle verbs add design guided recovery for daemon, audit, persona, grant, vault, and trust posture.\n\nHow to use it\n  - start with `ember doctor` for adaptive diagnosis\n  - use `ember recover diagnose` when the failure class is not obvious\n  - move to `ember recover <class>` when you need class-specific actions\n  - use `ember recover explain F-CODE` to print the exact runbook section\n\nRelated surfaces\n  ember doctor\n  ember recover diagnose\n  ember recover explain F-DAEMON-2\n  docs/runbook/recovery.md"
         }
         "receipt" => {
-            "ember explain receipt\n\nWhat it does\n  Receipts are the signed witness artifacts emitted when grants or delegated authority reach meaningful terminal or exportable states.\n\nWhy they matter\n  The receipt is the durable artifact you can export, verify offline, and hand to a third party as evidence of what happened.\n\nRelated surfaces\n  ember receipt show\n  ember receipt verify\n  ember audit query"
+            "ember explain receipt\n\nWhat it does\n  Receipts are the signed witness artifacts emitted when grants or delegated authority reach meaningful terminal or exportable states.\n\nWhy they matter\n  The receipt is the durable artifact you can export, verify offline, and hand to a third party as evidence of what happened.\n\nRelated surfaces\n  ember receipt list\n  ember receipt show <id>\n  ember receipt verify"
         }
         "persona" => {
             "ember explain persona\n\nWhat it does\n  Personas are the local identities Ember uses as the subject for grants, delegated authority, and related authority-bearing actions.\n\nOperator jobs\n  - create a persona for a new agent or lane\n  - inspect the current persona set\n  - revoke a persona that should stop receiving authority\n\nRelated surfaces\n  ember persona create\n  ember persona list\n  ember grant create"
@@ -1427,7 +1443,7 @@ pub(super) fn render_explain_topic(topic: &[String]) -> Result<String, String> {
             "ember explain codex\n\nWhat it does\n  Launches Codex with Ember-managed PATH wiring and session setup.\n\nAuth model\n  Codex keeps its native login lane. Use `codex login` first, or `codex login --device-auth` on a headless host.\n\nLauncher model\n  - default lane: managed prod daemon\n  - host lane: explicit `--host`\n  - isolated lane: explicit `--isolated`\n\nRelated surfaces\n  ember status\n  ember doctor"
         }
         "cursor" => {
-            "ember explain cursor\n\nWhat it does\n  Launches Cursor with Ember-managed PATH wiring and session setup.\n\nAuth model\n  Cursor account/model auth remains Cursor-owned on the baseline lane. Ember does not broker Cursor model spend unless a future loopback-projector mediation mode is explicitly designed.\n\nLauncher model\n  - default lane: host baseline through the managed prod daemon\n  - host lane: explicit `--host`\n  - isolated and Sandvault lanes: reserved; currently return explicit errors\n\nGovernance boundary\n  Ember governs session registration, delegated authority posture, and PATH-shadowed tools. Cursor's upstream model credential stays client-side.\n\nRelated surfaces\n  ember status\n  ember doctor"
+            "ember explain cursor\n\nWhat it does\n  Launches Cursor with Ember-managed PATH wiring and session setup.\n\nAuth model\n  Cursor account/model auth remains Cursor-owned on the baseline lane. Ember does not broker Cursor model spend unless a future loopback-projector mediation mode is explicitly designed.\n\nLauncher model\n  - default lane: host baseline through the managed prod daemon\n  - host lane: explicit `--host`\n  - isolated and Sandvault lanes: reserved; currently return explicit errors\n\nGovernance boundary\n  Ember governs session registration, delegated authority posture, and PATH-shadowed tools. Cursor's upstream model credential stays client-side.\n\nEgress boundary\n  `ember cursor` strips ambient proxy env and injects `HTTPS_PROXY` only from a daemon-returned `cursor_egress_proxy_url`. Current daemon releases do not return that field yet, so this is a typed seam for the future egress endpoint, not a governed model-spend claim.\n\nRelated surfaces\n  ember status\n  ember doctor"
         }
         "github setup" => {
             "ember explain github setup\n\nWhat it does\n  Registers or stores the GitHub App credentials Ember needs for the HTTPS/App lane.\n\nManifest flow\n  `ember github setup --from-manifest` starts GitHub's App-manifest flow on a 127.0.0.1 callback, exchanges the returned code for the App credential bundle, and keeps private key material out of terminal output.\n\nDirect recovery inputs\n  - App private key PEM\n  - numeric App ID\n  - numeric installation ID\n  - App slug\n\nAfter success\n  Re-run `ember github status` to confirm the lane is ready.\n\nRelated surfaces\n  ember github status\n  ember doctor"

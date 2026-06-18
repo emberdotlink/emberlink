@@ -1,5 +1,5 @@
 //! Integration tests for `ember broker {issue, revoke, list}`
-//! (implementation-note-414).
+//! (implementation-note-321).
 //!
 //! Each test spawns a real `ember-daemon` socket listener on a temp
 //! `UnixStream` path with a `MockBroker`-backed registry installed (the
@@ -267,7 +267,7 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
         provider: "anthropic".to_string(),
         scope_json: r#"{"name":"cli-round-trip"}"#.to_string(),
         ttl: "15m".to_string(),
-        reason: "implementation-note-473issue-test".to_string(),
+        reason: "implementation-note-376issue-test".to_string(),
         json: true,
     };
     let res = broker_command(cmd, opts(&socket));

@@ -1234,8 +1234,8 @@ mod tests {
             verify_receipt_v2, verify_spawn_witness_parent_signature,
         };
 
-        let parent_signer = FixtureSigner::new("implementation-note-351spawn-witness-parent-key");
-        let daemon_signer = FixtureSigner::new("implementation-note-351spawn-witness-daemon-key");
+        let parent_signer = FixtureSigner::new("implementation-note-251spawn-witness-parent-key");
+        let daemon_signer = FixtureSigner::new("implementation-note-251spawn-witness-daemon-key");
         let parent_pk = parent_signer.public_key();
         let daemon_pk = daemon_signer.public_key();
 

@@ -39,6 +39,15 @@ fn permissive_test_policy() -> PolicyEngine {
                 tier: None,
             },
             PolicyRule {
+                action: ActionSelector::parse(
+                    "registry.ember.systems/ember-systems/ember-gh/pr_list@v1",
+                )
+                .expect("valid action_ref selector"),
+                risk: RiskLevel::Low,
+                requirement: ApprovalRequirement::Auto,
+                tier: None,
+            },
+            PolicyRule {
                 action: ActionSelector::named("git.push.main"),
                 risk: RiskLevel::Critical,
                 requirement: ApprovalRequirement::Denied,
@@ -224,8 +233,8 @@ async fn full_grant_lifecycle_via_socket() {
                 serde_json::json!({
                     "persona_id": pid,
                     "credential_name": "test-key",
-                    "scope": "read",
-                    "action": "deploy.staging",
+                    "action_ref": "registry.ember.systems/ember-systems/ember-gh/pr_list@v1",
+                    "resource_id": "octo/repo",
                 }),
             )
             .unwrap();
@@ -863,12 +872,35 @@ async fn dashboard_tcp_listener_serves_html() {
         &response_str[..response_str.len().min(120)]
     );
     assert!(
-        response_str.contains("<!DOCTYPE html>"),
+        response_str
+            .to_ascii_lowercase()
+            .contains("<!doctype html"),
         "expected HTML body, got: {}",
+        &response_str[..response_str.len().min(500)]
+    );
+    assert!(
+        response_str.contains("content-type: text/html"),
+        "expected text/html response, got: {}",
         &response_str[..response_str.len().min(500)]
     );
 
     shutdown_tx.send(true).unwrap();
+}
+
+fn extract_dashboard_csrf_token(html: &str) -> Option<&str> {
+    let legacy_marker = "const CSRF_TOKEN = \"";
+    if let Some(start) = html.find(legacy_marker) {
+        let rest = &html[start + legacy_marker.len()..];
+        return rest.find('"').map(|end| &rest[..end]);
+    }
+
+    let spa_marker = "<meta name=\"ember-csrf-token\" content=\"";
+    if let Some(start) = html.find(spa_marker) {
+        let rest = &html[start + spa_marker.len()..];
+        return rest.find('"').map(|end| &rest[..end]);
+    }
+
+    None
 }
 
 /// End-to-end CSRF protection: POST without the X-Ember-CSRF-Token header
@@ -904,7 +936,9 @@ async fn dashboard_csrf_protects_post_endpoints() {
 
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // 1. GET / returns HTML containing CSRF_TOKEN constant (and no placeholder).
+    // 1. GET / returns HTML containing a rendered CSRF token. The legacy
+    // dashboard uses `const CSRF_TOKEN`; the embedded Warden Console SPA uses
+    // a meta tag read by its transport client.
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -913,21 +947,8 @@ async fn dashboard_csrf_protects_post_endpoints() {
     let mut body = Vec::new();
     stream.read_to_end(&mut body).await.unwrap();
     let body_str = std::str::from_utf8(&body).unwrap();
-    assert!(
-        body_str.contains("const CSRF_TOKEN ="),
-        "HTML must define CSRF_TOKEN"
-    );
-    assert!(
-        !body_str.contains("{{CSRF_TOKEN}}"),
-        "template placeholder must be replaced"
-    );
-
-    // Extract the token from the HTML (parsed from `const CSRF_TOKEN = "...";`).
-    let marker = "const CSRF_TOKEN = \"";
-    let start = body_str.find(marker).unwrap() + marker.len();
-    let rest = &body_str[start..];
-    let end = rest.find('"').unwrap();
-    let token = &rest[..end];
+    let token = extract_dashboard_csrf_token(body_str).expect("HTML must define CSRF token");
+    assert_ne!(token, "{{CSRF_TOKEN}}", "template placeholder must be replaced");
     assert_eq!(token.len(), 64, "token must be 64 hex chars");
 
     // 2. POST without header -> 403.
@@ -963,7 +984,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
     );
 
     // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
-    //    fails downstream. implementation-note-107: with the WebAuthn gate active
+    //    fails downstream. implementation-note-89: with the WebAuthn gate active
     //    (no `EMBER_DISABLE_BIO=1`), an empty body reaches the gate and gets
     //    401 "missing webauthn challenge_id". Without the gate, the legacy
     //    path reaches the store and gets 400 "approval not found". Either
@@ -1156,7 +1177,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-375 tests — RETIRED (design S4).
+// implementation-note-275 tests — RETIRED (design S4).
 //
 // The `try_auto_unseal_from_keyring`, `AutoUnsealOutcome`, and
 // `se_unseal_interactive` functions were deleted in design S4 (the vault

@@ -39,7 +39,7 @@ fn accept_with_timeout(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() >= deadline {
                     panic!(
-                        "listener.accept() timed out after {:?} — implementation-note-407 guard fired",
+                        "listener.accept() timed out after {:?} — implementation-note-314 guard fired",
                         timeout
                     );
                 }
@@ -1098,7 +1098,7 @@ fn cursor_help_discloses_ambient_model_auth_boundary() {
 
     assert!(help.contains("Cursor account/model auth remains Cursor-owned"));
     assert!(help.contains("it does not broker Cursor model spend"));
-    assert!(help.contains("HTTPS_PROXY egress control needs a daemon-provided Cursor egress URL"));
+    assert!(help.contains("HTTPS_PROXY is injected only when the daemon returns a Cursor egress URL"));
 }
 
 #[test]
@@ -1199,14 +1199,12 @@ fn render_explain_topic_uses_structural_color_when_enabled() {
 #[test]
 fn display_command_text_shortens_repo_build_prefix_for_human_cards() {
     assert_eq!(
-        display_command_text(
-            "/private/tmp/emberlink-forge-close-execution-rpc/target/debug/ember doctor"
-        ),
+        display_command_text("/workspace/emberlink-repo-build/target/debug/ember doctor"),
         "ember doctor"
     );
     assert_eq!(
         display_command_text(
-            "sudo /private/tmp/emberlink-forge-close-execution-rpc/target/debug/ember daemon install"
+            "sudo /workspace/emberlink-repo-build/target/debug/ember daemon install",
         ),
         "sudo ember daemon install"
     );
@@ -1596,9 +1594,7 @@ fn fake_status_overview_with_vault_session(vault_session: VaultStatusView) -> St
         ember_initialized: true,
         launcher_issue: None,
         current_launcher_lane: Some(CurrentLauncherLane::RepoBuild {
-            path: PathBuf::from(
-                "/private/tmp/emberlink-forge-close-execution-rpc/target/debug/ember",
-            ),
+            path: PathBuf::from("/workspace/emberlink-repo-build/target/debug/ember"),
         }),
         managed_daemon_issue: None,
         delegation_template_issue: None,
@@ -1631,7 +1627,7 @@ fn primary_status_action_prefers_vault_unlock_when_the_vault_is_hard_locked() {
     assert_eq!(action.kind, PrimaryActionKind::FixNow);
     assert_eq!(
         action.command,
-        "/private/tmp/emberlink-forge-close-execution-rpc/target/debug/ember vault unlock"
+        "/workspace/emberlink-repo-build/target/debug/ember vault unlock"
     );
 }
 
@@ -1660,7 +1656,7 @@ fn primary_status_action_prefers_doctor_when_workflow_bundle_is_missing() {
     assert_eq!(action.kind, PrimaryActionKind::FixNow);
     assert_eq!(
         action.command,
-        "/private/tmp/emberlink-forge-close-execution-rpc/target/debug/ember doctor"
+        "/workspace/emberlink-repo-build/target/debug/ember doctor"
     );
 }
 
@@ -1757,11 +1753,16 @@ fn render_status_overview_text_ready_surfaces_auth_truth() {
             CODEX_DEFAULT_SCOPE,
         ))
         .expect("decode codex grant"),
+        serde_json::from_value(fake_grant_info_json_with_lane(
+            "grant-cursor",
+            "persona-a",
+            CURSOR_DEFAULT_SCOPE,
+            CURSOR_DEFAULT_SCOPE,
+        ))
+        .expect("decode cursor grant"),
     ];
-    overview.summary.grant_live_leases = vec![
-        "grant-claude-oauth".to_string(),
-        "grant-codex".to_string(),
-    ];
+    overview.summary.grant_live_leases =
+        vec!["grant-claude-oauth".to_string(), "grant-codex".to_string()];
 
     let rendered = render_status_overview_text(&overview);
     assert!(
@@ -1813,7 +1814,7 @@ fn render_doctor_text_uses_structured_unlock_guidance_without_repo_path_walls() 
     );
     assert!(
         !rendered
-            .contains("/private/tmp/emberlink-forge-close-execution-rpc/target/debug/ember claude"),
+            .contains("/workspace/emberlink-repo-build/target/debug/ember claude"),
         "doctor should shorten repo-build commands on the structured diagnosis surface: {rendered}"
     );
 }
@@ -1849,6 +1850,13 @@ fn render_doctor_text_surfaces_auth_truth() {
             CODEX_DEFAULT_SCOPE,
         ))
         .expect("decode codex grant"),
+        serde_json::from_value(fake_grant_info_json_with_lane(
+            "grant-cursor",
+            "persona-a",
+            CURSOR_DEFAULT_SCOPE,
+            CURSOR_DEFAULT_SCOPE,
+        ))
+        .expect("decode cursor grant"),
     ];
     overview.summary.grant_live_leases =
         vec!["grant-claude-api".to_string(), "grant-codex".to_string()];
@@ -1951,6 +1959,43 @@ fn fake_persona_info_json(id: &str, name: &str, status: &str) -> serde_json::Val
     })
 }
 
+#[test]
+fn operator_persona_resolution_prefers_active_root() {
+    let personas = vec![
+        fake_persona_info_json("persona-target", "cursor-default", "active"),
+        fake_persona_info_json("persona-root-revoked", "root", "revoked"),
+        fake_persona_info_json(
+            "persona-runtime",
+            "runtime-claude-code-default-123",
+            "active",
+        ),
+        fake_persona_info_json("persona-root", "root", "active"),
+        fake_persona_info_json("persona-codex", "codex-default", "active"),
+    ];
+
+    let resolved = resolve_operator_persona_id_from_list(&personas, "persona-target")
+        .expect("resolve active root");
+    assert_eq!(resolved, "persona-root");
+}
+
+#[test]
+fn operator_persona_resolution_skips_runtime_and_revoked_personas() {
+    let personas = vec![
+        fake_persona_info_json("persona-target", "cursor-default", "active"),
+        fake_persona_info_json(
+            "persona-runtime",
+            "runtime-claude-code-default-123",
+            "active",
+        ),
+        fake_persona_info_json("persona-revoked", "codex-default", "revoked"),
+        fake_persona_info_json("persona-operator", "claude-code-default", "active"),
+    ];
+
+    let resolved = resolve_operator_persona_id_from_list(&personas, "persona-target")
+        .expect("resolve active durable persona");
+    assert_eq!(resolved, "persona-operator");
+}
+
 fn fake_grant_info_json(id: &str, persona_id: &str) -> serde_json::Value {
     fake_grant_info_json_with_lane(id, persona_id, "api-key", "read")
 }
@@ -1991,6 +2036,17 @@ fn fake_grant_info_json_with_lane(
         "max_children_per_day": null,
         "auto_delegate_scope_template": null
     })
+}
+
+fn fake_runtime_delegable_grant_info_json_with_lane(
+    id: &str,
+    persona_id: &str,
+    credential_name: &str,
+    scope: &str,
+) -> serde_json::Value {
+    let mut grant = fake_grant_info_json_with_lane(id, persona_id, credential_name, scope);
+    grant["max_delegation_depth"] = serde_json::json!(1);
+    grant
 }
 
 fn fake_audit_entry_json(id: i64) -> serde_json::Value {
@@ -2340,7 +2396,8 @@ fn render_status_text_running_calls_out_repo_build_managed_daemon_drift() {
             "plain status must name repo-build-vs-managed-daemon drift before launcher failure: {rendered}"
         );
     assert!(
-        rendered.contains("sudo /Users/example/repos/emberlink-dev/target/debug/ember daemon install"),
+        rendered
+            .contains("sudo /Users/example/repos/emberlink-dev/target/debug/ember daemon install"),
         "plain status must point at the repo-built installer path, not ambient PATH: {rendered}"
     );
 }
@@ -3183,8 +3240,7 @@ fn sample_manifest_conversion() -> emberlink_cli::onboarding::github_app::Manife
 fn fake_private_key_pem() -> String {
     format!(
         "{}RSA PRIVATE KEY-----\nsecret\n{}RSA PRIVATE KEY-----\n",
-        "-----BEGIN ",
-        "-----END "
+        "-----BEGIN ", "-----END "
     )
 }
 
@@ -3782,28 +3838,30 @@ fn init_rerun_command_prefers_claude_when_requested() {
         init_rerun_command(Some(OnboardingTarget::Codex)),
         "`ember init --for codex`"
     );
+    assert_eq!(
+        init_rerun_command(Some(OnboardingTarget::Cursor)),
+        "`ember init --for cursor`"
+    );
     assert_eq!(init_rerun_command(None), "`ember init`");
 }
 
 #[test]
 fn init_command_with_ember_command_uses_explicit_repo_build_path() {
     assert_eq!(
-        init_command_with_ember_command(
-            "/home/operator/emberlink-example/target/debug/ember",
-            Some(OnboardingTarget::Claude),
-        ),
-        "/home/operator/emberlink-example/target/debug/ember init --for claude"
+        init_command_with_ember_command("target/debug/ember", Some(OnboardingTarget::Claude)),
+        "target/debug/ember init --for claude"
     );
     assert_eq!(
-        init_command_with_ember_command(
-            "/home/operator/emberlink-example/target/debug/ember",
-            Some(OnboardingTarget::Codex),
-        ),
-        "/home/operator/emberlink-example/target/debug/ember init --for codex"
+        init_command_with_ember_command("target/debug/ember", Some(OnboardingTarget::Codex)),
+        "target/debug/ember init --for codex"
     );
     assert_eq!(
-        init_command_with_ember_command("/home/operator/emberlink-example/target/debug/ember", None),
-        "/home/operator/emberlink-example/target/debug/ember init"
+        init_command_with_ember_command("target/debug/ember", Some(OnboardingTarget::Cursor)),
+        "target/debug/ember init --for cursor"
+    );
+    assert_eq!(
+        init_command_with_ember_command("target/debug/ember", None),
+        "target/debug/ember init"
     );
 }
 
@@ -3841,6 +3899,26 @@ fn init_for_codex_parses_to_canonical_target() {
             assert_eq!(for_target, Some(OnboardingTarget::Codex));
         }
         _ => panic!("expected init command"),
+    }
+}
+
+#[test]
+fn init_for_cursor_parses_to_canonical_target() {
+    match parse_cli(&["init", "--for", "cursor"]).command {
+        Commands::Init { for_target, .. } => {
+            assert_eq!(for_target, Some(OnboardingTarget::Cursor));
+        }
+        _ => panic!("expected init command"),
+    }
+}
+
+#[test]
+fn uninstall_for_cursor_parses_to_canonical_target() {
+    match parse_cli(&["uninstall", "--for", "cursor"]).command {
+        Commands::Uninstall { for_target } => {
+            assert_eq!(for_target, OnboardingTarget::Cursor);
+        }
+        _ => panic!("expected uninstall command"),
     }
 }
 
@@ -5011,6 +5089,14 @@ fn status_json_value_surfaces_runtime_auth_truth() {
         quiet_hours_start: None,
         quiet_hours_end: None,
     });
+    overview.summary.personas.push(
+        serde_json::from_value(fake_persona_info_json(
+            "persona-cursor",
+            "cursor-default",
+            "active",
+        ))
+        .expect("decode cursor persona"),
+    );
     overview.summary.grants = vec![
         serde_json::from_value(fake_grant_info_json_with_lane(
             "grant-claude-oauth",
@@ -5026,9 +5112,19 @@ fn status_json_value_surfaces_runtime_auth_truth() {
             CODEX_DEFAULT_SCOPE,
         ))
         .expect("decode codex grant"),
+        serde_json::from_value(fake_runtime_delegable_grant_info_json_with_lane(
+            "grant-cursor",
+            "persona-cursor",
+            CURSOR_DEFAULT_SCOPE,
+            CURSOR_DEFAULT_SCOPE,
+        ))
+        .expect("decode cursor grant"),
     ];
-    overview.summary.grant_live_leases =
-        vec!["grant-claude-oauth".to_string(), "grant-codex".to_string()];
+    overview.summary.grant_live_leases = vec![
+        "grant-claude-oauth".to_string(),
+        "grant-codex".to_string(),
+        "grant-cursor".to_string(),
+    ];
 
     let payload = status_json_value(&overview);
     assert_eq!(
@@ -5050,6 +5146,22 @@ fn status_json_value_surfaces_runtime_auth_truth() {
     assert_eq!(
         payload["auth"]["codex"]["model_auth_governed"],
         serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+        payload["auth"]["cursor"]["kind"],
+        serde_json::Value::String("cursor_owned_model_auth".to_string())
+    );
+    assert_eq!(
+        payload["auth"]["cursor"]["model_auth_governed"],
+        serde_json::Value::Bool(false)
+    );
+    assert_eq!(
+        payload["auth"]["cursor"]["launcher_grant_active"],
+        serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+        payload["auth"]["cursor"]["grant_id"],
+        serde_json::Value::String("grant-cursor".to_string())
     );
 }
 
@@ -5092,6 +5204,56 @@ fn status_json_does_not_report_codex_session_active_without_live_lease() {
     assert_eq!(
         payload["auth"]["codex"]["grant_id"],
         serde_json::Value::Null
+    );
+}
+
+#[test]
+fn status_json_does_not_report_cursor_ready_without_live_lease() {
+    let mut overview = fake_status_overview_with_vault_session(VaultStatusView {
+        posture: "interactive-unlocked".to_string(),
+        unlocked: true,
+        live_vault_attached: true,
+        session_pin_count: 1,
+        grace_window_secs: 300,
+        grace_remaining_secs: 0,
+        grace_lock_pending: false,
+        grace_zero_due: false,
+        idle_secs: None,
+        idle_timeout_secs: 300,
+        quiet_hours_start: None,
+        quiet_hours_end: None,
+    });
+    overview.summary.personas.push(
+        serde_json::from_value(fake_persona_info_json(
+            "persona-cursor",
+            "cursor-default",
+            "active",
+        ))
+        .expect("decode cursor persona"),
+    );
+    overview.summary.grants = vec![
+        serde_json::from_value(fake_runtime_delegable_grant_info_json_with_lane(
+            "grant-cursor",
+            "persona-cursor",
+            CURSOR_DEFAULT_SCOPE,
+            CURSOR_DEFAULT_SCOPE,
+        ))
+        .expect("decode cursor grant"),
+    ];
+    overview.summary.grant_live_leases = Vec::new();
+
+    let payload = status_json_value(&overview);
+    assert_eq!(
+        payload["auth"]["cursor"]["kind"],
+        serde_json::Value::String("cursor_owned_model_auth".to_string())
+    );
+    assert_eq!(
+        payload["auth"]["cursor"]["launcher_grant_active"],
+        serde_json::Value::Bool(false)
+    );
+    assert_eq!(
+        payload["auth"]["cursor"]["model_auth_governed"],
+        serde_json::Value::Bool(false)
     );
 }
 
@@ -6951,8 +7113,7 @@ fn receipt_verify_v2_id_uses_trust_explain_without_daemon_private_key() {
             ready_tx.send(()).expect("signal ready");
 
             for expected_method in ["receipt.get", "trust.explain"] {
-                let mut stream =
-                    accept_with_timeout(&listener, std::time::Duration::from_secs(10));
+                let mut stream = accept_with_timeout(&listener, std::time::Duration::from_secs(10));
                 let mut reader =
                     std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
                 let mut line = String::new();
@@ -6977,7 +7138,10 @@ fn receipt_verify_v2_id_uses_trust_explain_without_daemon_private_key() {
                             request["params"]["artifact_kind"],
                             serde_json::json!("receipt")
                         );
-                        assert_eq!(request["params"]["sidecar_bytes_b64"], serde_json::json!(""));
+                        assert_eq!(
+                            request["params"]["sidecar_bytes_b64"],
+                            serde_json::json!("")
+                        );
                         let artifact_b64 = request["params"]["artifact_bytes_b64"]
                             .as_str()
                             .expect("artifact bytes b64");
@@ -7157,8 +7321,8 @@ fn receipt_artifact_latest_uses_newest_persisted_artifact() {
     });
 
     ready_rx.recv().expect("wait for fake daemon ready");
-    let target =
-        resolve_receipt_artifact_export_target(&config, None, true).expect("latest artifact target");
+    let target = resolve_receipt_artifact_export_target(&config, None, true)
+        .expect("latest artifact target");
     assert_eq!(target, "rct-v1-newer");
     server.join().expect("fake daemon thread");
 }
@@ -7490,36 +7654,69 @@ fn approval_resolve_routes_through_daemon_when_socket_exists() {
             let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
             ready_tx.send(()).expect("signal ready");
 
-            let mut stream = accept_with_timeout(&listener, std::time::Duration::from_secs(10));
-            let mut reader =
-                std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .expect("read fake daemon request");
-            let request: serde_json::Value =
-                serde_json::from_str(line.trim()).expect("parse fake daemon request");
-            assert_eq!(request["method"], serde_json::json!("resolve_approval"));
-            assert_eq!(request["params"]["id"], serde_json::json!("approval-123"));
-            assert_eq!(request["params"]["decision"], serde_json::json!("always"));
-            assert_eq!(
-                request["params"]["expires_at"],
-                serde_json::json!("2026-06-18T00:00:00")
-            );
+            for expected_method in [
+                "list_pending_approvals",
+                "list_personas",
+                "resolve_approval",
+            ] {
+                let mut stream = accept_with_timeout(&listener, std::time::Duration::from_secs(10));
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!(expected_method));
 
-            let mut resolved = fake_approval_request_json("approval-123", "persona-a");
-            resolved["status"] = serde_json::json!("approved");
-            resolved["result_grant_id"] = serde_json::json!("grant-123");
+                let response = match expected_method {
+                    "list_pending_approvals" => serde_json::json!({
+                        "id": request["id"],
+                        "result": [fake_approval_request_json("approval-123", "persona-a")],
+                    }),
+                    "list_personas" => serde_json::json!({
+                        "id": request["id"],
+                        "result": [
+                            fake_persona_info_json(
+                                "persona-runtime",
+                                "runtime-claude-code-default-123",
+                                "active",
+                            ),
+                            fake_persona_info_json("persona-revoked", "codex-default", "revoked"),
+                            fake_persona_info_json("persona-operator", "claude-code-default", "active"),
+                        ],
+                    }),
+                    "resolve_approval" => {
+                        assert_eq!(request["params"]["id"], serde_json::json!("approval-123"));
+                        assert_eq!(request["params"]["decision"], serde_json::json!("always"));
+                        assert_eq!(
+                            request["params"]["expires_at"],
+                            serde_json::json!("2026-06-18T00:00:00")
+                        );
+                        assert_eq!(
+                            request["params"]["caller_persona_id"],
+                            serde_json::json!("persona-operator")
+                        );
 
-            let mut encoded = serde_json::to_string(&serde_json::json!({
-                "id": request["id"],
-                "result": resolved,
-            }))
-            .expect("encode fake daemon response");
-            encoded.push('\n');
-            stream
-                .write_all(encoded.as_bytes())
-                .expect("write fake daemon response");
+                        let mut resolved = fake_approval_request_json("approval-123", "persona-a");
+                        resolved["status"] = serde_json::json!("approved");
+                        resolved["result_grant_id"] = serde_json::json!("grant-123");
+                        serde_json::json!({
+                            "id": request["id"],
+                            "result": resolved,
+                        })
+                    }
+                    other => panic!("unexpected method: {other}"),
+                };
+
+                let mut encoded =
+                    serde_json::to_string(&response).expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
         }
     });
 
@@ -8394,7 +8591,7 @@ fn unlocked_vault_session() -> VaultStatusView {
 }
 
 #[test]
-fn compute_status_lanes_covers_all_six_lanes_in_order() {
+fn compute_status_lanes_covers_all_seven_lanes_in_order() {
     let overview = fake_status_overview_with_vault_session(unlocked_vault_session());
     let lanes = compute_status_lanes(&overview);
     let names: Vec<&str> = lanes.iter().map(|l| l.name).collect();
@@ -8405,6 +8602,7 @@ fn compute_status_lanes_covers_all_six_lanes_in_order() {
             "Presence",
             "Claude",
             "Codex",
+            "Cursor",
             "GitHub",
             "Shadow PATH"
         ],
@@ -8416,7 +8614,8 @@ fn compute_status_lanes_covers_all_six_lanes_in_order() {
 fn compute_status_lanes_ready_host_marks_infra_ok_and_missing_grants_fail() {
     // Fixture: daemon running, vault unlocked, GitHub App lane, no launcher
     // issue, and the default grant has scope "read" (NOT a Claude/Codex
-    // runtime grant) — so the two model-auth lanes are the only failures.
+    // runtime grant or Cursor launcher grant) — so the runtime/launcher
+    // auth lanes are the only failures.
     let overview = fake_status_overview_with_vault_session(unlocked_vault_session());
     let lanes = compute_status_lanes(&overview);
     let lane = |name: &str| lanes.iter().find(|l| l.name == name).unwrap();
@@ -8444,6 +8643,88 @@ fn compute_status_lanes_ready_host_marks_infra_ok_and_missing_grants_fail() {
             .as_deref()
             .unwrap()
             .contains("init --for codex")
+    );
+    let cursor = lane("Cursor");
+    assert_eq!(cursor.mark, StatusLaneMark::Fail);
+    assert!(
+        cursor
+            .next_action
+            .as_deref()
+            .unwrap()
+            .contains("init --for cursor")
+    );
+}
+
+#[test]
+fn compute_status_lanes_marks_cursor_ok_with_launch_ready_grant() {
+    let mut overview = fake_status_overview_with_vault_session(unlocked_vault_session());
+    overview.summary.personas.push(
+        serde_json::from_value(fake_persona_info_json(
+            "persona-cursor",
+            "cursor-default",
+            "active",
+        ))
+        .expect("decode cursor persona"),
+    );
+    overview.summary.grants = vec![
+        serde_json::from_value(fake_runtime_delegable_grant_info_json_with_lane(
+            "grant-cursor",
+            "persona-cursor",
+            CURSOR_DEFAULT_SCOPE,
+            CURSOR_DEFAULT_SCOPE,
+        ))
+        .expect("decode cursor grant"),
+    ];
+    overview.summary.grant_live_leases = vec!["grant-cursor".to_string()];
+
+    let lanes = compute_status_lanes(&overview);
+    let cursor = lanes
+        .iter()
+        .find(|lane| lane.name == "Cursor")
+        .expect("cursor lane");
+    assert_eq!(cursor.mark, StatusLaneMark::Ok);
+    assert_eq!(cursor.detail, "launch grant ready; model auth Cursor-owned");
+    assert_eq!(cursor.next_action, None);
+}
+
+#[test]
+fn compute_status_lanes_marks_cursor_failed_with_stale_grant_without_live_lease() {
+    let mut overview = fake_status_overview_with_vault_session(unlocked_vault_session());
+    overview.summary.personas.push(
+        serde_json::from_value(fake_persona_info_json(
+            "persona-cursor",
+            "cursor-default",
+            "active",
+        ))
+        .expect("decode cursor persona"),
+    );
+    overview.summary.grants = vec![
+        serde_json::from_value(fake_runtime_delegable_grant_info_json_with_lane(
+            "grant-cursor-stale",
+            "persona-cursor",
+            CURSOR_DEFAULT_SCOPE,
+            CURSOR_DEFAULT_SCOPE,
+        ))
+        .expect("decode cursor grant"),
+    ];
+    overview.summary.grant_live_leases = Vec::new();
+
+    let lanes = compute_status_lanes(&overview);
+    let cursor = lanes
+        .iter()
+        .find(|lane| lane.name == "Cursor")
+        .expect("cursor lane");
+    assert_eq!(cursor.mark, StatusLaneMark::Fail);
+    assert_eq!(
+        cursor.detail,
+        "no launch-ready grant; model auth Cursor-owned"
+    );
+    assert!(
+        cursor
+            .next_action
+            .as_deref()
+            .unwrap()
+            .contains("init --for cursor")
     );
 }
 
@@ -8476,6 +8757,7 @@ fn render_status_lane_checklist_shows_every_lane_and_a_next_action() {
         "Presence",
         "Claude",
         "Codex",
+        "Cursor",
         "GitHub",
         "Shadow PATH",
     ] {

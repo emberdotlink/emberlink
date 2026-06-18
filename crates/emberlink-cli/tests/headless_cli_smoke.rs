@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-474 — clap-parse smoke for the
+//! implementation-note-377 — clap-parse smoke for the
 //! `ember headless [enroll|revoke|status]` surface.
 //!
 //! The real socket round-trip is exercised by the qember.sh T3
@@ -97,9 +97,9 @@ fn headless_unknown_subcommand_is_refused() {
     );
 }
 
-// ─── implementation-note-242 — clap smoke ──────────
+// ─── implementation-note-178 — clap smoke ──────────
 //
-// implementation-note-243
+// implementation-note-179
 
 #[test]
 fn headless_help_lists_preflight_subcommand() {

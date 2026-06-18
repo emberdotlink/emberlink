@@ -7,9 +7,10 @@ pub mod binary_pin;
 pub mod bridge_frame;
 pub mod claim_journal;
 pub mod codex_oauth;
-pub mod codex_proxy;
 pub mod config;
 pub mod credential_store;
+pub mod cursor_egress_proxy;
+pub mod gemini_oauth;
 pub mod daemon_wrap_key;
 pub mod dashboard;
 pub mod delegation_template;
@@ -27,6 +28,10 @@ pub mod init_first_grant;
 pub mod interactive_unlock;
 pub mod kms;
 pub mod kms_edge;
+// `loopback_proxy` — design §2: one per-session loopback-TCP credential-
+// injection registry shared by the codex GPT-plan and gemini Code Assist OAuth
+// lanes (each `Open` carries its own `&'static LoopbackProjector`).
+pub mod loopback_proxy;
 pub mod notification;
 pub mod notify;
 pub mod operator_identity;

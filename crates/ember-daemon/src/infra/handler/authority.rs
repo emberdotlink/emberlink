@@ -1,6 +1,6 @@
 use super::*;
 
-// implementation-note-216: quarantine state. Flipped by the daemon
+// Quarantine state. Flipped by the daemon
 // runtime's startup sampling verify (or any later detected break) so the
 // dispatch layer can refuse write-class socket methods while still allowing
 // read-class probes (audit_verify, audit_query, audit_log_query,
@@ -62,7 +62,7 @@ pub enum QuarantineAuthority {
     /// `/var/log/ember-audit-witness.log` has the wrong owner (e.g. the
     /// daemon's `ember` uid owns it, undermining the cross-trust-domain
     /// anchor). Surfaced by the periodic witness-integrity check
-    /// (implementation-note-217 in Phase C).
+    /// (in Phase C).
     WitnessOwnerMismatch,
 }
 
@@ -229,6 +229,8 @@ pub(super) fn is_read_class_method(method: &str) -> bool {
             | "health"
             | "status"
             | "vault_status"
+            | "catalog.search_actions"
+            | "catalog_search_actions"
             // design — vault_rotate_plan is read-class: it mints a
             // confirmation token + returns the rotation plan, mutating no
             // vault state. (vault_rotate_execute is NOT read-class — it is the
@@ -246,7 +248,7 @@ pub(super) fn is_read_class_method(method: &str) -> bool {
 }
 
 /// Authority class required to dispatch a JSON-RPC method, per design
-/// §"Destination". Phase B (implementation-note-218)
+/// §"Destination". Phase B
 /// declares the type + table; Phase B-enforce will gate dispatch on
 /// the lookup. **No enforcement in this slice.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,7 +271,7 @@ pub enum AuthorityClass {
 /// tier matrix.
 ///
 /// Phase B-enforce
-/// (implementation-note-219) flips the table
+/// flips the table
 /// from telemetry-only to enforcing and classifies every currently-
 /// shipping JSON-RPC method:
 ///
@@ -312,7 +314,7 @@ pub enum AuthorityClass {
 /// a classification entry returns -32601 (effectively unreachable from
 /// external callers) AND fails the exhaustivity test; the dev sees the
 /// gap at test time instead of shipping unprotected.
-// implementation-note-220: load-bearing per-method authority
+// Load-bearing per-method authority
 // resolution. Every dispatch arm must have an explicit entry here; unknown
 // names return None so JSON-RPC method-not-found stays distinct from authority
 // denial.
@@ -358,6 +360,12 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "poll_notifications"
         | "await_approval"
         | "headless_preflight_gaps"
+        // Authority Catalog action search is a daemon-owned read-only
+        // projection over bundled Action Manifests. It does not decide
+        // authority or inspect secrets; invocation still routes through
+        // action_ref -> execution_contract -> need <= grant.
+        | "catalog.search_actions"
+        | "catalog_search_actions"
         // -S3 preflight authority coverage: read-only verdict over a
         // planned action set against active grant statements + posture.
         // Persona-scoped inside the handler via
@@ -385,13 +393,13 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "trust_show"
         | "trust.explain"
         | "trust_explain"
-        // implementation-note-221 (design §Component 3) —
+        // Per design §Component 3 —
         // `trust.rotation_status` is read-only ("is anything in
         // flight?"). `trust.rotate_dev_ir` itself is a registry
         // mutation and goes through the standard authority path.
         | "trust.rotation_status"
         | "trust_rotation_status"
-        // implementation-note-222: refresh_cert
+        // refresh_cert
         // is read-class authority (produces a new cert from an existing
         // valid one; never escalates). Per design §Component 4.
         // Anchor: refresh_cert_dispatch_landed
@@ -404,7 +412,7 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         // no credentials, mutates no state. ConnectOnly mirrors the
         // adjacent `list_*` / `grant_status` / `vault_status` arms.
         | "status"
-        // implementation-note-223: local anonymous telemetry
+        // Local anonymous telemetry
         // posture. These methods toggle only the daemon-local empirical
         // collector and purge its local files; they mint no credential and do
         // not expose telemetry row contents over the socket.
@@ -414,7 +422,7 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "telemetry_opt_in"
         | "telemetry.opt_out"
         | "telemetry_opt_out"
-        // implementation-note-32 (Tier 1):
+        // (Tier 1):
         // subprocess_audit_log is intentionally ConnectOnly. The handler
         // builds the action string from the vendor field (whitelist-
         // gated) and refuses any caller-supplied action prefix, so a
@@ -588,6 +596,7 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "recover_grant_abandon"
         | "recover_persona_abandon"
         | "extend_grant"
+        | "grant.extend"
         | "revoke_statement"
         | "evaluate_tool_call"
         | "use_credential"
@@ -618,12 +627,15 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "submit_approval"
         | "propose_grant"
         | "resolve_approval"
+        | "approval.resolve"
+        | "approval_resolve"
+        | "approval.narrow"
+        | "approval_narrow"
         | "grant.expire_stale"
         | "expire_grants"
         | "create_standing_grant"
         | "remove_standing_grant"
         | "request_access"
-        | "request_access_blocking"
         | "broker_issue"
         | "broker_revoke"
         | "broker_list"

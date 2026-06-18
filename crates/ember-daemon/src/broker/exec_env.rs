@@ -1,4 +1,4 @@
-//! Linux memfd-sealed credential surface for broker exec (implementation-note-132-
+//! Linux memfd-sealed credential surface for broker exec (implementation-note-112-
 //! EXEC-ENV-LEAK-VIA-PROC Phase 1).
 //!
 //! ## Problem

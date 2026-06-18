@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Supported**. Reviewed: 2026-06-17. Status: current.
-
 # CLI and Troubleshooting
 
 For the current pre-release surface, the top-level operator journey is:
@@ -13,6 +8,13 @@ For the current pre-release surface, the top-level operator journey is:
 
 Everything else should support that journey, not compete with it.
 
+For Codex users, the parallel advanced path is:
+
+1. `codex login`
+2. `ember init --for codex`
+3. `ember status`
+4. `ember codex`
+
 ## What to remember first
 
 If you only remember one rule, make it this:
@@ -21,11 +23,15 @@ If you only remember one rule, make it this:
 - verify with `ember status`
 - relaunch through `ember claude`
 
+If you are using Codex, sign in with Codex first, then let `ember init --for
+codex` import and broker runtime authority for the managed launcher.
+
 ## Headline commands
 
 - `ember init`
 - `ember status`
 - `ember claude`
+- `ember codex`
 - `ember vault ...`
 - `ember grant ...`
 - `ember approval ...`
@@ -39,7 +45,7 @@ If the installed path looks wrong, start here and in this order:
 
 ```bash
 ember status
-ember status --troubleshoot
+ember doctor
 sudo ember daemon install
 ```
 
@@ -55,7 +61,7 @@ ember github setup
 ```
 
 For the current App-first truth and degraded PAT boundary, see
-[GitHub setup and auth](./github-setup-and-auth/).
+[GitHub setup and auth](./github-setup-and-auth.md).
 
 ## After repair
 
@@ -68,6 +74,19 @@ ember claude
 That is the supported managed launcher path. Do not switch to lower-level
 foreground-daemon habits just because something broke once.
 
+For Codex, go back to:
+
+```bash
+ember codex
+```
+
+If this fails before Emberlink session setup, check Codex native auth first and
+then rerun `ember init --for codex`:
+
+```bash
+codex login
+```
+
 ## What is intentionally not the primary docs story
 
 The current public-friendly docs should not center:
@@ -79,4 +98,4 @@ The current public-friendly docs should not center:
 
 The right public rule is: solve user jobs, not subsystem archaeology.
 
-For the wider command contract, see the [CLI reference](../reference/cli-reference/).
+For the wider command contract, see the [CLI reference](../reference/cli-reference.md).

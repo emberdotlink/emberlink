@@ -1,6 +1,6 @@
 //! CLASSIFICATION: PUBLIC
 //!
-//! implementation-note-387: integration coverage for two
+//! implementation-note-293: integration coverage for two
 //! parent-task acceptance criteria that subtasks B/C/D shipped behavior for
 //! but did not test end-to-end via `handle_spawn_directive`:
 //!
@@ -44,7 +44,7 @@ fn blake3_of_file(path: &std::path::Path) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// implementation-note-387: dispatch a `SpawnDirective` for
+/// implementation-note-293: dispatch a `SpawnDirective` for
 /// `/usr/bin/id` and assert the child's output reports the expected uid.
 /// Because the test runs as the current user with `target_uid = current
 /// uid`, the privilege-drop codepath (when running as root) reduces to a
@@ -99,7 +99,7 @@ async fn test_setuid_drop_before_execve() {
     );
 }
 
-/// implementation-note-387: dispatch a `SpawnDirective` with a
+/// implementation-note-293: dispatch a `SpawnDirective` with a
 /// wrong `content_hash_expected`. The hash gate must close the connection
 /// with a `HashMismatch` frame before any privilege drop or spawn. The
 /// stricter assertion is that NO `OutputBytes` and NO `Exit` precede

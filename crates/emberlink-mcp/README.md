@@ -1,6 +1,5 @@
 # emberlink-mcp
 
-
 MCP server for Emberlink's daemon-backed authority surface. It speaks
 JSON-RPC 2.0 over stdio and is an MCP-shaped client of the local daemon, not a
 second trust root.
@@ -8,8 +7,8 @@ second trust root.
 ## Current truth
 
 - daemon-backed by default
-- talks to the local daemon socket unless `--no-daemon` is passed
-- exposes both grant tools and daemon observability tools
+- exposes only the canonical daemon control/read tools
+- does not expose credential materialization tools
 - intended as a preview integration surface, not the primary friendly-drop
   onboarding lane
 
@@ -30,22 +29,16 @@ emberlink-mcp [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--persona <ID>` | `default` | Persona ID to operate as |
 | `--label <LABEL>` | `emberlink-mcp` | Human-readable label for this MCP server |
 | `--daemon-socket <PATH>` | platform default | Path to the local daemon Unix socket |
-| `--db <PATH>` | in-memory | Optional local EventStore path retained for compatibility/tests; daemon-backed grant flows do not require it |
-| `--no-daemon` | off | Disable daemon transport and run fail-closed for daemon-backed tools |
 
-## Minimal Claude / MCP client wiring
+## Minimal Claude / MCP Client Wiring
 
 ```json
 {
   "mcpServers": {
     "ember": {
-      "command": "emberlink-mcp",
-      "args": [
-        "--persona", "my-agent-persona"
-      ]
+      "command": "emberlink-mcp"
     }
   }
 }
@@ -59,22 +52,24 @@ on macOS, `/run/ember/daemon.sock` on Linux).
 
 | Tool | Description | Required params |
 |---|---|---|
-| `whoami` | Get the agent identity (`persona_id`, label) | none |
-| `list_grants` | List active grants for the caller persona | none |
-| `request_grant` | Request daemon-mediated access to a credential-bearing action | `scope`, `resource_id`, `duration_secs` |
-| `grant_status` | Check status of a grant or approval id | `grant_id` |
-| `use_credential` | Redeem an active grant | `grant_id`, `credential_id` |
-| `list_receipts` | List emitted Grant Receipts | none |
-| `get_receipt` | Fetch a single receipt by id | `id` |
-| `grant_budget_status` | Read budget/lifecycle status for a grant | `grant_id` |
+| `session.describe` | Describe a live Runtime Persona attach target | `runtime_persona_id` |
+| `catalog.search_actions` | Search the Action Manifest catalog projection | none |
+| `access.request` | Request authority for a manifest action | `persona_id`, `action_ref`, `credential_name`, plus `resource_id` or `target` |
+| `grant.list` | List active grants visible to a persona | `persona_id` |
+| `status.get` | Read daemon status projection | none |
+| `evidence.query` | Query receipt evidence | none |
+| `evidence.get` | Fetch one receipt/evidence item | `id` |
 
-## Request shape notes
+## Request Shape Notes
 
-### `request_grant`
+### `access.request`
 
-For daemon-backed flows, `resource_id` is required so the request can be routed
-through the daemon policy engine with the correct synthesized action. A minimal
-request looks like:
+`access.request` is manifest-shaped. The caller names `action_ref`; the daemon
+loads the Action Manifest, derives `need`, and mints or submits a composite
+grant with one Statement per `need` atom. The caller must provide a concrete
+resource selector with either `resource_id` or a typed `target`.
+
+Minimal example:
 
 ```json
 {
@@ -82,46 +77,45 @@ request looks like:
   "id": 1,
   "method": "tools/call",
   "params": {
-    "name": "request_grant",
+    "name": "access.request",
     "arguments": {
-      "scope": "repo:read",
-      "resource_id": "github-token",
-      "duration_secs": 3600,
-      "reason": "CI run"
+      "persona_id": "persona-123",
+      "action_ref": "registry.ember.systems/ember-systems/ember-gh/pr_list@v1",
+      "credential_name": "github-token",
+      "target": {
+        "kind": "github_repo",
+        "repo": "emberdotlink/emberlink"
+      },
+      "ttl_secs": 3600
     }
   }
 }
 ```
 
-When policy auto-approves, the tool can return an already-approved result. When
-approval is required, it returns a pending request id that can be polled via
-`grant_status`.
+Removed fields:
 
-### `grant_status`
+- `action`
+- `scope`
 
-`grant_status` accepts either:
+Removed MCP tools:
 
-- a pending approval/request id from `request_grant`
-- an active grant id
-
-The returned JSON shape reflects which one the daemon resolved.
-
-## Fail-closed behavior
-
-Without a daemon link, daemon-backed tools do not fall back to local state.
-
-- `request_grant`
+- `whoami`
 - `list_grants`
+- `request_grant`
 - `grant_status`
 - `use_credential`
-- receipt/budget tools
+- `list_receipts`
+- `get_receipt`
+- `grant_budget_status`
 
-all return tool errors when the daemon is unavailable or when `--no-daemon` is
-used.
+## Fail-Closed Behavior
+
+Without a daemon link, canonical tools do not fall back to local state. Tool
+failures are surfaced as MCP tool results with `isError: true` when the call
+reaches a known tool; removed tool names return JSON-RPC `unknown tool` errors.
 
 ## Protocol
 
 - transport: JSON-RPC 2.0 over stdio (newline-delimited)
 - MCP protocol version: `2024-11-05`
 - maximum line length: 1 MB
-- tool failures are surfaced as MCP tool results with `isError: true`

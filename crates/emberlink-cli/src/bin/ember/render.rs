@@ -1555,6 +1555,12 @@ pub(super) fn render_launcher_actionable_error(surface: &str, err: &str) -> (Str
             "ember codex",
             "ember explain codex",
         ),
+        "cursor" => (
+            "Cursor",
+            "ember init --for cursor",
+            "ember cursor",
+            "ember explain cursor",
+        ),
         _ => ("Launcher", "ember init", "ember", "ember explain"),
     };
     let help_cmd = format!("{launch_cmd} --help");

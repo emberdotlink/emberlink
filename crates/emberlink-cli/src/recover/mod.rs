@@ -7,7 +7,7 @@
 //! `broker`, `audit`, `install`) that is incrementally populated as
 //! per-F-code implementations land. Today the scaffold exposes the verb
 //! surface and the `--explain F-CODE` runbook bridge; per-F-code recovery
-//! work is tracked as `implementation-note-458-*` tasks shipping progressively.
+//! work is tracked as `implementation-note-361-*` tasks shipping progressively.
 //!
 //! Each recovery action emits a Receipt of kind `recovery.action` once the
 //! per-F-code implementation lands. Authority-modifying recovery is gated

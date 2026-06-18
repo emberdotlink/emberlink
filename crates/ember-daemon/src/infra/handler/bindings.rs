@@ -2,117 +2,6 @@ use super::*;
 use crate::infra::rpc_error::RpcError;
 use core_grants::GrantState as CoreGrantState;
 
-/// `session.lookup_or_open` JSON-RPC verb — peercred-bound session
-/// lookup/creation per implementation-note-153.
-///
-/// This helper is the kernel-attested identity barrier for session-open.
-/// On launcher flows that also establish caller enrollment and attach
-/// workflow authority, those steps must remain a compound atomic
-/// transaction: callers must not observe a "session opened first,
-/// authority attached later" gap. The richer launcher-facing path lives
-/// in `infra::handlers::session::handle_register_session`; this helper
-/// keeps the low-level peercred gate explicit so future refactors do not
-/// weaken the invariant by treating `session.lookup_or_open` as a casual
-/// lookup.
-///
-/// Returns the (session_id, persona, parent_pid) triple for the
-/// caller's existing session, or opens a fresh session bound to the
-/// kernel-attested principal. The persona identity is sourced from
-/// the kernel-attested `PeerCredPrincipal` — a caller cannot lie
-/// about which persona they are.
-///
-/// **Principal binding gates** (per design §"Subprocess identity
-/// spoofing (Phase 1)"):
-///
-/// - When `principal` is `None`, the call is refused with `-32401`
-///   ("principal binding unavailable") — `session.lookup_or_open`
-///   is wire-only and demands kernel attestation.
-/// - When `params.persona` is supplied AND the persona's bound uid
-///   does not match `principal.uid`, refuse with `-32004`.
-/// - When `params.parent_pid` is supplied AND it disagrees with
-///   `principal.pid`, refuse with `-32004` — the brief calls this
-///   out: "refuses caller-supplied `parent_pid` that does not match
-///   peer pid".
-///
-/// Params: `{ "persona"?: <string>, "parent_pid"?: <i32> }`
-/// Result: `{ "session_id": <string>, "persona_id"?: <string>,
-///            "parent_pid": <i32>, "socket_path": <string> }`
-///
-/// implementation-note-153.
-pub async fn handle_session_lookup_or_open(
-    principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
-    store: &crate::infra::store::DaemonStore,
-    params: &Value,
-) -> Result<Value, (i32, String)> {
-    let principal = principal.ok_or_else(|| {
-        RpcError::OperatorAttestationFailed(
-            "session.lookup_or_open requires kernel-attested principal — \
-         wire-only RPC, refused on Internal source"
-                .to_string(),
-        )
-    })?;
-
-    // implementation-note-152 — refuse if the bound peer has been
-    // reaped between connection-accept and this RPC dispatch. PID-reuse
-    // could otherwise hand the freshly-recycled PID to a new process
-    // that this session would then bind to.
-    crate::broker::handler::check_principal_is_alive(Some(principal))?;
-
-    // Persona-name → bound-uid check (when the caller asserts which
-    // persona they're opening a session for, kernel attests it).
-    // implementation-note-224 — gate
-    // now consults `agent_socket_enrollments` (the new authority) via
-    // the store, falling back to the legacy thread-local registry
-    // during the transition.
-    crate::broker::handler::check_principal_against_persona(
-        Some(principal),
-        store,
-        params,
-        "persona",
-    )?;
-
-    // parent_pid binding: brief calls this out — caller-supplied
-    // parent_pid that does not match peer pid is refused.
-    if let Some(claimed_pid) = params.get("parent_pid").and_then(|v| v.as_i64())
-        && claimed_pid as i32 != principal.pid
-    {
-        tracing::warn!(
-            claimed_parent_pid = claimed_pid,
-            principal_pid = principal.pid,
-            principal_uid = principal.uid,
-            "session.lookup_or_open: rejecting — claimed parent_pid disagrees with kernel-attested peer pid"
-        );
-        return Err(RpcError::NotFound(
-            format!(
-                "principal binding mismatch: claimed parent_pid {} does not match kernel-attested peer pid {}",
-                claimed_pid, principal.pid
-            ),
-        )
-        .into());
-    }
-
-    // Mint a fresh session id. Production wiring (registry of open
-    // sessions, persistence under `sessions_dir`, etc.) lives in the
-    // sibling implementation-note-225 task; this surface
-    // establishes the peercred gate so the production wiring can
-    // drop into a kernel-attested foundation.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let session_id = format!("sess_{:032x}", nanos);
-
-    let mut response = json!({
-        "session_id": session_id,
-        "parent_pid": principal.pid,
-        "socket_path": principal.socket_path.display().to_string(),
-    });
-    if let Some(persona) = params.get("persona").and_then(|v| v.as_str()) {
-        response["persona_id"] = json!(persona);
-    }
-    Ok(response)
-}
-
 /// `binding.delete` JSON-RPC verb — graceful delete of a workload Persona binding.
 ///
 /// Per design §"binding.delete":
@@ -138,7 +27,7 @@ pub async fn handle_session_lookup_or_open(
 /// the locally-bound `core_grants::Grant` they captured at request entry.
 /// New requests fail because lookup runs after the SQL flip.
 ///
-/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-226)
+/// `binding_revoke_urgent` (a separate verb)
 /// will skip the in-flight drain by also poisoning the in-process
 /// grant cache — that path is intentionally NOT reused here because it
 /// inverts the contract callers rely on for the graceful path.
@@ -573,7 +462,7 @@ pub async fn binding_upsert(store: &DaemonStore, params: &Value) -> Result<Value
     }))
 }
 
-/// implementation-note-74 (design §9 + §6) — atomic
+/// Per design §9 + §6 — atomic
 /// `create_agent_persona` RPC handler.
 ///
 /// Replaces the two-call sequence `create_persona` + `delegate_grant`
@@ -650,7 +539,7 @@ pub async fn create_agent_persona(
     };
     let binding_request_id = params["binding_request_id"].as_str();
     let agent_id = params["agent_id"].as_str();
-    // implementation-note-227 #2 — when the orchestrator spawns a SCION worker it requests the
+    // Per design §2 — when the orchestrator spawns a SCION worker it requests the
     // daemon-minted design bridge client bundle (the container's mTLS identity
     // per design §2) in the same daemon-owned spawn call. The daemon owns this
     // mint (it holds the bridge CA, mlock'd, never on disk); the orchestrator
@@ -817,7 +706,7 @@ pub async fn create_agent_persona(
 
     // ── Phase 5 (optional): mint the design bridge client bundle ──
     //
-    // implementation-note-227 #2. The bundle is the container's mTLS identity (SPIFFE SAN
+    // The bundle is the container's mTLS identity (SPIFFE SAN
     // `spiffe://emberd/persona/<persona>` + `spiffe://emberd/container/<id>`,
     // design §2), minted daemon-side via the shared register_session bundle
     // primitive. FAIL-SOFT and SEPARATE from the spawn success above: a bridge
@@ -865,7 +754,7 @@ pub async fn create_agent_persona(
                     Some(container_id),
                 ) {
                     Ok(bundle) => {
-                        // spawn_time_cert_write_landed — implementation-note-228
+                        // spawn_time_cert_write_landed
                         // (design CRIT-2). Pin the freshly-minted client cert's
                         // blake3-hex fingerprint + Unix `not_after` onto the
                         // persona row in a single UPDATE so the M3 `refresh_cert`

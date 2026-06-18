@@ -403,7 +403,6 @@ pub fn generate_secure_enclave_key_with_policy(
             // blobs; the daemon never sees raw key material. See
             // `docs/adr/216-*.md` and design §4.
             //
-            // Anchor: implementation-note-92
             SeAccessPolicy::Headless => AccessControlOptions::PRIVATE_KEY_USAGE.bits(),
             SeAccessPolicy::UserPresence => (AccessControlOptions::PRIVATE_KEY_USAGE
                 | AccessControlOptions::USER_PRESENCE)
@@ -1138,7 +1137,7 @@ pub fn delete_secure_enclave_key(_label: &str) -> Result<(), SeError> {
 /// On the stub path: derives a 32-byte key from `SHA-256(label || private_bytes)`,
 /// then produces `nonce(16) || auth_tag(32) || xor_stream(plaintext)` where the
 /// auth tag is `SHA-256(0xFF || nonce || key || ciphertext)` (encrypt-then-MAC,
-/// per implementation-note-86 -B) and the stream key is
+/// per adversarial-review item -B) and the stream key is
 /// `SHA-256(counter || nonce || key)` per 32-byte block.
 ///
 /// # Errors
@@ -1203,7 +1202,7 @@ pub fn se_wrap(label: &EciesKeyLabel, plaintext: &[u8]) -> Result<Vec<u8>, SeErr
 /// Inverse of [`se_wrap`]. On the stub path, **verifies the auth tag
 /// constant-time first, then XOR-decrypts** (encrypt-then-MAC + verify-
 /// then-decrypt; see [`stub_unwrap`] for the per-byte invariant and the
-/// implementation-note-86 -B rationale).
+/// adversarial-review item -B rationale).
 ///
 /// # Errors
 ///
@@ -1221,7 +1220,7 @@ pub fn se_unwrap(label: &EciesKeyLabel, ciphertext: &[u8]) -> Result<Vec<u8>, Se
             // BiometryCurrentSet protection set by `generate_secure_enclave_key`)
             // triggers a biometric prompt here. For the daemon's separate-uid
             // posture (design) the install-side followup
-            // (implementation-note-86) pins the key to
+            // pins the key to
             // the SystemKeychain without biometric protection so the daemon
             // can decrypt at startup without operator presence.
             #[cfg(feature = "se-real")]
@@ -1331,7 +1330,7 @@ fn keystream_block(counter: u8, nonce: &[u8; 16], key: &[u8; 32]) -> [u8; 32] {
 
 /// Compute encrypt-then-MAC auth tag: `SHA-256(0xFF || nonce || key || ciphertext)`.
 ///
-/// implementation-note-86 -B — the tag MUST be
+/// Adversarial-review item -B — the tag MUST be
 /// computed over the CIPHERTEXT (encrypt-then-MAC), not the plaintext.
 /// Tag-over-plaintext requires decryption before verification, which
 /// turned `stub_unwrap` into a padding/timing oracle on a malformed
@@ -1399,7 +1398,7 @@ fn stub_wrap(private_bytes: &[u8], label: &str, plaintext: &[u8]) -> Result<Vec<
 /// Stub unwrap: verify tag (constant-time, against ciphertext) **then**
 /// XOR-decrypt.
 ///
-/// implementation-note-86 -B — the prior
+/// Adversarial-review item -B — the prior
 /// implementation decrypted before verifying, which:
 ///   1. Did work the attacker controlled (touched every ciphertext byte
 ///      before the tag check), and
@@ -1747,7 +1746,7 @@ mod tests {
         assert_eq!(pt, b"hello");
     }
 
-    /// T1 — implementation-note-86 -B: stub_unwrap
+    /// T1 — adversarial-review item -B: stub_unwrap
     /// must reject tampered ciphertext via the auth tag before producing
     /// any plaintext. Exercises the encrypt-then-MAC + verify-then-decrypt
     /// invariant on the stub path (deterministic, no SE hardware needed).
@@ -1783,7 +1782,7 @@ mod tests {
         }
     }
 
-    /// T1 — implementation-note-86 -B: tampering
+    /// T1 — adversarial-review item -B: tampering
     /// with the stored auth-tag region (offset 16..48) must also be
     /// rejected. Complement to the body-tamper test — both attacker-
     /// reachable regions of the blob are covered.

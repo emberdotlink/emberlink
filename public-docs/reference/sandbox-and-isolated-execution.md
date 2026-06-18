@@ -1,8 +1,3 @@
-
-
-> [!NOTE]
-> Support level: **Preview**. Reviewed: 2026-06-17. Status: current.
-
 # Sandbox and Isolated Execution
 
 Emberlink exposes a real `ember sandbox ...` surface for managed isolated
@@ -19,7 +14,7 @@ Today the truthful sandbox contract is:
 - `sandbox run` is still split at the final interactive handoff
 
 That means the sandbox surface is useful and real, but not as settled as the
-main `ember claude` path.
+main launcher path.
 
 ## Commands that are real today
 
@@ -80,10 +75,12 @@ Do not read the current sandbox docs as a promise that:
 - the whole final prompt/exec handoff is already daemon-owned
 - sandbox is the main beginner path for Emberlink
 
-The current public story is narrower than that.
+The current public story is narrower than that. Start with `ember claude` or
+the advanced `ember codex` launcher path before treating sandbox as the default
+beginner workflow.
 
 ## Related pages
 
-- [CLI reference](./cli-reference/)
-- [Install and first run](../get-started/install-and-first-run/)
-- [Architecture overview](../concepts/architecture/)
+- [CLI reference](./cli-reference.md)
+- [Install and first run](../get-started/install-and-first-run.md)
+- [Architecture overview](../concepts/architecture.md)

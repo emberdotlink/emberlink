@@ -463,7 +463,7 @@ mod tests {
         entry.set_password(&hex::encode(seed)).expect("seed write");
     }
 
-    /// implementation-note-462:
+    /// implementation-note-365:
     /// the load-bearing migration test. Seeds the two legacy labels,
     /// runs the migration, asserts one root Principal + the two
     /// children with the imported legacy fingerprints. Then runs the

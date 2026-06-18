@@ -68,7 +68,7 @@ pub fn unlock_prompt_intent_with_policy(
             "Revoke an Ember grant".to_string(),
             grant_id_detail_lines(requested_params),
         ),
-        "extend_grant" => (
+        "grant.extend" | "extend_grant" => (
             PresencePromptClass::Approval,
             "Extend an Ember grant".to_string(),
             grant_id_detail_lines(requested_params),

@@ -93,7 +93,7 @@ pub fn build_banner(persona_name: &str, req: &ApprovalRequestInfo) -> Banner {
 ///
 /// Best-effort — errors are silently swallowed. The call is skipped when
 /// `EMBER_NO_DESKTOP_NOTIFY=1` is set (useful in CI/tests).
-pub(super) fn notify_require_approval(store: &DaemonStore, req: &ApprovalRequestInfo) {
+pub(crate) fn notify_require_approval(store: &DaemonStore, req: &ApprovalRequestInfo) {
     #[cfg(test)]
     {
         let _ = (store, req);

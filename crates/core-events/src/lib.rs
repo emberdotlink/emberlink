@@ -266,7 +266,7 @@ impl Validate for EventEnvelope {
             ));
         }
         // event_subject_validator_alias_aware — checkpoint for
-        // implementation-note-46.
+        // implementation-note-33.
         //
         // Body emission canonicalizes principal subjects to
         // `SubjectKind::Principal` per prior change (Canonicalize principal event
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn validator_accepts_legacy_root_alias_subject() {
         // event_subject_validator_alias_aware — regression for
-        // implementation-note-46.
+        // implementation-note-33.
         //
         // Pre-#6065 daemons wrote RootCreated events with
         // `subject.kind = SubjectKind::Root`. prior change changed `body.subject()`

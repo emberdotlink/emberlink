@@ -138,7 +138,7 @@ fn issue_authority_grant_issued_receipt(
     Ok(Some(envelope.receipt_id))
 }
 
-pub(super) async fn handle_create(
+pub(crate) async fn handle_create(
     store: &DaemonStore,
     policy: &PolicyEngine,
     source: &DispatchSource,
@@ -515,7 +515,7 @@ pub(super) fn handle_create_composite(
     }))
 }
 
-pub(super) async fn handle_delegate(
+pub(crate) async fn handle_delegate(
     store: &DaemonStore,
     ctx: &RequestContext,
     source: &DispatchSource,
@@ -543,7 +543,7 @@ pub(super) async fn handle_delegate(
     } else {
         None
     };
-    // implementation-note-237: load via DaemonGrantStore to obtain
+    // implementation-note-172: load via DaemonGrantStore to obtain
     // core_grants::Grant at the state-machine boundary. Ownership
     // checks below use `parent_grant.issuer.0` (persona_id) directly.
     // TODO: delegate_grant log_event credential_name
@@ -577,7 +577,7 @@ pub(super) async fn handle_delegate(
             );
             return Err(HandlerError::PrincipalMismatch.to_jsonrpc());
         }
-        // implementation-note-237: compare against issuer.0 (core_grants::PrincipalId).
+        // implementation-note-172: compare against issuer.0 (core_grants::PrincipalId).
         if principal != parent_grant.issuer.0 {
             tracing::warn!(
                 caller_persona_id = %principal,
@@ -628,7 +628,7 @@ pub(super) async fn handle_delegate(
     }))
 }
 
-pub(super) fn handle_revoke(
+pub(crate) fn handle_revoke(
     store: &DaemonStore,
     ctx: &RequestContext,
     events_tx: Option<&broadcast::Sender<GrantEvent>>,
@@ -637,7 +637,7 @@ pub(super) fn handle_revoke(
     let id = params["id"]
         .as_str()
         .ok_or_else(|| RpcError::InvalidParams("missing 'id'".to_string()))?;
-    // implementation-note-237: load via DaemonGrantStore for issuer.
+    // implementation-note-172: load via DaemonGrantStore for issuer.
     // credential_name lives on GrantInfo (the SQL row projection),
     // not on core_grants::Grant — fetch both so the audit row carries
     // the credential identity.
@@ -754,11 +754,11 @@ pub(super) fn handle_revoke(
     Ok(json!({"revoked": true}))
 }
 
-pub(super) fn handle_revoke_statement(
+pub(crate) fn handle_revoke_statement(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-238 — revoke a single Statement
+    // implementation-note-173 — revoke a single Statement
     // within a composite grant. The grant remains active; only requests
     // resolving to the named sid are denied at the proxy + use_credential
     // boundaries.
@@ -783,7 +783,7 @@ pub(super) fn handle_revoke_statement(
     }))
 }
 
-pub(super) fn handle_evaluate(
+pub(crate) fn handle_evaluate(
     store: &DaemonStore,
     ctx: &RequestContext,
     params: &Value,
@@ -815,7 +815,7 @@ pub(super) fn handle_evaluate(
 // it expands the existing grant's authority surface), and the policy
 // engine evaluates `credential.access`. `extend_grant` remains as the
 // legacy spelling for older CLI callers.
-pub(super) fn handle_extend(
+pub(crate) fn handle_extend(
     store: &DaemonStore,
     policy: &PolicyEngine,
     source: &DispatchSource,
@@ -893,7 +893,7 @@ pub(super) fn handle_extend(
     }))
 }
 
-pub(super) fn handle_expire_stale(store: &DaemonStore) -> Result<Value, (i32, String)> {
+pub(crate) fn handle_expire_stale(store: &DaemonStore) -> Result<Value, (i32, String)> {
     // grant_expire_stale_rpc_landed: daemon-owned expiry sweep for the
     // design open_store migration; `expire_grants` remains a compatibility
     // spelling for older CLI callers.

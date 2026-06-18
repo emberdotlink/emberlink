@@ -52,6 +52,90 @@ async fn recovery_action_receipt_dispatch_signs_and_logs() {
 }
 
 #[tokio::test]
+async fn recovery_action_receipt_is_visible_to_receipt_get_and_list() {
+    let _guard = setup_receipt_identity();
+    let store = DaemonStore::open_in_memory().unwrap();
+    let vault = test_vault();
+    let policy = test_policy();
+    let rl = test_rate_limiter();
+
+    let result = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "recovery_action_receipt",
+        &json!({
+            "recovery_id": "recover-receipt-visible-test",
+            "surface": "lifecycle",
+            "verb": "daemon",
+            "target_kind": "launchdaemon",
+            "target_id": "sh.emberlink.daemon",
+            "requested_action": "launchctl kickstart -k system/sh.emberlink.daemon",
+            "prior_state_digest": "blake3:1111111111111111",
+            "dry_run_digest": "blake3:2222222222222222",
+            "operator_confirmation_token_hash": null,
+            "operator_persona_id": null,
+            "authority_evidence": {
+                "scope": "daemon_crash",
+                "before_state": "exited",
+                "after_state": "running",
+                "log_excerpt_hash": "blake3:3333333333333333",
+                "launchctl_label": "sh.emberlink.daemon",
+                "launchctl_target": "system/sh.emberlink.daemon",
+                "socket_path": "/Library/Application Support/Emberlink/run/daemon.sock",
+                "log_path": "/var/log/emberd.err",
+            },
+            "outcome": "executed",
+            "related_receipt_ids": [],
+            "runbook_ref": "docs/runbook/recovery.md#f-daemon-1",
+            "adr_refs": ["design", "design"],
+        }),
+    )
+    .await
+    .unwrap();
+    let receipt_id = result["receipt_id"]
+        .as_str()
+        .expect("receipt_id")
+        .to_string();
+
+    let fetched = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "receipt.get",
+        &json!({ "id": receipt_id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fetched["receipt_id"], result["receipt_id"]);
+    assert_eq!(fetched["kind"], json!(RECEIPT_KIND_RECOVERY_ACTION));
+    assert_eq!(fetched["body"]["verb"], json!("daemon"));
+    assert_eq!(fetched["body"]["outcome"], json!("executed"));
+
+    let listed = dispatch_method(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        "receipt.list",
+        &json!({
+            "kind": RECEIPT_KIND_RECOVERY_ACTION,
+            "since": "1970-01-01T00:00:00Z"
+        }),
+    )
+    .await
+    .unwrap();
+    let rows = listed.as_array().expect("receipt.list rows");
+    assert!(
+        rows.iter()
+            .any(|row| row["receipt_id"] == json!(receipt_id)),
+        "recovery.action receipt should be listed: {rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn recovery_action_receipt_accepts_daemon_crash_executed_receipt() {
     let _guard = setup_receipt_identity();
     let store = DaemonStore::open_in_memory().unwrap();

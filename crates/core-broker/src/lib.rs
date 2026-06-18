@@ -7,7 +7,7 @@
 //! Provider-specific scopes (Cloudflare, Anthropic, GitHub, AWS STS, GCP,
 //! Tailscale) are represented at the trait boundary as opaque
 //! `serde_json::Value` payloads. Each provider implementation deserializes
-//! this into its own typed struct (see `implementation-note-17` and
+//! this into its own typed struct (see `implementation-note-14` and
 //! sibling tasks). The trait stays provider-agnostic so a single
 //! `Box<dyn Broker>` can be stored in the daemon's broker registry.
 //!
@@ -20,7 +20,7 @@
 
 // `anthropic` ships the real Anthropic Admin-API broker. ureq does not
 // compile to `wasm32-unknown-unknown`, so the module is also gated off
-// for that target. Feature-gated per implementation-note-18: the trait
+// for that target. Feature-gated per implementation-note-15: the trait
 // crate compiles with --no-default-features to trait + types + MockBroker
 // only; provider impls require explicit opt-in.
 #[cfg(all(not(target_arch = "wasm32"), feature = "anthropic"))]
@@ -38,7 +38,7 @@ pub mod cloudflare;
 pub use cloudflare::CloudflareBroker;
 
 // Opaque `SecretRef` contract — agents hold the opaque id, never the
-// plaintext (implementation-note-19). The trust boundary for
+// plaintext (implementation-note-16). The trust boundary for
 // resolving `SecretRef` → plaintext is ember-proxy / ember-tools, which
 // emits a per-resolution Receipt.
 pub mod secret_ref;
@@ -48,7 +48,7 @@ pub use secret_ref::SecretRef;
 // speak a provider's native scope language; native scope is a pure projection
 // of the grant-bounded action-need, never a caller input.
 pub mod project;
-// GCP projector + native scope (implementation-note-16 — the
+// GCP projector + native scope (implementation-note-13 — the
 // AWS STS `provider_echo + I7 clamp = matched pair` shape, mirrored for
 // GCP impersonation mints). Lives in its own module to mirror the
 // per-provider file decomposition the AWS PermissionSpec projector
@@ -603,7 +603,7 @@ fn identity_upper_bound(
             })
         }
         BrokerProvider::Gcp => {
-            // implementation-note-16 — mirrors the AWS STS arm
+            // implementation-note-13 — mirrors the AWS STS arm
             // above (prior change): the projector re-parses the minted native
             // scope to extract the impersonation-target SA email, which
             // the broker stamps into `MintStamp::Identity { identity: <sa> }`.
@@ -1198,7 +1198,7 @@ impl Broker for MockBroker {
         st.issue_count += 1;
         let id = format!("mock-{}", st.issue_count);
         st.active.insert(id.clone(), req.ttl);
-        // implementation-note-20 — the MockBroker must
+        // implementation-note-17 — the MockBroker must
         // mirror the prod adapter's `MintStamp` variant for the provider
         // it's standing in for, so downstream audit/verifier policy
         // exercised in tests matches what they'd see in prod. If a future
