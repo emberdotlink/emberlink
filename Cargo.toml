@@ -42,6 +42,7 @@ members = [
     "crates/ember-presence",
     "crates/ember-relay",
     "crates/ember-rpc",
+    "crates/ember-authority",
 ]
 exclude = ["fuzz", "crates/ember-daemon/fuzz"]
 resolver = "2"
