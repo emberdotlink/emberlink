@@ -121,7 +121,7 @@ fn handle_control(
             action,
             context,
         } => run_diagnostic_session(
-            control, state_root, quiesced, peer.uid, challenge, context, action,
+            control, state_root, quiesced, &state, challenge, context, action,
         ),
         ControlRequest::ReceiptList => bounded_receipt_response(ControlResponse::ReceiptList {
             receipts: ReceiptProjection::list(control.store())?,
@@ -151,7 +151,7 @@ fn run_diagnostic_session(
     control: &AuthorityControl,
     state_root: &Path,
     quiesced: &AtomicBool,
-    peer_uid: u32,
+    authority_state: &ember_authority::model::PersistentAuthorityState,
     challenge: String,
     context: ember_authority::model::LaunchContext,
     action: ember_authority::model::ActionRequest,
@@ -161,10 +161,9 @@ fn run_diagnostic_session(
         .join("sessions")
         .join(format!("{}.sock", &endpoint_id[..16]));
     let mut supervisor = SessionSupervisor::bind(endpoint.clone())?;
-
     let launch = control.open_diagnostic_session(
         &challenge,
-        peer_uid,
+        authority_state.operator_uid,
         &context,
         endpoint.to_string_lossy().into_owned(),
     )?;
@@ -175,7 +174,16 @@ fn run_diagnostic_session(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
             action_bytes,
         );
-        let mut command = Command::new(cli_binary()?);
+        let reviewed_cli = fs::canonicalize(cli_binary()?)
+            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        let reviewed_digest = identity::executable_digest(&reviewed_cli)
+            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        let reviewed_identity = identity::executable_identity(&reviewed_cli)
+            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        if reviewed_digest != authority_state.caller_eligibility.executable_digest {
+            return Err(Refusal::new("untrusted_launcher"));
+        }
+        let mut command = Command::new(&reviewed_cli);
         command
             .env_clear()
             .arg("__session-child")
@@ -195,6 +203,11 @@ fn run_diagnostic_session(
         let pid = supervisor.launch(&mut command)?;
         let pid_version = identity::process_pid_version(pid)
             .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        let launched_identity = identity::process_executable_identity(pid, pid_version)
+            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        if launched_identity != reviewed_identity {
+            return Err(Refusal::new("untrusted_launcher"));
+        }
         control.activate_session(
             &launch.session_id,
             &launch.execution_binding_id,
