@@ -420,6 +420,7 @@ pub struct ValidatedInitialization {
     pub authority_fingerprint: String,
     pub release_manifest_digest: String,
     pub daemon_executable_digest: String,
+    pub daemon_executable_identity: String,
     pub registry_bytes: String,
     pub operator_uid: u32,
     pub qualification_grant: QualificationGrantRecord,
@@ -604,6 +605,15 @@ impl InitializationRequest {
             &self.release,
         )?;
         let registry_bytes = ActionDefinitionRegistry::initialize(publisher, definition)?;
+        let daemon_executable_identity = self
+            .artifacts
+            .iter()
+            .find(|source| source.artifact_id == "bootstrap:emberd")
+            .ok_or_else(|| Refusal::new("release_artifact_invalid"))
+            .and_then(|source| {
+                crate::identity::executable_identity(&source.path)
+                    .map_err(|_| Refusal::new("release_artifact_invalid"))
+            })?;
         Ok(ValidatedInitialization {
             authority_fingerprint,
             release_manifest_digest: self.release.release_manifest_digest.clone(),
@@ -615,6 +625,7 @@ impl InitializationRequest {
                 .find(|entry| entry.artifact_id == "bootstrap:emberd")
                 .map(|entry| entry.digest.clone())
                 .ok_or_else(|| Refusal::new("release_artifact_invalid"))?,
+            daemon_executable_identity,
             registry_bytes,
             operator_uid: caller.operator_uid,
             qualification_grant: grant.clone(),

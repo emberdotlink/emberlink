@@ -35,6 +35,20 @@ struct ProtectedTip {
     daemon_executable_digest: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledDaemonBinding {
+    pub executable_digest: String,
+    pub executable_identity: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstalledDaemonBindingProjection {
+    schema: String,
+    generation: u64,
+    daemon_executable_digest: String,
+    daemon_executable_identity: Option<String>,
+}
+
 pub struct DurableStore {
     root: PathBuf,
     state: Mutex<PersistentAuthorityState>,
@@ -64,7 +78,7 @@ impl DurableStore {
         if tip.schema != TIP_SCHEMA {
             return Err(Refusal::new("restore_failed"));
         }
-        enforce_high_water(root, tip.generation, &tip_bytes)?;
+        enforce_high_water(root, tip.generation, &tip_bytes, true)?;
         commit_continuity(root, Some((tip.generation, sha256(&tip_bytes))))?;
         let path = generation_path(root, tip.generation);
         let state_bytes = read_bounded(&path, RECEIPT_ENVELOPE_LIMIT * 8)?;
@@ -84,16 +98,34 @@ impl DurableStore {
         })
     }
 
-    /// Return the manifest-pinned daemon digest without decoding authority
-    /// owner state or Device custody into the client process.
-    pub fn installed_daemon_executable_digest(root: &Path) -> Result<String, Refusal> {
+    /// Return the daemon binding from the digest-verified installed generation
+    /// without decoding Device custody or other owner-only state.
+    pub fn installed_daemon_binding(root: &Path) -> Result<InstalledDaemonBinding, Refusal> {
         let tip_bytes = read_bounded(&root.join("protected-tip.json"), 16_384)?;
         let tip: ProtectedTip = decode_canonical(&tip_bytes, 16_384, "restore_failed")?;
         if tip.schema != TIP_SCHEMA {
             return Err(Refusal::new("restore_failed"));
         }
-        enforce_high_water(root, tip.generation, &tip_bytes)?;
-        Ok(tip.daemon_executable_digest)
+        enforce_high_water(root, tip.generation, &tip_bytes, false)?;
+        let state_bytes = read_bounded(
+            &generation_path(root, tip.generation),
+            RECEIPT_ENVELOPE_LIMIT * 8,
+        )?;
+        if sha256(&state_bytes) != tip.state_digest {
+            return Err(Refusal::new("restore_failed"));
+        }
+        let projection: InstalledDaemonBindingProjection =
+            serde_json::from_slice(&state_bytes).map_err(|_| Refusal::new("restore_failed"))?;
+        if projection.schema != STATE_SCHEMA
+            || projection.generation != tip.generation
+            || projection.daemon_executable_digest != tip.daemon_executable_digest
+        {
+            return Err(Refusal::new("restore_failed"));
+        }
+        Ok(InstalledDaemonBinding {
+            executable_digest: projection.daemon_executable_digest,
+            executable_identity: projection.daemon_executable_identity,
+        })
     }
 
     pub fn snapshot(&self) -> Result<PersistentAuthorityState, Refusal> {
@@ -112,7 +144,7 @@ impl DurableStore {
             .map_err(|_| Refusal::new("state_unavailable"))?;
         let tip_bytes = read_bounded(&self.root.join("protected-tip.json"), 16_384)?;
         let tip: ProtectedTip = decode_canonical(&tip_bytes, 16_384, "restore_failed")?;
-        enforce_high_water(&self.root, tip.generation, &tip_bytes)?;
+        enforce_high_water(&self.root, tip.generation, &tip_bytes, false)?;
         let state_bytes = read_bounded(
             &generation_path(&self.root, tip.generation),
             RECEIPT_ENVELOPE_LIMIT * 8,
@@ -156,6 +188,15 @@ impl DurableStore {
     pub fn protected_tip_digest(&self) -> Result<String, Refusal> {
         let bytes = read_bounded(&self.root.join("protected-tip.json"), 16_384)?;
         Ok(sha256(&bytes))
+    }
+
+    pub(crate) fn finalize_initial_continuity(&self) -> Result<(), Refusal> {
+        let tip_bytes = read_bounded(&self.root.join("protected-tip.json"), 16_384)?;
+        let tip: ProtectedTip = decode_canonical(&tip_bytes, 16_384, "restore_failed")?;
+        if tip.schema != TIP_SCHEMA {
+            return Err(Refusal::new("restore_failed"));
+        }
+        record_high_water(&self.root, tip.generation, sha256(&tip_bytes))
     }
 }
 
@@ -929,7 +970,7 @@ fn persist_generation(root: &Path, state: &PersistentAuthorityState) -> Result<(
     // written before the protected tip, and only the tip rename publishes the
     // transaction. A fault before that rename leaves unreferenced bytes and the
     // prior committed generation, never a mixed committed state.
-    atomic_write(&path, &bytes)?;
+    atomic_write_new(&path, &bytes)?;
     stage_continuity(root, state, &tip_bytes)?;
     atomic_write(&root.join("protected-tip.json"), &tip_bytes)?;
     commit_continuity(root, Some((state.generation, sha256(&tip_bytes))))
@@ -961,6 +1002,7 @@ struct HighWaterMark {
     schema: String,
     generation: u64,
     protected_tip_digest: String,
+    continuity_record_digest: String,
 }
 
 fn stage_continuity(
@@ -999,11 +1041,14 @@ fn stage_continuity(
 /// tip, so a crash before tip publication still restores the prior committed
 /// generation instead of tripping rollback detection.
 fn record_high_water(root: &Path, generation: u64, tip_digest: String) -> Result<(), Refusal> {
-    let (_, _, high_water) = continuity_paths(root)?;
+    let (continuity, _, high_water) = continuity_paths(root)?;
+    let continuity_bytes =
+        read_bounded(&continuity, 16_384).map_err(|_| Refusal::new("continuity_unavailable"))?;
     let mark = HighWaterMark {
         schema: "ember.authority-high-water/v1".into(),
         generation,
         protected_tip_digest: tip_digest,
+        continuity_record_digest: sha256(&continuity_bytes),
     };
     let mark_bytes =
         serde_jcs::to_vec(&mark).map_err(|_| Refusal::new("continuity_unavailable"))?;
@@ -1035,26 +1080,57 @@ fn commit_continuity(root: &Path, mark: Option<(u64, String)>) -> Result<(), Ref
             .map_err(|_| Refusal::new("continuity_unavailable"))?;
     }
     match mark {
-        Some((generation, tip_digest)) => record_high_water(root, generation, tip_digest),
-        None => Ok(()),
+        Some((generation, tip_digest)) if path.exists() => {
+            record_high_water(root, generation, tip_digest)
+        }
+        Some(_) | None => Ok(()),
     }
 }
 
-/// Restore-time anti-rollback: the published tip must be at or above the last
-/// recorded high-water generation, and an equal generation must carry the exact
-/// recorded tip bytes. A restored older generation/tip/continuity triple is
-/// refused instead of silently reactivating superseded authority state.
-fn enforce_high_water(root: &Path, tip_generation: u64, tip_bytes: &[u8]) -> Result<(), Refusal> {
-    let (_, _, high_water) = continuity_paths(root)?;
-    if !high_water.exists() {
-        return Err(Refusal::new("state_rollback_detected"));
-    }
+fn enforce_high_water(
+    root: &Path,
+    tip_generation: u64,
+    tip_bytes: &[u8],
+    allow_staged_transition: bool,
+) -> Result<(), Refusal> {
+    let (continuity, staged, high_water) = continuity_paths(root)?;
     let bytes =
         read_bounded(&high_water, 16_384).map_err(|_| Refusal::new("state_rollback_detected"))?;
     let mark: HighWaterMark = decode_canonical(&bytes, 16_384, "state_rollback_detected")?;
-    if mark.schema != "ember.authority-high-water/v1"
-        || tip_generation < mark.generation
-        || (tip_generation == mark.generation && sha256(tip_bytes) != mark.protected_tip_digest)
+    let continuity_bytes =
+        read_bounded(&continuity, 16_384).map_err(|_| Refusal::new("state_rollback_detected"))?;
+    if mark.schema != "ember.authority-high-water/v1" {
+        return Err(Refusal::new("state_rollback_detected"));
+    }
+    let continuity_digest = sha256(&continuity_bytes);
+    let tip_digest = sha256(tip_bytes);
+    let current_is_committed = continuity_digest == mark.continuity_record_digest;
+    if current_is_committed
+        && tip_generation == mark.generation
+        && tip_digest == mark.protected_tip_digest
+    {
+        return Ok(());
+    }
+    let is_next_tip =
+        allow_staged_transition && mark.generation.checked_add(1) == Some(tip_generation);
+    if !is_next_tip {
+        return Err(Refusal::new("state_rollback_detected"));
+    }
+    let (next_bytes, expected_prior_digest) = if current_is_committed {
+        (
+            read_bounded(&staged, 16_384).map_err(|_| Refusal::new("state_rollback_detected"))?,
+            continuity_digest,
+        )
+    } else {
+        // Crash recovery after continuity publication but before the high-water
+        // update: the published next record must chain from the marked record.
+        (continuity_bytes, mark.continuity_record_digest)
+    };
+    let next_record: crate::initialization::RootContinuityRecord =
+        decode_canonical(&next_bytes, 16_384, "state_rollback_detected")?;
+    if tip_generation.checked_add(1) != Some(next_record.generation)
+        || next_record.prior_record_digest != expected_prior_digest
+        || next_record.protected_tip_digest != tip_digest
     {
         return Err(Refusal::new("state_rollback_detected"));
     }
@@ -1113,20 +1189,83 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
         .map_err(|_| Refusal::new("state_unavailable"))
 }
 
+pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Refusal::new("state_unavailable"))?;
+    ensure_private_directory(parent)?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("state"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temp)
+            .map_err(|_| Refusal::new("state_unavailable"))?;
+        file.write_all(bytes)
+            .map_err(|_| Refusal::new("state_unavailable"))?;
+        file.sync_all()
+            .map_err(|_| Refusal::new("state_unavailable"))?;
+        fs::hard_link(&temp, path).map_err(|_| Refusal::new("state_unavailable"))?;
+        fs::remove_file(&temp).map_err(|_| Refusal::new("state_unavailable"))?;
+        OpenOptions::new()
+            .read(true)
+            .open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| Refusal::new("state_unavailable"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, Refusal> {
-    let file = fs::File::open(path).map_err(|_| Refusal::new("restore_failed"))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| Refusal::new("restore_failed"))?;
     let metadata = file
         .metadata()
         .map_err(|_| Refusal::new("restore_failed"))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != crate::effective_uid()
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(Refusal::new("restore_failed"));
+    }
     if metadata.len() > limit as u64 {
         return Err(Refusal::new("input_too_large"));
     }
-    let mut bytes = Vec::with_capacity(limit.saturating_add(1));
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(limit)
+        .saturating_add(1)
+        .min(limit.saturating_add(1));
+    let mut bytes = Vec::with_capacity(capacity);
     file.take(limit.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| Refusal::new("restore_failed"))?;
     if bytes.len() > limit {
         return Err(Refusal::new("input_too_large"));
+    }
+    let current = fs::symlink_metadata(path).map_err(|_| Refusal::new("restore_failed"))?;
+    if current.file_type().is_symlink()
+        || !current.file_type().is_file()
+        || (current.dev(), current.ino()) != (metadata.dev(), metadata.ino())
+        || current.uid() != metadata.uid()
+        || current.mode() != metadata.mode()
+        || current.nlink() != 1
+    {
+        return Err(Refusal::new("restore_failed"));
     }
     Ok(bytes)
 }

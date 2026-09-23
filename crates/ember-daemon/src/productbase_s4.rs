@@ -51,7 +51,7 @@ pub fn run(state_root: &Path) -> Result<(), String> {
                 continue;
             }
         };
-        let response = match handle_control(&control, state_root, &quiesced, &mut stream) {
+        let response = match handle_control(&control, state_root, &lease, &quiesced, &mut stream) {
             Ok(response) => response,
             Err(error) => {
                 if is_durability_failure(error.code) {
@@ -98,6 +98,7 @@ fn verify_daemon_executable(control: &AuthorityControl) -> Result<(), Refusal> {
 fn handle_control(
     control: &AuthorityControl,
     state_root: &Path,
+    lease: &DaemonLease,
     quiesced: &AtomicBool,
     stream: &mut UnixStream,
 ) -> Result<ControlResponse, Refusal> {
@@ -106,6 +107,7 @@ fn handle_control(
         .map_err(|_| Refusal::new("transport_failed"))?;
     let request: ControlRequest = read_control_frame(stream)?;
     let peer = ExecutionBindingAuthority::authenticate_fd(stream)?;
+    lease.verify_root_identity()?;
     verify_daemon_executable(control)?;
     let state = control.verify_persisted_state(state_root)?;
     if peer.uid != state.operator_uid {
@@ -139,9 +141,7 @@ fn handle_control(
             challenge,
             action,
             context,
-        } => run_diagnostic_session(
-            control, state_root, quiesced, &state, challenge, context, action,
-        ),
+        } => run_diagnostic_session(control, lease, quiesced, &state, challenge, context, action),
         ControlRequest::ReceiptList => bounded_receipt_response(ControlResponse::ReceiptList {
             receipts: ReceiptProjection::list(control.store())?,
         }),
@@ -172,7 +172,7 @@ fn bounded_receipt_response(response: ControlResponse) -> Result<ControlResponse
 
 fn run_diagnostic_session(
     control: &AuthorityControl,
-    state_root: &Path,
+    lease: &DaemonLease,
     quiesced: &AtomicBool,
     authority_state: &ember_authority::model::PersistentAuthorityState,
     challenge: String,
@@ -180,10 +180,12 @@ fn run_diagnostic_session(
     action: ember_authority::model::ActionRequest,
 ) -> Result<ControlResponse, Refusal> {
     let endpoint_id = uuid::Uuid::new_v4().simple().to_string();
-    let endpoint = state_root
+    let endpoint = lease
+        .root_path
         .join("sessions")
         .join(format!("{}.sock", &endpoint_id[..16]));
     let mut supervisor = SessionSupervisor::bind(endpoint.clone())?;
+    lease.verify_root_identity()?;
     let launch = control.open_diagnostic_session(
         &challenge,
         authority_state.operator_uid,
@@ -209,7 +211,7 @@ fn run_diagnostic_session(
             .env_clear()
             .arg("__session-child")
             .arg("--state-root")
-            .arg(state_root)
+            .arg(&lease.root_path)
             .arg("--endpoint")
             .arg(&launch.endpoint)
             .arg("--session-id")
@@ -229,6 +231,7 @@ fn run_diagnostic_session(
         if launched_identity != authority_state.caller_eligibility.executable_identity {
             return Err(Refusal::new("untrusted_launcher"));
         }
+        lease.verify_root_identity()?;
         control.activate_session(
             &launch.session_id,
             &launch.execution_binding_id,
@@ -277,6 +280,7 @@ fn run_diagnostic_session(
                 );
                 continue;
             }
+            lease.verify_root_identity()?;
             let kernel = AuthorityKernel::new(control.store().clone());
             let response = match kernel.submit(&launch.session_id, process, session_request.action)
             {
@@ -303,6 +307,7 @@ fn run_diagnostic_session(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     })();
+    lease.verify_root_identity()?;
     let close_result = control.close_session(&launch.session_id);
     if let Err(error) = close_result {
         if is_durability_failure(error.code) {
@@ -330,6 +335,9 @@ fn cli_binary() -> Result<PathBuf, Refusal> {
 }
 
 struct DaemonLease {
+    _root_directory: File,
+    root_path: PathBuf,
+    root_identity: (u64, u64),
     _file: File,
     socket_path: PathBuf,
     socket_identity: Option<(u64, u64)>,
@@ -337,6 +345,28 @@ struct DaemonLease {
 
 impl DaemonLease {
     fn acquire(state_root: &Path, socket_path: &Path) -> Result<Self, Refusal> {
+        let root_directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(state_root)
+            .map_err(|_| Refusal::new("authority_lease_untrusted"))?;
+        let root_metadata = root_directory
+            .metadata()
+            .map_err(|_| Refusal::new("authority_lease_untrusted"))?;
+        if !root_metadata.file_type().is_dir()
+            || root_metadata.uid() != ember_authority::effective_uid()
+            || root_metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(Refusal::new("authority_lease_untrusted"));
+        }
+        // The directory inode cannot be replaced by unlinking `daemon.lock`.
+        // Lock it before touching the lease file or incumbent endpoint.
+        let root_locked =
+            unsafe { libc::flock(root_directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if root_locked != 0 {
+            return Err(Refusal::new("authority_in_use"));
+        }
+        let root_identity = (root_metadata.dev(), root_metadata.ino());
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -361,12 +391,20 @@ impl DaemonLease {
         if locked != 0 {
             return Err(Refusal::new("authority_in_use"));
         }
+        verify_path_identity(state_root, root_identity)?;
         remove_stale_socket(socket_path)?;
         Ok(Self {
+            _root_directory: root_directory,
+            root_path: state_root.to_owned(),
+            root_identity,
             _file: file,
             socket_path: socket_path.to_owned(),
             socket_identity: None,
         })
+    }
+
+    fn verify_root_identity(&self) -> Result<(), Refusal> {
+        verify_path_identity(&self.root_path, self.root_identity)
     }
 
     fn claim_socket(&mut self, path: &Path) -> Result<(), Refusal> {
@@ -395,6 +433,19 @@ impl Drop for DaemonLease {
             let _ = fs::remove_file(&self.socket_path);
         }
     }
+}
+
+fn verify_path_identity(path: &Path, expected: (u64, u64)) -> Result<(), Refusal> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| Refusal::new("state_unavailable"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != ember_authority::effective_uid()
+        || metadata.permissions().mode() & 0o777 != 0o700
+        || (metadata.dev(), metadata.ino()) != expected
+    {
+        return Err(Refusal::new("state_unavailable"));
+    }
+    Ok(())
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), Refusal> {

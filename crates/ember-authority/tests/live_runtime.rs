@@ -180,9 +180,12 @@ fn live_session_action_produces_a_durable_verifiable_receipt() {
     assert_eq!(verified["state"], "verified");
     assert_eq!(verified["receipt_id"], receipt_id);
     assert_eq!(
-        verified["classification"]["deployment_class"],
-        "disposable-qualification"
+        verified["classification"]["schema"],
+        "ember.release-classification/v1"
     );
+    assert_eq!(verified["classification"]["deployment_class"], "release");
+    assert_eq!(verified["classification"]["development_only"], false);
+    assert_eq!(verified["classification"]["release_provenance"], "verified");
     assert_eq!(verified["initialization_evidence"]["kind"], "release");
     let (code, stdout, stderr) = ember(&cli_binary, home.path(), &["receipt", "show", &receipt_id]);
     assert_eq!(code, 0, "{stderr}");

@@ -401,6 +401,20 @@ impl ProductClassification {
             credential_use: "forbidden".into(),
         }
     }
+
+    pub fn release_qualified() -> Self {
+        Self {
+            schema: "ember.release-classification/v1".into(),
+            qualification_mode: "release".into(),
+            qualification_state: "qualified".into(),
+            deployment_class: "release".into(),
+            development_only: false,
+            production_classification: "production".into(),
+            secret_classification: "non-secret".into(),
+            release_provenance: "verified".into(),
+            credential_use: "forbidden".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -411,9 +425,9 @@ pub enum InitializationEvidence {
         release_qualification_digest: String,
     },
     Development {
-        development_manifest_digest: String,
-        development_bootstrap_attestation_digest: String,
-        development_qualification_record_digest: String,
+        qualification_manifest_digest: String,
+        qualification_bootstrap_attestation_digest: String,
+        qualification_record_digest: String,
     },
 }
 
@@ -435,13 +449,13 @@ impl InitializationEvidence {
                 release_qualification_digest,
             } => vec![release_manifest_digest, release_qualification_digest],
             Self::Development {
-                development_manifest_digest,
-                development_bootstrap_attestation_digest,
-                development_qualification_record_digest,
+                qualification_manifest_digest,
+                qualification_bootstrap_attestation_digest,
+                qualification_record_digest,
             } => vec![
-                development_manifest_digest,
-                development_bootstrap_attestation_digest,
-                development_qualification_record_digest,
+                qualification_manifest_digest,
+                qualification_bootstrap_attestation_digest,
+                qualification_record_digest,
             ],
         }
     }

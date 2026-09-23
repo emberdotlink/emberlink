@@ -632,6 +632,28 @@ fn changed_signed_definition_byte_is_an_invalid_signature() {
 }
 
 #[test]
+fn transaction_never_replaces_an_existing_generation_file() {
+    let (directory, control) = authority("generation-no-clobber");
+    let generation_path = directory
+        .path()
+        .join("authority/generations/00000000000000000001.json");
+    let sentinel = b"preexisting-generation";
+    std::fs::write(&generation_path, sentinel).unwrap();
+    std::fs::set_permissions(&generation_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = control
+        .store()
+        .transaction(|state| {
+            state.sequence += 1;
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "state_unavailable");
+    assert_eq!(std::fs::read(generation_path).unwrap(), sentinel);
+    assert_eq!(control.store().snapshot().unwrap().generation, 0);
+}
+
+#[test]
 fn protected_tip_rollback_is_refused() {
     let (directory, control) = authority("rollback");
     let root = directory.path().join("authority");
@@ -669,12 +691,34 @@ fn orphaned_staged_continuity_preserves_last_committed_generation() {
         slot_id: committed.slot_id.clone(),
     };
     std::fs::write(&staged_path, serde_jcs::to_vec(&orphan).unwrap()).unwrap();
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(control);
 
     AuthorityControl::restore(&root).unwrap();
     assert_eq!(std::fs::read(&continuity_path).unwrap(), committed_bytes);
     assert!(!staged_path.exists());
 }
+#[test]
+fn published_continuity_recovers_when_high_water_update_was_interrupted() {
+    let (directory, control) = authority("continuity-high-water-crash");
+    let root = directory.path().join("authority");
+    let high_water_path = directory.path().join("authority.high-water.json");
+    let prior_high_water = std::fs::read(&high_water_path).unwrap();
+    control
+        .store()
+        .transaction(|state| {
+            state.sequence += 1;
+            Ok(())
+        })
+        .unwrap();
+    let advanced_high_water = std::fs::read(&high_water_path).unwrap();
+    drop(control);
+
+    std::fs::write(&high_water_path, prior_high_water).unwrap();
+    AuthorityControl::restore(&root).unwrap();
+    assert_eq!(std::fs::read(high_water_path).unwrap(), advanced_high_water);
+}
+
 #[test]
 fn missing_high_water_anchor_is_refused() {
     let (directory, control) = authority("missing-high-water");

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    audit::{DurableStore, EvidenceJournal, atomic_write, now_unix, sha256},
+    audit::{DurableStore, EvidenceJournal, atomic_write_new, now_unix, sha256},
     device::{DeviceCustody, DeviceState},
     diagnostic_bootstrap::{DevelopmentInitializationProof, DevelopmentInitializationRequest},
     initialization::{
@@ -105,9 +105,9 @@ impl AuthorityControl {
         let validated = request.validate(anchor, now)?;
         let plan = InitializationPlan {
             authority_fingerprint: validated.authority_fingerprint,
-            classification: ProductClassification::development_diagnostic(),
+            classification: ProductClassification::release_qualified(),
             daemon_executable_digest: validated.daemon_executable_digest,
-            daemon_executable_identity: None,
+            daemon_executable_identity: Some(validated.daemon_executable_identity),
             registry_bytes: validated.registry_bytes,
             operator_uid: validated.operator_uid,
             root_intent_digest: validated.root_intent_digest,
@@ -244,8 +244,9 @@ impl AuthorityControl {
         };
         let continuity_bytes = serde_jcs::to_vec(&current_continuity)
             .map_err(|_| Refusal::new("continuity_unavailable"))?;
-        atomic_write(&continuity_path, &continuity_bytes)
+        atomic_write_new(&continuity_path, &continuity_bytes)
             .map_err(|_| Refusal::new("continuity_unavailable"))?;
+        store.finalize_initial_continuity()?;
         Ok((
             Self {
                 store: Arc::new(store),
@@ -514,12 +515,36 @@ fn verify_continuity(
         .map_err(|_| Refusal::new("continuity_unavailable"))?;
     let continuity: RootContinuityRecord =
         crate::audit::decode_canonical(&bytes, 16_384, "continuity_unavailable")?;
+    let expected_generation = state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| Refusal::new("continuity_unavailable"))?;
+    let slot_matches = state
+        .development_initialization
+        .as_ref()
+        .is_none_or(|proof| continuity.slot_id == proof.prior_continuity.slot_id);
+    let prior_matches = if state.generation == 0 {
+        continuity.prior_record_digest == state.initialization.continuity_digest
+    } else {
+        is_sha256_digest(&continuity.prior_record_digest)
+    };
     if continuity.schema != "ember.root-continuity-record/v1"
-        || continuity.generation == 0
+        || continuity.generation != expected_generation
+        || !slot_matches
+        || !prior_matches
         || continuity.authority_fingerprint != state.authority_fingerprint
         || continuity.protected_tip_digest != store.protected_tip_digest()?
     {
         return Err(Refusal::new("continuity_unavailable"));
     }
     Ok(())
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }

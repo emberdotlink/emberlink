@@ -553,9 +553,9 @@ impl DevelopmentInitializationRequest {
             route: route.clone(),
             root_intent_digest: digest_encoded(&intent_bytes),
             evidence: InitializationEvidence::Development {
-                development_manifest_digest: manifest_digest,
-                development_bootstrap_attestation_digest: attestation_digest,
-                development_qualification_record_digest: qualification_digest,
+                qualification_manifest_digest: manifest_digest,
+                qualification_bootstrap_attestation_digest: attestation_digest,
+                qualification_record_digest: qualification_digest,
             },
             continuity_digest,
             classification,
@@ -580,18 +580,18 @@ pub fn verify_persisted_development(
     )?);
     let continuity_digest = digest_encoded(&encode_continuity(&proof.prior_continuity)?);
     let InitializationEvidence::Development {
-        development_manifest_digest,
-        development_bootstrap_attestation_digest,
-        development_qualification_record_digest,
+        qualification_manifest_digest,
+        qualification_bootstrap_attestation_digest,
+        qualification_record_digest,
     } = &state.initialization.evidence
     else {
         return Err(Refusal::new("development_initialization_invalid"));
     };
     if state.classification != ProductClassification::development_diagnostic()
         || proof.qualification_record.classification != state.classification
-        || manifest_digest != *development_manifest_digest
-        || attestation_digest != *development_bootstrap_attestation_digest
-        || qualification_digest != *development_qualification_record_digest
+        || manifest_digest != *qualification_manifest_digest
+        || attestation_digest != *qualification_bootstrap_attestation_digest
+        || qualification_digest != *qualification_record_digest
         || continuity_digest != state.initialization.continuity_digest
         || digest_encoded(&encode_development_intent(&proof.intent)?)
             != state.initialization.root_intent_digest

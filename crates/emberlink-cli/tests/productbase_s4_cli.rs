@@ -3,7 +3,7 @@
 use ember_authority::AUTHORITY_STATE_DIRECTORY;
 use std::{
     io::Write as _,
-    os::unix::fs::PermissionsExt as _,
+    os::unix::fs::{PermissionsExt as _, symlink},
     path::{Path, PathBuf},
     process::{Child, Command},
     thread::sleep,
@@ -109,6 +109,52 @@ fn assert_json_tamper_refused(
         std::fs::remove_file(socket).unwrap();
     }
 }
+
+fn assert_symlink_replacement_refused(cli: &Path, state_root: &Path, path: &Path) {
+    let daemon_binary = daemon_binary();
+    let daemon = Daemon(
+        Command::new(&daemon_binary)
+            .args(["--state-dir", state_root.to_str().unwrap()])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&state_root.join("control.sock"));
+    let original_path = path.with_extension("original-test-file");
+    std::fs::rename(path, &original_path).unwrap();
+    symlink(&original_path, path).unwrap();
+    let (code, _, stderr) = ember(cli, state_root, &["status", "--json"]);
+    assert_ne!(code, 0, "symlinked {} was accepted", path.display());
+    assert!(
+        !stderr.is_empty(),
+        "symlinked {} gave no refusal",
+        path.display()
+    );
+    drop(daemon);
+    std::fs::remove_file(path).unwrap();
+    std::fs::rename(&original_path, path).unwrap();
+    let socket = state_root.join("control.sock");
+    if socket.exists() {
+        std::fs::remove_file(&socket).unwrap();
+    }
+    let restored = Daemon(
+        Command::new(&daemon_binary)
+            .args(["--state-dir", state_root.to_str().unwrap()])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let (code, _, stderr) = ember(cli, state_root, &["status", "--json"]);
+    assert_eq!(
+        code,
+        0,
+        "restoring {} did not recover: {stderr}",
+        path.display()
+    );
+    drop(restored);
+    if socket.exists() {
+        std::fs::remove_file(socket).unwrap();
+    }
+}
 fn expected_classification() -> serde_json::Value {
     serde_json::json!({
         "schema": "ember.development-classification/v1",
@@ -181,7 +227,7 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
         .to_owned();
     assert_eq!(initialized["evidence"]["kind"], "development");
     assert!(
-        initialized["evidence"]["development_manifest_digest"]
+        initialized["evidence"]["qualification_manifest_digest"]
             .as_str()
             .is_some_and(|digest| digest.starts_with("sha256:"))
     );
@@ -231,9 +277,9 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
             .starts_with("sha256:")
     );
     for field in [
-        "development_bootstrap_attestation_digest",
-        "development_manifest_digest",
-        "development_qualification_record_digest",
+        "qualification_bootstrap_attestation_digest",
+        "qualification_manifest_digest",
+        "qualification_record_digest",
     ] {
         assert!(
             status["initialization"]["evidence"][field]
@@ -311,6 +357,34 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     assert_eq!(code, 0, "{stderr}");
     let post_session_status: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(post_session_status["active_sessions"], 0);
+    let alias_root = home.path().join("authority-alias");
+    std::os::unix::fs::symlink(&state_root, &alias_root).unwrap();
+    let (code, _, stderr) = ember(&cli_binary, &alias_root, &["receipt", "list", "--json"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("state_root_untrusted"), "{stderr}");
+    let (code, _, stderr) = ember(
+        &cli_binary,
+        &alias_root,
+        &[
+            "session",
+            "open",
+            "diagnostic",
+            "--challenge",
+            "pb-r2-ok",
+            "--",
+            "ember",
+            "action",
+            "run",
+            ember_authority::model::ACTION_REF_TEXT,
+            "--definition-digest",
+            DEFINITION_DIGEST,
+            "--input",
+            "{\"challenge\":\"pb-r2-ok\"}",
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(stderr.contains("state_root_untrusted"), "{stderr}");
+    std::fs::remove_file(alias_root).unwrap();
 
     let tip_path = state_root.join("protected-tip.json");
     let tip: serde_json::Value =
@@ -366,9 +440,24 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     assert_json_tamper_refused(&cli_binary, &state_root, &high_water_path, |high_water| {
         high_water["protected_tip_digest"] = serde_json::json!(zero_digest.clone());
     });
+    assert_json_tamper_refused(&cli_binary, &state_root, &high_water_path, |high_water| {
+        high_water["generation"] =
+            serde_json::json!(high_water["generation"].as_u64().unwrap() - 1);
+    });
     assert_json_tamper_refused(&cli_binary, &state_root, &continuity_path, |continuity| {
         continuity["protected_tip_digest"] = serde_json::json!(zero_digest.clone());
     });
+    assert_json_tamper_refused(&cli_binary, &state_root, &continuity_path, |continuity| {
+        continuity["generation"] =
+            serde_json::json!(continuity["generation"].as_u64().unwrap() + 1);
+    });
+    assert_json_tamper_refused(&cli_binary, &state_root, &continuity_path, |continuity| {
+        continuity["prior_record_digest"] = serde_json::json!(zero_digest.clone());
+    });
+    assert_json_tamper_refused(&cli_binary, &state_root, &continuity_path, |continuity| {
+        continuity["slot_id"] = serde_json::json!("tampered-slot");
+    });
+    assert_symlink_replacement_refused(&cli_binary, &state_root, &tip_path);
 
     let restarted = Daemon(
         Command::new(&daemon_binary)
@@ -427,7 +516,7 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     std::fs::write(&generation_path, tampered_generation).unwrap();
     let (code, _, stderr) = ember(&cli_binary, &state_root, &["status", "--json"]);
     assert_ne!(code, 0);
-    assert!(stderr.contains("restore_failed"), "{stderr}");
+    assert!(stderr.contains("authority_endpoint_untrusted"), "{stderr}");
 
     drop(restarted);
     home.close().unwrap();

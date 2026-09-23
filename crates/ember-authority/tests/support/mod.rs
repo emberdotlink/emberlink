@@ -61,7 +61,7 @@ pub fn launch_context() -> LaunchContext {
 pub fn request(directory: &Path, target: &str) -> InitializationRequest {
     let bootstrap_path = directory.join("bootstrap.bin");
     let executable_path = directory.join("ember.bin");
-    fs::write(&bootstrap_path, b"reviewed emberd fixture").unwrap();
+    fs::copy(std::env::current_exe().unwrap(), &bootstrap_path).unwrap();
     fs::write(&executable_path, b"reviewed ember fixture").unwrap();
     request_for_runtime(directory, target, bootstrap_path, executable_path)
 }

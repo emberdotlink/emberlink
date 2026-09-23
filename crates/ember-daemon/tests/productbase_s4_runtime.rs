@@ -5,8 +5,11 @@ use ember_authority::{
 };
 use std::{
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
-    process::{Child, Command, Stdio},
+    os::unix::{
+        fs::{MetadataExt as _, PermissionsExt},
+        net::UnixStream,
+    },
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +32,21 @@ fn wait_for_socket(path: &std::path::Path) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("daemon socket never appeared at {}", path.display());
+}
+fn wait_for_exit(mut child: Child) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    panic!(
+        "second daemon remained live; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -102,6 +120,28 @@ fn daemon_refuses_concurrent_owner_and_recovers_stale_socket() {
         String::from_utf8_lossy(&second.stderr).contains("authority_in_use"),
         "{}",
         String::from_utf8_lossy(&second.stderr)
+    );
+    let original_socket = std::fs::symlink_metadata(&socket).unwrap();
+    std::fs::remove_file(state_root.join("daemon.lock")).unwrap();
+    let replacement_lock_second = wait_for_exit(
+        Command::new(&daemon_binary)
+            .args(["--state-dir", state_root.to_str().unwrap()])
+            .env("HOME", home.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!replacement_lock_second.status.success());
+    assert!(
+        String::from_utf8_lossy(&replacement_lock_second.stderr).contains("authority_in_use"),
+        "{}",
+        String::from_utf8_lossy(&replacement_lock_second.stderr)
+    );
+    let current_socket = std::fs::symlink_metadata(&socket).unwrap();
+    assert_eq!(
+        (current_socket.dev(), current_socket.ino()),
+        (original_socket.dev(), original_socket.ino())
     );
 
     daemon.0.kill().unwrap();

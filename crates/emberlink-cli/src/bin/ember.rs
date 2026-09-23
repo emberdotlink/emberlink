@@ -122,6 +122,7 @@ fn status_command(root: &Path) -> Result<i32, i32> {
 }
 
 fn session_command(root: &Path, args: &[String]) -> Result<i32, i32> {
+    validate_existing_state_root(root).map_err(report_refusal)?;
     let separator = args
         .iter()
         .position(|argument| argument == "--")
@@ -237,6 +238,7 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
     )
     .map_err(report_refusal)?;
     let root = PathBuf::from(argument(args, "--state-root")?);
+    validate_existing_state_root(&root).map_err(report_refusal)?;
     let mut stream = trusted_daemon_stream(&root, Path::new(endpoint), "session_endpoint_failed")?;
     write_frame(
         &mut stream,
@@ -260,6 +262,7 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
 }
 
 fn receipt_command(root: &Path, args: &[String]) -> Result<i32, i32> {
+    validate_existing_state_root(root).map_err(report_refusal)?;
     // Every Receipt read is an authenticated daemon call: the CLI never opens
     // private authority state (and its Device keys) in-process.
     let request = match args.first().map(String::as_str) {
@@ -319,6 +322,9 @@ fn trusted_daemon_stream(
     let expected_uid = ember_authority::effective_uid();
     let canonical_root =
         fs::canonicalize(root).map_err(|_| report_code("state_root_unavailable"))?;
+    if canonical_root != root {
+        return Err(report_code("state_root_untrusted"));
+    }
     let root_metadata =
         fs::metadata(&canonical_root).map_err(|_| report_code("state_root_unavailable"))?;
     if root_metadata.uid() != expected_uid || root_metadata.permissions().mode() & 0o777 != 0o700 {
@@ -362,24 +368,24 @@ fn trusted_daemon_stream(
         .map(|path| path.with_file_name("emberd"))
         .and_then(fs::canonicalize)
         .map_err(|_| report_code("authority_endpoint_untrusted"))?;
-    let pinned_digest =
-        ember_authority::audit::DurableStore::installed_daemon_executable_digest(&canonical_root)
-            .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    let installed = ember_authority::audit::DurableStore::installed_daemon_binding(&canonical_root)
+        .map_err(|_| report_code("authority_endpoint_untrusted"))?;
     let expected_digest = ember_authority::identity::executable_digest(&expected_daemon)
         .map_err(|_| report_code("authority_endpoint_untrusted"))?;
-    if expected_digest != pinned_digest {
+    if expected_digest != installed.executable_digest {
         return Err(report_code("authority_endpoint_untrusted"));
     }
     let observed_daemon =
         ember_authority::identity::process_executable_path(peer.pid, peer.pid_version)
             .and_then(fs::canonicalize)
             .map_err(|_| report_code("authority_endpoint_untrusted"))?;
-    let expected_identity = ember_authority::identity::executable_identity(&expected_daemon)
-        .map_err(|_| report_code("authority_endpoint_untrusted"))?;
     let observed_identity =
         ember_authority::identity::process_executable_identity(peer.pid, peer.pid_version)
             .map_err(|_| report_code("authority_endpoint_untrusted"))?;
-    if observed_daemon != expected_daemon || observed_identity != expected_identity {
+    let installed_identity = installed
+        .executable_identity
+        .ok_or_else(|| report_code("authority_endpoint_untrusted"))?;
+    if observed_daemon != expected_daemon || observed_identity != installed_identity {
         return Err(report_code("authority_endpoint_untrusted"));
     }
     Ok(stream)
