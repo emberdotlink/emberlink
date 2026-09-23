@@ -1059,7 +1059,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
         .map_err(|_| Refusal::new("state_unavailable"))
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, Refusal> {
+pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, Refusal> {
     let file = fs::File::open(path).map_err(|_| Refusal::new("restore_failed"))?;
     let metadata = file
         .metadata()

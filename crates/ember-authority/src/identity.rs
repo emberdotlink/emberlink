@@ -223,15 +223,25 @@ pub fn executable_identity(path: &std::path::Path) -> io::Result<String> {
 
 #[cfg(target_os = "linux")]
 pub fn process_executable_identity(pid: u32, expected_pid_version: u64) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
     if process_pid_version(pid)? != expected_pid_version {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "process identity changed",
         ));
     }
-    let executable = std::fs::File::open(format!("/proc/{pid}/exe"))?;
-    let identity = digest_reader(executable)?;
-    if process_pid_version(pid)? != expected_pid_version {
+    let link = format!("/proc/{pid}/exe");
+    let executable = std::fs::File::open(&link)?;
+    let opened = executable.metadata()?;
+    let identity = digest_reader(&executable)?;
+    // An execve preserves the start time, so pid_version alone cannot detect an
+    // image swap. The live `/proc/<pid>/exe` target must still be the exact
+    // inode that was hashed.
+    let current = std::fs::metadata(&link)?;
+    if (current.dev(), current.ino()) != (opened.dev(), opened.ino())
+        || process_pid_version(pid)? != expected_pid_version
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "process identity changed",

@@ -340,10 +340,8 @@ fn continuity_path(root: &Path) -> Result<PathBuf, Refusal> {
 
 fn verify_continuity(root: &Path, store: &DurableStore) -> Result<(), Refusal> {
     let path = continuity_path(root)?;
-    let bytes = fs::read(path).map_err(|_| Refusal::new("continuity_unavailable"))?;
-    if bytes.len() > 16_384 {
-        return Err(Refusal::new("continuity_unavailable"));
-    }
+    let bytes = crate::audit::read_bounded(&path, 16_384)
+        .map_err(|_| Refusal::new("continuity_unavailable"))?;
     let continuity: RootContinuityRecord =
         crate::audit::decode_canonical(&bytes, 16_384, "continuity_unavailable")?;
     let state = store.snapshot()?;
