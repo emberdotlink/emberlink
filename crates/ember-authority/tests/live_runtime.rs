@@ -75,7 +75,8 @@ fn live_session_action_produces_a_durable_verifiable_receipt() {
         daemon_binary.clone(),
         cli_binary.clone(),
     );
-    AuthorityControl::initialize_at(&state_root, request, &support::anchor(), now_unix()).unwrap();
+    AuthorityControl::initialize_release_at(&state_root, request, &support::anchor(), now_unix())
+        .unwrap();
 
     let daemon = Daemon(
         Command::new(&daemon_binary)
@@ -209,7 +210,8 @@ fn replaced_daemon_artifact_refuses_before_opening_authority_rpc() {
         daemon_binary.clone(),
         cli_binary,
     );
-    AuthorityControl::initialize_at(&state_root, request, &support::anchor(), now_unix()).unwrap();
+    AuthorityControl::initialize_release_at(&state_root, request, &support::anchor(), now_unix())
+        .unwrap();
 
     std::fs::OpenOptions::new()
         .append(true)

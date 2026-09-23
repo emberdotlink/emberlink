@@ -107,8 +107,7 @@ fn handle_control(
     let request: ControlRequest = read_control_frame(stream)?;
     let peer = ExecutionBindingAuthority::authenticate_fd(stream)?;
     verify_daemon_executable(control)?;
-    control.verify_persisted_state(state_root)?;
-    let state = control.store().snapshot()?;
+    let state = control.verify_persisted_state(state_root)?;
     if peer.uid != state.operator_uid {
         return Err(Refusal::new("persona_mismatch"));
     }
@@ -134,7 +133,7 @@ fn handle_control(
     match request {
         ControlRequest::Ping => Ok(ControlResponse::Pong),
         ControlRequest::Status => Ok(ControlResponse::Status {
-            status: AuthorityControl::read_status(state_root)?,
+            status: AuthorityControl::read_status(&state)?,
         }),
         ControlRequest::OpenDiagnostic {
             challenge,
@@ -360,7 +359,7 @@ impl DaemonLease {
         // pointer nor accesses Rust-managed memory.
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if locked != 0 {
-            return Err(Refusal::new("daemon_already_running"));
+            return Err(Refusal::new("authority_in_use"));
         }
         remove_stale_socket(socket_path)?;
         Ok(Self {

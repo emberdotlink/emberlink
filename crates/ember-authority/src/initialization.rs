@@ -804,7 +804,7 @@ fn validate_semantics(
             .release_qualification
             .release_signing_trust_root_version
             != release.release_manifest.release_signing_trust_root_version
-        || records.release_qualification.qualification_state != "qualification-only"
+        || records.release_qualification.qualification_state != "provisional"
         || records.release_qualification.record_revision != 1
         || continuity.schema != "ember.root-continuity-record/v1"
         || continuity.generation != 0

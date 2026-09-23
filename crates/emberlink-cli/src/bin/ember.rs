@@ -36,7 +36,11 @@ fn dispatch(args: &[String]) -> Result<i32, i32> {
     if args.first().map(String::as_str) == Some("__session-child") {
         return session_child(&args[1..]);
     }
-    let (root, args) = if args.first().map(String::as_str) == Some("--state-dir") {
+    let explicit_state_dir = args.first().map(String::as_str) == Some("--state-dir");
+    if !explicit_state_dir && args.first().map(String::as_str) == Some("init") {
+        return refuse("state_root_unavailable");
+    }
+    let (root, args) = if explicit_state_dir {
         let root = args
             .get(1)
             .map(PathBuf::from)
@@ -63,6 +67,7 @@ fn dispatch(args: &[String]) -> Result<i32, i32> {
 
 #[derive(serde::Serialize)]
 struct InitializationOutput {
+    schema: &'static str,
     state: &'static str,
     receipt: InitializationReceipt,
     classification: ember_authority::model::ProductClassification,
@@ -88,10 +93,10 @@ fn init_command(root: &Path, args: &[String]) -> Result<i32, i32> {
     let action_definition_digest = request.records.action_definitions[0]
         .action_definition_digest
         .clone();
-    let (control, receipt) =
-        AuthorityControl::initialize_development(root, request).map_err(report_refusal)?;
+    let (control, receipt) = AuthorityControl::initialize(root, request).map_err(report_refusal)?;
     let state = control.store().snapshot().map_err(report_refusal)?;
     print_json(&InitializationOutput {
+        schema: "ember.initialization-result/v1",
         state: "initialized",
         receipt,
         classification: state.classification,

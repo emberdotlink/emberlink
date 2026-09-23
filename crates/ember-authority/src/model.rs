@@ -376,40 +376,29 @@ pub struct ActionResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductClassification {
+    pub schema: String,
     pub qualification_mode: String,
     pub qualification_state: String,
     pub deployment_class: String,
+    pub development_only: bool,
     pub production_classification: String,
+    pub secret_classification: String,
     pub release_provenance: String,
     pub credential_use: String,
-    pub credential_scope: String,
-    pub federation: String,
 }
 
 impl ProductClassification {
     pub fn development_diagnostic() -> Self {
         Self {
+            schema: "ember.development-classification/v1".into(),
             qualification_mode: "non-secret-diagnostic".into(),
             qualification_state: "provisional".into(),
             deployment_class: "disposable-qualification".into(),
+            development_only: true,
             production_classification: "non-production".into(),
+            secret_classification: "non-secret".into(),
             release_provenance: "absent".into(),
             credential_use: "forbidden".into(),
-            credential_scope: "none".into(),
-            federation: "not-applicable".into(),
-        }
-    }
-
-    pub fn legacy_release_qualification() -> Self {
-        Self {
-            qualification_mode: "release-qualification".into(),
-            qualification_state: "qualification-only".into(),
-            deployment_class: "disposable-qualification".into(),
-            production_classification: "non-production".into(),
-            release_provenance: "present".into(),
-            credential_use: "forbidden".into(),
-            credential_scope: "none".into(),
-            federation: "not-applicable".into(),
         }
     }
 }

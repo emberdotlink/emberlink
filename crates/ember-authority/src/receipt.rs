@@ -3,8 +3,8 @@ use core_events::receipt::{ReceiptEnvelope, verify_receipt_v2};
 use crate::{
     action_definition::ActionDefinitionRegistry,
     audit::{
-        DurableStore, classification_digest, decode_canonical, initialization_receipt_body,
-        linked_fact_set_digest, operation_fact_digests, operation_receipt_body, sha256,
+        DurableStore, decode_canonical, initialization_receipt_body, linked_fact_set_digest,
+        operation_fact_digests, operation_receipt_body, sha256,
     },
     device::DeviceCustody,
     model::{ReceiptIndexRow, Refusal},
@@ -93,6 +93,13 @@ impl ReceiptProjection {
 
     pub fn verify(store: &DurableStore, receipt_id: &str) -> Result<(), Refusal> {
         let state = store.snapshot()?;
+        Self::verify_state(&state, receipt_id)
+    }
+
+    pub(crate) fn verify_state(
+        state: &crate::model::PersistentAuthorityState,
+        receipt_id: &str,
+    ) -> Result<(), Refusal> {
         let stored = state
             .receipts
             .get(receipt_id)
@@ -120,7 +127,7 @@ impl ReceiptProjection {
             return Err(Refusal::new("receipt_invalid"));
         }
         if envelope.kind == "authority.initialization" {
-            return verify_initialization(&state, stored, &envelope);
+            return verify_initialization(state, stored, &envelope);
         }
         if envelope.kind != "action.operation" {
             return Err(Refusal::new("receipt_invalid"));
@@ -185,7 +192,7 @@ impl ReceiptProjection {
             &core_crypto::Ed25519Verifier,
         )
         .map_err(|_| Refusal::new("receipt_invalid"))?;
-        verify_checkpoint_chain(&state)?;
+        verify_checkpoint_chain(state)?;
         Ok(())
     }
 }
@@ -220,13 +227,10 @@ fn verify_initialization(
     {
         return Err(Refusal::new("receipt_invalid"));
     }
-    let classification_digest = classification_digest(&state.classification)
-        .map_err(|_| Refusal::new("receipt_invalid"))?;
-    let expected_fact_count = 3 + record.evidence.fact_digests().len();
+    let expected_fact_count = 2 + record.evidence.fact_digests().len();
     let mut initialization_facts = vec![
         record.root_intent_digest.as_str(),
         record.continuity_digest.as_str(),
-        classification_digest.as_str(),
     ];
     initialization_facts.extend(record.evidence.fact_digests());
     let mut facts = initialization_facts

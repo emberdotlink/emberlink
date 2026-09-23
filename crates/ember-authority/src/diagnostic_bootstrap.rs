@@ -35,7 +35,7 @@ const MANIFEST_DOMAIN: &str = "ember/development-initialization-manifest/v1";
 const ATTESTATION_DOMAIN: &[u8] = b"ember/development-bootstrap-attestation/v1\0";
 const INTENT_DOMAIN: &str = "ember/development-root-initialization-intent/v1";
 const QUALIFICATION_DOMAIN: &str = "ember/development-qualification-record/v1";
-const PUBLISHER_ID: &str = "publisher:ember-development-diagnostic";
+const PUBLISHER_ID: &str = "publisher:packet-fixture";
 const SIGNER_KEY_ID: &str = "publisher:ember-development-diagnostic:ephemeral";
 const ARTIFACT_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -248,7 +248,7 @@ pub fn build_request(
         profile_id: "productbase-development-diagnostic".into(),
         artifact_digest: profile_artifact.digest.clone(),
         executable_digest: executable.digest.clone(),
-        launch_scope: "qualification-only".into(),
+        launch_scope: "provisional".into(),
     };
     let caller = CallerEligibilityRecord {
         principal_id: grant.principal_id.clone(),
@@ -696,7 +696,7 @@ pub fn validate_new_state_root(root: &Path) -> Result<(), Refusal> {
     }
     for path in continuity_paths(root)? {
         match fs::symlink_metadata(path) {
-            Ok(_) => return Err(Refusal::new("already_initialized")),
+            Ok(_) => return Err(Refusal::new("continuity_unavailable")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(Refusal::new("state_root_untrusted")),
         }
@@ -988,14 +988,15 @@ pub fn encode_development_qualification(
     let mut encoder = LenEncoder::new(QUALIFICATION_DOMAIN)?;
     encoder
         .string(&value.schema)?
+        .string(&value.classification.schema)?
         .string(&value.classification.qualification_mode)?
         .string(&value.classification.qualification_state)?
         .string(&value.classification.deployment_class)?
+        .bool(value.classification.development_only)
         .string(&value.classification.production_classification)?
+        .string(&value.classification.secret_classification)?
         .string(&value.classification.release_provenance)?
         .string(&value.classification.credential_use)?
-        .string(&value.classification.credential_scope)?
-        .string(&value.classification.federation)?
         .digest(&value.attestation_key_fingerprint)?
         .list(&value.executable_artifact_digest_list, encode_artifact)?
         .list(&value.profile_artifact_digest_list, encode_artifact)?

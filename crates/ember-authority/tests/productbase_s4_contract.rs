@@ -4,7 +4,7 @@ use core_crypto::Signer as _;
 use ember_authority::{
     action_admission::ActionAdmission,
     action_definition::ActionDefinitionRegistry,
-    audit::{classification_digest, decode_canonical, now_unix, sha256},
+    audit::{decode_canonical, now_unix, sha256},
     canonical::encode_action_permit,
     control::AuthorityControl,
     device::DeviceCustody,
@@ -94,7 +94,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     let root = directory.path().join("authority");
     let valid = initialization_request(directory.path(), "initialization");
     let (control, receipt) =
-        AuthorityControl::initialize_at(&root, valid, &anchor(), now_unix()).unwrap();
+        AuthorityControl::initialize_release_at(&root, valid, &anchor(), now_unix()).unwrap();
     assert_eq!(receipt.generation, 1);
     ReceiptProjection::verify(control.store(), &receipt.receipt_id).unwrap();
     drop(control);
@@ -104,7 +104,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     let altered = initialization_request(directory.path(), "initialization");
     std::fs::write(&altered.artifacts[0].path, b"altered").unwrap();
     assert_eq!(
-        AuthorityControl::initialize_at(
+        AuthorityControl::initialize_release_at(
             &directory.path().join("authority"),
             altered,
             &anchor(),
@@ -120,7 +120,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     let mut wrong_root = initialization_request(directory.path(), "initialization");
     wrong_root.intent_signature.push('0');
     assert_eq!(
-        AuthorityControl::initialize_at(
+        AuthorityControl::initialize_release_at(
             &directory.path().join("authority"),
             wrong_root,
             &anchor(),
@@ -137,7 +137,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     let mut wrong_anchor = anchor();
     wrong_anchor.signer_authorization_chain_digest = sha256(b"untrusted");
     assert_eq!(
-        AuthorityControl::initialize_at(
+        AuthorityControl::initialize_release_at(
             &directory.path().join("authority"),
             unanchored,
             &wrong_anchor,
@@ -156,7 +156,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
         path: extra.artifacts[0].path.clone(),
     });
     assert_eq!(
-        AuthorityControl::initialize_at(
+        AuthorityControl::initialize_release_at(
             &directory.path().join("authority"),
             extra,
             &anchor(),
@@ -172,7 +172,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     let expired = initialization_request(directory.path(), "initialization");
     let expired_at = expired.activation_plan.maintenance_window_expiry;
     assert_eq!(
-        AuthorityControl::initialize_at(
+        AuthorityControl::initialize_release_at(
             &directory.path().join("authority"),
             expired,
             &anchor(),
@@ -189,7 +189,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     conflicting.signed_bundle.push(' ');
     collision.records.action_definitions.push(conflicting);
     assert_eq!(
-        AuthorityControl::initialize_at(
+        AuthorityControl::initialize_release_at(
             &directory.path().join("authority"),
             collision,
             &anchor(),
@@ -208,7 +208,8 @@ fn failed_initialization_leaves_a_fail_closed_partial_authority() {
     let malformed_root = directory.path().join(&oversized_name);
     let request = initialization_request(directory.path(), "atomic-initialization");
     assert!(
-        AuthorityControl::initialize_at(&malformed_root, request, &anchor(), now_unix()).is_err()
+        AuthorityControl::initialize_release_at(&malformed_root, request, &anchor(), now_unix())
+            .is_err()
     );
     assert!(malformed_root.is_dir());
     assert!(
@@ -220,7 +221,7 @@ fn failed_initialization_leaves_a_fail_closed_partial_authority() {
     assert!(AuthorityControl::restore(&malformed_root).is_err());
     let retry = initialization_request(directory.path(), "atomic-initialization-retry");
     assert_eq!(
-        AuthorityControl::initialize_at(&malformed_root, retry, &anchor(), now_unix())
+        AuthorityControl::initialize_release_at(&malformed_root, retry, &anchor(), now_unix())
             .err()
             .unwrap()
             .code,
@@ -230,7 +231,8 @@ fn failed_initialization_leaves_a_fail_closed_partial_authority() {
     std::fs::remove_dir_all(&malformed_root).unwrap();
     let replacement_root = directory.path().join("authority");
     let replacement = initialization_request(directory.path(), "atomic-initialization-replacement");
-    AuthorityControl::initialize_at(&replacement_root, replacement, &anchor(), now_unix()).unwrap();
+    AuthorityControl::initialize_release_at(&replacement_root, replacement, &anchor(), now_unix())
+        .unwrap();
     AuthorityControl::restore(&replacement_root).unwrap();
 }
 
@@ -254,7 +256,7 @@ fn development_root_validation_refuses_aliases_permissions_and_existing_continui
     std::fs::write(&staged, b"unexpected").unwrap();
     assert_eq!(
         validate_new_state_root(&root).unwrap_err().code,
-        "already_initialized"
+        "continuity_unavailable"
     );
     assert_eq!(std::fs::read(&staged).unwrap(), b"unexpected");
     std::fs::remove_file(&staged).unwrap();
@@ -1082,7 +1084,7 @@ fn development_authority(label: &str) -> (TempDir, std::path::PathBuf, Authority
     let root = directory.path().join("authority");
     let executable = std::env::current_exe().unwrap();
     let request = build_request(directory.path(), &executable, &executable, now_unix()).unwrap();
-    let (control, _) = AuthorityControl::initialize_development(&root, request).unwrap();
+    let (control, _) = AuthorityControl::initialize(&root, request).unwrap();
     (directory, root, control)
 }
 
@@ -1136,19 +1138,26 @@ fn mutated_persisted_development_records_refuse_restore() {
 }
 
 #[test]
-fn development_initialization_receipt_commits_classification_fact() {
+fn development_initialization_receipt_has_exact_fact_set_and_signed_classification() {
     let (_directory, _root, control) = development_authority("dev-classification-fact");
     let state = control.store().snapshot().unwrap();
     let receipt_id = state.initialization.receipt_id.as_ref().unwrap();
-    let expected = classification_digest(&state.classification)
-        .unwrap()
-        .strip_prefix("sha256:")
-        .unwrap()
-        .to_owned();
-    assert!(
-        state.receipts[receipt_id]
-            .fact_digests
-            .iter()
-            .any(|digest| digest == &expected)
+    let stored = &state.receipts[receipt_id];
+    let mut expected = vec![
+        state.initialization.root_intent_digest.as_str(),
+        state.initialization.continuity_digest.as_str(),
+    ];
+    expected.extend(state.initialization.evidence.fact_digests());
+    let mut expected = expected
+        .into_iter()
+        .map(|digest| digest.strip_prefix("sha256:").unwrap().to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(expected.len(), 5);
+    assert_eq!(stored.fact_digests, expected);
+    let envelope: serde_json::Value = serde_json::from_str(&stored.canonical_bytes).unwrap();
+    assert_eq!(
+        envelope["body"]["classification"],
+        serde_json::to_value(&state.classification).unwrap()
     );
 }

@@ -45,7 +45,7 @@ pub fn authority(target: &str) -> (TempDir, AuthorityControl) {
     let request = request(directory.path(), target);
     let anchor = anchor();
     let (control, _) =
-        AuthorityControl::initialize_at(&root, request, &anchor, now_unix()).unwrap();
+        AuthorityControl::initialize_release_at(&root, request, &anchor, now_unix()).unwrap();
     (directory, control)
 }
 pub fn launch_context() -> LaunchContext {
@@ -131,7 +131,7 @@ pub fn request_for_runtime(
         profile_id: "productbase-s4-diagnostic".into(),
         artifact_digest: profile_artifact.digest.clone(),
         executable_digest: executable.digest.clone(),
-        launch_scope: "qualification-only".into(),
+        launch_scope: "provisional".into(),
     };
     let caller = CallerEligibilityRecord {
         principal_id: grant.principal_id.clone(),
@@ -194,7 +194,7 @@ pub fn request_for_runtime(
             activation_qualification_plan_digest: ZERO_DIGEST.into(),
             release_signing_trust_root_fingerprint: release_trust_root(),
             release_signing_trust_root_version: 1,
-            qualification_state: "qualification-only".into(),
+            qualification_state: "provisional".into(),
             record_revision: 1,
         },
     };

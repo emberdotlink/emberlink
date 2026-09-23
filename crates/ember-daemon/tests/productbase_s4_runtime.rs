@@ -1,12 +1,11 @@
 //! Installed daemon artifact authentication at the real process boundary.
 
-#[path = "../../ember-authority/tests/support/mod.rs"]
-mod support;
-
-use ember_authority::{AUTHORITY_STATE_DIRECTORY, audit::now_unix, control::AuthorityControl};
+use ember_authority::{
+    audit::now_unix, control::AuthorityControl, diagnostic_bootstrap::build_request,
+};
 use std::{
     io::Write,
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -41,17 +40,13 @@ fn replaced_daemon_artifact_refuses_before_opening_authority_rpc() {
 
     let home = tempfile::Builder::new()
         .prefix("pb4")
-        .tempdir_in("/tmp")
+        .tempdir_in("/private/tmp")
         .unwrap();
-    let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
-    std::fs::create_dir_all(state_root.parent().unwrap()).unwrap();
-    let request = support::request_for_runtime(
-        home.path(),
-        "pb-s4-replaced-daemon",
-        daemon_binary.clone(),
-        std::env::current_exe().unwrap(),
-    );
-    AuthorityControl::initialize_at(&state_root, request, &support::anchor(), now_unix()).unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state_root = home.path().join("authority");
+    let cli_binary = std::env::current_exe().unwrap();
+    let request = build_request(home.path(), &cli_binary, &daemon_binary, now_unix()).unwrap();
+    AuthorityControl::initialize(&state_root, request).unwrap();
 
     std::fs::OpenOptions::new()
         .append(true)
@@ -60,6 +55,7 @@ fn replaced_daemon_artifact_refuses_before_opening_authority_rpc() {
         .write_all(b"altered")
         .unwrap();
     let output = Command::new(&daemon_binary)
+        .args(["--state-dir", state_root.to_str().unwrap()])
         .env("HOME", home.path())
         .output()
         .unwrap();
@@ -79,15 +75,11 @@ fn daemon_refuses_concurrent_owner_and_recovers_stale_socket() {
         .prefix("pb4-daemon-lease")
         .tempdir_in("/private/tmp")
         .unwrap();
-    let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
-    std::fs::create_dir_all(state_root.parent().unwrap()).unwrap();
-    let request = support::request_for_runtime(
-        home.path(),
-        "pb-s4-daemon-lease",
-        daemon_binary.clone(),
-        std::env::current_exe().unwrap(),
-    );
-    AuthorityControl::initialize_at(&state_root, request, &support::anchor(), now_unix()).unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state_root = home.path().join("authority");
+    let cli_binary = std::env::current_exe().unwrap();
+    let request = build_request(home.path(), &cli_binary, &daemon_binary, now_unix()).unwrap();
+    AuthorityControl::initialize(&state_root, request).unwrap();
 
     let mut daemon = Daemon(
         Command::new(&daemon_binary)
@@ -107,7 +99,7 @@ fn daemon_refuses_concurrent_owner_and_recovers_stale_socket() {
         .unwrap();
     assert!(!second.status.success());
     assert!(
-        String::from_utf8_lossy(&second.stderr).contains("daemon_already_running"),
+        String::from_utf8_lossy(&second.stderr).contains("authority_in_use"),
         "{}",
         String::from_utf8_lossy(&second.stderr)
     );

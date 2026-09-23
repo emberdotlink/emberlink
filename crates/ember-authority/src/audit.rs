@@ -102,7 +102,10 @@ impl DurableStore {
             .map_err(|_| Refusal::new("state_unavailable"))
             .map(|state| state.clone())
     }
-    pub fn verify_persisted_state(&self) -> Result<(), Refusal> {
+    pub(crate) fn inspect_verified_state<T>(
+        &self,
+        inspect: impl FnOnce(&PersistentAuthorityState) -> Result<T, Refusal>,
+    ) -> Result<T, Refusal> {
         let state = self
             .state
             .lock()
@@ -124,7 +127,7 @@ impl DurableStore {
         {
             return Err(Refusal::new("restore_failed"));
         }
-        Ok(())
+        inspect(&state)
     }
 
     pub fn transaction<T>(
@@ -294,12 +297,10 @@ impl EvidenceJournal {
             return Err(Refusal::new("initialization_receipt_invalid"));
         }
         let terminal_sequence = 1;
-        let classification_digest = classification_digest(&state.classification)?;
-        let expected_fact_count = 3 + state.initialization.evidence.fact_digests().len();
+        let expected_fact_count = 2 + state.initialization.evidence.fact_digests().len();
         let mut initialization_facts = vec![
             state.initialization.root_intent_digest.as_str(),
             state.initialization.continuity_digest.as_str(),
-            classification_digest.as_str(),
         ];
         initialization_facts.extend(state.initialization.evidence.fact_digests());
         let mut fact_digests = initialization_facts
@@ -416,13 +417,6 @@ pub fn initialization_receipt_body(
         "linked_fact_set_digest": linked_fact_set_digest,
         "signer_generation": signer_generation,
     })
-}
-pub fn classification_digest(
-    classification: &crate::model::ProductClassification,
-) -> Result<String, Refusal> {
-    let bytes =
-        serde_jcs::to_vec(classification).map_err(|_| Refusal::new("classification_invalid"))?;
-    Ok(sha256(&bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
