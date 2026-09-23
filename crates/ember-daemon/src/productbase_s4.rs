@@ -1,5 +1,4 @@
 use ember_authority::{
-    audit::sha256,
     control::AuthorityControl,
     identity,
     ipc::{
@@ -70,8 +69,8 @@ fn verify_daemon_executable(control: &AuthorityControl) -> Result<(), Refusal> {
     let executable = std::env::current_exe()
         .and_then(fs::canonicalize)
         .map_err(|_| Refusal::new("process_identity_unavailable"))?;
-    let digest =
-        sha256(&fs::read(executable).map_err(|_| Refusal::new("process_identity_unavailable"))?);
+    let digest = identity::executable_digest(&executable)
+        .map_err(|_| Refusal::new("process_identity_unavailable"))?;
     if digest != control.store().snapshot()?.daemon_executable_digest {
         return Err(Refusal::new("untrusted_daemon"));
     }
@@ -103,14 +102,12 @@ fn handle_control(
     if observed_cli != reviewed_cli {
         return Err(Refusal::new("untrusted_launcher"));
     }
-    let reviewed_digest =
-        sha256(&fs::read(&reviewed_cli).map_err(|_| Refusal::new("process_identity_unavailable"))?);
-    let reviewed_identity = identity::executable_identity(&reviewed_cli)
+    let reviewed_digest = identity::executable_digest(&reviewed_cli)
         .map_err(|_| Refusal::new("process_identity_unavailable"))?;
     let observed_identity = identity::process_executable_identity(peer.pid, peer.pid_version)
         .map_err(|_| Refusal::new("process_identity_unavailable"))?;
     if reviewed_digest != state.caller_eligibility.executable_digest
-        || observed_identity != reviewed_identity
+        || observed_identity != state.caller_eligibility.executable_identity
     {
         return Err(Refusal::new("untrusted_launcher"));
     }
@@ -178,8 +175,6 @@ fn run_diagnostic_session(
             .map_err(|_| Refusal::new("process_identity_unavailable"))?;
         let reviewed_digest = identity::executable_digest(&reviewed_cli)
             .map_err(|_| Refusal::new("process_identity_unavailable"))?;
-        let reviewed_identity = identity::executable_identity(&reviewed_cli)
-            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
         if reviewed_digest != authority_state.caller_eligibility.executable_digest {
             return Err(Refusal::new("untrusted_launcher"));
         }
@@ -205,7 +200,7 @@ fn run_diagnostic_session(
             .map_err(|_| Refusal::new("process_identity_unavailable"))?;
         let launched_identity = identity::process_executable_identity(pid, pid_version)
             .map_err(|_| Refusal::new("process_identity_unavailable"))?;
-        if launched_identity != reviewed_identity {
+        if launched_identity != authority_state.caller_eligibility.executable_identity {
             return Err(Refusal::new("untrusted_launcher"));
         }
         control.activate_session(

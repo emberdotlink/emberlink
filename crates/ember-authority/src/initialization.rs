@@ -150,6 +150,9 @@ pub struct CallerEligibilityRecord {
     pub operator_uid: u32,
     pub profile_artifact_digest: String,
     pub executable_digest: String,
+    /// Release-signed loaded-code identity: `cdhash:<40 hex>` on macOS or
+    /// `sha256:<64 hex>` on Linux.
+    pub executable_identity: String,
     pub trusted_project_digest: String,
     pub maintenance_window_expiry: u64,
 }
@@ -664,6 +667,7 @@ fn validate_semantics(
         || profile.artifact_digest != caller.profile_artifact_digest
         || profile.artifact_digest != project.profile_artifact_digest
         || caller.trusted_project_digest != digest(&encode_project(project)?)
+        || !valid_executable_identity(&caller.executable_identity)
         || plan.maintenance_window_expiry != caller.maintenance_window_expiry
         || now >= plan.maintenance_window_expiry
         || now >= grant.expiry
@@ -853,6 +857,19 @@ fn encode_profile(value: &HarnessProfileAuthorization) -> Result<Vec<u8>, Refusa
     Ok(e.finish())
 }
 
+fn valid_executable_identity(value: &str) -> bool {
+    let (prefix, width) = if cfg!(target_os = "macos") {
+        ("cdhash:", 40)
+    } else if cfg!(target_os = "linux") {
+        ("sha256:", 64)
+    } else {
+        return false;
+    };
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|hex| hex.len() == width && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 fn encode_caller(value: &CallerEligibilityRecord) -> Result<Vec<u8>, Refusal> {
     let mut e = Encoder::new("ember/caller-eligibility/v1")?;
     e.string(&value.principal_id)?
@@ -860,6 +877,7 @@ fn encode_caller(value: &CallerEligibilityRecord) -> Result<Vec<u8>, Refusal> {
         .u64(value.operator_uid.into())
         .digest(&value.profile_artifact_digest)?
         .digest(&value.executable_digest)?
+        .string(&value.executable_identity)?
         .digest(&value.trusted_project_digest)?
         .u64(value.maintenance_window_expiry);
     Ok(e.finish())

@@ -89,6 +89,14 @@ pub fn request_for_runtime(
         artifact_id: "executable:ember".into(),
         digest: sha256(&fs::read(&executable_path).unwrap()),
     };
+    let executable_identity = ember_authority::identity::executable_identity(&executable_path)
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                format!("cdhash:{}", "0".repeat(40))
+            } else {
+                executable.digest.clone()
+            }
+        });
     let profile_artifact = ArtifactDigestEntry {
         artifact_id: "profile:productbase-s4".into(),
         digest: sha256(&fs::read(&profile_path).unwrap()),
@@ -131,6 +139,7 @@ pub fn request_for_runtime(
         operator_uid: ember_authority::effective_uid(),
         profile_artifact_digest: profile.artifact_digest.clone(),
         executable_digest: executable.digest.clone(),
+        executable_identity,
         trusted_project_digest: project_digest,
         maintenance_window_expiry: expiry,
     };
