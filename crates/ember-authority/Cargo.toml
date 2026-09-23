@@ -3,63 +3,25 @@ name = "ember-authority"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Local authority kernel, host adapters, and founder-presence installer."
+description = "Local Action authority, settlement journal, and Receipt verification."
 publish = false
 autobins = false
 
-[[bin]]
-name = "ember-authority"
-path = "src/bin/ember.rs"
-
-[[bin]]
-name = "ember-askpass"
-path = "src/bin/ember-askpass.rs"
-
-[[bin]]
-name = "ember-host-builder"
-path = "src/bin/ember-host-builder.rs"
-
-[[bin]]
-name = "ember-host-planner"
-path = "src/bin/ember-host-planner.rs"
-
-[[bin]]
-name = "ember-host-reconciler"
-path = "src/bin/ember-host-reconciler.rs"
-
 [dependencies]
 base64 = "=0.22.1"
-chacha20poly1305 = "=0.10.1"
-command-fds = "=0.3.3"
+core-crypto = { path = "../core-crypto" }
+core-events = { path = "../core-events" }
 ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
-fs2 = "=0.4.3"
 hex = "=0.4.3"
-jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-jsonschema = { version = "=0.18.3", default-features = false }
 libc = "=0.2.186"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
-p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "std"] }
-reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-rsa = "=0.9.10"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_jcs = "=0.2.0"
 serde_json = "=1.0.150"
 sha2 = "=0.10.9"
-tempfile = "=3.27.0"
 thiserror = "=2.0.18"
 time = { version = "=0.3.47", features = ["formatting", "parsing", "serde"] }
 uuid = { version = "=1.23.2", features = ["serde", "v4"] }
-zeroize = "=1.8.2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "=0.10.1"
-objc2 = "=0.6.4"
-objc2-foundation = { version = "=0.3.2", features = ["NSString"] }
-objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["LAContext", "std"] }
-security-framework = { version = "=3.7.0", features = ["OSX_10_15"] }
-security-framework-sys = { version = "=2.17.0", features = ["OSX_10_15"] }
 
 [dev-dependencies]
-assert_matches = "=1.5.0"
-parking_lot = "=0.12.5"
-
+tempfile = "=3.27.0"
