@@ -25,6 +25,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_signal: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_shutdown_handlers() -> Result<(), String> {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = request_shutdown as *const () as usize;
+    action.sa_flags = 0;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+        {
+            return Err(format!(
+                "signal handler unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn run(state_root: &Path) -> Result<(), String> {
     validate_existing_state_root(state_root).map_err(|error| error.to_string())?;
     let socket_path = state_root.join("control.sock");
@@ -38,14 +63,31 @@ pub fn run(state_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
+    install_shutdown_handlers()?;
     println!(
         "emberd ProductBase authority ready: {}",
         socket_path.display()
     );
     let quiesced = AtomicBool::new(false);
-    for connection in listener.incoming() {
-        let mut stream = match connection {
-            Ok(stream) => stream,
+    loop {
+        let mut event = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut event, 1, 1_000) };
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            break;
+        }
+        if ready < 0 {
+            eprintln!("emberd: poll failed: {}", std::io::Error::last_os_error());
+            continue;
+        }
+        if ready == 0 {
+            continue;
+        }
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
             Err(error) => {
                 eprintln!("emberd: accept failed: {error}");
                 continue;
@@ -65,7 +107,7 @@ pub fn run(state_root: &Path) -> Result<(), String> {
         if let Err(error) = write_control_frame(&mut stream, &response) {
             eprintln!("emberd: response failed: {error}");
         }
-        if quiesced.load(Ordering::SeqCst) {
+        if quiesced.load(Ordering::SeqCst) || SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             break;
         }
     }

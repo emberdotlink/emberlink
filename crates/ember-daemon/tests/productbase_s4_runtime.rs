@@ -163,3 +163,38 @@ fn daemon_refuses_concurrent_owner_and_recovers_stale_socket() {
     assert!(restarted.0.try_wait().unwrap().is_none());
     UnixStream::connect(&socket).unwrap();
 }
+
+#[test]
+fn daemon_sigterm_exits_cleanly_and_removes_control_socket() {
+    let daemon_binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_emberd"));
+    let home = tempfile::Builder::new()
+        .prefix("pb4-daemon-stop")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state_root = home.path().join("authority");
+    let cli_binary = std::env::current_exe().unwrap();
+    let request = build_request(home.path(), &cli_binary, &daemon_binary, now_unix()).unwrap();
+    AuthorityControl::initialize(&state_root, request).unwrap();
+
+    let daemon = Command::new(&daemon_binary)
+        .args(["--state-dir", state_root.to_str().unwrap()])
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let socket = state_root.join("control.sock");
+    wait_for_socket(&socket);
+    assert_eq!(
+        unsafe { libc::kill(daemon.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let output = wait_for_exit(daemon);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!socket.exists());
+}
