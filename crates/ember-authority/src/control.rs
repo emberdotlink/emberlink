@@ -291,7 +291,11 @@ impl AuthorityControl {
             checkpoint_digest: state.checkpoint_digest.clone(),
             maintenance_window_expiry: state.caller_eligibility.maintenance_window_expiry,
             journal_health: EvidenceJournal::health(state)?.into(),
-            active_sessions: state.sessions.len() as u64,
+            active_sessions: state
+                .sessions
+                .values()
+                .filter(|session| session.state == SessionState::Active)
+                .count() as u64,
             initialization: state.initialization.clone(),
             classification: state.classification.clone(),
         })

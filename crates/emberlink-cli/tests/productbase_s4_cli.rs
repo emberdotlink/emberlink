@@ -307,6 +307,10 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     assert_exact_classification(&result["classification"]);
     assert_eq!(result["initialization_evidence"]["kind"], "development");
     let receipt_id = result["receipt_id"].as_str().unwrap().to_owned();
+    let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["status", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let post_session_status: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(post_session_status["active_sessions"], 0);
 
     let tip_path = state_root.join("protected-tip.json");
     let tip: serde_json::Value =
@@ -572,7 +576,10 @@ fn initialization_refuses_untrusted_daemon_sibling_without_state_writes() {
         ],
     );
     assert_ne!(code, 0);
-    assert!(stderr.contains("invalid_initialization_command"), "{stderr}");
+    assert!(
+        stderr.contains("invalid_initialization_command"),
+        "{stderr}"
+    );
     assert_no_state();
 
     let (code, _, stderr) = ember(&cli, &state_root, &init_args);
