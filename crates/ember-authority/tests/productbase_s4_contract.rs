@@ -19,7 +19,7 @@ use ember_authority::{
     network_enforcement::NetworkEnforcement,
     operation::OperationSettlement,
     receipt::ReceiptProjection,
-    runner::JournalHealth,
+    runner::{JournalHealth, RawResultFrame},
     runtime_presence::AuthenticatedProcess,
 };
 use serde::{Deserialize, Serialize};
@@ -195,6 +195,29 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
         .code,
         "identity_collision"
     );
+}
+#[test]
+fn failed_initialization_leaves_no_restorable_partial_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let oversized_name = "a".repeat(240);
+    let malformed_root = directory.path().join(&oversized_name);
+    let request = initialization_request(directory.path(), "atomic-initialization");
+    assert!(
+        AuthorityControl::initialize_at(&malformed_root, request, &anchor(), now_unix()).is_err()
+    );
+    assert!(!malformed_root.exists());
+    assert!(
+        !directory
+            .path()
+            .join(format!("{oversized_name}.high-water.json"))
+            .exists()
+    );
+    assert!(AuthorityControl::restore(&malformed_root).is_err());
+
+    let retry_root = directory.path().join("authority");
+    let request = initialization_request(directory.path(), "atomic-initialization-retry");
+    AuthorityControl::initialize_at(&retry_root, request, &anchor(), now_unix()).unwrap();
+    AuthorityControl::restore(&retry_root).unwrap();
 }
 
 #[test]
@@ -470,6 +493,62 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
     assert_eq!(ReceiptProjection::list(control.store()).unwrap().len(), 2);
 }
 
+fn mutate_registry(control: &AuthorityControl, mutate: impl FnOnce(&mut serde_json::Value)) {
+    control
+        .store()
+        .transaction(|state| {
+            let mut registry: serde_json::Value =
+                serde_json::from_str(&state.registry_bytes).unwrap();
+            mutate(&mut registry);
+            state.registry_bytes = serde_jcs::to_string(&registry).unwrap();
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn inactive_publisher_and_definition_refuse_before_begin() {
+    for field in ["publisher_active", "definition_active"] {
+        let (_root, control) = authority(field);
+        let (session_id, process) = active_session(&control, field);
+        mutate_registry(&control, |registry| registry[field] = false.into());
+        let before = control.store().snapshot().unwrap().sequence;
+        let error = AuthorityKernel::new(control.store().clone())
+            .submit(&session_id, process, request(field, field))
+            .unwrap_err();
+        assert_eq!(error.code, "definition_inactive");
+        let snapshot = control.store().snapshot().unwrap();
+        assert_eq!(snapshot.sequence, before);
+        assert!(snapshot.operations.is_empty());
+        assert_eq!(snapshot.receipts.len(), 1);
+    }
+}
+
+#[test]
+fn changed_signed_definition_byte_is_an_invalid_signature() {
+    let (_root, control) = authority("changed-definition-byte");
+    let (session_id, process) = active_session(&control, "changed-definition-byte");
+    mutate_registry(&control, |registry| {
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(registry["signed_bundle"].as_str().unwrap()).unwrap();
+        envelope["bundle"]["definitions"][0]["action_key"] = "altered".into();
+        registry["signed_bundle"] = serde_jcs::to_string(&envelope).unwrap().into();
+    });
+    let before = control.store().snapshot().unwrap().sequence;
+    let error = AuthorityKernel::new(control.store().clone())
+        .submit(
+            &session_id,
+            process,
+            request("changed-definition-byte", "changed-definition-byte"),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_signature");
+    let snapshot = control.store().snapshot().unwrap();
+    assert_eq!(snapshot.sequence, before);
+    assert!(snapshot.operations.is_empty());
+    assert_eq!(snapshot.receipts.len(), 1);
+}
+
 #[test]
 fn protected_tip_rollback_is_refused() {
     let (directory, control) = authority("rollback");
@@ -485,6 +564,17 @@ fn protected_tip_rollback_is_refused() {
         .unwrap();
     drop(control);
     std::fs::write(root.join("protected-tip.json"), old_tip).unwrap();
+    assert_eq!(
+        AuthorityControl::restore(&root).err().unwrap().code,
+        "state_rollback_detected"
+    );
+}
+#[test]
+fn missing_high_water_anchor_is_refused() {
+    let (directory, control) = authority("missing-high-water");
+    let root = directory.path().join("authority");
+    drop(control);
+    std::fs::remove_file(directory.path().join("authority.high-water.json")).unwrap();
     assert_eq!(
         AuthorityControl::restore(&root).err().unwrap().code,
         "state_rollback_detected"
@@ -557,6 +647,56 @@ struct FailedJournal;
 impl JournalHealth for FailedJournal {
     fn health(&self) -> Result<&'static str, ember_authority::model::Refusal> {
         Err(ember_authority::model::Refusal::new("journal_unavailable"))
+    }
+}
+struct InvalidResultJournal {
+    two_frames: bool,
+}
+
+impl JournalHealth for InvalidResultJournal {
+    fn health(&self) -> Result<&'static str, ember_authority::model::Refusal> {
+        Ok("ready")
+    }
+
+    fn raw_result_frames(&self, facts: DiagnosticFacts) -> Vec<RawResultFrame> {
+        let frame = RawResultFrame {
+            payload_schema_identifier: "wrong.schema".into(),
+            payload_schema_version: "v1".into(),
+            payload_semantics: "diagnostic-facts".into(),
+            payload: facts,
+        };
+        if self.two_frames {
+            vec![frame.clone(), frame]
+        } else {
+            vec![frame]
+        }
+    }
+}
+
+#[test]
+fn unsupported_runner_results_settle_one_failure_without_payload() {
+    for (name, two_frames) in [("wrong-tuple", false), ("two-frames", true)] {
+        let (_root, control) = authority(name);
+        let (session_id, process) = active_session(&control, name);
+        let before = control.store().snapshot().unwrap().sequence;
+        let error = AuthorityKernel::new(control.store().clone())
+            .submit_with_journal_at(
+                &session_id,
+                process,
+                request(name, name),
+                now_unix(),
+                &InvalidResultJournal { two_frames },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "runner_failed");
+        let snapshot = control.store().snapshot().unwrap();
+        assert_eq!(snapshot.sequence, before + 1);
+        let operation = snapshot.operations.values().next().unwrap();
+        assert_eq!(operation.status, OperationStatus::ExecutionFailure);
+        assert!(operation.facts.is_none());
+        let receipt_id = operation.receipt_id.as_ref().unwrap();
+        assert_eq!(snapshot.receipts.len(), 2);
+        ReceiptProjection::verify(control.store(), receipt_id).unwrap();
     }
 }
 

@@ -6,6 +6,7 @@ mod support;
 
 use ember_authority::{AUTHORITY_STATE_DIRECTORY, audit::now_unix, control::AuthorityControl};
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     process::{Child, Command},
     thread::sleep,
@@ -178,4 +179,46 @@ fn live_session_action_produces_a_durable_verifiable_receipt() {
     let (code, stdout, stderr) = ember(&cli_binary, home.path(), &["receipt", "show", &receipt_id]);
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains(&receipt_id), "{stdout}");
+}
+
+#[test]
+fn replaced_daemon_artifact_refuses_before_opening_authority_rpc() {
+    let (built_daemon, built_cli) = binaries();
+    let installation = tempfile::tempdir().unwrap();
+    let daemon_binary = installation.path().join("emberd");
+    let cli_binary = installation.path().join("ember");
+    std::fs::copy(built_daemon, &daemon_binary).unwrap();
+    std::fs::copy(built_cli, &cli_binary).unwrap();
+
+    let home = tempfile::Builder::new()
+        .prefix("pb4")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
+    std::fs::create_dir_all(state_root.parent().unwrap()).unwrap();
+    let request = support::request_for_runtime(
+        home.path(),
+        "pb-s4-replaced-daemon",
+        daemon_binary.clone(),
+        cli_binary,
+    );
+    AuthorityControl::initialize_at(&state_root, request, &support::anchor(), now_unix()).unwrap();
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&daemon_binary)
+        .unwrap()
+        .write_all(b"altered")
+        .unwrap();
+    let output = Command::new(&daemon_binary)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("untrusted_daemon"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!state_root.join("control.sock").exists());
 }

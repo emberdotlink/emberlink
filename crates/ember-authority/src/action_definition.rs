@@ -27,15 +27,20 @@ pub struct ResolvedDefinition {
 #[serde(deny_unknown_fields)]
 struct RegistryState {
     publisher: PublisherTrustRoot,
+    publisher_active: bool,
     definition_digest: String,
+    definition_active: bool,
     signed_bundle: String,
 }
 
 #[derive(Clone)]
 pub struct ActionDefinitionRegistry {
     publisher: PublisherTrustRoot,
+    publisher_active: bool,
     definition_digest: String,
+    definition_active: bool,
     canonical_definition: String,
+    signed_bundle: String,
 }
 
 impl ActionDefinitionRegistry {
@@ -50,7 +55,9 @@ impl ActionDefinitionRegistry {
         )?;
         serde_jcs::to_string(&RegistryState {
             publisher: publisher.clone(),
+            publisher_active: true,
             definition_digest: definition.action_definition_digest.clone(),
+            definition_active: true,
             signed_bundle: definition.signed_bundle.clone(),
         })
         .map_err(|_| Refusal::new("invalid_bundle"))
@@ -66,14 +73,16 @@ impl ActionDefinitionRegistry {
             &state.signed_bundle,
             &state.publisher,
             &state.definition_digest,
-        )
-        .map_err(|_| Refusal::new("registry_restore_failed"))?;
+        )?;
         let canonical_definition = serde_jcs::to_string(&definition)
             .map_err(|_| Refusal::new("registry_restore_failed"))?;
         Ok(Self {
             publisher: state.publisher,
+            publisher_active: state.publisher_active,
             definition_digest: state.definition_digest,
+            definition_active: state.definition_active,
             canonical_definition,
+            signed_bundle: state.signed_bundle,
         })
     }
 
@@ -89,11 +98,25 @@ impl ActionDefinitionRegistry {
         if expected_digest != self.definition_digest {
             return Err(Refusal::new("definition_digest_mismatch"));
         }
+        if !self.publisher_active || !self.definition_active {
+            return Err(Refusal::new("definition_inactive"));
+        }
         // This tranche has no registry mutation path. Rollback of the
         // containing registry bytes is enforced by DurableStore's
         // protected-tip high-water record.
         if now >= self.publisher.not_after {
             return Err(Refusal::new("publisher_not_trusted"));
+        }
+        let authenticated_definition = verify_signed_bundle(
+            &self.signed_bundle,
+            &self.publisher,
+            &self.definition_digest,
+        )?;
+        if serde_jcs::to_string(&authenticated_definition)
+            .map_err(|_| Refusal::new("registry_restore_failed"))?
+            != self.canonical_definition
+        {
+            return Err(Refusal::new("registry_restore_failed"));
         }
         let definition: Value = decode_canonical(
             self.canonical_definition.as_bytes(),
@@ -135,6 +158,32 @@ fn verify_signed_bundle(
         return Err(Refusal::new("publisher_not_trusted"));
     }
     let bundle = &envelope["bundle"];
+    let canonical_bundle = serde_jcs::to_vec(bundle).map_err(|_| Refusal::new("invalid_bundle"))?;
+    let mut preimage = BUNDLE_DOMAIN.to_vec();
+    preimage.extend_from_slice(publisher.signer_key_id.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(&canonical_bundle);
+    let public: [u8; 32] = STANDARD
+        .decode(&publisher.public_key)
+        .map_err(|_| Refusal::new("invalid_signature"))?
+        .try_into()
+        .map_err(|_| Refusal::new("invalid_signature"))?;
+    let signature_text = envelope["signature"]
+        .as_str()
+        .ok_or_else(|| Refusal::new("invalid_signature"))?;
+    let signature: [u8; 64] = STANDARD
+        .decode(signature_text)
+        .map_err(|_| Refusal::new("invalid_signature"))?
+        .try_into()
+        .map_err(|_| Refusal::new("invalid_signature"))?;
+    VerifyingKey::from_bytes(&public)
+        .map_err(|_| Refusal::new("invalid_signature"))?
+        .verify(&preimage, &Signature::from_bytes(&signature))
+        .map_err(|_| Refusal::new("invalid_signature"))?;
+    let bundle_digest = format!("sha256:{}", hex::encode(Sha256::digest(&preimage)));
+    if envelope["bundle_digest"] != bundle_digest {
+        return Err(Refusal::new("bundle_digest_mismatch"));
+    }
     let bundle_object = bundle
         .as_object()
         .ok_or_else(|| Refusal::new("invalid_bundle"))?;
@@ -180,32 +229,6 @@ fn verify_signed_bundle(
     if domain_digest(DEFINITION_DOMAIN, &canonical_wrapper) != expected_definition_digest {
         return Err(Refusal::new("definition_digest_mismatch"));
     }
-    let canonical_bundle = serde_jcs::to_vec(bundle).map_err(|_| Refusal::new("invalid_bundle"))?;
-    let mut preimage = BUNDLE_DOMAIN.to_vec();
-    preimage.extend_from_slice(publisher.signer_key_id.as_bytes());
-    preimage.push(0);
-    preimage.extend_from_slice(&canonical_bundle);
-    let bundle_digest = format!("sha256:{}", hex::encode(Sha256::digest(&preimage)));
-    if envelope["bundle_digest"] != bundle_digest {
-        return Err(Refusal::new("bundle_digest_mismatch"));
-    }
-    let public: [u8; 32] = STANDARD
-        .decode(&publisher.public_key)
-        .map_err(|_| Refusal::new("invalid_signature"))?
-        .try_into()
-        .map_err(|_| Refusal::new("invalid_signature"))?;
-    let signature_text = envelope["signature"]
-        .as_str()
-        .ok_or_else(|| Refusal::new("invalid_signature"))?;
-    let signature: [u8; 64] = STANDARD
-        .decode(signature_text)
-        .map_err(|_| Refusal::new("invalid_signature"))?
-        .try_into()
-        .map_err(|_| Refusal::new("invalid_signature"))?;
-    VerifyingKey::from_bytes(&public)
-        .map_err(|_| Refusal::new("invalid_signature"))?
-        .verify(&preimage, &Signature::from_bytes(&signature))
-        .map_err(|_| Refusal::new("invalid_signature"))?;
     Ok(definitions[0].clone())
 }
 

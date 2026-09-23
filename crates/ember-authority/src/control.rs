@@ -106,7 +106,13 @@ impl AuthorityControl {
         let stored_receipt =
             EvidenceJournal::append_initialization(&mut state, &custody.receipt_signer()?)?;
         let prior_digest = sha256(&encode_continuity(&request.prior_continuity)?);
-        let store = DurableStore::initialize(root, state)?;
+        let store = match DurableStore::initialize(root, state) {
+            Ok(store) => store,
+            Err(error) => {
+                cleanup_failed_initialization(root, &continuity_path);
+                return Err(error);
+            }
+        };
         let current_continuity = RootContinuityRecord {
             schema: "ember.root-continuity-record/v1".into(),
             generation: 1,
@@ -118,7 +124,7 @@ impl AuthorityControl {
         let continuity_bytes = serde_jcs::to_vec(&current_continuity)
             .map_err(|_| Refusal::new("continuity_unavailable"))?;
         if atomic_write(&continuity_path, &continuity_bytes).is_err() {
-            let _ = fs::remove_dir_all(root);
+            cleanup_failed_initialization(root, &continuity_path);
             return Err(Refusal::new("continuity_unavailable"));
         }
         let control = Self {
@@ -306,6 +312,17 @@ fn verify_stored_receipts(store: &DurableStore) -> Result<(), Refusal> {
         ReceiptProjection::verify(store, &receipt_id)?;
     }
     Ok(())
+}
+
+fn cleanup_failed_initialization(root: &Path, continuity_path: &Path) {
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(continuity_path);
+    if let (Some(parent), Some(name)) = (
+        root.parent(),
+        root.file_name().and_then(|value| value.to_str()),
+    ) {
+        let _ = fs::remove_file(parent.join(format!("{name}.high-water.json")));
+    }
 }
 
 fn continuity_path(root: &Path) -> Result<PathBuf, Refusal> {

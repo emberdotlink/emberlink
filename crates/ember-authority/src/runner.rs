@@ -6,7 +6,8 @@ use crate::{
     device::DeviceCustody,
     initialization::RouteAuthorization,
     model::{
-        ActionPermit, ActionRequest, DiagnosticFacts, DiagnosticInput, Refusal, SessionRecord,
+        ActionPermit, ActionRef, ActionRequest, DiagnosticFacts, DiagnosticInput, Refusal,
+        SessionRecord,
     },
     network_enforcement::NetworkEnforcement,
 };
@@ -16,8 +17,25 @@ const RESULT_SCHEMA_IDENTIFIER: &str = "emberlink.diagnostic-facts";
 const RESULT_SCHEMA_VERSION: &str = "v1";
 const RESULT_SEMANTICS: &str = "diagnostic-facts";
 
+#[derive(Clone, Debug)]
+pub struct RawResultFrame {
+    pub payload_schema_identifier: String,
+    pub payload_schema_version: String,
+    pub payload_semantics: String,
+    pub payload: DiagnosticFacts,
+}
+
 pub trait JournalHealth: Send + Sync {
     fn health(&self) -> Result<&'static str, Refusal>;
+
+    fn raw_result_frames(&self, facts: DiagnosticFacts) -> Vec<RawResultFrame> {
+        vec![RawResultFrame {
+            payload_schema_identifier: RESULT_SCHEMA_IDENTIFIER.into(),
+            payload_schema_version: RESULT_SCHEMA_VERSION.into(),
+            payload_semantics: RESULT_SEMANTICS.into(),
+            payload: facts,
+        }]
+    }
 }
 
 pub struct RunnerRegistry;
@@ -101,16 +119,27 @@ impl DiagnosticRunner {
         permit: &ActionPermit,
         input: &DiagnosticInput,
         journal: &dyn JournalHealth,
+        registry: &crate::action_definition::ActionDefinitionRegistry,
+        current_authority_epoch: u64,
+        now: u64,
     ) -> Result<DiagnosticFacts, Refusal> {
         let canonical = encode_action_permit(permit, true)
             .map_err(|_| Refusal::new("authorization_invalid"))?;
         if sha256(&canonical) != self.authorized_permit_digest
             || permit.signature.is_empty()
+            || current_authority_epoch != permit.authority_epoch
             || sha256(&serde_jcs::to_vec(input).map_err(|_| Refusal::new("authorization_invalid"))?)
                 != permit.canonical_typed_input_digest
         {
             return Err(Refusal::new("authorization_invalid"));
         }
+        registry
+            .resolve(
+                &ActionRef::diagnostic(),
+                &permit.action_definition_digest,
+                now,
+            )
+            .map_err(|_| Refusal::new("unsupported_result_frame"))?;
         input.validate()?;
         let health = journal
             .health()
@@ -122,11 +151,22 @@ impl DiagnosticRunner {
             challenge: input.challenge.clone(),
             journal_health: health.into(),
         };
-        let encoded =
-            serde_jcs::to_vec(&facts).map_err(|_| Refusal::new("unsupported_result_frame"))?;
+        let frames = journal.raw_result_frames(facts);
+        if frames.len() != 1 {
+            return Err(Refusal::new("unsupported_result_frame"));
+        }
+        let frame = frames.into_iter().next().expect("length checked");
+        if frame.payload_schema_identifier != RESULT_SCHEMA_IDENTIFIER
+            || frame.payload_schema_version != RESULT_SCHEMA_VERSION
+            || frame.payload_semantics != RESULT_SEMANTICS
+        {
+            return Err(Refusal::new("unsupported_result_frame"));
+        }
+        let encoded = serde_jcs::to_vec(&frame.payload)
+            .map_err(|_| Refusal::new("unsupported_result_frame"))?;
         if encoded.len() as u64 > permit.byte_budget {
             return Err(Refusal::new("unsupported_result_frame"));
         }
-        Ok(facts)
+        Ok(frame.payload)
     }
 }

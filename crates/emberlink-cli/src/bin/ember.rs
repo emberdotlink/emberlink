@@ -159,7 +159,7 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
         "invalid_request",
     )
     .map_err(report_refusal)?;
-    let root = default_state_dir()?;
+    let root = PathBuf::from(argument(args, "--state-root")?);
     let mut stream = trusted_daemon_stream(&root, Path::new(endpoint), "session_endpoint_failed")?;
     write_frame(
         &mut stream,

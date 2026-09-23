@@ -168,7 +168,8 @@ pub fn encode_action_permit(
         .string(&permit.consequence_class)?
         .string(&permit.capability)?
         .string(&permit.nonce)?
-        .u64(permit.issuance);
+        .u64(permit.issuance)
+        .string(&permit.signer_key_id)?;
     if include_signature {
         e.string(&permit.signature)?;
     }

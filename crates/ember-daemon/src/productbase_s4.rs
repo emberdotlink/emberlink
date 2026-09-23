@@ -26,6 +26,7 @@ use std::{
 
 pub fn run(state_root: &Path) -> Result<(), String> {
     let control = AuthorityControl::restore(state_root).map_err(|error| error.to_string())?;
+    verify_daemon_executable(&control).map_err(|error| error.to_string())?;
     let socket_path = state_root.join("control.sock");
     remove_socket(&socket_path);
     let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
@@ -61,6 +62,18 @@ pub fn run(state_root: &Path) -> Result<(), String> {
         if quiesced.load(Ordering::SeqCst) {
             break;
         }
+    }
+    Ok(())
+}
+
+fn verify_daemon_executable(control: &AuthorityControl) -> Result<(), Refusal> {
+    let executable = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+    let digest =
+        sha256(&fs::read(executable).map_err(|_| Refusal::new("process_identity_unavailable"))?);
+    if digest != control.store().snapshot()?.daemon_executable_digest {
+        return Err(Refusal::new("untrusted_daemon"));
     }
     Ok(())
 }
@@ -158,7 +171,10 @@ fn run_diagnostic_session(
         );
         let mut command = Command::new(cli_binary()?);
         command
+            .env_clear()
             .arg("__session-child")
+            .arg("--state-root")
+            .arg(state_root)
             .arg("--endpoint")
             .arg(&launch.endpoint)
             .arg("--session-id")

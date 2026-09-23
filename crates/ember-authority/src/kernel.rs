@@ -148,7 +148,16 @@ impl AuthorityKernel {
             now,
         )?;
 
-        match runner.run(&permit, &request.input, journal) {
+        let post_begin = self.store.snapshot()?;
+        let post_begin_registry = ActionDefinitionRegistry::restore(&post_begin.registry_bytes)?;
+        match runner.run(
+            &permit,
+            &request.input,
+            journal,
+            &post_begin_registry,
+            post_begin.authority_epoch,
+            now,
+        ) {
             Ok(facts) => {
                 // The bound child must still be the live, reviewed process at
                 // settlement. The runner already ran, so a Session whose child

@@ -984,7 +984,7 @@ fn commit_continuity(root: &Path, mark: Option<(u64, String)>) -> Result<(), Ref
 fn enforce_high_water(root: &Path, tip_generation: u64, tip_bytes: &[u8]) -> Result<(), Refusal> {
     let (_, _, high_water) = continuity_paths(root)?;
     if !high_water.exists() {
-        return Ok(());
+        return Err(Refusal::new("state_rollback_detected"));
     }
     let bytes =
         read_bounded(&high_water, 16_384).map_err(|_| Refusal::new("state_rollback_detected"))?;
