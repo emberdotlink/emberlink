@@ -48,6 +48,8 @@ const BODY_KEYS: &[&str] = &[
     "checkpoint_digest",
     "linked_fact_set_digest",
     "signer_generation",
+    "classification",
+    "initialization_evidence",
 ];
 
 pub struct ReceiptProjection;
@@ -164,6 +166,8 @@ impl ReceiptProjection {
             &stored.checkpoint_digest,
             &linked_digest,
             state.devices.receipt.generation,
+            &state.classification,
+            &state.initialization.evidence,
         )?;
         if expected_facts != stored.fact_digests || envelope.body != expected_body {
             return Err(Refusal::new("receipt_invalid"));
@@ -216,23 +220,24 @@ fn verify_initialization(
     {
         return Err(Refusal::new("receipt_invalid"));
     }
-    let mut facts = [
-        &record.root_intent_digest,
-        &record.release_manifest_digest,
-        &record.release_qualification_digest,
-        &record.continuity_digest,
-    ]
-    .into_iter()
-    .map(|value| {
-        value
-            .strip_prefix("sha256:")
-            .map(str::to_owned)
-            .ok_or_else(|| Refusal::new("receipt_invalid"))
-    })
-    .collect::<Result<Vec<_>, _>>()?;
+    let expected_fact_count = 2 + record.evidence.fact_digests().len();
+    let mut initialization_facts = vec![
+        record.root_intent_digest.as_str(),
+        record.continuity_digest.as_str(),
+    ];
+    initialization_facts.extend(record.evidence.fact_digests());
+    let mut facts = initialization_facts
+        .into_iter()
+        .map(|value| {
+            value
+                .strip_prefix("sha256:")
+                .map(str::to_owned)
+                .ok_or_else(|| Refusal::new("receipt_invalid"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     facts.sort();
     facts.dedup();
-    if facts.len() != 4 || facts != stored.fact_digests {
+    if facts.len() != expected_fact_count || facts != stored.fact_digests {
         return Err(Refusal::new("receipt_invalid"));
     }
     let linked_digest = linked_fact_set_digest(

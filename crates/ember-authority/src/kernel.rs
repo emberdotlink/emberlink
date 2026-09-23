@@ -95,6 +95,8 @@ impl AuthorityKernel {
                     operation_id: operation.operation_id,
                     receipt_id: receipt.row.receipt_id,
                     status: "success".into(),
+                    classification: snapshot.classification.clone(),
+                    initialization_evidence: snapshot.initialization.evidence.clone(),
                 });
             }
         }
@@ -113,7 +115,7 @@ impl AuthorityKernel {
             &snapshot.authority_fingerprint,
             snapshot.authority_epoch,
             &snapshot.installation_id,
-            &snapshot.release_manifest_digest,
+            snapshot.initialization.evidence.release_manifest_digest(),
             &session,
             &request,
             &definition,
@@ -127,7 +129,7 @@ impl AuthorityKernel {
             &snapshot.authority_fingerprint,
             snapshot.authority_epoch,
             &snapshot.installation_id,
-            &snapshot.release_manifest_digest,
+            snapshot.initialization.evidence.release_manifest_digest(),
             &session,
             &request,
             &definition,
@@ -181,6 +183,8 @@ impl AuthorityKernel {
                     operation_id: operation.operation_id,
                     receipt_id: receipt.row.receipt_id,
                     status: "success".into(),
+                    classification: snapshot.classification.clone(),
+                    initialization_evidence: snapshot.initialization.evidence.clone(),
                 })
             }
             Err(_) => {

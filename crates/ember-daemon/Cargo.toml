@@ -14,6 +14,7 @@ autotests = false
 [dependencies]
 base64 = "0.22"
 ember-authority = { path = "../ember-authority" }
+libc = "=0.2.186"
 serde_jcs = "0.2"
 uuid = { version = "1", features = ["v4"] }
 

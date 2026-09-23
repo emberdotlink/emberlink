@@ -1,5 +1,6 @@
 use ember_authority::{
     control::AuthorityControl,
+    diagnostic_bootstrap::validate_existing_state_root,
     identity,
     ipc::{
         CONTROL_FRAME_LIMIT, ControlRequest, ControlResponse, SessionActionRequest,
@@ -12,9 +13,10 @@ use ember_authority::{
     session_supervisor::SessionSupervisor,
 };
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
+    os::fd::AsRawFd as _,
     os::unix::{
-        fs::PermissionsExt as _,
+        fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -24,11 +26,16 @@ use std::{
 };
 
 pub fn run(state_root: &Path) -> Result<(), String> {
+    validate_existing_state_root(state_root).map_err(|error| error.to_string())?;
+    let socket_path = state_root.join("control.sock");
+    let mut lease =
+        DaemonLease::acquire(state_root, &socket_path).map_err(|error| error.to_string())?;
     let control = AuthorityControl::restore(state_root).map_err(|error| error.to_string())?;
     verify_daemon_executable(&control).map_err(|error| error.to_string())?;
-    let socket_path = state_root.join("control.sock");
-    remove_socket(&socket_path);
     let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
+    lease
+        .claim_socket(&socket_path)
+        .map_err(|error| error.to_string())?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
     println!(
@@ -113,6 +120,9 @@ fn handle_control(
     }
     match request {
         ControlRequest::Ping => Ok(ControlResponse::Pong),
+        ControlRequest::Status => Ok(ControlResponse::Status {
+            status: AuthorityControl::read_status(state_root)?,
+        }),
         ControlRequest::OpenDiagnostic {
             challenge,
             action,
@@ -130,7 +140,11 @@ fn handle_control(
         }
         ControlRequest::ReceiptVerify { receipt_id } => {
             ReceiptProjection::verify(control.store(), &receipt_id)?;
-            Ok(ControlResponse::ReceiptVerified { receipt_id })
+            Ok(ControlResponse::ReceiptVerified {
+                receipt_id,
+                classification: state.classification.clone(),
+                initialization_evidence: state.initialization.evidence.clone(),
+            })
         }
     }
 }
@@ -254,7 +268,9 @@ fn run_diagnostic_session(
             let kernel = AuthorityKernel::new(control.store().clone());
             let response = match kernel.submit(&launch.session_id, process, session_request.action)
             {
-                Ok(action) => SessionActionResponse::Success { action },
+                Ok(action) => SessionActionResponse::Success {
+                    action: Box::new(action),
+                },
                 Err(error) => {
                     if is_durability_failure(error.code) {
                         quiesced.store(true, Ordering::SeqCst);
@@ -301,8 +317,85 @@ fn cli_binary() -> Result<PathBuf, Refusal> {
     Ok(cli)
 }
 
-fn remove_socket(path: &Path) {
-    if path.exists() {
-        let _ = fs::remove_file(path);
+struct DaemonLease {
+    _file: File,
+    socket_path: PathBuf,
+    socket_identity: Option<(u64, u64)>,
+}
+
+impl DaemonLease {
+    fn acquire(state_root: &Path, socket_path: &Path) -> Result<Self, Refusal> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(state_root.join("daemon.lock"))
+            .map_err(|_| Refusal::new("authority_lease_untrusted"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| Refusal::new("authority_lease_untrusted"))?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != ember_authority::effective_uid()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(Refusal::new("authority_lease_untrusted"));
+        }
+        // SAFETY: `file` owns a live descriptor and `flock` neither retains the
+        // pointer nor accesses Rust-managed memory.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked != 0 {
+            return Err(Refusal::new("daemon_already_running"));
+        }
+        remove_stale_socket(socket_path)?;
+        Ok(Self {
+            _file: file,
+            socket_path: socket_path.to_owned(),
+            socket_identity: None,
+        })
     }
+
+    fn claim_socket(&mut self, path: &Path) -> Result<(), Refusal> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| Refusal::new("authority_endpoint_untrusted"))?;
+        if !metadata.file_type().is_socket() || metadata.uid() != ember_authority::effective_uid() {
+            return Err(Refusal::new("authority_endpoint_untrusted"));
+        }
+        self.socket_identity = Some((metadata.dev(), metadata.ino()));
+        Ok(())
+    }
+}
+
+impl Drop for DaemonLease {
+    fn drop(&mut self) {
+        let Some((dev, ino)) = self.socket_identity else {
+            return;
+        };
+        let Ok(metadata) = fs::symlink_metadata(&self.socket_path) else {
+            return;
+        };
+        if metadata.file_type().is_socket()
+            && metadata.uid() == ember_authority::effective_uid()
+            && (metadata.dev(), metadata.ino()) == (dev, ino)
+        {
+            let _ = fs::remove_file(&self.socket_path);
+        }
+    }
+}
+
+fn remove_stale_socket(path: &Path) -> Result<(), Refusal> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(Refusal::new("authority_endpoint_untrusted")),
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != ember_authority::effective_uid()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(Refusal::new("authority_endpoint_untrusted"));
+    }
+    fs::remove_file(path).map_err(|_| Refusal::new("authority_endpoint_untrusted"))
 }

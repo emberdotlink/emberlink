@@ -8,6 +8,7 @@ use ember_authority::{
     canonical::encode_action_permit,
     control::AuthorityControl,
     device::DeviceCustody,
+    diagnostic_bootstrap::build_request,
     identity,
     initialization::{ArtifactSource, RootContinuityRecord},
     ipc::{CONTROL_FRAME_LIMIT, FRAME_LIMIT, read_control_frame, read_frame},
@@ -24,6 +25,7 @@ use ember_authority::{
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Cursor, os::unix::net::UnixStream};
+use tempfile::TempDir;
 
 use support::{
     DEFINITION_DIGEST, PUBLISHER_NOT_AFTER, anchor, authority, launch_context,
@@ -414,7 +416,7 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
         &snapshot.authority_fingerprint,
         snapshot.authority_epoch,
         &snapshot.installation_id,
-        &snapshot.release_manifest_digest,
+        snapshot.initialization.evidence.release_manifest_digest(),
         &session,
         &request,
         &definition,
@@ -444,7 +446,7 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
         &snapshot.authority_fingerprint,
         snapshot.authority_epoch,
         &snapshot.installation_id,
-        &snapshot.release_manifest_digest,
+        snapshot.initialization.evidence.release_manifest_digest(),
         &session,
         &request,
         &definition,
@@ -669,7 +671,7 @@ fn running_operation_recovers_to_effect_unknown_receipt() {
         &snapshot.authority_fingerprint,
         snapshot.authority_epoch,
         &snapshot.installation_id,
-        &snapshot.release_manifest_digest,
+        snapshot.initialization.evidence.release_manifest_digest(),
         &session,
         &action,
         &definition,
@@ -825,7 +827,7 @@ fn signed_permit_rejects_every_changed_authority_axis() {
         &snapshot.authority_fingerprint,
         snapshot.authority_epoch,
         &snapshot.installation_id,
-        &snapshot.release_manifest_digest,
+        snapshot.initialization.evidence.release_manifest_digest(),
         &session,
         &request,
         &definition,
@@ -878,7 +880,7 @@ fn signed_permit_rejects_every_changed_authority_axis() {
             &snapshot.authority_fingerprint,
             snapshot.authority_epoch,
             &snapshot.installation_id,
-            &snapshot.release_manifest_digest,
+            snapshot.initialization.evidence.release_manifest_digest(),
             &session,
             &request,
             &definition,
@@ -1025,4 +1027,65 @@ fn canonical_and_frame_limits_accept_exact_and_refuse_plus_one() {
             .code,
         "input_too_large"
     );
+}
+
+fn development_authority(label: &str) -> (TempDir, std::path::PathBuf, AuthorityControl) {
+    let directory = tempfile::Builder::new()
+        .prefix(label)
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let root = directory.path().join("authority");
+    let executable = std::env::current_exe().unwrap();
+    let request = build_request(directory.path(), &executable, &executable, now_unix()).unwrap();
+    let (control, _) = AuthorityControl::initialize_development(&root, request).unwrap();
+    (directory, root, control)
+}
+
+#[test]
+fn mutated_persisted_development_records_refuse_restore() {
+    for (label, expected, mutate) in [
+        ("dev-manifest", "development_initialization_invalid", 0_u8),
+        (
+            "dev-attestation",
+            "development_initialization_invalid",
+            1_u8,
+        ),
+        ("dev-publisher", "development_manifest_invalid", 2_u8),
+        (
+            "dev-classification",
+            "development_initialization_invalid",
+            3_u8,
+        ),
+    ] {
+        let (_directory, root, control) = development_authority(label);
+        control
+            .store()
+            .transaction(|state| {
+                let proof = state.development_initialization.as_mut().unwrap();
+                match mutate {
+                    0 => {
+                        proof.manifest.bootstrap_artifact_digest_list[0].digest =
+                            format!("sha256:{}", "0".repeat(64))
+                    }
+                    1 => {
+                        proof.bootstrap_attestation.attestation_public_key =
+                            format!("ed25519-pub:{}", "0".repeat(64))
+                    }
+                    2 => {
+                        proof.records.publisher_trust_roots[0].publisher_id =
+                            "publisher:mutated".into()
+                    }
+                    3 => state.classification.production_classification = "production".into(),
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(control);
+        let error = match AuthorityControl::restore(&root) {
+            Ok(_) => panic!("{label} mutation restored"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, expected, "{label}");
+    }
 }

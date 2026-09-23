@@ -325,6 +325,80 @@ impl InitialRecords {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevelopmentInitialRecords {
+    pub qualification_grants: Vec<QualificationGrantRecord>,
+    pub harness_profile_authorizations: Vec<HarnessProfileAuthorization>,
+    pub caller_eligibility: Vec<CallerEligibilityRecord>,
+    pub publisher_trust_roots: Vec<PublisherTrustRoot>,
+    pub action_definitions: Vec<InitialActionDefinitionRecord>,
+    pub trusted_projects: Vec<TrustedProjectAuthorization>,
+    pub routes: Vec<RouteAuthorization>,
+    pub policy: DenyByDefaultPolicy,
+    pub recovery_manifest: RecoveryManifest,
+    pub coverage: InitialQualificationCoverageSet,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DevelopmentInitialRecordDigests {
+    pub grant_set: String,
+    pub profile_set: String,
+    pub caller_set: String,
+    pub publisher_set: String,
+    pub definition_set: String,
+    pub project_set: String,
+    pub route_set: String,
+    pub policy: String,
+    pub recovery: String,
+    pub coverage: String,
+}
+
+impl DevelopmentInitialRecords {
+    pub fn digests(&self) -> Result<DevelopmentInitialRecordDigests, Refusal> {
+        Ok(DevelopmentInitialRecordDigests {
+            grant_set: digest(&encode_set(
+                "ember/development-qualification-grant-set/v1",
+                &self.qualification_grants,
+                encode_grant,
+            )?),
+            profile_set: digest(&encode_set(
+                "ember/development-harness-profile-authorization-set/v1",
+                &self.harness_profile_authorizations,
+                encode_profile,
+            )?),
+            caller_set: digest(&encode_set(
+                "ember/development-caller-eligibility-set/v1",
+                &self.caller_eligibility,
+                encode_caller,
+            )?),
+            publisher_set: digest(&encode_set(
+                "ember/development-publisher-trust-root-set/v1",
+                &self.publisher_trust_roots,
+                encode_publisher,
+            )?),
+            definition_set: digest(&encode_set(
+                "ember/development-action-definition-set/v1",
+                &self.action_definitions,
+                encode_definition,
+            )?),
+            project_set: digest(&encode_set(
+                "ember/development-trusted-project-authorization-set/v1",
+                &self.trusted_projects,
+                encode_project,
+            )?),
+            route_set: digest(&encode_set(
+                "ember/development-qualification-route-set/v1",
+                &self.routes,
+                encode_route,
+            )?),
+            policy: digest(&encode_policy(&self.policy)?),
+            recovery: digest(&encode_recovery(&self.recovery_manifest)?),
+            coverage: digest(&encode_coverage(&self.coverage)?),
+        })
+    }
+}
+
 pub fn digest_encoded(bytes: &[u8]) -> String {
     digest(bytes)
 }

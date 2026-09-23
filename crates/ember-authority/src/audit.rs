@@ -198,6 +198,8 @@ impl EvidenceJournal {
             &checkpoint_digest,
             &linked_fact_set_digest,
             signer.generation(),
+            &state.classification,
+            &state.initialization.evidence,
         )?;
         let body_bytes = serde_jcs::to_vec(&body).map_err(|_| Refusal::new("receipt_invalid"))?;
         if body_bytes.len() > RECEIPT_BODY_LIMIT || body_bytes.len() > 65_536 {
@@ -239,6 +241,8 @@ impl EvidenceJournal {
             completed_at,
             signed_receipt_digest: sha256(&canonical),
             terminal_sequence,
+            classification: state.classification.clone(),
+            initialization_evidence: state.initialization.evidence.clone(),
         };
         let stored = StoredReceipt {
             row,
@@ -266,24 +270,25 @@ impl EvidenceJournal {
             return Err(Refusal::new("initialization_receipt_invalid"));
         }
         let terminal_sequence = 1;
-        let mut fact_digests = [
-            &state.initialization.root_intent_digest,
-            &state.initialization.release_manifest_digest,
-            &state.initialization.release_qualification_digest,
-            &state.initialization.continuity_digest,
-        ]
-        .into_iter()
-        .map(|digest| {
-            digest
-                .strip_prefix("sha256:")
-                .filter(|value| value.len() == 64 && hex::decode(value).is_ok())
-                .map(str::to_owned)
-                .ok_or_else(|| Refusal::new("initialization_receipt_invalid"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let expected_fact_count = 2 + state.initialization.evidence.fact_digests().len();
+        let mut initialization_facts = vec![
+            state.initialization.root_intent_digest.as_str(),
+            state.initialization.continuity_digest.as_str(),
+        ];
+        initialization_facts.extend(state.initialization.evidence.fact_digests());
+        let mut fact_digests = initialization_facts
+            .into_iter()
+            .map(|digest| {
+                digest
+                    .strip_prefix("sha256:")
+                    .filter(|value| value.len() == 64 && hex::decode(value).is_ok())
+                    .map(str::to_owned)
+                    .ok_or_else(|| Refusal::new("initialization_receipt_invalid"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         fact_digests.sort();
         fact_digests.dedup();
-        if fact_digests.len() != 4 {
+        if fact_digests.len() != expected_fact_count {
             return Err(Refusal::new("initialization_receipt_invalid"));
         }
         let linked_fact_set_digest = linked_fact_set_digest(
@@ -347,6 +352,8 @@ impl EvidenceJournal {
             completed_at: state.initialization.initialized_at,
             signed_receipt_digest: sha256(&canonical),
             terminal_sequence,
+            classification: state.classification.clone(),
+            initialization_evidence: state.initialization.evidence.clone(),
         };
         let stored = StoredReceipt {
             row,
@@ -374,8 +381,8 @@ pub fn initialization_receipt_body(
         "schema": "ember.authority-initialization-receipt-body/v1",
         "operation_id": state.initialization.operation_id,
         "root_intent_digest": state.initialization.root_intent_digest,
-        "release_manifest_digest": state.initialization.release_manifest_digest,
-        "release_qualification_digest": state.initialization.release_qualification_digest,
+        "initialization_evidence": state.initialization.evidence,
+        "classification": state.classification,
         "continuity_digest": state.initialization.continuity_digest,
         "initialized_at": state.initialization.initialized_at,
         "terminal_sequence": terminal_sequence,
@@ -396,6 +403,8 @@ pub fn operation_receipt_body(
     checkpoint_digest: &str,
     linked_fact_set_digest: &str,
     signer_generation: u64,
+    classification: &crate::model::ProductClassification,
+    initialization_evidence: &crate::model::InitializationEvidence,
 ) -> Result<serde_json::Value, Refusal> {
     let action_boundary = match status {
         OperationStatus::Success => "effect_committed",
@@ -441,6 +450,8 @@ pub fn operation_receipt_body(
         "checkpoint_digest": checkpoint_digest,
         "linked_fact_set_digest": linked_fact_set_digest,
         "signer_generation": signer_generation,
+        "classification": classification,
+        "initialization_evidence": initialization_evidence,
     }))
 }
 

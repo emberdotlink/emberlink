@@ -1,6 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ember_authority::{
     AUTHORITY_STATE_DIRECTORY,
+    audit::now_unix,
+    control::{AuthorityControl, InitializationReceipt},
+    diagnostic_bootstrap::{build_request, validate_existing_state_root, validate_new_state_root},
     ipc::{
         ControlRequest, ControlResponse, SessionActionRequest, SessionActionResponse,
         read_control_frame, read_frame, write_control_frame, write_frame,
@@ -30,20 +33,91 @@ fn main() {
 }
 
 fn dispatch(args: &[String]) -> Result<i32, i32> {
+    if args.first().map(String::as_str) == Some("__session-child") {
+        return session_child(&args[1..]);
+    }
+    let (root, args) = if args.first().map(String::as_str) == Some("--state-dir") {
+        let root = args
+            .get(1)
+            .map(PathBuf::from)
+            .ok_or_else(|| report_code("state_root_unavailable"))?;
+        (root, &args[2..])
+    } else {
+        (default_state_dir()?, args)
+    };
     match args.first().map(String::as_str) {
-        Some("session") => session_command(&args[1..]),
-        Some("receipt") => receipt_command(&args[1..]),
+        Some("init") => init_command(&root, &args[1..]),
+        Some("status") if args.len() == 2 && args[1] == "--json" => status_command(&root),
+        Some("session") => session_command(&root, &args[1..]),
+        Some("receipt") => receipt_command(&root, &args[1..]),
         Some("action") => refuse("session_required"),
-        Some("__session-child") => session_child(&args[1..]),
         Some("--help" | "-h") | None => {
-            println!("usage: ember <session open|receipt list|show|verify>");
+            println!(
+                "usage: ember [--state-dir <absolute-path>] <init diagnostic|status|session open|receipt list|show|verify>"
+            );
             Ok(0)
         }
         _ => refuse("unknown_command"),
     }
 }
 
-fn session_command(args: &[String]) -> Result<i32, i32> {
+#[derive(serde::Serialize)]
+struct InitializationOutput {
+    state: &'static str,
+    receipt: InitializationReceipt,
+    classification: ember_authority::model::ProductClassification,
+    evidence: ember_authority::model::InitializationEvidence,
+    action_definition_digest: String,
+}
+
+fn init_command(root: &Path, args: &[String]) -> Result<i32, i32> {
+    let project = match args {
+        [diagnostic, project_flag, project]
+            if diagnostic == "diagnostic" && project_flag == "--project" =>
+        {
+            PathBuf::from(project)
+        }
+        _ => return refuse("invalid_initialization_command"),
+    };
+    validate_new_state_root(root).map_err(report_refusal)?;
+    let cli = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| report_code("bootstrap_artifact_invalid"))?;
+    let daemon = fs::canonicalize(cli.with_file_name("emberd"))
+        .map_err(|_| report_code("bootstrap_artifact_invalid"))?;
+    let request = build_request(&project, &cli, &daemon, now_unix()).map_err(report_refusal)?;
+    let action_definition_digest = request.records.action_definitions[0]
+        .action_definition_digest
+        .clone();
+    let (control, receipt) =
+        AuthorityControl::initialize_development(root, request).map_err(report_refusal)?;
+    let state = control.store().snapshot().map_err(report_refusal)?;
+    print_json(&InitializationOutput {
+        state: "initialized",
+        receipt,
+        classification: state.classification,
+        evidence: state.initialization.evidence,
+        action_definition_digest,
+    })?;
+    Ok(0)
+}
+
+fn status_command(root: &Path) -> Result<i32, i32> {
+    validate_existing_state_root(root).map_err(report_refusal)?;
+    let mut stream = trusted_control_stream(root)?;
+    write_control_frame(&mut stream, &ControlRequest::Status).map_err(report_refusal)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|_| report_code("transport_failed"))?;
+    match read_control_frame::<ControlResponse>(&mut stream).map_err(report_refusal)? {
+        ControlResponse::Status { status } => print_json(&status)?,
+        ControlResponse::Refusal { code } => return refuse(&code),
+        _ => return refuse("unexpected_daemon_response"),
+    }
+    Ok(0)
+}
+
+fn session_command(root: &Path, args: &[String]) -> Result<i32, i32> {
     let separator = args
         .iter()
         .position(|argument| argument == "--")
@@ -66,7 +140,6 @@ fn session_command(args: &[String]) -> Result<i32, i32> {
     if action.input.challenge != challenge {
         return refuse("uncovered_need");
     }
-    let root = default_state_dir()?;
     let current = fs::canonicalize(
         std::env::current_dir().map_err(|_| report_code("launch_context_unavailable"))?,
     )
@@ -79,7 +152,7 @@ fn session_command(args: &[String]) -> Result<i32, i32> {
         project_root: current.clone(),
         worktree: current,
     };
-    let mut stream = trusted_control_stream(&root)?;
+    let mut stream = trusted_control_stream(root)?;
     write_control_frame(
         &mut stream,
         &ControlRequest::OpenDiagnostic {
@@ -182,8 +255,7 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
     }
 }
 
-fn receipt_command(args: &[String]) -> Result<i32, i32> {
-    let root = default_state_dir()?;
+fn receipt_command(root: &Path, args: &[String]) -> Result<i32, i32> {
     // Every Receipt read is an authenticated daemon call: the CLI never opens
     // private authority state (and its Device keys) in-process.
     let request = match args.first().map(String::as_str) {
@@ -196,7 +268,7 @@ fn receipt_command(args: &[String]) -> Result<i32, i32> {
         },
         _ => return refuse("invalid_receipt_command"),
     };
-    let mut stream = trusted_control_stream(&root)?;
+    let mut stream = trusted_control_stream(root)?;
     write_control_frame(&mut stream, &request).map_err(report_refusal)?;
     stream
         .shutdown(Shutdown::Write)
@@ -204,7 +276,16 @@ fn receipt_command(args: &[String]) -> Result<i32, i32> {
     match read_control_frame::<ControlResponse>(&mut stream).map_err(report_refusal)? {
         ControlResponse::ReceiptList { receipts } => print_json(&receipts)?,
         ControlResponse::ReceiptShow { canonical_receipt } => println!("{canonical_receipt}"),
-        ControlResponse::ReceiptVerified { receipt_id } => println!("verified {receipt_id}"),
+        ControlResponse::ReceiptVerified {
+            receipt_id,
+            classification,
+            initialization_evidence,
+        } => print_json(&serde_json::json!({
+            "state": "verified",
+            "receipt_id": receipt_id,
+            "classification": classification,
+            "initialization_evidence": initialization_evidence,
+        }))?,
         ControlResponse::Refusal { code } => return refuse(&code),
         _ => return refuse("unexpected_daemon_response"),
     }
@@ -213,7 +294,9 @@ fn receipt_command(args: &[String]) -> Result<i32, i32> {
 
 fn default_state_dir() -> Result<PathBuf, i32> {
     let home = std::env::var_os("HOME").ok_or_else(|| report_code("state_root_unavailable"))?;
-    let root = PathBuf::from(home).join(AUTHORITY_STATE_DIRECTORY);
+    let root = fs::canonicalize(PathBuf::from(home))
+        .map_err(|_| report_code("state_root_unavailable"))?
+        .join(AUTHORITY_STATE_DIRECTORY);
     if !root.is_absolute() {
         return Err(report_code("state_root_unavailable"));
     }

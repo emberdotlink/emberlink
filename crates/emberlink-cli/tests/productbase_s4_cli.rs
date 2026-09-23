@@ -1,10 +1,8 @@
 //! Real CLI Session -> typed Action -> durable Receipt product path.
 
-#[path = "../../ember-authority/tests/support/mod.rs"]
-mod support;
-
-use ember_authority::{AUTHORITY_STATE_DIRECTORY, audit::now_unix, control::AuthorityControl};
+use ember_authority::AUTHORITY_STATE_DIRECTORY;
 use std::{
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Child, Command},
     thread::sleep,
@@ -40,10 +38,17 @@ fn wait_for_socket(path: &Path) {
     panic!("daemon control socket never appeared at {}", path.display());
 }
 
-fn ember(cli: &Path, home: &Path, args: &[&str]) -> (i32, String, String) {
+fn ember(cli: &Path, state_root: &Path, args: &[&str]) -> (i32, String, String) {
     let output = Command::new(cli)
+        .arg("--state-dir")
+        .arg(state_root)
+        .current_dir(
+            state_root
+                .ancestors()
+                .nth(3)
+                .expect("state root must be under the test HOME"),
+        )
         .args(args)
-        .env("HOME", home)
         .output()
         .unwrap();
     (
@@ -64,89 +69,180 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
 
     let home = tempfile::Builder::new()
         .prefix("pb4")
-        .tempdir_in("/tmp")
+        .tempdir_in("/private/tmp")
         .unwrap();
     let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
     std::fs::create_dir_all(state_root.parent().unwrap()).unwrap();
-    let request = support::request_for_runtime(
-        home.path(),
-        "pb-s4-live",
-        daemon_binary.clone(),
-        cli_binary.clone(),
+    std::fs::set_permissions(
+        state_root.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = ember(
+        &cli_binary,
+        &state_root,
+        &[
+            "init",
+            "diagnostic",
+            "--project",
+            home.path().to_str().unwrap(),
+        ],
     );
-    AuthorityControl::initialize_at(&state_root, request, &support::anchor(), now_unix()).unwrap();
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let initialized: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(initialized["state"], "initialized");
+    assert_eq!(
+        initialized["classification"]["production_classification"],
+        "non-production"
+    );
+    assert_eq!(
+        initialized["classification"]["deployment_class"],
+        "disposable-qualification"
+    );
+    assert_eq!(initialized["evidence"]["kind"], "development");
+    assert!(
+        initialized["evidence"]["development_manifest_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    let definition_digest = initialized["action_definition_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, _, stderr) = ember(
+        &cli_binary,
+        &state_root,
+        &[
+            "init",
+            "diagnostic",
+            "--project",
+            home.path().to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(stderr.contains("already_initialized"), "{stderr}");
 
     let daemon = Daemon(
         Command::new(&daemon_binary)
-            .env("HOME", home.path())
+            .args(["--state-dir", state_root.to_str().unwrap()])
             .spawn()
             .unwrap(),
     );
     wait_for_socket(&state_root.join("control.sock"));
 
+    let already_running = Command::new(&daemon_binary)
+        .args(["--state-dir", state_root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!already_running.status.success());
+    assert!(String::from_utf8_lossy(&already_running.stderr).contains("daemon_already_running"));
+
+    let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["status", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let status: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(status["state"], "ready");
+    assert_eq!(
+        status["classification"]["production_classification"],
+        "non-production"
+    );
+    assert_eq!(status["initialization"]["evidence"]["kind"], "development");
+
+    let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["receipt", "list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let initial_receipts: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(initial_receipts.as_array().unwrap().len(), 1);
+
     let (code, _, stderr) = ember(
         &cli_binary,
-        home.path(),
+        &state_root,
         &[
             "action",
             "run",
             ember_authority::model::ACTION_REF_TEXT,
             "--definition-digest",
-            support::DEFINITION_DIGEST,
+            definition_digest.as_str(),
             "--input",
-            "{\"challenge\":\"pb-s4-live\"}",
+            "{\"challenge\":\"pb-r2-ok\"}",
         ],
     );
     assert_ne!(code, 0);
     assert!(stderr.contains("session_required"), "{stderr}");
+    let (_, stdout, _) = ember(&cli_binary, &state_root, &["receipt", "list", "--json"]);
+    let after_refusal: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(after_refusal.as_array().unwrap().len(), 1);
 
     let (code, stdout, stderr) = ember(
         &cli_binary,
-        home.path(),
+        &state_root,
         &[
             "session",
             "open",
             "diagnostic",
             "--challenge",
-            "pb-s4-live",
+            "pb-r2-ok",
             "--",
             "ember",
             "action",
             "run",
             ember_authority::model::ACTION_REF_TEXT,
             "--definition-digest",
-            support::DEFINITION_DIGEST,
+            definition_digest.as_str(),
             "--input",
-            "{\"challenge\":\"pb-s4-live\"}",
+            "{\"challenge\":\"pb-r2-ok\"}",
         ],
     );
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(result["status"], "success");
-    assert_eq!(result["facts"]["challenge"], "pb-s4-live");
+    assert_eq!(result["facts"]["challenge"], "pb-r2-ok");
     assert_eq!(result["facts"]["journal_health"], "ready");
+    assert_eq!(
+        result["classification"]["production_classification"],
+        "non-production"
+    );
+    assert_eq!(result["initialization_evidence"]["kind"], "development");
     let receipt_id = result["receipt_id"].as_str().unwrap().to_owned();
 
     drop(daemon);
-    let _ = std::fs::remove_file(state_root.join("control.sock"));
+    std::fs::remove_file(state_root.join("control.sock")).unwrap();
     let _restarted = Daemon(
         Command::new(&daemon_binary)
-            .env("HOME", home.path())
+            .args(["--state-dir", state_root.to_str().unwrap()])
             .spawn()
             .unwrap(),
     );
     wait_for_socket(&state_root.join("control.sock"));
-    let (code, stdout, stderr) = ember(&cli_binary, home.path(), &["receipt", "list", "--json"]);
+    let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["receipt", "list", "--json"]);
     assert_eq!(code, 0, "{stderr}");
+    let receipts: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(receipts.as_array().unwrap().len(), 2);
     assert!(stdout.contains(&receipt_id), "{stdout}");
+    assert_eq!(
+        receipts[0]["classification"]["production_classification"],
+        "non-production"
+    );
     let (code, stdout, stderr) = ember(
         &cli_binary,
-        home.path(),
+        &state_root,
         &["receipt", "verify", &receipt_id],
     );
     assert_eq!(code, 0, "{stderr}");
-    assert_eq!(stdout.trim(), format!("verified {receipt_id}"));
-    let (code, stdout, stderr) = ember(&cli_binary, home.path(), &["receipt", "show", &receipt_id]);
+    let verified: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(verified["state"], "verified");
+    assert_eq!(verified["receipt_id"], receipt_id);
+    assert_eq!(
+        verified["classification"]["production_classification"],
+        "non-production"
+    );
+    let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["receipt", "show", &receipt_id]);
     assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains(&receipt_id), "{stdout}");
+    let shown: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        shown["body"]["classification"]["production_classification"],
+        "non-production"
+    );
+    assert_eq!(
+        shown["body"]["initialization_evidence"]["kind"],
+        "development"
+    );
 }

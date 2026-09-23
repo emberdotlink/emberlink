@@ -11,6 +11,7 @@ pub const CONTROL_FRAME_LIMIT: usize = 65_536;
 #[allow(clippy::large_enum_variant)]
 pub enum ControlRequest {
     Ping,
+    Status,
     OpenDiagnostic {
         challenge: String,
         context: LaunchContext,
@@ -29,6 +30,9 @@ pub enum ControlRequest {
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlResponse {
     Pong,
+    Status {
+        status: crate::control::AuthorityStatus,
+    },
     SessionComplete {
         exit_code: i32,
         stdout: String,
@@ -42,6 +46,8 @@ pub enum ControlResponse {
     },
     ReceiptVerified {
         receipt_id: String,
+        classification: crate::model::ProductClassification,
+        initialization_evidence: crate::model::InitializationEvidence,
     },
     Refusal {
         code: String,
@@ -59,7 +65,7 @@ pub struct SessionActionRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionActionResponse {
-    Success { action: ActionResponse },
+    Success { action: Box<ActionResponse> },
     Refusal { code: String },
 }
 

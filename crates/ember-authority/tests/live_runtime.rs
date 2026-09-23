@@ -175,7 +175,14 @@ fn live_session_action_produces_a_durable_verifiable_receipt() {
         &["receipt", "verify", &receipt_id],
     );
     assert_eq!(code, 0, "{stderr}");
-    assert_eq!(stdout.trim(), format!("verified {receipt_id}"));
+    let verified: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(verified["state"], "verified");
+    assert_eq!(verified["receipt_id"], receipt_id);
+    assert_eq!(
+        verified["classification"]["deployment_class"],
+        "disposable-qualification"
+    );
+    assert_eq!(verified["initialization_evidence"]["kind"], "release");
     let (code, stdout, stderr) = ember(&cli_binary, home.path(), &["receipt", "show", &receipt_id]);
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains(&receipt_id), "{stdout}");

@@ -118,7 +118,7 @@ impl OperationSettlement {
                 &state.authority_fingerprint,
                 state.authority_epoch,
                 &state.installation_id,
-                &state.release_manifest_digest,
+                state.initialization.evidence.release_manifest_digest(),
                 &session,
                 request,
                 &resolved,

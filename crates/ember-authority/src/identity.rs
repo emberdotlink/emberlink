@@ -132,6 +132,16 @@ pub fn executable_identity(path: &std::path::Path) -> io::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn executable_identity_from_file(file: &std::fs::File) -> io::Result<String> {
+    use std::os::fd::AsRawFd as _;
+
+    executable_identity(std::path::Path::new(&format!(
+        "/dev/fd/{}",
+        file.as_raw_fd()
+    )))
+}
+
+#[cfg(target_os = "macos")]
 pub fn process_executable_identity(pid: u32, expected_pid_version: u64) -> io::Result<String> {
     use std::ffi::c_void;
 
@@ -222,6 +232,15 @@ pub fn executable_identity(path: &std::path::Path) -> io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn executable_identity_from_file(file: &std::fs::File) -> io::Result<String> {
+    use io::Seek as _;
+
+    let mut reader = file.try_clone()?;
+    reader.rewind()?;
+    digest_reader(reader)
+}
+
+#[cfg(target_os = "linux")]
 pub fn process_executable_identity(pid: u32, expected_pid_version: u64) -> io::Result<String> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -278,6 +297,14 @@ pub fn process_executable_path(
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn executable_identity(_path: &std::path::Path) -> io::Result<String> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unsupported host",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn executable_identity_from_file(_file: &std::fs::File) -> io::Result<String> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "unsupported host",

@@ -112,7 +112,12 @@ fn purpose_allows(purpose: &str, payload: &[u8]) -> bool {
         return true;
     }
     match purpose {
-        PURPOSE_ROOT => payload.starts_with(&label_prefix("ember/root-initialization-intent/v1")),
+        PURPOSE_ROOT => {
+            payload.starts_with(&label_prefix("ember/root-initialization-intent/v1"))
+                || payload.starts_with(&label_prefix(
+                    "ember/development-root-initialization-intent/v1",
+                ))
+        }
         PURPOSE_ACTION_PERMIT => payload.starts_with(b"ember/action-permit-signature-input/v1\0"),
         PURPOSE_RECEIPT => is_receipt_envelope(payload),
         _ => false,

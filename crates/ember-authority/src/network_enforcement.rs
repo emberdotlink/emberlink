@@ -22,7 +22,7 @@ impl NetworkEnforcement {
         authority_fingerprint: &str,
         authority_epoch: u64,
         installation_id: &str,
-        release_manifest_digest: &str,
+        release_manifest_digest: Option<&str>,
         session: &SessionRecord,
         _request: &ActionRequest,
         definition: &ResolvedDefinition,
@@ -65,7 +65,7 @@ impl NetworkEnforcement {
             recipient_key_fingerprint: None,
             provider_route_id: None,
             route_qualification_version: None,
-            release_manifest_digest: Some(release_manifest_digest.into()),
+            release_manifest_digest: release_manifest_digest.map(str::to_owned),
             profile_artifact_digest: None,
             target: decision.need.target.clone(),
             protocol: decision.need.protocol.clone(),
@@ -96,7 +96,7 @@ impl NetworkEnforcement {
         authority_fingerprint: &str,
         authority_epoch: u64,
         installation_id: &str,
-        release_manifest_digest: &str,
+        release_manifest_digest: Option<&str>,
         session: &SessionRecord,
         request: &ActionRequest,
         definition: &ResolvedDefinition,
@@ -146,7 +146,7 @@ impl NetworkEnforcement {
             && permit.recipient_key_fingerprint.is_none()
             && permit.provider_route_id.is_none()
             && permit.route_qualification_version.is_none()
-            && permit.release_manifest_digest.as_deref() == Some(release_manifest_digest)
+            && permit.release_manifest_digest.as_deref() == release_manifest_digest
             && permit.profile_artifact_digest.is_none()
             && permit.target == decision.need.target
             && permit.protocol == decision.need.protocol

@@ -1576,6 +1576,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1641,6 +1642,7 @@ dependencies = [
  "ed25519-dalek",
  "ember-authority",
  "hex",
+ "libc",
  "serde_jcs",
  "tempfile",
  "uuid",

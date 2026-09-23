@@ -347,6 +347,8 @@ pub struct ReceiptIndexRow {
     pub completed_at: u64,
     pub signed_receipt_digest: String,
     pub terminal_sequence: u64,
+    pub classification: ProductClassification,
+    pub initialization_evidence: InitializationEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -367,6 +369,87 @@ pub struct ActionResponse {
     pub operation_id: String,
     pub receipt_id: String,
     pub status: String,
+    pub classification: ProductClassification,
+    pub initialization_evidence: InitializationEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductClassification {
+    pub qualification_mode: String,
+    pub qualification_state: String,
+    pub deployment_class: String,
+    pub production_classification: String,
+    pub release_provenance: String,
+    pub credential_use: String,
+}
+
+impl ProductClassification {
+    pub fn development_diagnostic() -> Self {
+        Self {
+            qualification_mode: "non-secret-diagnostic".into(),
+            qualification_state: "provisional".into(),
+            deployment_class: "disposable-qualification".into(),
+            production_classification: "non-production".into(),
+            release_provenance: "absent".into(),
+            credential_use: "forbidden".into(),
+        }
+    }
+
+    pub fn legacy_release_qualification() -> Self {
+        Self {
+            qualification_mode: "release-qualification".into(),
+            qualification_state: "qualification-only".into(),
+            deployment_class: "disposable-qualification".into(),
+            production_classification: "non-production".into(),
+            release_provenance: "present".into(),
+            credential_use: "forbidden".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InitializationEvidence {
+    Release {
+        release_manifest_digest: String,
+        release_qualification_digest: String,
+    },
+    Development {
+        development_manifest_digest: String,
+        development_bootstrap_attestation_digest: String,
+        development_qualification_record_digest: String,
+    },
+}
+
+impl InitializationEvidence {
+    pub fn release_manifest_digest(&self) -> Option<&str> {
+        match self {
+            Self::Release {
+                release_manifest_digest,
+                ..
+            } => Some(release_manifest_digest),
+            Self::Development { .. } => None,
+        }
+    }
+
+    pub fn fact_digests(&self) -> Vec<&str> {
+        match self {
+            Self::Release {
+                release_manifest_digest,
+                release_qualification_digest,
+            } => vec![release_manifest_digest, release_qualification_digest],
+            Self::Development {
+                development_manifest_digest,
+                development_bootstrap_attestation_digest,
+                development_qualification_record_digest,
+            } => vec![
+                development_manifest_digest,
+                development_bootstrap_attestation_digest,
+                development_qualification_record_digest,
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -374,8 +457,7 @@ pub struct ActionResponse {
 pub struct InitializationRecord {
     pub operation_id: String,
     pub root_intent_digest: String,
-    pub release_manifest_digest: String,
-    pub release_qualification_digest: String,
+    pub evidence: InitializationEvidence,
     pub continuity_digest: String,
     pub initialized_at: u64,
     pub receipt_id: Option<String>,
@@ -389,7 +471,7 @@ pub struct PersistentAuthorityState {
     pub authority_fingerprint: String,
     pub authority_epoch: u64,
     pub installation_id: String,
-    pub release_manifest_digest: String,
+    pub classification: ProductClassification,
     /// Digest of the reviewed `emberd` bootstrap artifact. Clients authenticate
     /// the control endpoint's serving process against this value, so a
     /// same-UID impostor socket cannot masquerade as the installed authority.
@@ -400,6 +482,8 @@ pub struct PersistentAuthorityState {
     pub registry_sequence: u64,
     pub qualification_coverage: QualificationCoverage,
     pub initialization: InitializationRecord,
+    pub development_initialization:
+        Option<crate::diagnostic_bootstrap::DevelopmentInitializationProof>,
     pub qualification_grant: crate::initialization::QualificationGrantRecord,
     pub caller_eligibility: crate::initialization::CallerEligibilityRecord,
     pub harness_profile_authorization: crate::initialization::HarnessProfileAuthorization,

@@ -47,7 +47,7 @@ impl RunnerRegistry {
         authority_fingerprint: &str,
         authority_epoch: u64,
         installation_id: &str,
-        release_manifest_digest: &str,
+        release_manifest_digest: Option<&str>,
         session: &SessionRecord,
         request: &ActionRequest,
         definition: &ResolvedDefinition,

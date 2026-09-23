@@ -27,7 +27,9 @@ fn main() {
 
 fn default_state_dir() -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join(ember_authority::AUTHORITY_STATE_DIRECTORY)
+    std::fs::canonicalize(PathBuf::from(home))
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(ember_authority::AUTHORITY_STATE_DIRECTORY)
 }
 
 fn fail(message: &str) -> ! {

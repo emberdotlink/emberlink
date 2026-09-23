@@ -9,12 +9,13 @@ use std::{
 use crate::{
     audit::{DurableStore, EvidenceJournal, atomic_write, now_unix, sha256},
     device::{DeviceCustody, DeviceState},
+    diagnostic_bootstrap::DevelopmentInitializationRequest,
     initialization::{
         InitializationRequest, ReleaseVerificationAnchor, RootContinuityRecord, encode_continuity,
     },
     model::{
-        GrantUse, InitializationRecord, PersistentAuthorityState, QualificationCoverage, Refusal,
-        SessionRecord, SessionState,
+        GrantUse, InitializationEvidence, InitializationRecord, PersistentAuthorityState,
+        ProductClassification, QualificationCoverage, Refusal, SessionRecord, SessionState,
     },
     operation::OperationSettlement,
     receipt::ReceiptProjection,
@@ -30,6 +31,18 @@ pub struct InitializationReceipt {
     pub generation: u64,
     pub receipt_id: String,
     pub root_intent_digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityStatus {
+    pub state: String,
+    pub authority_fingerprint: String,
+    pub authority_epoch: u64,
+    pub generation: u64,
+    pub checkpoint_digest: String,
+    pub initialization: InitializationRecord,
+    pub classification: ProductClassification,
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +86,7 @@ impl AuthorityControl {
             authority_fingerprint: validated.authority_fingerprint.clone(),
             authority_epoch: 1,
             installation_id: uuid::Uuid::new_v4().to_string(),
-            release_manifest_digest: validated.release_manifest_digest.clone(),
+            classification: ProductClassification::legacy_release_qualification(),
             daemon_executable_digest: validated.daemon_executable_digest.clone(),
             operator_uid: validated.operator_uid,
             initialized_at: now,
@@ -83,12 +96,110 @@ impl AuthorityControl {
             initialization: InitializationRecord {
                 operation_id,
                 root_intent_digest: validated.root_intent_digest.clone(),
-                release_manifest_digest: validated.release_manifest_digest.clone(),
-                release_qualification_digest: validated.release_qualification_digest,
+                evidence: InitializationEvidence::Release {
+                    release_manifest_digest: validated.release_manifest_digest.clone(),
+                    release_qualification_digest: validated.release_qualification_digest,
+                },
                 continuity_digest: validated.continuity_digest,
                 initialized_at: now,
                 receipt_id: None,
             },
+            development_initialization: None,
+            qualification_grant: validated.qualification_grant,
+            caller_eligibility: validated.caller_eligibility,
+            harness_profile_authorization: validated.harness_profile_authorization,
+            trusted_project: validated.trusted_project,
+            route: validated.route,
+            devices: request.devices,
+            sessions: BTreeMap::new(),
+            submissions: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            receipts: BTreeMap::new(),
+            used_permit_nonces: BTreeMap::new(),
+            sequence: 0,
+            checkpoint_digest: format!("sha256:{}", "0".repeat(64)),
+        };
+        let stored_receipt =
+            EvidenceJournal::append_initialization(&mut state, &custody.receipt_signer()?)?;
+        let prior_digest = sha256(&encode_continuity(&request.prior_continuity)?);
+        let store = match DurableStore::initialize(root, state) {
+            Ok(store) => store,
+            Err(error) => {
+                cleanup_failed_initialization(root, &continuity_path);
+                return Err(error);
+            }
+        };
+        let current_continuity = RootContinuityRecord {
+            schema: "ember.root-continuity-record/v1".into(),
+            generation: 1,
+            authority_fingerprint: validated.authority_fingerprint.clone(),
+            prior_record_digest: prior_digest,
+            protected_tip_digest: store.protected_tip_digest()?,
+            slot_id: request.prior_continuity.slot_id,
+        };
+        let continuity_bytes = serde_jcs::to_vec(&current_continuity)
+            .map_err(|_| Refusal::new("continuity_unavailable"))?;
+        if atomic_write(&continuity_path, &continuity_bytes).is_err() {
+            cleanup_failed_initialization(root, &continuity_path);
+            return Err(Refusal::new("continuity_unavailable"));
+        }
+        let control = Self {
+            store: Arc::new(store),
+        };
+        Ok((
+            control,
+            InitializationReceipt {
+                authority_fingerprint: validated.authority_fingerprint,
+                authority_epoch: 1,
+                generation: 1,
+                receipt_id: stored_receipt.row.receipt_id,
+                root_intent_digest: validated.root_intent_digest,
+            },
+        ))
+    }
+
+    pub fn initialize_development(
+        root: &Path,
+        request: DevelopmentInitializationRequest,
+    ) -> Result<(Self, InitializationReceipt), Refusal> {
+        Self::initialize_development_at(root, request, now_unix())
+    }
+
+    pub fn initialize_development_at(
+        root: &Path,
+        request: DevelopmentInitializationRequest,
+        now: u64,
+    ) -> Result<(Self, InitializationReceipt), Refusal> {
+        let continuity_path = continuity_path(root)?;
+        if root.exists() || continuity_path.exists() {
+            return Err(Refusal::new("already_initialized"));
+        }
+        let validated = request.validate(now)?;
+        let custody = DeviceCustody::restore(&request.devices)?;
+        let development_initialization = request.proof();
+        let operation_id = format!("initialization:{}", uuid::Uuid::new_v4());
+        let mut state = PersistentAuthorityState {
+            schema: "ember.authority-state/v1".into(),
+            generation: 0,
+            authority_fingerprint: validated.authority_fingerprint.clone(),
+            authority_epoch: 1,
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            classification: validated.classification,
+            daemon_executable_digest: validated.daemon_executable_digest,
+            operator_uid: validated.operator_uid,
+            initialized_at: now,
+            registry_bytes: validated.registry_bytes,
+            registry_sequence: 1,
+            qualification_coverage: QualificationCoverage::diagnostic(),
+            initialization: InitializationRecord {
+                operation_id,
+                root_intent_digest: validated.root_intent_digest.clone(),
+                evidence: validated.evidence,
+                continuity_digest: validated.continuity_digest,
+                initialized_at: now,
+                receipt_id: None,
+            },
+            development_initialization: Some(development_initialization),
             qualification_grant: validated.qualification_grant,
             caller_eligibility: validated.caller_eligibility,
             harness_profile_authorization: validated.harness_profile_authorization,
@@ -144,6 +255,7 @@ impl AuthorityControl {
 
     pub fn restore(root: &Path) -> Result<Self, Refusal> {
         let store = Arc::new(DurableStore::restore(root)?);
+        verify_initialization_state(&store.snapshot()?)?;
         verify_continuity(root, &store)?;
         verify_stored_receipts(&store)?;
         OperationSettlement::recover_running(&store)?;
@@ -152,9 +264,24 @@ impl AuthorityControl {
 
     pub fn restore_read_only(root: &Path) -> Result<Self, Refusal> {
         let store = Arc::new(DurableStore::restore(root)?);
+        verify_initialization_state(&store.snapshot()?)?;
         verify_continuity(root, &store)?;
         verify_stored_receipts(&store)?;
         Ok(Self { store })
+    }
+
+    pub fn read_status(root: &Path) -> Result<AuthorityStatus, Refusal> {
+        let control = Self::restore_read_only(root)?;
+        let state = control.store.snapshot()?;
+        Ok(AuthorityStatus {
+            state: "ready".into(),
+            authority_fingerprint: state.authority_fingerprint,
+            authority_epoch: state.authority_epoch,
+            generation: state.generation,
+            checkpoint_digest: state.checkpoint_digest,
+            initialization: state.initialization,
+            classification: state.classification,
+        })
     }
 
     pub fn generate_devices() -> Result<DeviceState, Refusal> {
@@ -307,6 +434,14 @@ impl AuthorityControl {
         &self.store
     }
 }
+fn verify_initialization_state(state: &PersistentAuthorityState) -> Result<(), Refusal> {
+    match &state.initialization.evidence {
+        InitializationEvidence::Development { .. } => {
+            crate::diagnostic_bootstrap::verify_persisted_development(state)
+        }
+        InitializationEvidence::Release { .. } => Ok(()),
+    }
+}
 
 fn verify_stored_receipts(store: &DurableStore) -> Result<(), Refusal> {
     let receipt_ids = store.snapshot()?.receipts.into_keys().collect::<Vec<_>>();
@@ -317,12 +452,17 @@ fn verify_stored_receipts(store: &DurableStore) -> Result<(), Refusal> {
 }
 
 fn cleanup_failed_initialization(root: &Path, continuity_path: &Path) {
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(root.join("protected-tip.json"));
+    let generations = root.join("generations");
+    let _ = fs::remove_file(generations.join("00000000000000000000.json"));
+    let _ = fs::remove_dir(&generations);
+    let _ = fs::remove_dir(root);
     let _ = fs::remove_file(continuity_path);
     if let (Some(parent), Some(name)) = (
         root.parent(),
         root.file_name().and_then(|value| value.to_str()),
     ) {
+        let _ = fs::remove_file(parent.join(format!("{name}.continuity.next.json")));
         let _ = fs::remove_file(parent.join(format!("{name}.high-water.json")));
     }
 }

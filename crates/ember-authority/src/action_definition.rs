@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -15,6 +15,68 @@ const BUNDLE_DOMAIN: &[u8] = b"emberlink.action-definition-bundle/v1\0";
 const MAX_REGISTRY_BYTES: usize = 1_048_576;
 const MAX_REGISTRY_STATE_BYTES: usize = 2_097_152;
 const DIAGNOSTIC_DEFINITION: &str = r#"{"action_ref":{"action_key":"authority_status","action_version":"v2","plugin_address":"packet-fixture.local/packet-fixture/diagnostic"},"audit_fields":["action_ref","definition_digest","input.challenge","output.journal_health"],"default_runner_classes":["builtin"],"delivery_lane":"sealed-exec","handler_ref":"builtin.diagnostic.authority-status/v1","idempotency":"idempotent","input_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"}},"required":["challenge"],"type":"object"},"interaction_class":"inline_interactive","material_classes":["non_secret"],"need_template":{"items":[{"material_class":"non_secret","permissions":["authority.status.read"],"provider":"ember.local","required":true}],"schema":"emberlink.need-template/v1"},"output_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"},"journal_health":{"maxLength":5,"minLength":5,"type":"string"}},"required":["challenge","journal_health"],"type":"object"},"provider_adapter":"builtin/non-secret","result_frame_count_ceiling":1,"result_frame_payload_allowlist":[{"payload_schema_identifier":"emberlink.diagnostic-facts","payload_schema_version":"v1","payload_semantics":"diagnostic-facts"}],"risk_tier":"low","runner_adapter":"builtin.diagnostic.authority-status/v1","semantic_labels":["diagnostic"],"summary":"Read local authority journal health","target_template":{"input_path":"input.challenge","kind":"exact","schema":"emberlink.target-template/v1"}}"#;
+
+pub(crate) fn sign_diagnostic_bundle(
+    publisher_id: &str,
+    signer_key_id: &str,
+    not_after: u64,
+    published_at: u64,
+    signing_key: &SigningKey,
+) -> Result<(PublisherTrustRoot, InitialActionDefinitionRecord), Refusal> {
+    let definition: Value = serde_json::from_str(DIAGNOSTIC_DEFINITION)
+        .map_err(|_| Refusal::new("invalid_definition"))?;
+    validate_closed_definition(&definition)?;
+    let plugin_address = definition["action_ref"]["plugin_address"]
+        .as_str()
+        .ok_or_else(|| Refusal::new("invalid_definition"))?;
+    let publisher = PublisherTrustRoot {
+        publisher_id: publisher_id.into(),
+        signer_key_id: signer_key_id.into(),
+        public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        not_after,
+    };
+    let definition_wrapper = json!({
+        "schema": "emberlink.action-definition/v1",
+        "publisher_id": publisher_id,
+        "plugin_address": plugin_address,
+        "definition": &definition,
+    });
+    let definition_digest = domain_digest(
+        DEFINITION_DOMAIN,
+        &serde_jcs::to_vec(&definition_wrapper).map_err(|_| Refusal::new("invalid_definition"))?,
+    );
+    let bundle = json!({
+        "bundle_revision": 1,
+        "definitions": [definition],
+        "plugin_address": plugin_address,
+        "plugin_version": "0.1.0",
+        "previous_bundle_digest": Value::Null,
+        "published_at": published_at,
+        "publisher_id": publisher_id,
+        "schema": "emberlink.action-definition-bundle/v1",
+    });
+    let canonical_bundle =
+        serde_jcs::to_vec(&bundle).map_err(|_| Refusal::new("invalid_bundle"))?;
+    let mut preimage = BUNDLE_DOMAIN.to_vec();
+    preimage.extend_from_slice(signer_key_id.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(&canonical_bundle);
+    let envelope = json!({
+        "bundle": bundle,
+        "bundle_digest": format!("sha256:{}", hex::encode(Sha256::digest(&preimage))),
+        "signature": STANDARD.encode(signing_key.sign(&preimage).to_bytes()),
+        "signer_key_id": signer_key_id,
+    });
+    let signed_bundle =
+        serde_jcs::to_string(&envelope).map_err(|_| Refusal::new("invalid_bundle"))?;
+    Ok((
+        publisher,
+        InitialActionDefinitionRecord {
+            action_definition_digest: definition_digest,
+            signed_bundle,
+        },
+    ))
+}
 
 #[derive(Clone, Debug)]
 pub struct ResolvedDefinition {
