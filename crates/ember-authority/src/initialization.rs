@@ -129,6 +129,7 @@ pub struct QualificationGrantRecord {
     pub request_count_ceiling: u64,
     pub byte_budget: u64,
     pub rate_ceiling: u64,
+    pub offline_bound: bool,
     pub expiry: u64,
 }
 
@@ -681,6 +682,7 @@ fn validate_semantics(
         || grant.request_count_ceiling != 1
         || grant.rate_ceiling != 1
         || grant.byte_budget != 65_536
+        || grant.offline_bound
         || records.policy.schema != "ember.deny-by-default-policy/v1"
         || records.policy.default_decision != "deny"
         || records.policy.credential_delivery != "forbidden"

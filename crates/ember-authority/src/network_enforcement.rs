@@ -36,7 +36,7 @@ impl NetworkEnforcement {
             &serde_jcs::to_vec(&decision.qualification_coverage)
                 .map_err(|_| Refusal::new("qualification_mismatch"))?,
         );
-        let expiry = now.saturating_add(60).min(decision.grant.expires_at);
+        let expiry = decision.grant.expires_at;
         let mut permit = ActionPermit {
             permit_kind: "one-shot".into(),
             authority_fingerprint: authority_fingerprint.into(),
@@ -76,7 +76,7 @@ impl NetworkEnforcement {
             rate_ceiling: decision.grant.rate_ceiling,
             remaining_use_ceiling: decision.grant.remaining_uses,
             expiry,
-            offline_bound: true,
+            offline_bound: decision.grant.offline_bound,
             consequence_class: decision.consequence_class.clone(),
             capability: decision.need.permission.clone(),
             nonce: uuid::Uuid::new_v4().to_string(),
@@ -156,14 +156,10 @@ impl NetworkEnforcement {
             && permit.byte_budget == decision.grant.byte_budget
             && permit.rate_ceiling == decision.grant.rate_ceiling
             && permit.remaining_use_ceiling == decision.grant.remaining_uses
-            && permit.expiry
-                == decision
-                    .grant
-                    .expires_at
-                    .min(permit.issuance.saturating_add(60))
+            && permit.expiry == decision.grant.expires_at
             && permit.expiry > permit.issuance
             && permit.issuance <= now
-            && permit.offline_bound
+            && permit.offline_bound == decision.grant.offline_bound
             && permit.consequence_class == decision.consequence_class
             && permit.capability == decision.need.permission
             && !permit.nonce.is_empty()

@@ -6,6 +6,7 @@ pub mod audit;
 pub mod canonical;
 pub mod control;
 pub mod device;
+#[cfg_attr(target_os = "macos", allow(unsafe_code))]
 pub mod identity;
 pub mod initialization;
 pub mod ipc;

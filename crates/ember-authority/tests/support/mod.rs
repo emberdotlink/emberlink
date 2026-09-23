@@ -104,7 +104,7 @@ pub fn request_for_runtime(
     let grant = QualificationGrantRecord {
         grant_id: "grant:productbase-s4-diagnostic".into(),
         principal_id: "principal:operator".into(),
-        persona_id: format!("persona:operator:{}", ember_authority::effective_uid()),
+        persona_id: "persona:operator:local".into(),
         action_definition_digest: DEFINITION_DIGEST.into(),
         target: target.into(),
         permission: "authority.status.read".into(),
@@ -116,6 +116,7 @@ pub fn request_for_runtime(
         request_count_ceiling: 1,
         byte_budget: 65_536,
         rate_ceiling: 1,
+        offline_bound: false,
         expiry,
     };
     let profile = HarnessProfileAuthorization {
@@ -191,7 +192,7 @@ pub fn request_for_runtime(
     let preliminary = records.digests().unwrap();
     let plan = ActivationQualificationPlan {
         qualification_principal_id: "principal:operator".into(),
-        qualification_persona_id: format!("persona:operator:{}", ember_authority::effective_uid()),
+        qualification_persona_id: "persona:operator:local".into(),
         qualification_harness_profile_artifact_digest: profile.artifact_digest.clone(),
         qualification_harness_profile_authorization_set_digest: preliminary.profile_set.clone(),
         qualification_grant_set_digest: preliminary.grant_set.clone(),

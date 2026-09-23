@@ -231,6 +231,17 @@ fn action_path_settles_once_and_receipt_survives_session_close() {
             request("submission-ok", "contract-ok"),
         )
         .unwrap();
+    let snapshot = control.store().snapshot().unwrap();
+    let session = snapshot.sessions.get(&session_id).unwrap();
+    let operation = snapshot
+        .operations
+        .values()
+        .find(|operation| operation.receipt_id.as_deref() == Some(response.receipt_id.as_str()))
+        .unwrap();
+    let permit = &operation.authorization.permit;
+    assert_eq!(permit.expiry, session.grant.expires_at);
+    assert!(!permit.offline_bound);
+    assert!(!permit.grant_use_id_and_ceiling_list[0].offline_bound);
     control.close_session(&session_id).unwrap();
     drop(control);
 
@@ -651,6 +662,7 @@ impl JournalHealth for FailedJournal {
 }
 struct InvalidResultJournal {
     two_frames: bool,
+    altered_payload: bool,
 }
 
 impl JournalHealth for InvalidResultJournal {
@@ -658,9 +670,16 @@ impl JournalHealth for InvalidResultJournal {
         Ok("ready")
     }
 
-    fn raw_result_frames(&self, facts: DiagnosticFacts) -> Vec<RawResultFrame> {
+    fn raw_result_frames(&self, mut facts: DiagnosticFacts) -> Vec<RawResultFrame> {
+        if self.altered_payload {
+            facts.challenge = "forged".into();
+        }
         let frame = RawResultFrame {
-            payload_schema_identifier: "wrong.schema".into(),
+            payload_schema_identifier: if self.altered_payload {
+                "emberlink.diagnostic-facts".into()
+            } else {
+                "wrong.schema".into()
+            },
             payload_schema_version: "v1".into(),
             payload_semantics: "diagnostic-facts".into(),
             payload: facts,
@@ -675,7 +694,11 @@ impl JournalHealth for InvalidResultJournal {
 
 #[test]
 fn unsupported_runner_results_settle_one_failure_without_payload() {
-    for (name, two_frames) in [("wrong-tuple", false), ("two-frames", true)] {
+    for (name, two_frames, altered_payload) in [
+        ("wrong-tuple", false, false),
+        ("two-frames", true, false),
+        ("altered-payload", false, true),
+    ] {
         let (_root, control) = authority(name);
         let (session_id, process) = active_session(&control, name);
         let before = control.store().snapshot().unwrap().sequence;
@@ -685,7 +708,10 @@ fn unsupported_runner_results_settle_one_failure_without_payload() {
                 process,
                 request(name, name),
                 now_unix(),
-                &InvalidResultJournal { two_frames },
+                &InvalidResultJournal {
+                    two_frames,
+                    altered_payload,
+                },
             )
             .unwrap_err();
         assert_eq!(error.code, "runner_failed");
@@ -788,7 +814,8 @@ fn signed_permit_rejects_every_changed_authority_axis() {
         |value| value.byte_budget += 1,
         |value| value.rate_ceiling += 1,
         |value| value.remaining_use_ceiling += 1,
-        |value| value.offline_bound = false,
+        |value| value.expiry += 1,
+        |value| value.offline_bound = true,
         |value| value.consequence_class = "other-consequence".into(),
         |value| value.capability = "other-capability".into(),
         |value| value.operation_id = None,

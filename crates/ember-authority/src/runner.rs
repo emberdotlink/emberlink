@@ -159,6 +159,8 @@ impl DiagnosticRunner {
         if frame.payload_schema_identifier != RESULT_SCHEMA_IDENTIFIER
             || frame.payload_schema_version != RESULT_SCHEMA_VERSION
             || frame.payload_semantics != RESULT_SEMANTICS
+            || frame.payload.challenge != input.challenge
+            || frame.payload.journal_health != health
         {
             return Err(Refusal::new("unsupported_result_frame"));
         }

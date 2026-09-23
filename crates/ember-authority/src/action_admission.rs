@@ -89,10 +89,12 @@ impl ActionAdmission {
             && grant.byte_budget >= need.byte_count
             && grant.rate_ceiling >= need.rate
             && grant.remaining_uses > 0
-            && !grant.revoked
-            && now < grant.expires_at;
+            && !grant.revoked;
         if !covered {
             return Err(Refusal::new("uncovered_need"));
+        }
+        if now >= grant.expires_at {
+            return Err(Refusal::new("authorization_expired"));
         }
         let grant_use_ceiling = grant.ceiling(need.need_item_id.clone());
         Ok(AdmissionDecision {

@@ -80,6 +80,7 @@ pub struct GrantUseCeiling {
     pub byte_budget: u64,
     pub rate_ceiling: u64,
     pub remaining_use_ceiling: u64,
+    pub offline_bound: bool,
     pub expires_at: u64,
 }
 
@@ -101,6 +102,7 @@ pub struct GrantUse {
     pub byte_budget: u64,
     pub rate_ceiling: u64,
     pub remaining_uses: u64,
+    pub offline_bound: bool,
     pub expires_at: u64,
     pub revoked: bool,
 }
@@ -114,6 +116,7 @@ impl GrantUse {
             byte_budget: self.byte_budget,
             rate_ceiling: self.rate_ceiling,
             remaining_use_ceiling: self.remaining_uses,
+            offline_bound: self.offline_bound,
             expires_at: self.expires_at,
         }
     }

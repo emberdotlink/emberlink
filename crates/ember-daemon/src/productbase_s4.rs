@@ -103,9 +103,15 @@ fn handle_control(
     if observed_cli != reviewed_cli {
         return Err(Refusal::new("untrusted_launcher"));
     }
-    let observed_digest =
-        sha256(&fs::read(&observed_cli).map_err(|_| Refusal::new("process_identity_unavailable"))?);
-    if observed_digest != state.caller_eligibility.executable_digest {
+    let reviewed_digest =
+        sha256(&fs::read(&reviewed_cli).map_err(|_| Refusal::new("process_identity_unavailable"))?);
+    let reviewed_identity = identity::executable_identity(&reviewed_cli)
+        .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+    let observed_identity = identity::process_executable_identity(peer.pid, peer.pid_version)
+        .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+    if reviewed_digest != state.caller_eligibility.executable_digest
+        || observed_identity != reviewed_identity
+    {
         return Err(Refusal::new("untrusted_launcher"));
     }
     match request {

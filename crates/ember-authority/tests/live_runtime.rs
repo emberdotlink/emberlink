@@ -222,3 +222,30 @@ fn replaced_daemon_artifact_refuses_before_opening_authority_rpc() {
     );
     assert!(!state_root.join("control.sock").exists());
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn loaded_executable_identity_detects_restore_after_launch() {
+    use std::process::Stdio;
+
+    let installation = tempfile::tempdir().unwrap();
+    let executable = installation.path().join("emberd");
+    std::fs::copy("/usr/bin/yes", &executable).unwrap();
+    let mut replacement = Command::new(&executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = replacement.id();
+    let pid_version = ember_authority::identity::process_pid_version(pid).unwrap();
+
+    let reviewed_path = installation.path().join("reviewed");
+    std::fs::copy("/bin/cat", &reviewed_path).unwrap();
+    std::fs::rename(&reviewed_path, &executable).unwrap();
+    let reviewed = ember_authority::identity::executable_identity(&executable).unwrap();
+    let loaded = ember_authority::identity::process_executable_identity(pid, pid_version).unwrap();
+
+    assert_ne!(loaded, reviewed);
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+}

@@ -280,13 +280,12 @@ fn trusted_daemon_stream(
         ember_authority::identity::process_executable_path(peer.pid, peer.pid_version)
             .and_then(fs::canonicalize)
             .map_err(|_| report_code("authority_endpoint_untrusted"))?;
-    let expected_digest = ember_authority::audit::sha256(
-        &fs::read(&expected_daemon).map_err(|_| report_code("authority_endpoint_untrusted"))?,
-    );
-    let observed_digest = ember_authority::audit::sha256(
-        &fs::read(&observed_daemon).map_err(|_| report_code("authority_endpoint_untrusted"))?,
-    );
-    if observed_daemon != expected_daemon || observed_digest != expected_digest {
+    let expected_identity = ember_authority::identity::executable_identity(&expected_daemon)
+        .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    let observed_identity =
+        ember_authority::identity::process_executable_identity(peer.pid, peer.pid_version)
+            .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    if observed_daemon != expected_daemon || observed_identity != expected_identity {
         return Err(report_code("authority_endpoint_untrusted"));
     }
     Ok(stream)

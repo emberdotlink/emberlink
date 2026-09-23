@@ -172,8 +172,9 @@ impl AuthorityControl {
             challenge: challenge.to_owned(),
         }
         .validate()?;
+        let launch_time = now_unix();
         self.store.transaction(|state| {
-            let expected_persona = format!("persona:operator:{expected_uid}");
+            let expected_persona = "persona:operator:local";
             let project_digest = sha256(context.project_root.as_bytes());
             let worktree_digest = sha256(context.worktree.as_bytes());
             if state.operator_uid != expected_uid
@@ -202,7 +203,7 @@ impl AuthorityControl {
                 || state.route.runner_class != "builtin"
                 || state.route.delivery_lane != "sealed-exec"
                 || state.qualification_grant.operation_class != "diagnostic.read"
-                || now_unix() >= state.caller_eligibility.maintenance_window_expiry
+                || launch_time >= state.caller_eligibility.maintenance_window_expiry
             {
                 return Err(Refusal::new("launch_not_authorized"));
             }
@@ -250,10 +251,11 @@ impl AuthorityControl {
                         byte_budget: state.qualification_grant.byte_budget,
                         rate_ceiling: state.qualification_grant.rate_ceiling,
                         remaining_uses: state.qualification_grant.request_count_ceiling,
+                        offline_bound: state.qualification_grant.offline_bound,
                         expires_at: state
                             .qualification_grant
                             .expiry
-                            .min(now_unix().saturating_add(300)),
+                            .min(launch_time.saturating_add(60)),
                         revoked: false,
                     },
                     endpoint,
