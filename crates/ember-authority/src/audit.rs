@@ -975,7 +975,18 @@ fn record_high_water(root: &Path, generation: u64, tip_digest: String) -> Result
 fn commit_continuity(root: &Path, mark: Option<(u64, String)>) -> Result<(), Refusal> {
     let (path, staged, _) = continuity_paths(root)?;
     if staged.exists() {
-        fs::rename(&staged, &path).map_err(|_| Refusal::new("continuity_unavailable"))?;
+        let staged_bytes =
+            read_bounded(&staged, 16_384).map_err(|_| Refusal::new("continuity_unavailable"))?;
+        let staged_record: crate::initialization::RootContinuityRecord =
+            decode_canonical(&staged_bytes, 16_384, "continuity_unavailable")?;
+        let staged_matches_published_tip = mark
+            .as_ref()
+            .is_some_and(|(_, tip_digest)| staged_record.protected_tip_digest == *tip_digest);
+        if staged_matches_published_tip {
+            fs::rename(&staged, &path).map_err(|_| Refusal::new("continuity_unavailable"))?;
+        } else {
+            fs::remove_file(&staged).map_err(|_| Refusal::new("continuity_unavailable"))?;
+        }
         let parent = path
             .parent()
             .ok_or_else(|| Refusal::new("continuity_unavailable"))?;

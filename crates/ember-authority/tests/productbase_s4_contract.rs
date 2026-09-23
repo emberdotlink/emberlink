@@ -9,7 +9,7 @@ use ember_authority::{
     control::AuthorityControl,
     device::DeviceCustody,
     identity,
-    initialization::ArtifactSource,
+    initialization::{ArtifactSource, RootContinuityRecord},
     ipc::{CONTROL_FRAME_LIMIT, FRAME_LIMIT, read_control_frame, read_frame},
     kernel::AuthorityKernel,
     model::{
@@ -602,6 +602,30 @@ fn protected_tip_rollback_is_refused() {
         AuthorityControl::restore(&root).err().unwrap().code,
         "state_rollback_detected"
     );
+}
+
+#[test]
+fn orphaned_staged_continuity_preserves_last_committed_generation() {
+    let (directory, control) = authority("orphaned-continuity");
+    let root = directory.path().join("authority");
+    let continuity_path = directory.path().join("authority.continuity.json");
+    let staged_path = directory.path().join("authority.continuity.next.json");
+    let committed_bytes = std::fs::read(&continuity_path).unwrap();
+    let committed: RootContinuityRecord = serde_json::from_slice(&committed_bytes).unwrap();
+    let orphan = RootContinuityRecord {
+        schema: committed.schema.clone(),
+        generation: committed.generation + 1,
+        authority_fingerprint: committed.authority_fingerprint.clone(),
+        prior_record_digest: sha256(&committed_bytes),
+        protected_tip_digest: sha256(b"tip-that-was-never-published"),
+        slot_id: committed.slot_id.clone(),
+    };
+    std::fs::write(&staged_path, serde_jcs::to_vec(&orphan).unwrap()).unwrap();
+    drop(control);
+
+    AuthorityControl::restore(&root).unwrap();
+    assert_eq!(std::fs::read(&continuity_path).unwrap(), committed_bytes);
+    assert!(!staged_path.exists());
 }
 #[test]
 fn missing_high_water_anchor_is_refused() {
