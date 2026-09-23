@@ -21,5 +21,15 @@ uuid = { version = "1", features = ["v4"] }
 name = "emberd"
 path = "src/bin/emberd.rs"
 
+[[test]]
+name = "productbase_s4_runtime"
+path = "tests/productbase_s4_runtime.rs"
+
+[dev-dependencies]
+core-crypto = { path = "../core-crypto" }
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+hex = "=0.4.3"
+tempfile = "=3.27.0"
+
 [lints]
 workspace = true

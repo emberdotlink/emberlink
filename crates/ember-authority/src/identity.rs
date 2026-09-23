@@ -1,5 +1,22 @@
 use std::io;
 
+pub fn executable_digest(path: &std::path::Path) -> io::Result<String> {
+    use io::Read as _;
+    use sha2::{Digest as _, Sha256};
+
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
 #[cfg(target_os = "macos")]
 pub fn process_pid_version(pid: u32) -> io::Result<u64> {
     crate::macos_process::process_instance(pid)

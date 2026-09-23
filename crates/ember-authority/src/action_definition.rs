@@ -98,15 +98,15 @@ impl ActionDefinitionRegistry {
         if expected_digest != self.definition_digest {
             return Err(Refusal::new("definition_digest_mismatch"));
         }
+        if now >= self.publisher.not_after {
+            return Err(Refusal::new("publisher_not_trusted"));
+        }
         if !self.publisher_active || !self.definition_active {
             return Err(Refusal::new("definition_inactive"));
         }
         // This tranche has no registry mutation path. Rollback of the
         // containing registry bytes is enforced by DurableStore's
         // protected-tip high-water record.
-        if now >= self.publisher.not_after {
-            return Err(Refusal::new("publisher_not_trusted"));
-        }
         let authenticated_definition = verify_signed_bundle(
             &self.signed_bundle,
             &self.publisher,

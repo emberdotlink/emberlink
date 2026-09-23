@@ -210,12 +210,14 @@ impl OperationSettlement {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn settle(
         store: &DurableStore,
         operation_id: &str,
-        status: OperationStatus,
-        facts: Option<DiagnosticFacts>,
-        failure_code: Option<&str>,
+        mut status: OperationStatus,
+        mut facts: Option<DiagnosticFacts>,
+        mut failure_code: Option<&str>,
+        observed_process: Option<AuthenticatedProcess>,
         completed_at: u64,
     ) -> Result<(OperationRecord, StoredReceipt), Refusal> {
         store.transaction(|state| {
@@ -247,11 +249,17 @@ impl OperationSettlement {
                     .sessions
                     .get(&current.session_id)
                     .ok_or_else(|| Refusal::new("session_binding_mismatch"))?;
+                let live = observed_process
+                    .ok_or_else(|| Refusal::new("session_binding_mismatch"))
+                    .and_then(|process| ExecutionBindingAuthority::revalidate(session, process));
                 if session.state != crate::model::SessionState::Active
                     || session.execution_binding_digest != current.execution_binding_digest
                     || completed_at >= session.grant.expires_at
+                    || live.is_err()
                 {
-                    return Err(Refusal::new("session_binding_mismatch"));
+                    status = OperationStatus::EffectUnknown;
+                    facts = None;
+                    failure_code = Some("effect_unknown");
                 }
             }
             let custody = DeviceCustody::restore(&state.devices)?;
@@ -293,6 +301,7 @@ impl OperationSettlement {
                 OperationStatus::EffectUnknown,
                 None,
                 Some("effect_unknown"),
+                None,
                 now_unix(),
             )?;
         }

@@ -19,6 +19,11 @@ publish = false
 name = "ember"
 path = "src/bin/ember.rs"
 
+[[test]]
+name = "productbase_s4_cli"
+path = "tests/productbase_s4_cli.rs"
+
+
 [dependencies]
 base64 = "0.22"
 ember-authority = { path = "../ember-authority" }
@@ -26,6 +31,12 @@ serde = "1"
 serde_jcs = "0.2"
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+core-crypto = { path = "../core-crypto" }
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+hex = "=0.4.3"
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

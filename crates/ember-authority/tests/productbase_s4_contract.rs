@@ -475,6 +475,7 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
         OperationStatus::Success,
         Some(facts.clone()),
         None,
+        Some(process),
         now,
     )
     .unwrap();
@@ -483,6 +484,7 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
         &operation.operation_id,
         OperationStatus::Success,
         Some(facts),
+        None,
         None,
         now.saturating_add(1),
     )
@@ -495,6 +497,7 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
             OperationStatus::ExecutionFailure,
             None,
             Some("runner_failed"),
+            None,
             now,
         )
         .unwrap_err()
@@ -533,6 +536,26 @@ fn inactive_publisher_and_definition_refuse_before_begin() {
         assert!(snapshot.operations.is_empty());
         assert_eq!(snapshot.receipts.len(), 1);
     }
+}
+
+#[test]
+fn publisher_expiry_precedes_inactive_definition_refusal() {
+    let (_root, control) = authority("expired-inactive-publisher");
+    mutate_registry(&control, |registry| {
+        registry["publisher_active"] = false.into();
+        registry["definition_active"] = false.into();
+    });
+    let state = control.store().snapshot().unwrap();
+    let registry = ActionDefinitionRegistry::restore(&state.registry_bytes).unwrap();
+    let request = request("expired-inactive-publisher", "expired-inactive-publisher");
+    let error = registry
+        .resolve(
+            &request.action_ref,
+            request.required_definition_digest().unwrap(),
+            4_102_444_800,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "publisher_not_trusted");
 }
 
 #[test]

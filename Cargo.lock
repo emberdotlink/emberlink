@@ -1637,8 +1637,12 @@ name = "ember-daemon"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "core-crypto",
+ "ed25519-dalek",
  "ember-authority",
+ "hex",
  "serde_jcs",
+ "tempfile",
  "uuid",
 ]
 
@@ -1813,10 +1817,14 @@ name = "emberlink-cli"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "core-crypto",
+ "ed25519-dalek",
  "ember-authority",
+ "hex",
  "serde",
  "serde_jcs",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 

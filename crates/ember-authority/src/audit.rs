@@ -32,6 +32,7 @@ struct ProtectedTip {
     schema: String,
     generation: u64,
     state_digest: String,
+    daemon_executable_digest: String,
 }
 
 pub struct DurableStore {
@@ -81,6 +82,18 @@ impl DurableStore {
             root: root.to_owned(),
             state: Mutex::new(state),
         })
+    }
+
+    /// Return the manifest-pinned daemon digest without decoding authority
+    /// owner state or Device custody into the client process.
+    pub fn installed_daemon_executable_digest(root: &Path) -> Result<String, Refusal> {
+        let tip_bytes = read_bounded(&root.join("protected-tip.json"), 16_384)?;
+        let tip: ProtectedTip = decode_canonical(&tip_bytes, 16_384, "restore_failed")?;
+        if tip.schema != TIP_SCHEMA {
+            return Err(Refusal::new("restore_failed"));
+        }
+        enforce_high_water(root, tip.generation, &tip_bytes)?;
+        Ok(tip.daemon_executable_digest)
     }
 
     pub fn snapshot(&self) -> Result<PersistentAuthorityState, Refusal> {
@@ -871,6 +884,7 @@ fn persist_generation(root: &Path, state: &PersistentAuthorityState) -> Result<(
         schema: TIP_SCHEMA.into(),
         generation: state.generation,
         state_digest: sha256(&bytes),
+        daemon_executable_digest: state.daemon_executable_digest.clone(),
     };
     let tip_bytes = serde_jcs::to_vec(&tip).map_err(|_| Refusal::new("state_unavailable"))?;
     // Order matters: the generation body and the next continuity record are

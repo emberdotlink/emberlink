@@ -159,34 +159,21 @@ impl AuthorityKernel {
             now,
         ) {
             Ok(facts) => {
-                // The bound child must still be the live, reviewed process at
-                // settlement. The runner already ran, so a Session whose child
-                // died or was invalidated settles effect-unknown, never success.
-                let live = self.store.snapshot()?;
-                let current = live
-                    .sessions
-                    .get(session_id)
-                    .cloned()
-                    .ok_or_else(|| Refusal::new("session_binding_mismatch"))?;
-                if ExecutionBindingAuthority::revalidate(&current, authenticated_process).is_err() {
-                    OperationSettlement::settle(
-                        &self.store,
-                        &operation.operation_id,
-                        OperationStatus::EffectUnknown,
-                        None,
-                        Some("effect_unknown"),
-                        now_unix().max(now),
-                    )?;
-                    return Err(Refusal::new("session_binding_mismatch"));
-                }
+                // Success liveness is revalidated while the settlement owner
+                // holds the state transaction. A lost binding is atomically
+                // terminalized as effect-unknown rather than committed success.
                 let (operation, receipt) = OperationSettlement::settle(
                     &self.store,
                     &operation.operation_id,
                     OperationStatus::Success,
                     Some(facts.clone()),
                     None,
+                    Some(authenticated_process),
                     now_unix().max(now),
                 )?;
+                if operation.status != OperationStatus::Success {
+                    return Err(Refusal::new("session_binding_mismatch"));
+                }
                 Ok(ActionResponse {
                     action_ref: operation.action_ref,
                     definition_digest: operation.definition_digest,
@@ -203,6 +190,7 @@ impl AuthorityKernel {
                     OperationStatus::ExecutionFailure,
                     None,
                     Some("runner_failed"),
+                    None,
                     now_unix().max(now),
                 )?;
                 Err(Refusal::new("runner_failed"))

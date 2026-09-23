@@ -269,13 +269,20 @@ fn trusted_daemon_stream(
     if peer.uid != expected_uid {
         return Err(report_code("authority_endpoint_untrusted"));
     }
-    // Authenticate the serving process itself against the `emberd` artifact
-    // installed beside this reviewed CLI. This does not deserialize authority
-    // state (or its private Device keys) into the client process.
+    // Pin the serving process to the initialized release manifest without
+    // decoding authority owner state or Device custody in the client.
     let expected_daemon = std::env::current_exe()
         .map(|path| path.with_file_name("emberd"))
         .and_then(fs::canonicalize)
         .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    let pinned_digest =
+        ember_authority::audit::DurableStore::installed_daemon_executable_digest(&canonical_root)
+            .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    let expected_digest = ember_authority::identity::executable_digest(&expected_daemon)
+        .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    if expected_digest != pinned_digest {
+        return Err(report_code("authority_endpoint_untrusted"));
+    }
     let observed_daemon =
         ember_authority::identity::process_executable_path(peer.pid, peer.pid_version)
             .and_then(fs::canonicalize)
