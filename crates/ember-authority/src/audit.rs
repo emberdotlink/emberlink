@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -1049,11 +1049,21 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, Refusal> {
-    let metadata = fs::metadata(path).map_err(|_| Refusal::new("restore_failed"))?;
+    let file = fs::File::open(path).map_err(|_| Refusal::new("restore_failed"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| Refusal::new("restore_failed"))?;
     if metadata.len() > limit as u64 {
         return Err(Refusal::new("input_too_large"));
     }
-    fs::read(path).map_err(|_| Refusal::new("restore_failed"))
+    let mut bytes = Vec::with_capacity(limit.saturating_add(1));
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Refusal::new("restore_failed"))?;
+    if bytes.len() > limit {
+        return Err(Refusal::new("input_too_large"));
+    }
+    Ok(bytes)
 }
 
 pub fn sha256(bytes: &[u8]) -> String {

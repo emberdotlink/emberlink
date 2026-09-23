@@ -123,10 +123,9 @@ fn read_bounded_frame<T: serde::de::DeserializeOwned + Serialize>(
     if length > limit {
         return Err(Refusal::new("frame_too_large"));
     }
-    let mut storage = [0_u8; CONTROL_FRAME_LIMIT];
-    let bytes = &mut storage[..length];
+    let mut bytes = vec![0_u8; length];
     reader
-        .read_exact(bytes)
+        .read_exact(&mut bytes)
         .map_err(|_| Refusal::new("invalid_frame"))?;
     let mut trailing = [0_u8; 1];
     if reader
@@ -136,5 +135,5 @@ fn read_bounded_frame<T: serde::de::DeserializeOwned + Serialize>(
     {
         return Err(Refusal::new("invalid_frame"));
     }
-    crate::audit::decode_canonical(bytes, limit, "invalid_frame")
+    crate::audit::decode_canonical(&bytes, limit, "invalid_frame")
 }
