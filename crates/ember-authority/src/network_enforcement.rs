@@ -3,6 +3,7 @@ use core_crypto::{Signature, Signer as _, Verifier as _};
 use crate::{
     action_admission::AdmissionDecision,
     action_definition::ResolvedDefinition,
+    audit::sha256,
     canonical::encode_action_permit,
     device::{DeviceCustody, PURPOSE_ACTION_PERMIT},
     model::{ActionPermit, ActionRequest, Refusal, SessionRecord},
@@ -31,9 +32,13 @@ impl NetworkEnforcement {
         now: u64,
     ) -> Result<ActionPermit, Refusal> {
         let signer = custody.action_permit_signer()?;
-        let expiry = now.saturating_add(30).min(decision.grant.expires_at);
+        let qualification_coverage_digest = sha256(
+            &serde_jcs::to_vec(&decision.qualification_coverage)
+                .map_err(|_| Refusal::new("qualification_mismatch"))?,
+        );
+        let expiry = now.saturating_add(60).min(decision.grant.expires_at);
         let mut permit = ActionPermit {
-            permit_kind: "action".into(),
+            permit_kind: "one-shot".into(),
             authority_fingerprint: authority_fingerprint.into(),
             authority_epoch,
             installation_id: installation_id.into(),
@@ -45,6 +50,7 @@ impl NetworkEnforcement {
             execution_binding_digest: session.execution_binding_digest.clone(),
             assurance_profile_id: decision.assurance_profile_id.clone(),
             assurance_profile_digest: decision.assurance_profile_digest.clone(),
+            qualification_coverage_digest,
             action_definition_id: definition.action_ref.identity(),
             action_definition_version: definition.action_ref.action_version.clone(),
             action_definition_digest: definition.digest.clone(),
@@ -99,26 +105,36 @@ impl NetworkEnforcement {
         custody: &DeviceCustody,
         now: u64,
     ) -> Result<(), Refusal> {
+        if permit.authority_epoch != authority_epoch {
+            return Err(Refusal::new("stale_authority_epoch"));
+        }
         let signer = custody.action_permit_signer()?;
         let expected_ceiling = &decision.grant_use_ceiling;
-        let fields_match = permit.permit_kind == "action"
+        let fields_match = permit.permit_kind == "one-shot"
             && permit.authority_fingerprint == authority_fingerprint
             && permit.authority_epoch == authority_epoch
             && permit.installation_id == installation_id
             && permit.proxy_instance_id.is_none()
             && permit.session_id == session.session_id
             && permit.execution_ordinal_first.is_none()
+            && permit.execution_ordinal_count.is_none()
             && permit
                 .operation_id
                 .as_ref()
-                .is_some_and(|id| id.len() <= 256)
+                .is_some_and(|id| !id.is_empty() && id.len() <= 256)
             && permit.execution_binding_digest == session.execution_binding_digest
             && permit.assurance_profile_id == decision.assurance_profile_id
             && permit.assurance_profile_digest == decision.assurance_profile_digest
+            && permit.qualification_coverage_digest
+                == sha256(
+                    &serde_jcs::to_vec(&decision.qualification_coverage)
+                        .map_err(|_| Refusal::new("qualification_mismatch"))?,
+                )
             && permit.action_definition_id == definition.action_ref.identity()
             && permit.action_definition_version == definition.action_ref.action_version
             && permit.action_definition_digest == definition.digest
-            && permit.action_definition_digest == request.definition_digest
+            && request.definition_digest.as_deref()
+                == Some(permit.action_definition_digest.as_str())
             && permit.canonicalizer_id == CANONICALIZER_ID
             && permit.canonicalizer_digest == CANONICALIZER_DIGEST
             && permit.canonical_typed_input_digest == typed_input_digest
@@ -140,11 +156,17 @@ impl NetworkEnforcement {
             && permit.byte_budget == decision.grant.byte_budget
             && permit.rate_ceiling == decision.grant.rate_ceiling
             && permit.remaining_use_ceiling == decision.grant.remaining_uses
-            && permit.expiry <= decision.grant.expires_at
+            && permit.expiry
+                == decision
+                    .grant
+                    .expires_at
+                    .min(permit.issuance.saturating_add(60))
             && permit.expiry > permit.issuance
+            && permit.issuance <= now
             && permit.offline_bound
             && permit.consequence_class == decision.consequence_class
             && permit.capability == decision.need.permission
+            && !permit.nonce.is_empty()
             && permit.nonce.len() <= 256
             && permit.signer_key_id == signer.key_id();
         if !fields_match {

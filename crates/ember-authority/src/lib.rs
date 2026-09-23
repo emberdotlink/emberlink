@@ -21,6 +21,7 @@ pub mod recovery;
 pub mod runner;
 #[allow(unsafe_code)]
 pub mod runtime_presence;
+pub mod session_supervisor;
 
 pub const AUTHORITY_STATE_DIRECTORY: &str = ".local/state/ember-authority";
 

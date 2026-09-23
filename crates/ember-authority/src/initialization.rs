@@ -11,7 +11,7 @@ use crate::{
         DeviceCustody, DeviceCustodyEvidence, DeviceState, authority_fingerprint,
         device_set_digest, signing_key_fingerprint,
     },
-    model::{DEFINITION_DIGEST, Refusal},
+    model::Refusal,
 };
 
 const MAX_MEMBERS: usize = 64;
@@ -341,6 +341,7 @@ pub struct InitializationRequest {
 pub struct ValidatedInitialization {
     pub authority_fingerprint: String,
     pub release_manifest_digest: String,
+    pub daemon_executable_digest: String,
     pub registry_bytes: String,
     pub operator_uid: u32,
     pub qualification_grant: QualificationGrantRecord,
@@ -378,37 +379,37 @@ impl InitializationRequest {
         let grant_set_digest = digest(&encode_set(
             "ember/initial-qualification-grant-set/v1",
             &self.records.qualification_grants,
-            |value| encode_grant(value),
+            encode_grant,
         )?);
         let profile_set_digest = digest(&encode_set(
             "ember/initial-qualification-harness-profile-authorization-set/v1",
             &self.records.harness_profile_authorizations,
-            |value| encode_profile(value),
+            encode_profile,
         )?);
         let caller_set_digest = digest(&encode_set(
             "ember/initial-qualification-caller-eligibility-set/v1",
             &self.records.caller_eligibility,
-            |value| encode_caller(value),
+            encode_caller,
         )?);
         let publisher_set_digest = digest(&encode_set(
             "ember/initial-qualification-publisher-trust-root-set/v1",
             &self.records.publisher_trust_roots,
-            |value| encode_publisher(value),
+            encode_publisher,
         )?);
         let definition_set_digest = digest(&encode_set(
             "ember/initial-qualification-action-definition-set/v1",
             &self.records.action_definitions,
-            |value| encode_definition(value),
+            encode_definition,
         )?);
         let project_set_digest = digest(&encode_set(
             "ember/initial-trusted-project-authorization-set/v1",
             &self.records.trusted_projects,
-            |value| encode_project(value),
+            encode_project,
         )?);
         let route_set_digest = digest(&encode_set(
             "ember/initial-qualification-route-set/v1",
             &self.records.routes,
-            |value| encode_route(value),
+            encode_route,
         )?);
         let policy_digest = digest(&encode_policy(&self.records.policy)?);
         let recovery_digest = digest(&encode_recovery(&self.records.recovery_manifest)?);
@@ -419,6 +420,12 @@ impl InitializationRequest {
         let root_device_set_digest = device_set_digest(&self.devices)?;
         let continuity_digest = digest(&encode_continuity(&self.prior_continuity)?);
 
+        if self.records.action_definitions.len() > 1 {
+            // This tranche installs exactly one closed diagnostic identity.
+            // Any second definition therefore conflicts with that immutable
+            // identity; do not collapse equivocation into a cardinality error.
+            return Err(Refusal::new("identity_collision"));
+        }
         let singleton = [
             self.records.qualification_grants.len(),
             self.records.harness_profile_authorizations.len(),
@@ -518,10 +525,18 @@ impl InitializationRequest {
             &self.prior_continuity,
             &self.release,
         )?;
-        let registry_bytes = ActionDefinitionRegistry::initialize(&definition.signed_bundle)?;
+        let registry_bytes = ActionDefinitionRegistry::initialize(publisher, definition)?;
         Ok(ValidatedInitialization {
             authority_fingerprint,
             release_manifest_digest: self.release.release_manifest_digest.clone(),
+            daemon_executable_digest: self
+                .release
+                .release_manifest
+                .bootstrap_artifact_digest_list
+                .iter()
+                .find(|entry| entry.artifact_id == "bootstrap:emberd")
+                .map(|entry| entry.digest.clone())
+                .ok_or_else(|| Refusal::new("release_artifact_invalid"))?,
             registry_bytes,
             operator_uid: caller.operator_uid,
             qualification_grant: grant.clone(),
@@ -553,7 +568,7 @@ fn validate_anchor(
         || manifest.release_signing_trust_root_fingerprint != anchor.trust_root_fingerprint
         || manifest.release_signing_trust_root_version != anchor.version
         || now < manifest.issuance
-        || now > manifest.expiry
+        || now >= manifest.expiry
         || !core_crypto::Ed25519Verifier.verify(
             &PublicKey(anchor.signer_public_key.clone()),
             &bytes,
@@ -649,21 +664,20 @@ fn validate_semantics(
         || profile.artifact_digest != project.profile_artifact_digest
         || caller.trusted_project_digest != digest(&encode_project(project)?)
         || plan.maintenance_window_expiry != caller.maintenance_window_expiry
-        || now > plan.maintenance_window_expiry
-        || now > grant.expiry
-        || now > publisher.not_after
-        || definition.action_definition_digest != DEFINITION_DIGEST
-        || grant.action_definition_digest != DEFINITION_DIGEST
-        || route.action_definition_digest != DEFINITION_DIGEST
+        || now >= plan.maintenance_window_expiry
+        || now >= grant.expiry
+        || now >= publisher.not_after
+        || grant.action_definition_digest != definition.action_definition_digest
+        || route.action_definition_digest != definition.action_definition_digest
         || route.runner_class != "builtin"
         || route.delivery_lane != "sealed-exec"
         || route.credential_slot.is_some()
         || grant.permission != "authority.status.read"
         || grant.material_class != "non_secret"
         || grant.provider != "ember.local"
-        || grant.protocol != "local"
-        || grant.destination != "daemon"
-        || grant.operation_class != "read_only_diagnostic"
+        || grant.protocol != "ember.local"
+        || grant.destination != "authority-journal"
+        || grant.operation_class != "diagnostic.read"
         || grant.request_count_ceiling != 1
         || grant.rate_ceiling != 1
         || grant.byte_budget != 65_536
@@ -718,10 +732,9 @@ fn validate_semantics(
         || continuity.prior_record_digest != ZERO_DIGEST
         || continuity.protected_tip_digest != ZERO_DIGEST
         || continuity.slot_id.is_empty()
-        || publisher.publisher_id != crate::action_definition::PUBLISHER_ID
-        || publisher.signer_key_id != crate::action_definition::SIGNER_KEY_ID
-        || publisher.public_key != crate::action_definition::PUBLISHER_PUBLIC_KEY
-        || publisher.not_after != crate::action_definition::PUBLISHER_NOT_AFTER
+        || publisher.publisher_id.is_empty()
+        || publisher.signer_key_id.is_empty()
+        || publisher.public_key.is_empty()
         || !release
             .release_manifest
             .executable_artifact_digest_list

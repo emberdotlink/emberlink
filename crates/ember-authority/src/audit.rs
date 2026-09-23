@@ -9,6 +9,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -62,6 +63,8 @@ impl DurableStore {
         if tip.schema != TIP_SCHEMA {
             return Err(Refusal::new("restore_failed"));
         }
+        enforce_high_water(root, tip.generation, &tip_bytes)?;
+        commit_continuity(root, Some((tip.generation, sha256(&tip_bytes))))?;
         let path = generation_path(root, tip.generation);
         let state_bytes = read_bounded(&path, RECEIPT_ENVELOPE_LIMIT * 8)?;
         if sha256(&state_bytes) != tip.state_digest {
@@ -210,6 +213,7 @@ impl EvidenceJournal {
         if canonical.len() > RECEIPT_ENVELOPE_LIMIT {
             return Err(Refusal::new("receipt_too_large"));
         }
+        ensure_receipt_show_frame_fits(&canonical)?;
         let canonical_bytes =
             String::from_utf8(canonical.clone()).map_err(|_| Refusal::new("receipt_invalid"))?;
         let row = ReceiptIndexRow {
@@ -315,6 +319,7 @@ impl EvidenceJournal {
         if canonical.len() > RECEIPT_ENVELOPE_LIMIT {
             return Err(Refusal::new("receipt_too_large"));
         }
+        ensure_receipt_show_frame_fits(&canonical)?;
         let row = ReceiptIndexRow {
             receipt_id: envelope.receipt_id.clone(),
             operation_id: state.initialization.operation_id.clone(),
@@ -501,38 +506,381 @@ pub fn linked_fact_set_digest(
     Ok(sha256_hex(&encoded.finish()))
 }
 
+fn ensure_receipt_show_frame_fits(canonical_receipt: &[u8]) -> Result<(), Refusal> {
+    let canonical_receipt =
+        std::str::from_utf8(canonical_receipt).map_err(|_| Refusal::new("receipt_invalid"))?;
+    let response = serde_json::json!({
+        "canonical_receipt": canonical_receipt,
+        "result": "receipt_show",
+    });
+    let bytes = serde_jcs::to_vec(&response).map_err(|_| Refusal::new("receipt_invalid"))?;
+    if bytes.len() > crate::ipc::CONTROL_FRAME_LIMIT {
+        return Err(Refusal::new("receipt_too_large"));
+    }
+    Ok(())
+}
+
 pub fn decode_canonical<T: serde::de::DeserializeOwned + Serialize>(
     bytes: &[u8],
     limit: usize,
     code: &'static str,
 ) -> Result<T, Refusal> {
+    let size_code = if limit == 16_384 {
+        "frame_too_large"
+    } else {
+        "input_too_large"
+    };
     if bytes.len() > limit {
-        return Err(Refusal::new(if limit == 16_384 {
-            "frame_too_large"
-        } else {
-            "input_too_large"
-        }));
+        return Err(Refusal::new(size_code));
     }
+    let started = Instant::now();
+    enforce_json_shape(
+        bytes,
+        if limit == 16_384 { 16 } else { 32 },
+        size_code,
+        code,
+        limit,
+        started,
+    )?;
     let value: T = serde_json::from_slice(bytes).map_err(|_| Refusal::new(code))?;
     let canonical = serde_jcs::to_vec(&value).map_err(|_| Refusal::new(code))?;
+    let complete_deadline = Duration::from_millis(2_000);
+    if started.elapsed() > complete_deadline {
+        return Err(Refusal::new(size_code));
+    }
     if canonical != bytes {
         return Err(Refusal::new(code));
     }
     Ok(value)
 }
 
+#[derive(Clone, Copy, Default)]
+struct KeySpan {
+    start: usize,
+    end: usize,
+}
+
+fn enforce_json_shape(
+    bytes: &[u8],
+    max_depth: usize,
+    limit_code: &'static str,
+    syntax_code: &'static str,
+    boundary_limit: usize,
+    started: Instant,
+) -> Result<(), Refusal> {
+    let (arena_limit, deadline) = match boundary_limit {
+        1_048_576 => (8_454_144_usize, Duration::from_millis(1_000)),
+        2_097_152 => (12_648_448_usize, Duration::from_millis(2_000)),
+        _ => (
+            boundary_limit.saturating_mul(8),
+            Duration::from_millis(1_000),
+        ),
+    };
+    let mut parser = BoundedJsonParser {
+        bytes,
+        index: 0,
+        max_depth,
+        values: 0,
+        members: 0,
+        work: 0,
+        started,
+        deadline,
+        limit_code,
+        syntax_code,
+        receipt_body_limit: (boundary_limit == 2_097_152).then_some(1_048_576),
+    };
+    std::str::from_utf8(bytes).map_err(|_| Refusal::new(syntax_code))?;
+    parser.skip_whitespace()?;
+    parser.parse_value(0)?;
+    parser.skip_whitespace()?;
+    if parser.index != bytes.len() {
+        return Err(Refusal::new(syntax_code));
+    }
+    let estimated_live = bytes
+        .len()
+        .checked_mul(2)
+        .and_then(|size| size.checked_add(parser.values.checked_mul(64)?))
+        .and_then(|size| size.checked_add(parser.members.checked_mul(32)?))
+        .ok_or_else(|| Refusal::new(limit_code))?;
+    if estimated_live > arena_limit {
+        return Err(Refusal::new(limit_code));
+    }
+    Ok(())
+}
+
+struct BoundedJsonParser<'a> {
+    bytes: &'a [u8],
+    index: usize,
+    max_depth: usize,
+    values: usize,
+    members: usize,
+    work: usize,
+    started: Instant,
+    deadline: Duration,
+    limit_code: &'static str,
+    syntax_code: &'static str,
+    receipt_body_limit: Option<usize>,
+}
+
+impl BoundedJsonParser<'_> {
+    fn charge(&mut self, units: usize) -> Result<(), Refusal> {
+        self.work = self
+            .work
+            .checked_add(units)
+            .ok_or_else(|| Refusal::new(self.limit_code))?;
+        if self.work > 50_000_000 || self.started.elapsed() > self.deadline {
+            return Err(Refusal::new(self.limit_code));
+        }
+        Ok(())
+    }
+
+    fn byte(&mut self) -> Result<Option<u8>, Refusal> {
+        self.charge(1)?;
+        Ok(self.bytes.get(self.index).copied())
+    }
+
+    fn bump(&mut self) -> Result<u8, Refusal> {
+        let byte = self.byte()?.ok_or_else(|| Refusal::new(self.syntax_code))?;
+        self.index += 1;
+        Ok(byte)
+    }
+
+    fn skip_whitespace(&mut self) -> Result<(), Refusal> {
+        while self.byte()?.is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.index += 1;
+        }
+        Ok(())
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<(), Refusal> {
+        self.charge(1)?;
+        self.values = self
+            .values
+            .checked_add(1)
+            .ok_or_else(|| Refusal::new(self.limit_code))?;
+        if self.values > 65_536 {
+            return Err(Refusal::new(self.limit_code));
+        }
+        match self.byte()? {
+            Some(b'{') => self.parse_object(depth + 1),
+            Some(b'[') => self.parse_array(depth + 1),
+            Some(b'"') => self.parse_string(false).map(|_| ()),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'n') => self.parse_literal(b"null"),
+            _ => Err(Refusal::new(self.syntax_code)),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<(), Refusal> {
+        if depth > self.max_depth {
+            return Err(Refusal::new(self.limit_code));
+        }
+        self.bump()?;
+        self.skip_whitespace()?;
+        if self.byte()? == Some(b'}') {
+            self.index += 1;
+            return Ok(());
+        }
+        let mut keys = [KeySpan::default(); 256];
+        let mut key_count = 0_usize;
+        loop {
+            self.charge(1)?;
+            if self.byte()? != Some(b'"') || key_count == keys.len() {
+                return Err(Refusal::new(if key_count == keys.len() {
+                    self.limit_code
+                } else {
+                    self.syntax_code
+                }));
+            }
+            let key = self.parse_string(true)?;
+            for prior in &keys[..key_count] {
+                self.charge(key.end.saturating_sub(key.start).max(1))?;
+                if self.bytes[prior.start..prior.end] == self.bytes[key.start..key.end] {
+                    return Err(Refusal::new(self.syntax_code));
+                }
+            }
+            keys[key_count] = key;
+            key_count += 1;
+            self.members = self
+                .members
+                .checked_add(1)
+                .ok_or_else(|| Refusal::new(self.limit_code))?;
+            self.skip_whitespace()?;
+            if self.bump()? != b':' {
+                return Err(Refusal::new(self.syntax_code));
+            }
+            self.skip_whitespace()?;
+            let value_start = self.index;
+            self.parse_value(depth)?;
+            if depth == 1
+                && self.bytes[key.start..key.end] == *b"body"
+                && self
+                    .receipt_body_limit
+                    .is_some_and(|limit| self.index.saturating_sub(value_start) > limit)
+            {
+                return Err(Refusal::new(self.limit_code));
+            }
+            self.skip_whitespace()?;
+            match self.bump()? {
+                b'}' => return Ok(()),
+                b',' => self.skip_whitespace()?,
+                _ => return Err(Refusal::new(self.syntax_code)),
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<(), Refusal> {
+        if depth > self.max_depth {
+            return Err(Refusal::new(self.limit_code));
+        }
+        self.bump()?;
+        self.skip_whitespace()?;
+        if self.byte()? == Some(b']') {
+            self.index += 1;
+            return Ok(());
+        }
+        let mut items = 0_usize;
+        loop {
+            self.charge(1)?;
+            if items == 65_535 {
+                return Err(Refusal::new(self.limit_code));
+            }
+            self.parse_value(depth)?;
+            items += 1;
+            self.skip_whitespace()?;
+            match self.bump()? {
+                b']' => return Ok(()),
+                b',' => self.skip_whitespace()?,
+                _ => return Err(Refusal::new(self.syntax_code)),
+            }
+        }
+    }
+
+    fn parse_string(&mut self, object_key: bool) -> Result<KeySpan, Refusal> {
+        if self.bump()? != b'"' {
+            return Err(Refusal::new(self.syntax_code));
+        }
+        let start = self.index;
+        loop {
+            match self.bump()? {
+                b'"' => {
+                    return Ok(KeySpan {
+                        start,
+                        end: self.index - 1,
+                    });
+                }
+                0x00..=0x1f => return Err(Refusal::new(self.syntax_code)),
+                b'\\' => {
+                    if object_key {
+                        // Closed production schemas contain only unescaped
+                        // ASCII field names. Rejecting escaped keys also
+                        // prevents semantic duplicate aliases before decode.
+                        return Err(Refusal::new(self.syntax_code));
+                    }
+                    match self.bump()? {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => self.parse_unicode_escape()?,
+                        _ => return Err(Refusal::new(self.syntax_code)),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<(), Refusal> {
+        let first = self.read_hex_quad()?;
+        if (0xd800..=0xdbff).contains(&first) {
+            if self.bump()? != b'\\' || self.bump()? != b'u' {
+                return Err(Refusal::new(self.syntax_code));
+            }
+            let second = self.read_hex_quad()?;
+            if !(0xdc00..=0xdfff).contains(&second) {
+                return Err(Refusal::new(self.syntax_code));
+            }
+        } else if (0xdc00..=0xdfff).contains(&first) {
+            return Err(Refusal::new(self.syntax_code));
+        }
+        Ok(())
+    }
+
+    fn read_hex_quad(&mut self) -> Result<u16, Refusal> {
+        let mut value = 0_u16;
+        for _ in 0..4 {
+            let digit = (self.bump()? as char)
+                .to_digit(16)
+                .ok_or_else(|| Refusal::new(self.syntax_code))? as u16;
+            value = value
+                .checked_mul(16)
+                .and_then(|value| value.checked_add(digit))
+                .ok_or_else(|| Refusal::new(self.syntax_code))?;
+        }
+        Ok(value)
+    }
+
+    fn parse_number(&mut self) -> Result<(), Refusal> {
+        let start = self.index;
+        if self.byte()? == Some(b'-') {
+            self.index += 1;
+        }
+        match self.bump()? {
+            b'0' => {
+                if self.byte()?.is_some_and(|byte| byte.is_ascii_digit()) {
+                    return Err(Refusal::new(self.syntax_code));
+                }
+            }
+            b'1'..=b'9' => {
+                while self.byte()?.is_some_and(|byte| byte.is_ascii_digit()) {
+                    self.index += 1;
+                }
+            }
+            _ => return Err(Refusal::new(self.syntax_code)),
+        }
+        if self
+            .byte()?
+            .is_some_and(|byte| matches!(byte, b'.' | b'e' | b'E'))
+        {
+            return Err(Refusal::new(self.syntax_code));
+        }
+        let number = std::str::from_utf8(&self.bytes[start..self.index])
+            .ok()
+            .and_then(|text| text.parse::<i128>().ok())
+            .ok_or_else(|| Refusal::new(self.syntax_code))?;
+        if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&number) {
+            return Err(Refusal::new(self.syntax_code));
+        }
+        Ok(())
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), Refusal> {
+        for expected in literal {
+            if self.bump()? != *expected {
+                return Err(Refusal::new(self.syntax_code));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn persist_generation(root: &Path, state: &PersistentAuthorityState) -> Result<(), Refusal> {
     let bytes = serde_jcs::to_vec(state).map_err(|_| Refusal::new("state_unavailable"))?;
     let path = generation_path(root, state.generation);
-    atomic_write(&path, &bytes)?;
     let tip = ProtectedTip {
         schema: TIP_SCHEMA.into(),
         generation: state.generation,
         state_digest: sha256(&bytes),
     };
     let tip_bytes = serde_jcs::to_vec(&tip).map_err(|_| Refusal::new("state_unavailable"))?;
+    // Order matters: the generation body and the next continuity record are
+    // written before the protected tip, and only the tip rename publishes the
+    // transaction. A fault before that rename leaves unreferenced bytes and the
+    // prior committed generation, never a mixed committed state.
+    atomic_write(&path, &bytes)?;
+    stage_continuity(root, state, &tip_bytes)?;
     atomic_write(&root.join("protected-tip.json"), &tip_bytes)?;
-    advance_continuity(root, state, &tip_bytes)
+    commit_continuity(root, Some((state.generation, sha256(&tip_bytes))))
 }
 
 fn generation_path(root: &Path, generation: u64) -> PathBuf {
@@ -540,18 +888,35 @@ fn generation_path(root: &Path, generation: u64) -> PathBuf {
         .join(format!("{generation:020}.json"))
 }
 
-fn advance_continuity(
+fn continuity_paths(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf), Refusal> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| Refusal::new("continuity_unavailable"))?;
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Refusal::new("continuity_unavailable"))?;
+    Ok((
+        parent.join(format!("{name}.continuity.json")),
+        parent.join(format!("{name}.continuity.next.json")),
+        parent.join(format!("{name}.high-water.json")),
+    ))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HighWaterMark {
+    schema: String,
+    generation: u64,
+    protected_tip_digest: String,
+}
+
+fn stage_continuity(
     root: &Path,
     state: &PersistentAuthorityState,
     protected_tip_bytes: &[u8],
 ) -> Result<(), Refusal> {
-    let Some(parent) = root.parent() else {
-        return Err(Refusal::new("continuity_unavailable"));
-    };
-    let Some(name) = root.file_name().and_then(|value| value.to_str()) else {
-        return Err(Refusal::new("continuity_unavailable"));
-    };
-    let path = parent.join(format!("{name}.continuity.json"));
+    let (path, staged, _) = continuity_paths(root)?;
     if !path.exists() {
         return Ok(());
     }
@@ -574,7 +939,63 @@ fn advance_continuity(
         slot_id: prior.slot_id,
     };
     let bytes = serde_jcs::to_vec(&next).map_err(|_| Refusal::new("continuity_unavailable"))?;
-    atomic_write(&path, &bytes).map_err(|_| Refusal::new("continuity_unavailable"))
+    atomic_write(&staged, &bytes).map_err(|_| Refusal::new("continuity_unavailable"))
+}
+
+/// Publishes the staged continuity record and only then advances the
+/// high-water mark. The mark therefore never exceeds the committed protected
+/// tip, so a crash before tip publication still restores the prior committed
+/// generation instead of tripping rollback detection.
+fn record_high_water(root: &Path, generation: u64, tip_digest: String) -> Result<(), Refusal> {
+    let (_, _, high_water) = continuity_paths(root)?;
+    let mark = HighWaterMark {
+        schema: "ember.authority-high-water/v1".into(),
+        generation,
+        protected_tip_digest: tip_digest,
+    };
+    let mark_bytes =
+        serde_jcs::to_vec(&mark).map_err(|_| Refusal::new("continuity_unavailable"))?;
+    atomic_write(&high_water, &mark_bytes).map_err(|_| Refusal::new("continuity_unavailable"))
+}
+
+fn commit_continuity(root: &Path, mark: Option<(u64, String)>) -> Result<(), Refusal> {
+    let (path, staged, _) = continuity_paths(root)?;
+    if staged.exists() {
+        fs::rename(&staged, &path).map_err(|_| Refusal::new("continuity_unavailable"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Refusal::new("continuity_unavailable"))?;
+        OpenOptions::new()
+            .read(true)
+            .open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| Refusal::new("continuity_unavailable"))?;
+    }
+    match mark {
+        Some((generation, tip_digest)) => record_high_water(root, generation, tip_digest),
+        None => Ok(()),
+    }
+}
+
+/// Restore-time anti-rollback: the published tip must be at or above the last
+/// recorded high-water generation, and an equal generation must carry the exact
+/// recorded tip bytes. A restored older generation/tip/continuity triple is
+/// refused instead of silently reactivating superseded authority state.
+fn enforce_high_water(root: &Path, tip_generation: u64, tip_bytes: &[u8]) -> Result<(), Refusal> {
+    let (_, _, high_water) = continuity_paths(root)?;
+    if !high_water.exists() {
+        return Ok(());
+    }
+    let bytes =
+        read_bounded(&high_water, 16_384).map_err(|_| Refusal::new("state_rollback_detected"))?;
+    let mark: HighWaterMark = decode_canonical(&bytes, 16_384, "state_rollback_detected")?;
+    if mark.schema != "ember.authority-high-water/v1"
+        || tip_generation < mark.generation
+        || (tip_generation == mark.generation && sha256(tip_bytes) != mark.protected_tip_digest)
+    {
+        return Err(Refusal::new("state_rollback_detected"));
+    }
+    Ok(())
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), Refusal> {

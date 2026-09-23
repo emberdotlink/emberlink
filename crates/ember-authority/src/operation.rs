@@ -12,6 +12,7 @@ use crate::{
     runtime_presence::{AuthenticatedProcess, ExecutionBindingAuthority},
 };
 
+#[allow(clippy::large_enum_variant)]
 pub enum ReplayDisposition {
     New,
     Completed(OperationRecord, StoredReceipt),
@@ -87,8 +88,9 @@ impl OperationSettlement {
                 .ok_or_else(|| Refusal::new("session_binding_mismatch"))?;
             ExecutionBindingAuthority::revalidate(&session, observed_process)?;
             let registry = ActionDefinitionRegistry::restore(&state.registry_bytes)?;
+            let expected_definition_digest = request.required_definition_digest()?;
             let resolved =
-                registry.resolve(&request.action_ref, &request.definition_digest, now)?;
+                registry.resolve(&request.action_ref, expected_definition_digest, now)?;
             if resolved.digest != definition.digest || resolved.definition != definition.definition
             {
                 return Err(Refusal::new("definition_digest_mismatch"));
@@ -152,7 +154,7 @@ impl OperationSettlement {
                 &session.persona_id,
                 &session.session_id,
                 &session.execution_binding_digest,
-                &request.definition_digest,
+                expected_definition_digest,
                 &request.submission_id,
             )?;
             let operation = OperationRecord {
@@ -163,7 +165,7 @@ impl OperationSettlement {
                 session_id: session.session_id.clone(),
                 execution_binding_digest: session.execution_binding_digest.clone(),
                 action_ref: request.action_ref.clone(),
-                definition_digest: request.definition_digest.clone(),
+                definition_digest: expected_definition_digest.into(),
                 typed_input_digest: typed_input_digest.into(),
                 authorization: AuthorizationSnapshot {
                     permit: permit.clone(),
@@ -245,7 +247,10 @@ impl OperationSettlement {
                     .sessions
                     .get(&current.session_id)
                     .ok_or_else(|| Refusal::new("session_binding_mismatch"))?;
-                if session.execution_binding_digest != current.execution_binding_digest {
+                if session.state != crate::model::SessionState::Active
+                    || session.execution_binding_digest != current.execution_binding_digest
+                    || completed_at >= session.grant.expires_at
+                {
                     return Err(Refusal::new("session_binding_mismatch"));
                 }
             }

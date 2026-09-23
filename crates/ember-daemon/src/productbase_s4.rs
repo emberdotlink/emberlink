@@ -3,13 +3,14 @@ use ember_authority::{
     control::AuthorityControl,
     identity,
     ipc::{
-        ControlRequest, ControlResponse, SessionActionRequest, SessionActionResponse, read_frame,
-        write_frame,
+        CONTROL_FRAME_LIMIT, ControlRequest, ControlResponse, SessionActionRequest,
+        SessionActionResponse, read_control_frame, read_frame, write_control_frame, write_frame,
     },
     kernel::AuthorityKernel,
     model::Refusal,
     receipt::ReceiptProjection,
     runtime_presence::ExecutionBindingAuthority,
+    session_supervisor::SessionSupervisor,
 };
 use std::{
     fs,
@@ -19,6 +20,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -33,6 +35,7 @@ pub fn run(state_root: &Path) -> Result<(), String> {
         "emberd ProductBase authority ready: {}",
         socket_path.display()
     );
+    let quiesced = AtomicBool::new(false);
     for connection in listener.incoming() {
         let mut stream = match connection {
             Ok(stream) => stream,
@@ -41,14 +44,22 @@ pub fn run(state_root: &Path) -> Result<(), String> {
                 continue;
             }
         };
-        let response = match handle_control(&control, state_root, &mut stream) {
+        let response = match handle_control(&control, state_root, &quiesced, &mut stream) {
             Ok(response) => response,
-            Err(error) => ControlResponse::Refusal {
-                code: error.code.into(),
-            },
+            Err(error) => {
+                if is_durability_failure(error.code) {
+                    quiesced.store(true, Ordering::SeqCst);
+                }
+                ControlResponse::Refusal {
+                    code: error.code.into(),
+                }
+            }
         };
-        if let Err(error) = write_frame(&mut stream, &response) {
+        if let Err(error) = write_control_frame(&mut stream, &response) {
             eprintln!("emberd: response failed: {error}");
+        }
+        if quiesced.load(Ordering::SeqCst) {
+            break;
         }
     }
     Ok(())
@@ -57,12 +68,13 @@ pub fn run(state_root: &Path) -> Result<(), String> {
 fn handle_control(
     control: &AuthorityControl,
     state_root: &Path,
+    quiesced: &AtomicBool,
     stream: &mut UnixStream,
 ) -> Result<ControlResponse, Refusal> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| Refusal::new("transport_failed"))?;
-    let request: ControlRequest = read_frame(stream)?;
+    let request: ControlRequest = read_control_frame(stream)?;
     let peer = ExecutionBindingAuthority::authenticate_fd(stream)?;
     let state = control.store().snapshot()?;
     if peer.uid != state.operator_uid {
@@ -85,15 +97,21 @@ fn handle_control(
     }
     match request {
         ControlRequest::Ping => Ok(ControlResponse::Pong),
-        ControlRequest::OpenDiagnostic { challenge, action } => {
-            run_diagnostic_session(control, state_root, challenge, action)
-        }
-        ControlRequest::ReceiptList => Ok(ControlResponse::ReceiptList {
+        ControlRequest::OpenDiagnostic {
+            challenge,
+            action,
+            context,
+        } => run_diagnostic_session(
+            control, state_root, quiesced, peer.uid, challenge, context, action,
+        ),
+        ControlRequest::ReceiptList => bounded_receipt_response(ControlResponse::ReceiptList {
             receipts: ReceiptProjection::list(control.store())?,
         }),
-        ControlRequest::ReceiptShow { receipt_id } => Ok(ControlResponse::ReceiptShow {
-            canonical_receipt: ReceiptProjection::show(control.store(), &receipt_id)?,
-        }),
+        ControlRequest::ReceiptShow { receipt_id } => {
+            bounded_receipt_response(ControlResponse::ReceiptShow {
+                canonical_receipt: ReceiptProjection::show(control.store(), &receipt_id)?,
+            })
+        }
         ControlRequest::ReceiptVerify { receipt_id } => {
             ReceiptProjection::verify(control.store(), &receipt_id)?;
             Ok(ControlResponse::ReceiptVerified { receipt_id })
@@ -101,31 +119,36 @@ fn handle_control(
     }
 }
 
+fn bounded_receipt_response(response: ControlResponse) -> Result<ControlResponse, Refusal> {
+    let bytes =
+        serde_jcs::to_vec(&response).map_err(|_| Refusal::new("receipt_projection_failed"))?;
+    if bytes.len() > CONTROL_FRAME_LIMIT {
+        return Err(Refusal::new("receipt_too_large"));
+    }
+    Ok(response)
+}
+
 fn run_diagnostic_session(
     control: &AuthorityControl,
     state_root: &Path,
+    quiesced: &AtomicBool,
+    peer_uid: u32,
     challenge: String,
+    context: ember_authority::model::LaunchContext,
     action: ember_authority::model::ActionRequest,
 ) -> Result<ControlResponse, Refusal> {
-    let sessions = state_root.join("sessions");
-    fs::create_dir_all(&sessions).map_err(|_| Refusal::new("state_unavailable"))?;
-    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700))
-        .map_err(|_| Refusal::new("state_unavailable"))?;
-    let endpoint = sessions.join(format!("{}.sock", uuid::Uuid::new_v4()));
-    let listener =
-        UnixListener::bind(&endpoint).map_err(|_| Refusal::new("session_endpoint_failed"))?;
-    fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600))
-        .map_err(|_| Refusal::new("session_endpoint_failed"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| Refusal::new("session_endpoint_failed"))?;
+    let endpoint_id = uuid::Uuid::new_v4().simple().to_string();
+    let endpoint = state_root
+        .join("sessions")
+        .join(format!("{}.sock", &endpoint_id[..16]));
+    let mut supervisor = SessionSupervisor::bind(endpoint.clone())?;
 
     let launch = control.open_diagnostic_session(
         &challenge,
-        control.store().snapshot()?.operator_uid,
+        peer_uid,
+        &context,
         endpoint.to_string_lossy().into_owned(),
     )?;
-    let mut child = None;
     let result = (|| -> Result<ControlResponse, Refusal> {
         let action_bytes =
             serde_jcs::to_vec(&action).map_err(|_| Refusal::new("invalid_request"))?;
@@ -133,7 +156,8 @@ fn run_diagnostic_session(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
             action_bytes,
         );
-        let spawned = Command::new(cli_binary()?)
+        let mut command = Command::new(cli_binary()?);
+        command
             .arg("__session-child")
             .arg("--endpoint")
             .arg(&launch.endpoint)
@@ -145,11 +169,8 @@ fn run_diagnostic_session(
             .arg(action_argument)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| Refusal::new("session_launch_failed"))?;
-        let pid = spawned.id();
-        child = Some(spawned);
+            .stderr(Stdio::piped());
+        let pid = supervisor.launch(&mut command)?;
         let pid_version = identity::process_pid_version(pid)
             .map_err(|_| Refusal::new("process_identity_unavailable"))?;
         control.activate_session(
@@ -159,63 +180,86 @@ fn run_diagnostic_session(
             Some(pid_version),
         )?;
 
-        let mut session_stream = accept_before(&listener, Instant::now() + Duration::from_secs(5))?;
-        session_stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|_| Refusal::new("transport_failed"))?;
-        let session_request: SessionActionRequest = read_frame(&mut session_stream)?;
-        let process = ExecutionBindingAuthority::authenticate_fd(&session_stream)?;
-        let response = if session_request.session_id != launch.session_id
-            || session_request.execution_binding_id != launch.execution_binding_id
-        {
-            SessionActionResponse::Refusal {
-                code: "session_binding_mismatch".into(),
+        // Serve the private endpoint until the reviewed child is authenticated.
+        // A wrong same-UID peer is refused and the listener keeps serving, so a
+        // squatting process cannot starve the child or hang the daemon.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _response = loop {
+            let mut session_stream = supervisor.accept_before(deadline)?;
+            session_stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|_| Refusal::new("transport_failed"))?;
+            let process = ExecutionBindingAuthority::authenticate_fd(&session_stream)?;
+            if Some(process.pid) != supervisor.child_id() {
+                let _ = write_frame(
+                    &mut session_stream,
+                    &SessionActionResponse::Refusal {
+                        code: "session_binding_mismatch".into(),
+                    },
+                );
+                continue;
             }
-        } else {
+            let session_request: SessionActionRequest = match read_frame(&mut session_stream) {
+                Ok(request) => request,
+                Err(error) => {
+                    let response = SessionActionResponse::Refusal {
+                        code: error.code.into(),
+                    };
+                    write_frame(&mut session_stream, &response)?;
+                    drop(session_stream);
+                    break response;
+                }
+            };
+            if session_request.session_id != launch.session_id
+                || session_request.execution_binding_id != launch.execution_binding_id
+            {
+                let _ = write_frame(
+                    &mut session_stream,
+                    &SessionActionResponse::Refusal {
+                        code: "session_binding_mismatch".into(),
+                    },
+                );
+                continue;
+            }
             let kernel = AuthorityKernel::new(control.store().clone());
-            match kernel.submit(&launch.session_id, process, session_request.action) {
+            let response = match kernel.submit(&launch.session_id, process, session_request.action)
+            {
                 Ok(action) => SessionActionResponse::Success { action },
-                Err(error) => SessionActionResponse::Refusal {
-                    code: error.code.into(),
-                },
-            }
+                Err(error) => {
+                    if is_durability_failure(error.code) {
+                        quiesced.store(true, Ordering::SeqCst);
+                    }
+                    SessionActionResponse::Refusal {
+                        code: error.code.into(),
+                    }
+                }
+            };
+            write_frame(&mut session_stream, &response)?;
+            drop(session_stream);
+            break response;
         };
-        write_frame(&mut session_stream, &response)?;
-        drop(session_stream);
-        let output = child
-            .take()
-            .ok_or_else(|| Refusal::new("session_launch_failed"))?
-            .wait_with_output()
-            .map_err(|_| Refusal::new("session_launch_failed"))?;
+        let output = supervisor.wait_with_output()?;
         Ok(ControlResponse::SessionComplete {
             exit_code: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     })();
-    if let Some(mut child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     let close_result = control.close_session(&launch.session_id);
-    remove_socket(&endpoint);
-    close_result?;
+    if let Err(error) = close_result {
+        if is_durability_failure(error.code) {
+            quiesced.store(true, Ordering::SeqCst);
+        }
+        return Err(error);
+    }
     result
 }
 
-fn accept_before(listener: &UnixListener, deadline: Instant) -> Result<UnixStream, Refusal> {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => return Ok(stream),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(Refusal::new("session_launch_failed"));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => return Err(Refusal::new("session_endpoint_failed")),
-        }
-    }
+fn is_durability_failure(code: &str) -> bool {
+    matches!(
+        code,
+        "state_unavailable" | "journal_unavailable" | "continuity_unavailable" | "restore_failed"
+    )
 }
 
 fn cli_binary() -> Result<PathBuf, Refusal> {

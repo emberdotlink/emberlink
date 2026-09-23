@@ -131,6 +131,7 @@ pub fn encode_action_permit(
         .digest(&permit.execution_binding_digest)?
         .string(&permit.assurance_profile_id)?
         .digest(&permit.assurance_profile_digest)?
+        .digest(&permit.qualification_coverage_digest)?
         .string(&permit.action_definition_id)?
         .string(&permit.action_definition_version)?
         .digest(&permit.action_definition_digest)?
@@ -167,8 +168,7 @@ pub fn encode_action_permit(
         .string(&permit.consequence_class)?
         .string(&permit.capability)?
         .string(&permit.nonce)?
-        .u64(permit.issuance)
-        .string(&permit.signer_key_id)?;
+        .u64(permit.issuance);
     if include_signature {
         e.string(&permit.signature)?;
     }

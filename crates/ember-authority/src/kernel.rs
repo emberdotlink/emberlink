@@ -8,7 +8,7 @@ use crate::{
     model::{ActionRequest, ActionResponse, OperationStatus, Refusal, SessionState},
     network_enforcement::NetworkEnforcement,
     operation::{OperationSettlement, ReplayDisposition},
-    runner::{DiagnosticRunner, JournalHealth},
+    runner::{JournalHealth, RunnerRegistry},
     runtime_presence::{AuthenticatedProcess, ExecutionBindingAuthority},
 };
 
@@ -50,7 +50,16 @@ impl AuthorityKernel {
         if request.schema != crate::model::ACTION_REQUEST_SCHEMA {
             return Err(Refusal::new("invalid_request"));
         }
+        let submission_id = request.submission_id.as_str();
+        let parsed_submission_id =
+            uuid::Uuid::parse_str(submission_id).map_err(|_| Refusal::new("invalid_request"))?;
+        if submission_id.len() != 36
+            || parsed_submission_id.hyphenated().to_string() != submission_id
+        {
+            return Err(Refusal::new("invalid_request"));
+        }
         request.input.validate()?;
+        let expected_definition_digest = request.required_definition_digest()?;
         let input_bytes =
             serde_jcs::to_vec(&request.input).map_err(|_| Refusal::new("invalid_input"))?;
         let typed_input_digest = sha256(&input_bytes);
@@ -91,7 +100,7 @@ impl AuthorityKernel {
         }
 
         let registry = ActionDefinitionRegistry::restore(&snapshot.registry_bytes)?;
-        let definition = registry.resolve(&request.action_ref, &request.definition_digest, now)?;
+        let definition = registry.resolve(&request.action_ref, expected_definition_digest, now)?;
         let decision = ActionAdmission::admit(
             &session,
             &definition,
@@ -113,6 +122,21 @@ impl AuthorityKernel {
             &custody,
             now,
         )?;
+        let runner = RunnerRegistry::resolve(
+            &permit,
+            &snapshot.authority_fingerprint,
+            snapshot.authority_epoch,
+            &snapshot.installation_id,
+            &snapshot.release_manifest_digest,
+            &session,
+            &request,
+            &definition,
+            &decision,
+            &typed_input_digest,
+            &custody,
+            &snapshot.route,
+            now,
+        )?;
         let operation = OperationSettlement::begin(
             &self.store,
             &permit,
@@ -124,8 +148,28 @@ impl AuthorityKernel {
             now,
         )?;
 
-        match DiagnosticRunner::run(&request.input, journal) {
+        match runner.run(&permit, &request.input, journal) {
             Ok(facts) => {
+                // The bound child must still be the live, reviewed process at
+                // settlement. The runner already ran, so a Session whose child
+                // died or was invalidated settles effect-unknown, never success.
+                let live = self.store.snapshot()?;
+                let current = live
+                    .sessions
+                    .get(session_id)
+                    .cloned()
+                    .ok_or_else(|| Refusal::new("session_binding_mismatch"))?;
+                if ExecutionBindingAuthority::revalidate(&current, authenticated_process).is_err() {
+                    OperationSettlement::settle(
+                        &self.store,
+                        &operation.operation_id,
+                        OperationStatus::EffectUnknown,
+                        None,
+                        Some("effect_unknown"),
+                        now_unix().max(now),
+                    )?;
+                    return Err(Refusal::new("session_binding_mismatch"));
+                }
                 let (operation, receipt) = OperationSettlement::settle(
                     &self.store,
                     &operation.operation_id,

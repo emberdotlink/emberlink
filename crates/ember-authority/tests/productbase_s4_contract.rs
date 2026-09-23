@@ -1,17 +1,19 @@
 mod support;
 
+use core_crypto::Signer as _;
 use ember_authority::{
     action_admission::ActionAdmission,
     action_definition::ActionDefinitionRegistry,
     audit::{decode_canonical, now_unix, sha256},
+    canonical::encode_action_permit,
     control::AuthorityControl,
     device::DeviceCustody,
     identity,
     initialization::ArtifactSource,
-    ipc::{FRAME_LIMIT, read_frame},
+    ipc::{CONTROL_FRAME_LIMIT, FRAME_LIMIT, read_control_frame, read_frame},
     kernel::AuthorityKernel,
     model::{
-        ACTION_REQUEST_SCHEMA, ActionRef, ActionRequest, DEFINITION_DIGEST, DiagnosticFacts,
+        ACTION_REQUEST_SCHEMA, ActionPermit, ActionRef, ActionRequest, DiagnosticFacts,
         DiagnosticInput, OperationStatus, QualificationCoverage,
     },
     network_enforcement::NetworkEnforcement,
@@ -23,7 +25,10 @@ use ember_authority::{
 use serde::{Deserialize, Serialize};
 use std::{io::Cursor, os::unix::net::UnixStream};
 
-use support::{anchor, authority, request as initialization_request};
+use support::{
+    DEFINITION_DIGEST, PUBLISHER_NOT_AFTER, anchor, authority, launch_context,
+    request as initialization_request,
+};
 
 fn active_session(control: &AuthorityControl, challenge: &str) -> (String, AuthenticatedProcess) {
     let (peer, _other) = UnixStream::pair().unwrap();
@@ -31,7 +36,12 @@ fn active_session(control: &AuthorityControl, challenge: &str) -> (String, Authe
         ember_authority::runtime_presence::ExecutionBindingAuthority::authenticate_fd(&peer)
             .unwrap();
     let launch = control
-        .open_diagnostic_session(challenge, process.uid, "test-session.sock".into())
+        .open_diagnostic_session(
+            challenge,
+            process.uid,
+            &launch_context(),
+            "test-session.sock".into(),
+        )
         .unwrap();
     control
         .activate_session(
@@ -44,16 +54,33 @@ fn active_session(control: &AuthorityControl, challenge: &str) -> (String, Authe
     (launch.session_id, process)
 }
 
-fn request(submission_id: &str, challenge: &str) -> ActionRequest {
+fn request(submission_label: &str, challenge: &str) -> ActionRequest {
     ActionRequest {
         schema: ACTION_REQUEST_SCHEMA.into(),
-        submission_id: submission_id.into(),
+        submission_id: deterministic_uuid(submission_label),
         action_ref: ActionRef::diagnostic(),
-        definition_digest: DEFINITION_DIGEST.into(),
+        definition_digest: Some(DEFINITION_DIGEST.into()),
         input: DiagnosticInput {
             challenge: challenge.into(),
         },
     }
+}
+
+fn deterministic_uuid(label: &str) -> String {
+    let digest = ember_authority::audit::sha256(label.as_bytes());
+    uuid::Uuid::from_bytes(
+        hex::decode(&digest["sha256:".len()..]).unwrap()[..16]
+            .try_into()
+            .unwrap(),
+    )
+    .to_string()
+}
+
+fn resign_permit(permit: &mut ActionPermit, custody: &DeviceCustody) {
+    permit.signature.clear();
+    let mut preimage = b"ember/action-permit-signature-input/v1\0".to_vec();
+    preimage.extend_from_slice(&encode_action_permit(permit, false).unwrap());
+    permit.signature = custody.action_permit_signer().unwrap().sign(&preimage).0;
 }
 
 #[test]
@@ -138,10 +165,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
 
     let directory = tempfile::tempdir().unwrap();
     let expired = initialization_request(directory.path(), "initialization");
-    let expired_at = expired
-        .activation_plan
-        .maintenance_window_expiry
-        .saturating_add(1);
+    let expired_at = expired.activation_plan.maintenance_window_expiry;
     assert_eq!(
         AuthorityControl::initialize_at(
             &directory.path().join("authority"),
@@ -153,6 +177,23 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
         .unwrap()
         .code,
         "initialization_invalid"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let mut collision = initialization_request(directory.path(), "initialization");
+    let mut conflicting = collision.records.action_definitions[0].clone();
+    conflicting.signed_bundle.push(' ');
+    collision.records.action_definitions.push(conflicting);
+    assert_eq!(
+        AuthorityControl::initialize_at(
+            &directory.path().join("authority"),
+            collision,
+            &anchor(),
+            now_unix(),
+        )
+        .err()
+        .unwrap()
+        .code,
+        "identity_collision"
     );
 }
 
@@ -204,6 +245,7 @@ fn action_boundary_refuses_missing_binding_definition_need_and_replay_conflict()
             .open_diagnostic_session(
                 "wrong-persona",
                 ember_authority::effective_uid().saturating_add(1),
+                &launch_context(),
                 "wrong-persona.sock".into(),
             )
             .unwrap_err()
@@ -228,6 +270,16 @@ fn action_boundary_refuses_missing_binding_definition_need_and_replay_conflict()
         "session_binding_mismatch"
     );
 
+    let mut missing_digest = request("missing-digest", "allowed");
+    missing_digest.definition_digest = None;
+    assert_eq!(
+        kernel
+            .submit(&session_id, process, missing_digest)
+            .unwrap_err()
+            .code,
+        "definition_digest_required"
+    );
+
     let mut unknown = request("unknown", "allowed");
     unknown.action_ref.action_key = "other".into();
     assert_eq!(
@@ -239,13 +291,27 @@ fn action_boundary_refuses_missing_binding_definition_need_and_replay_conflict()
     );
 
     let mut altered = request("altered", "allowed");
-    altered.definition_digest = format!("sha256:{}", "0".repeat(64));
+    altered.definition_digest = Some(format!("sha256:{}", "0".repeat(64)));
     assert_eq!(
         kernel
             .submit(&session_id, process, altered)
             .unwrap_err()
             .code,
         "definition_digest_mismatch"
+    );
+
+    let snapshot = control.store().snapshot().unwrap();
+    let inactive = ActionDefinitionRegistry::restore(&snapshot.registry_bytes).unwrap();
+    assert_eq!(
+        inactive
+            .resolve(
+                &ActionRef::diagnostic(),
+                DEFINITION_DIGEST,
+                PUBLISHER_NOT_AFTER,
+            )
+            .unwrap_err()
+            .code,
+        "publisher_not_trusted"
     );
 
     assert_eq!(
@@ -273,7 +339,7 @@ fn action_boundary_refuses_missing_binding_definition_need_and_replay_conflict()
         "replay_conflict"
     );
     let mut conflict = request("replay", "different");
-    conflict.definition_digest = DEFINITION_DIGEST.into();
+    conflict.definition_digest = Some(DEFINITION_DIGEST.into());
     assert_eq!(
         kernel
             .submit(&session_id, process, conflict)
@@ -295,7 +361,11 @@ fn expired_authorization_and_duplicate_settlement_fail_closed() {
     let session = snapshot.sessions[&session_id].clone();
     let definition = ActionDefinitionRegistry::restore(&snapshot.registry_bytes)
         .unwrap()
-        .resolve(&request.action_ref, &request.definition_digest, now)
+        .resolve(
+            &request.action_ref,
+            request.required_definition_digest().unwrap(),
+            now,
+        )
         .unwrap();
     let decision = ActionAdmission::admit(
         &session,
@@ -417,7 +487,7 @@ fn protected_tip_rollback_is_refused() {
     std::fs::write(root.join("protected-tip.json"), old_tip).unwrap();
     assert_eq!(
         AuthorityControl::restore(&root).err().unwrap().code,
-        "continuity_unavailable"
+        "state_rollback_detected"
     );
 }
 
@@ -432,7 +502,11 @@ fn running_operation_recovers_to_effect_unknown_receipt() {
     let session = snapshot.sessions[&session_id].clone();
     let definition = ActionDefinitionRegistry::restore(&snapshot.registry_bytes)
         .unwrap()
-        .resolve(&action.action_ref, &action.definition_digest, now)
+        .resolve(
+            &action.action_ref,
+            action.required_definition_digest().unwrap(),
+            now,
+        )
         .unwrap();
     let decision = ActionAdmission::admit(
         &session,
@@ -508,6 +582,141 @@ fn runner_failure_settles_a_failure_receipt() {
         .unwrap();
     ReceiptProjection::verify(control.store(), &failed.receipt_id).unwrap();
 }
+#[test]
+fn signed_permit_rejects_every_changed_authority_axis() {
+    let (_root, control) = authority("permit-axes");
+    let (session_id, _) = active_session(&control, "permit-axes");
+    let now = now_unix();
+    let request = request("permit-axes", "permit-axes");
+    let input_digest = sha256(&serde_jcs::to_vec(&request.input).unwrap());
+    let snapshot = control.store().snapshot().unwrap();
+    let session = snapshot.sessions[&session_id].clone();
+    let definition = ActionDefinitionRegistry::restore(&snapshot.registry_bytes)
+        .unwrap()
+        .resolve(
+            &request.action_ref,
+            request.required_definition_digest().unwrap(),
+            now,
+        )
+        .unwrap();
+    let decision = ActionAdmission::admit(
+        &session,
+        &definition,
+        &request.input,
+        now,
+        &QualificationCoverage::diagnostic(),
+    )
+    .unwrap();
+    let custody = DeviceCustody::restore(&snapshot.devices).unwrap();
+    let permit = NetworkEnforcement::issue_action_permit(
+        &snapshot.authority_fingerprint,
+        snapshot.authority_epoch,
+        &snapshot.installation_id,
+        &snapshot.release_manifest_digest,
+        &session,
+        &request,
+        &definition,
+        &decision,
+        &input_digest,
+        &custody,
+        now,
+    )
+    .unwrap();
+    let mutations: &[fn(&mut ActionPermit)] = &[
+        |value| value.authority_fingerprint = sha256(b"other-authority"),
+        |value| value.authority_epoch += 1,
+        |value| value.installation_id = "other-installation".into(),
+        |value| value.release_manifest_digest = None,
+        |value| value.session_id = "other-session".into(),
+        |value| value.execution_binding_digest = sha256(b"other-binding"),
+        |value| value.assurance_profile_id = "other-profile".into(),
+        |value| value.assurance_profile_digest = sha256(b"other-profile"),
+        |value| value.qualification_coverage_digest = sha256(b"other-coverage"),
+        |value| value.action_definition_id = "other-definition".into(),
+        |value| value.action_definition_version = "altered".into(),
+        |value| value.action_definition_digest = sha256(b"other-definition"),
+        |value| value.canonical_typed_input_digest = sha256(b"other-input"),
+        |value| value.need_item_id_list.clear(),
+        |value| value.grant_use_id_and_ceiling_list.clear(),
+        |value| value.credential_slot = Some("forbidden".into()),
+        |value| value.execution_lane = "proxy".into(),
+        |value| value.target = "other-target".into(),
+        |value| value.protocol = "other-protocol".into(),
+        |value| value.destination = "other-destination".into(),
+        |value| value.operation_class = "other-operation".into(),
+        |value| value.request_count_ceiling += 1,
+        |value| value.byte_budget += 1,
+        |value| value.rate_ceiling += 1,
+        |value| value.remaining_use_ceiling += 1,
+        |value| value.offline_bound = false,
+        |value| value.consequence_class = "other-consequence".into(),
+        |value| value.capability = "other-capability".into(),
+        |value| value.operation_id = None,
+        |value| value.nonce.clear(),
+        |value| value.issuance += 1,
+    ];
+    for (index, mutate) in mutations.iter().enumerate() {
+        let mut altered = permit.clone();
+        mutate(&mut altered);
+        resign_permit(&mut altered, &custody);
+        let result = NetworkEnforcement::verify_action_permit(
+            &altered,
+            &snapshot.authority_fingerprint,
+            snapshot.authority_epoch,
+            &snapshot.installation_id,
+            &snapshot.release_manifest_digest,
+            &session,
+            &request,
+            &definition,
+            &decision,
+            &input_digest,
+            &custody,
+            now,
+        );
+        let expected = if index == 1 {
+            "stale_authority_epoch"
+        } else {
+            "authorization_invalid"
+        };
+        assert_eq!(
+            result.err().map(|error| error.code),
+            Some(expected),
+            "mutation {index} was accepted"
+        );
+    }
+}
+
+#[test]
+fn restore_refuses_owner_committed_altered_receipt_bytes() {
+    let (root, control) = authority("altered-receipt");
+    let receipt_id = control
+        .store()
+        .snapshot()
+        .unwrap()
+        .initialization
+        .receipt_id
+        .unwrap();
+    control
+        .store()
+        .transaction(|state| {
+            state
+                .receipts
+                .get_mut(&receipt_id)
+                .unwrap()
+                .canonical_bytes
+                .push(' ');
+            Ok(())
+        })
+        .unwrap();
+    drop(control);
+    assert_eq!(
+        AuthorityControl::restore(root.path().join("authority").as_path())
+            .err()
+            .unwrap()
+            .code,
+        "receipt_invalid"
+    );
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -545,10 +754,61 @@ fn canonical_and_frame_limits_accept_exact_and_refuse_plus_one() {
             .code,
         "frame_too_large"
     );
+    let mut oversized_control = Vec::new();
+    oversized_control.extend_from_slice(&((CONTROL_FRAME_LIMIT + 1) as u32).to_be_bytes());
+    assert_eq!(
+        read_control_frame::<Pad>(&mut Cursor::new(oversized_control))
+            .unwrap_err()
+            .code,
+        "frame_too_large"
+    );
     assert_eq!(
         decode_canonical::<serde_json::Value>(br#"{"a":1,"a":2}"#, 64, "invalid")
             .unwrap_err()
             .code,
         "invalid"
+    );
+    let too_deep = format!("{}0{}", "[".repeat(33), "]".repeat(33));
+    assert_eq!(
+        decode_canonical::<serde_json::Value>(too_deep.as_bytes(), INPUT_LIMIT, "invalid",)
+            .unwrap_err()
+            .code,
+        "input_too_large"
+    );
+    let too_many_items = format!(
+        "[{}]",
+        std::iter::repeat_n("0", 65_536)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(
+        decode_canonical::<serde_json::Value>(too_many_items.as_bytes(), INPUT_LIMIT, "invalid",)
+            .unwrap_err()
+            .code,
+        "input_too_large"
+    );
+    let too_many_members = format!(
+        "{{{}}}",
+        (0..257)
+            .map(|index| format!("\"k{index}\":0"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(
+        decode_canonical::<serde_json::Value>(too_many_members.as_bytes(), INPUT_LIMIT, "invalid",)
+            .unwrap_err()
+            .code,
+        "input_too_large"
+    );
+    let oversized_body = serde_jcs::to_vec(&serde_json::json!({
+        "body": "x".repeat(INPUT_LIMIT),
+    }))
+    .unwrap();
+    assert!(oversized_body.len() < 2_097_152);
+    assert_eq!(
+        decode_canonical::<serde_json::Value>(&oversized_body, 2_097_152, "invalid")
+            .unwrap_err()
+            .code,
+        "input_too_large"
     );
 }

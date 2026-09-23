@@ -42,11 +42,11 @@ impl ActionAdmission {
             .string(&input.challenge)?
             .string("non_secret")?
             .string("ember.local")?
-            .string("local")?
-            .string("daemon")?
-            .string("read_only_diagnostic")?
+            .string("ember.local")?
+            .string("authority-journal")?
+            .string("diagnostic.read")?
             .u64(1)
-            .u64(4096)
+            .u64(65_536)
             .u64(1);
         Ok(Need {
             need_item_id: sha256(&encoded.finish()),
@@ -54,11 +54,11 @@ impl ActionAdmission {
             target: input.challenge.clone(),
             material_class: "non_secret".into(),
             provider: "ember.local".into(),
-            protocol: "local".into(),
-            destination: "daemon".into(),
-            operation_class: "read_only_diagnostic".into(),
+            protocol: "ember.local".into(),
+            destination: "authority-journal".into(),
+            operation_class: "diagnostic.read".into(),
             request_count: 1,
-            byte_count: 4096,
+            byte_count: 65_536,
             rate: 1,
         })
     }

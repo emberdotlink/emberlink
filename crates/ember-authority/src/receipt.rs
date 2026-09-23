@@ -76,7 +76,11 @@ impl ReceiptProjection {
         Ok(rows)
     }
 
+    /// `show` discloses durable bytes only after the same full verification
+    /// `verify` performs, so altered stored Receipt bytes are refused on both
+    /// read paths.
     pub fn show(store: &DurableStore, receipt_id: &str) -> Result<String, Refusal> {
+        Self::verify(store, receipt_id)?;
         store
             .snapshot()?
             .receipts

@@ -1,7 +1,6 @@
 use core_crypto::Signer as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use ember_authority::{
-    action_definition::{PUBLISHER_ID, PUBLISHER_NOT_AFTER, PUBLISHER_PUBLIC_KEY, SIGNER_KEY_ID},
     audit::{now_unix, sha256},
     control::AuthorityControl,
     device::{DeviceCustody, authority_fingerprint, device_set_digest, signing_key_fingerprint},
@@ -16,14 +15,30 @@ use ember_authority::{
         TrustedProjectAuthorization, digest_encoded, encode_activation_plan, encode_continuity,
         encode_project, encode_release_manifest, encode_root_intent,
     },
-    model::{DEFINITION_DIGEST, signed_bundle_bytes},
+    model::LaunchContext,
 };
 use std::{fs, path::Path};
 use tempfile::TempDir;
 
+pub const PUBLISHER_ID: &str = "publisher:packet-fixture";
+pub const SIGNER_KEY_ID: &str = "publisher:packet-fixture:key-productbase-s4-vector";
+pub const PUBLISHER_PUBLIC_KEY: &str = "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=";
+pub const PUBLISHER_NOT_AFTER: u64 = 4_102_444_800;
+pub const DEFINITION_DIGEST: &str =
+    "sha256:998427af8d0f017dc17eb574796759a0b6173edc9f3cdbc72a93b981e0a224e0";
+const DEFINITION_BYTES: &str = r#"{"action_ref":{"action_key":"authority_status","action_version":"v2","plugin_address":"packet-fixture.local/packet-fixture/diagnostic"},"audit_fields":["action_ref","definition_digest","input.challenge","output.journal_health"],"default_runner_classes":["builtin"],"delivery_lane":"sealed-exec","handler_ref":"builtin.diagnostic.authority-status/v1","idempotency":"idempotent","input_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"}},"required":["challenge"],"type":"object"},"interaction_class":"inline_interactive","material_classes":["non_secret"],"need_template":{"items":[{"material_class":"non_secret","permissions":["authority.status.read"],"provider":"ember.local","required":true}],"schema":"emberlink.need-template/v1"},"output_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"},"journal_health":{"maxLength":5,"minLength":5,"type":"string"}},"required":["challenge","journal_health"],"type":"object"},"provider_adapter":"builtin/non-secret","result_frame_count_ceiling":1,"result_frame_payload_allowlist":[{"payload_schema_identifier":"emberlink.diagnostic-facts","payload_schema_version":"v1","payload_semantics":"diagnostic-facts"}],"risk_tier":"low","runner_adapter":"builtin.diagnostic.authority-status/v1","semantic_labels":["diagnostic"],"summary":"Read local authority journal health","target_template":{"input_path":"input.challenge","kind":"exact","schema":"emberlink.target-template/v1"}}"#;
+
+pub fn signed_bundle_bytes() -> String {
+    format!(
+        r#"{{"bundle":{{"bundle_revision":1,"definitions":[{}],"plugin_address":"packet-fixture.local/packet-fixture/diagnostic","plugin_version":"0.1.0","previous_bundle_digest":null,"published_at":0,"publisher_id":"publisher:packet-fixture","schema":"emberlink.action-definition-bundle/v1"}},"bundle_digest":"sha256:37210f48517ec2aaf7c1a6f3a9063f28de46a6fa7fad70e7f99de9533d592e31","signature":"bGHGGKspupxD2t/mR3ecNSCyLuN/9JjZGh0nBYodhVvfGpeYEqlYmEPhr0d64eo5So+dg1sHgUeJ/usQ+9k7Ag==","signer_key_id":"publisher:packet-fixture:key-productbase-s4-vector"}}"#,
+        DEFINITION_BYTES,
+    )
+}
+
 const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const RELEASE_SEED: [u8; 32] = [7; 32];
 
+#[allow(dead_code)]
 pub fn authority(target: &str) -> (TempDir, AuthorityControl) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("authority");
@@ -33,7 +48,16 @@ pub fn authority(target: &str) -> (TempDir, AuthorityControl) {
         AuthorityControl::initialize_at(&root, request, &anchor, now_unix()).unwrap();
     (directory, control)
 }
+pub fn launch_context() -> LaunchContext {
+    let current = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let current = current.to_str().unwrap().to_owned();
+    LaunchContext {
+        project_root: current.clone(),
+        worktree: current,
+    }
+}
 
+#[allow(dead_code)]
 pub fn request(directory: &Path, target: &str) -> InitializationRequest {
     let bootstrap_path = directory.join("bootstrap.bin");
     let executable_path = directory.join("ember.bin");
@@ -70,9 +94,10 @@ pub fn request_for_runtime(
         digest: sha256(&fs::read(&profile_path).unwrap()),
     };
 
+    let launch_context = launch_context();
     let project = TrustedProjectAuthorization {
-        project_root_digest: sha256(b"productbase-s4-project-root"),
-        worktree_digest: sha256(b"productbase-s4-worktree"),
+        project_root_digest: sha256(launch_context.project_root.as_bytes()),
+        worktree_digest: sha256(launch_context.worktree.as_bytes()),
         profile_artifact_digest: profile_artifact.digest.clone(),
     };
     let project_digest = digest_encoded(&encode_project(&project).unwrap());
@@ -85,9 +110,9 @@ pub fn request_for_runtime(
         permission: "authority.status.read".into(),
         material_class: "non_secret".into(),
         provider: "ember.local".into(),
-        protocol: "local".into(),
-        destination: "daemon".into(),
-        operation_class: "read_only_diagnostic".into(),
+        protocol: "ember.local".into(),
+        destination: "authority-journal".into(),
+        operation_class: "diagnostic.read".into(),
         request_count_ceiling: 1,
         byte_budget: 65_536,
         rate_ceiling: 1,

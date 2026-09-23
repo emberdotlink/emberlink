@@ -1,16 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-use crate::model::{ActionRequest, ActionResponse, ReceiptIndexRow, Refusal};
+use crate::model::{ActionRequest, ActionResponse, LaunchContext, ReceiptIndexRow, Refusal};
 
 pub const FRAME_LIMIT: usize = 16_384;
+pub const CONTROL_FRAME_LIMIT: usize = 65_536;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum ControlRequest {
     Ping,
     OpenDiagnostic {
         challenge: String,
+        context: LaunchContext,
         action: ActionRequest,
     },
     ReceiptList,
@@ -70,8 +73,23 @@ pub enum ReceiptResponse {
 }
 
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(), Refusal> {
+    write_bounded_frame(writer, value, FRAME_LIMIT)
+}
+
+pub fn write_control_frame<T: Serialize>(
+    writer: &mut impl Write,
+    value: &T,
+) -> Result<(), Refusal> {
+    write_bounded_frame(writer, value, CONTROL_FRAME_LIMIT)
+}
+
+fn write_bounded_frame<T: Serialize>(
+    writer: &mut impl Write,
+    value: &T,
+    limit: usize,
+) -> Result<(), Refusal> {
     let bytes = serde_jcs::to_vec(value).map_err(|_| Refusal::new("invalid_frame"))?;
-    if bytes.len() > FRAME_LIMIT {
+    if bytes.len() > limit {
         return Err(Refusal::new("frame_too_large"));
     }
     let length = u32::try_from(bytes.len()).map_err(|_| Refusal::new("frame_too_large"))?;
@@ -84,17 +102,38 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
 pub fn read_frame<T: serde::de::DeserializeOwned + Serialize>(
     reader: &mut impl Read,
 ) -> Result<T, Refusal> {
+    read_bounded_frame(reader, FRAME_LIMIT)
+}
+
+pub fn read_control_frame<T: serde::de::DeserializeOwned + Serialize>(
+    reader: &mut impl Read,
+) -> Result<T, Refusal> {
+    read_bounded_frame(reader, CONTROL_FRAME_LIMIT)
+}
+
+fn read_bounded_frame<T: serde::de::DeserializeOwned + Serialize>(
+    reader: &mut impl Read,
+    limit: usize,
+) -> Result<T, Refusal> {
     let mut prefix = [0_u8; 4];
     reader
         .read_exact(&mut prefix)
         .map_err(|_| Refusal::new("invalid_frame"))?;
     let length = u32::from_be_bytes(prefix) as usize;
-    if length > FRAME_LIMIT {
+    if length > limit {
         return Err(Refusal::new("frame_too_large"));
     }
     let mut bytes = vec![0_u8; length];
     reader
         .read_exact(&mut bytes)
         .map_err(|_| Refusal::new("invalid_frame"))?;
-    crate::audit::decode_canonical(&bytes, FRAME_LIMIT, "invalid_frame")
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(|_| Refusal::new("invalid_frame"))?
+        != 0
+    {
+        return Err(Refusal::new("invalid_frame"));
+    }
+    crate::audit::decode_canonical(&bytes, limit, "invalid_frame")
 }

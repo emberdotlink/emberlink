@@ -2,12 +2,21 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ember_authority::{
     AUTHORITY_STATE_DIRECTORY,
     ipc::{
-        ControlRequest, ControlResponse, SessionActionRequest, SessionActionResponse, read_frame,
-        write_frame,
+        ControlRequest, ControlResponse, SessionActionRequest, SessionActionResponse,
+        read_control_frame, read_frame, write_control_frame, write_frame,
     },
-    model::{ACTION_REQUEST_SCHEMA, ActionRef, ActionRequest, DiagnosticInput},
+    model::{ACTION_REQUEST_SCHEMA, ActionRef, ActionRequest, DiagnosticInput, LaunchContext},
+    runtime_presence::ExecutionBindingAuthority,
 };
-use std::{os::unix::net::UnixStream, path::PathBuf};
+use std::{
+    fs,
+    net::Shutdown,
+    os::unix::{
+        fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
+        net::UnixStream,
+    },
+    path::{Path, PathBuf},
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,7 +33,7 @@ fn dispatch(args: &[String]) -> Result<i32, i32> {
     match args.first().map(String::as_str) {
         Some("session") => session_command(&args[1..]),
         Some("receipt") => receipt_command(&args[1..]),
-        Some("action") => refuse("missing_session"),
+        Some("action") => refuse("session_required"),
         Some("__session-child") => session_child(&args[1..]),
         Some("--help" | "-h") | None => {
             println!("usage: ember <session open|receipt list|show|verify>");
@@ -48,23 +57,42 @@ fn session_command(args: &[String]) -> Result<i32, i32> {
         return refuse("invalid_session_command");
     }
     let challenge = before[3].clone();
-    let mut tail = &args[separator + 1..];
-    if tail.first().map(String::as_str) == Some("ember") {
-        tail = &tail[1..];
+    let tail = &args[separator + 1..];
+    if tail.first().map(String::as_str) != Some("ember") {
+        return Err(report_code("invalid_action_command"));
     }
+    let tail = &tail[1..];
     let action = parse_action(tail)?;
     if action.input.challenge != challenge {
         return refuse("uncovered_need");
     }
-    let root = default_state_dir();
-    let mut stream = UnixStream::connect(root.join("control.sock"))
-        .map_err(|_| report_code("daemon_unavailable"))?;
-    write_frame(
+    let root = default_state_dir()?;
+    let current = fs::canonicalize(
+        std::env::current_dir().map_err(|_| report_code("launch_context_unavailable"))?,
+    )
+    .map_err(|_| report_code("launch_context_unavailable"))?;
+    let current = current
+        .to_str()
+        .ok_or_else(|| report_code("launch_context_unavailable"))?
+        .to_owned();
+    let context = LaunchContext {
+        project_root: current.clone(),
+        worktree: current,
+    };
+    let mut stream = trusted_control_stream(&root)?;
+    write_control_frame(
         &mut stream,
-        &ControlRequest::OpenDiagnostic { challenge, action },
+        &ControlRequest::OpenDiagnostic {
+            challenge,
+            action,
+            context,
+        },
     )
     .map_err(report_refusal)?;
-    match read_frame::<ControlResponse>(&mut stream).map_err(report_refusal)? {
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|_| report_code("transport_failed"))?;
+    match read_control_frame::<ControlResponse>(&mut stream).map_err(report_refusal)? {
         ControlResponse::SessionComplete {
             exit_code,
             stdout,
@@ -81,26 +109,35 @@ fn session_command(args: &[String]) -> Result<i32, i32> {
 }
 
 fn parse_action(args: &[String]) -> Result<ActionRequest, i32> {
-    if args.len() != 8
-        || args[0] != "action"
-        || args[1] != "run"
-        || args[3] != "--definition-digest"
-        || args[5] != "--input"
-    {
-        return Err(report_code("invalid_action_command"));
-    }
+    let (digest, input_index) = match args {
+        [action, run, _, digest_flag, digest, input_flag, _]
+            if action == "action"
+                && run == "run"
+                && digest_flag == "--definition-digest"
+                && input_flag == "--input" =>
+        {
+            (Some(digest.clone()), 6)
+        }
+        [action, run, _, input_flag, _]
+            if action == "action" && run == "run" && input_flag == "--input" =>
+        {
+            (None, 4)
+        }
+        _ => return Err(report_code("invalid_action_command")),
+    };
     let action_ref = ActionRef::parse(&args[2]).map_err(report_refusal)?;
-    let input: DiagnosticInput =
-        serde_json::from_str(&args[6]).map_err(|_| report_code("invalid_input"))?;
+    let input: DiagnosticInput = ember_authority::audit::decode_canonical(
+        args[input_index].as_bytes(),
+        ember_authority::ipc::FRAME_LIMIT,
+        "invalid_input",
+    )
+    .map_err(report_refusal)?;
     input.validate().map_err(report_refusal)?;
-    if args[7] != "--json" {
-        return Err(report_code("invalid_action_command"));
-    }
     Ok(ActionRequest {
         schema: ACTION_REQUEST_SCHEMA.into(),
         submission_id: uuid::Uuid::new_v4().to_string(),
         action_ref,
-        definition_digest: args[4].clone(),
+        definition_digest: digest,
         input,
     })
 }
@@ -122,8 +159,8 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
         "invalid_request",
     )
     .map_err(report_refusal)?;
-    let mut stream =
-        UnixStream::connect(endpoint).map_err(|_| report_code("session_endpoint_failed"))?;
+    let root = default_state_dir()?;
+    let mut stream = trusted_daemon_stream(&root, Path::new(endpoint), "session_endpoint_failed")?;
     write_frame(
         &mut stream,
         &SessionActionRequest {
@@ -133,6 +170,9 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
         },
     )
     .map_err(report_refusal)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|_| report_code("transport_failed"))?;
     match read_frame::<SessionActionResponse>(&mut stream).map_err(report_refusal)? {
         SessionActionResponse::Success { action } => {
             print_json(&action)?;
@@ -143,35 +183,113 @@ fn session_child(args: &[String]) -> Result<i32, i32> {
 }
 
 fn receipt_command(args: &[String]) -> Result<i32, i32> {
+    let root = default_state_dir()?;
+    // Every Receipt read is an authenticated daemon call: the CLI never opens
+    // private authority state (and its Device keys) in-process.
     let request = match args.first().map(String::as_str) {
         Some("list") if args.len() == 2 && args[1] == "--json" => ControlRequest::ReceiptList,
-        Some("show") if args.len() == 3 && args[2] == "--json" => ControlRequest::ReceiptShow {
+        Some("show") if args.len() == 2 => ControlRequest::ReceiptShow {
             receipt_id: args[1].clone(),
         },
-        Some("verify") if args.len() == 3 && args[2] == "--json" => ControlRequest::ReceiptVerify {
+        Some("verify") if args.len() == 2 => ControlRequest::ReceiptVerify {
             receipt_id: args[1].clone(),
         },
         _ => return refuse("invalid_receipt_command"),
     };
-    let root = default_state_dir();
-    let mut stream = UnixStream::connect(root.join("control.sock"))
-        .map_err(|_| report_code("daemon_unavailable"))?;
-    write_frame(&mut stream, &request).map_err(report_refusal)?;
-    match read_frame::<ControlResponse>(&mut stream).map_err(report_refusal)? {
+    let mut stream = trusted_control_stream(&root)?;
+    write_control_frame(&mut stream, &request).map_err(report_refusal)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|_| report_code("transport_failed"))?;
+    match read_control_frame::<ControlResponse>(&mut stream).map_err(report_refusal)? {
         ControlResponse::ReceiptList { receipts } => print_json(&receipts)?,
         ControlResponse::ReceiptShow { canonical_receipt } => println!("{canonical_receipt}"),
-        ControlResponse::ReceiptVerified { receipt_id } => {
-            print_json(&serde_json::json!({"receipt_id": receipt_id, "valid": true}))?
-        }
+        ControlResponse::ReceiptVerified { receipt_id } => println!("verified {receipt_id}"),
         ControlResponse::Refusal { code } => return refuse(&code),
         _ => return refuse("unexpected_daemon_response"),
     }
     Ok(0)
 }
 
-fn default_state_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join(AUTHORITY_STATE_DIRECTORY)
+fn default_state_dir() -> Result<PathBuf, i32> {
+    let home = std::env::var_os("HOME").ok_or_else(|| report_code("state_root_unavailable"))?;
+    let root = PathBuf::from(home).join(AUTHORITY_STATE_DIRECTORY);
+    if !root.is_absolute() {
+        return Err(report_code("state_root_unavailable"));
+    }
+    Ok(root)
+}
+
+fn trusted_control_stream(root: &Path) -> Result<UnixStream, i32> {
+    trusted_daemon_stream(root, &root.join("control.sock"), "daemon_unavailable")
+}
+
+fn trusted_daemon_stream(
+    root: &Path,
+    socket: &Path,
+    unavailable_code: &'static str,
+) -> Result<UnixStream, i32> {
+    let expected_uid = ember_authority::effective_uid();
+    let canonical_root =
+        fs::canonicalize(root).map_err(|_| report_code("state_root_unavailable"))?;
+    let root_metadata =
+        fs::metadata(&canonical_root).map_err(|_| report_code("state_root_unavailable"))?;
+    if root_metadata.uid() != expected_uid || root_metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(report_code("state_root_untrusted"));
+    }
+    let parent = socket
+        .parent()
+        .and_then(|value| fs::canonicalize(value).ok())
+        .ok_or_else(|| report_code("authority_endpoint_untrusted"))?;
+    let sessions = canonical_root.join("sessions");
+    if parent != canonical_root && parent != sessions {
+        return Err(report_code("authority_endpoint_untrusted"));
+    }
+    if parent == sessions {
+        let metadata =
+            fs::metadata(&sessions).map_err(|_| report_code("authority_endpoint_untrusted"))?;
+        if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o777 != 0o700 {
+            return Err(report_code("authority_endpoint_untrusted"));
+        }
+    }
+    let socket = parent.join(
+        socket
+            .file_name()
+            .ok_or_else(|| report_code("authority_endpoint_untrusted"))?,
+    );
+    let metadata = fs::symlink_metadata(&socket).map_err(|_| report_code(unavailable_code))?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(report_code("authority_endpoint_untrusted"));
+    }
+    let stream = UnixStream::connect(&socket).map_err(|_| report_code(unavailable_code))?;
+    let peer = ExecutionBindingAuthority::authenticate_fd(&stream).map_err(report_refusal)?;
+    if peer.uid != expected_uid {
+        return Err(report_code("authority_endpoint_untrusted"));
+    }
+    // Authenticate the serving process itself against the `emberd` artifact
+    // installed beside this reviewed CLI. This does not deserialize authority
+    // state (or its private Device keys) into the client process.
+    let expected_daemon = std::env::current_exe()
+        .map(|path| path.with_file_name("emberd"))
+        .and_then(fs::canonicalize)
+        .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    let observed_daemon =
+        ember_authority::identity::process_executable_path(peer.pid, peer.pid_version)
+            .and_then(fs::canonicalize)
+            .map_err(|_| report_code("authority_endpoint_untrusted"))?;
+    let expected_digest = ember_authority::audit::sha256(
+        &fs::read(&expected_daemon).map_err(|_| report_code("authority_endpoint_untrusted"))?,
+    );
+    let observed_digest = ember_authority::audit::sha256(
+        &fs::read(&observed_daemon).map_err(|_| report_code("authority_endpoint_untrusted"))?,
+    );
+    if observed_daemon != expected_daemon || observed_digest != expected_digest {
+        return Err(report_code("authority_endpoint_untrusted"));
+    }
+    Ok(stream)
 }
 
 fn argument<'a>(args: &'a [String], name: &str) -> Result<&'a str, i32> {

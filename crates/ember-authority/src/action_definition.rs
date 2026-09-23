@@ -1,20 +1,20 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     audit::decode_canonical,
-    model::{ActionRef, DEFINITION_BYTES, DEFINITION_DIGEST, Refusal, signed_bundle_bytes},
+    initialization::{InitialActionDefinitionRecord, PublisherTrustRoot},
+    model::{ActionRef, Refusal},
 };
 
 const DEFINITION_DOMAIN: &[u8] = b"emberlink.action-definition/v1\0";
 const BUNDLE_DOMAIN: &[u8] = b"emberlink.action-definition-bundle/v1\0";
-pub const PUBLISHER_ID: &str = "publisher:packet-fixture";
-pub const SIGNER_KEY_ID: &str = "publisher:packet-fixture:key-productbase-s4-vector";
-pub const PUBLISHER_PUBLIC_KEY: &str = "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=";
-pub const PUBLISHER_NOT_AFTER: u64 = 4_102_444_800;
 const MAX_REGISTRY_BYTES: usize = 1_048_576;
+const MAX_REGISTRY_STATE_BYTES: usize = 2_097_152;
+const DIAGNOSTIC_DEFINITION: &str = r#"{"action_ref":{"action_key":"authority_status","action_version":"v2","plugin_address":"packet-fixture.local/packet-fixture/diagnostic"},"audit_fields":["action_ref","definition_digest","input.challenge","output.journal_health"],"default_runner_classes":["builtin"],"delivery_lane":"sealed-exec","handler_ref":"builtin.diagnostic.authority-status/v1","idempotency":"idempotent","input_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"}},"required":["challenge"],"type":"object"},"interaction_class":"inline_interactive","material_classes":["non_secret"],"need_template":{"items":[{"material_class":"non_secret","permissions":["authority.status.read"],"provider":"ember.local","required":true}],"schema":"emberlink.need-template/v1"},"output_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"},"journal_health":{"maxLength":5,"minLength":5,"type":"string"}},"required":["challenge","journal_health"],"type":"object"},"provider_adapter":"builtin/non-secret","result_frame_count_ceiling":1,"result_frame_payload_allowlist":[{"payload_schema_identifier":"emberlink.diagnostic-facts","payload_schema_version":"v1","payload_semantics":"diagnostic-facts"}],"risk_tier":"low","runner_adapter":"builtin.diagnostic.authority-status/v1","semantic_labels":["diagnostic"],"summary":"Read local authority journal health","target_template":{"input_path":"input.challenge","kind":"exact","schema":"emberlink.target-template/v1"}}"#;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedDefinition {
@@ -23,22 +23,57 @@ pub struct ResolvedDefinition {
     pub definition: Value,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryState {
+    publisher: PublisherTrustRoot,
+    definition_digest: String,
+    signed_bundle: String,
+}
+
 #[derive(Clone)]
 pub struct ActionDefinitionRegistry {
+    publisher: PublisherTrustRoot,
+    definition_digest: String,
     canonical_definition: String,
 }
 
 impl ActionDefinitionRegistry {
-    pub fn initialize(signed_bundle_bytes: &str) -> Result<String, Refusal> {
-        verify_signed_bundle(signed_bundle_bytes)?;
-        Ok(signed_bundle_bytes.to_owned())
+    pub fn initialize(
+        publisher: &PublisherTrustRoot,
+        definition: &InitialActionDefinitionRecord,
+    ) -> Result<String, Refusal> {
+        verify_signed_bundle(
+            &definition.signed_bundle,
+            publisher,
+            &definition.action_definition_digest,
+        )?;
+        serde_jcs::to_string(&RegistryState {
+            publisher: publisher.clone(),
+            definition_digest: definition.action_definition_digest.clone(),
+            signed_bundle: definition.signed_bundle.clone(),
+        })
+        .map_err(|_| Refusal::new("invalid_bundle"))
     }
 
     pub fn restore(opaque_owner_bytes: &str) -> Result<Self, Refusal> {
-        verify_signed_bundle(opaque_owner_bytes)
+        let state: RegistryState = decode_canonical(
+            opaque_owner_bytes.as_bytes(),
+            MAX_REGISTRY_STATE_BYTES,
+            "registry_restore_failed",
+        )?;
+        let definition = verify_signed_bundle(
+            &state.signed_bundle,
+            &state.publisher,
+            &state.definition_digest,
+        )
+        .map_err(|_| Refusal::new("registry_restore_failed"))?;
+        let canonical_definition = serde_jcs::to_string(&definition)
             .map_err(|_| Refusal::new("registry_restore_failed"))?;
         Ok(Self {
-            canonical_definition: DEFINITION_BYTES.to_owned(),
+            publisher: state.publisher,
+            definition_digest: state.definition_digest,
+            canonical_definition,
         })
     }
 
@@ -48,16 +83,16 @@ impl ActionDefinitionRegistry {
         expected_digest: &str,
         now: u64,
     ) -> Result<ResolvedDefinition, Refusal> {
-        if action_ref != &ActionRef::diagnostic() {
-            return Err(Refusal::new("unknown_definition"));
-        }
         if expected_digest.is_empty() {
             return Err(Refusal::new("definition_digest_required"));
         }
-        if expected_digest != DEFINITION_DIGEST {
+        if expected_digest != self.definition_digest {
             return Err(Refusal::new("definition_digest_mismatch"));
         }
-        if now >= PUBLISHER_NOT_AFTER {
+        // This tranche has no registry mutation path. Rollback of the
+        // containing registry bytes is enforced by DurableStore's
+        // protected-tip high-water record.
+        if now >= self.publisher.not_after {
             return Err(Refusal::new("publisher_not_trusted"));
         }
         let definition: Value = decode_canonical(
@@ -66,6 +101,11 @@ impl ActionDefinitionRegistry {
             "invalid_definition",
         )?;
         validate_closed_definition(&definition)?;
+        let stored_ref: ActionRef = serde_json::from_value(definition["action_ref"].clone())
+            .map_err(|_| Refusal::new("invalid_definition"))?;
+        if action_ref != &stored_ref {
+            return Err(Refusal::new("unknown_definition"));
+        }
         Ok(ResolvedDefinition {
             action_ref: action_ref.clone(),
             digest: expected_digest.to_owned(),
@@ -74,11 +114,11 @@ impl ActionDefinitionRegistry {
     }
 }
 
-pub fn verify_fixture_vector() -> Result<(), Refusal> {
-    verify_signed_bundle(&signed_bundle_bytes())
-}
-
-fn verify_signed_bundle(bytes: &str) -> Result<(), Refusal> {
+fn verify_signed_bundle(
+    bytes: &str,
+    publisher: &PublisherTrustRoot,
+    expected_definition_digest: &str,
+) -> Result<Value, Refusal> {
     let envelope: Value = decode_canonical(bytes.as_bytes(), MAX_REGISTRY_BYTES, "invalid_bundle")?;
     let envelope_object = envelope
         .as_object()
@@ -91,7 +131,7 @@ fn verify_signed_bundle(bytes: &str) -> Result<(), Refusal> {
     {
         return Err(Refusal::new("invalid_bundle"));
     }
-    if envelope["signer_key_id"] != SIGNER_KEY_ID {
+    if envelope["signer_key_id"] != publisher.signer_key_id {
         return Err(Refusal::new("publisher_not_trusted"));
     }
     let bundle = &envelope["bundle"];
@@ -113,15 +153,15 @@ fn verify_signed_bundle(bytes: &str) -> Result<(), Refusal> {
             .iter()
             .any(|key| !bundle_object.contains_key(*key))
         || bundle["schema"] != "emberlink.action-definition-bundle/v1"
-        || bundle["publisher_id"] != PUBLISHER_ID
-        || bundle["plugin_address"] != "packet-fixture.local/packet-fixture/diagnostic"
-        || bundle["plugin_version"] != "0.1.0"
+        || bundle["publisher_id"] != publisher.publisher_id
         || bundle["bundle_revision"] != 1
         || !bundle["previous_bundle_digest"].is_null()
-        || bundle["published_at"] != 0
     {
         return Err(Refusal::new("invalid_bundle"));
     }
+    let plugin_address = bundle["plugin_address"]
+        .as_str()
+        .ok_or_else(|| Refusal::new("invalid_bundle"))?;
     let definitions = bundle["definitions"]
         .as_array()
         .ok_or_else(|| Refusal::new("invalid_bundle"))?;
@@ -131,18 +171,18 @@ fn verify_signed_bundle(bytes: &str) -> Result<(), Refusal> {
     validate_closed_definition(&definitions[0])?;
     let wrapper = json!({
         "schema": "emberlink.action-definition/v1",
-        "publisher_id": PUBLISHER_ID,
-        "plugin_address": "packet-fixture.local/packet-fixture/diagnostic",
+        "publisher_id": publisher.publisher_id,
+        "plugin_address": plugin_address,
         "definition": &definitions[0],
     });
     let canonical_wrapper =
         serde_jcs::to_vec(&wrapper).map_err(|_| Refusal::new("invalid_definition"))?;
-    if domain_digest(DEFINITION_DOMAIN, &canonical_wrapper) != DEFINITION_DIGEST {
+    if domain_digest(DEFINITION_DOMAIN, &canonical_wrapper) != expected_definition_digest {
         return Err(Refusal::new("definition_digest_mismatch"));
     }
     let canonical_bundle = serde_jcs::to_vec(bundle).map_err(|_| Refusal::new("invalid_bundle"))?;
     let mut preimage = BUNDLE_DOMAIN.to_vec();
-    preimage.extend_from_slice(SIGNER_KEY_ID.as_bytes());
+    preimage.extend_from_slice(publisher.signer_key_id.as_bytes());
     preimage.push(0);
     preimage.extend_from_slice(&canonical_bundle);
     let bundle_digest = format!("sha256:{}", hex::encode(Sha256::digest(&preimage)));
@@ -150,7 +190,7 @@ fn verify_signed_bundle(bytes: &str) -> Result<(), Refusal> {
         return Err(Refusal::new("bundle_digest_mismatch"));
     }
     let public: [u8; 32] = STANDARD
-        .decode(PUBLISHER_PUBLIC_KEY)
+        .decode(&publisher.public_key)
         .map_err(|_| Refusal::new("invalid_signature"))?
         .try_into()
         .map_err(|_| Refusal::new("invalid_signature"))?;
@@ -166,7 +206,7 @@ fn verify_signed_bundle(bytes: &str) -> Result<(), Refusal> {
         .map_err(|_| Refusal::new("invalid_signature"))?
         .verify(&preimage, &Signature::from_bytes(&signature))
         .map_err(|_| Refusal::new("invalid_signature"))?;
-    Ok(())
+    Ok(definitions[0].clone())
 }
 
 fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
@@ -177,52 +217,8 @@ fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
 }
 
 fn validate_closed_definition(value: &Value) -> Result<(), Refusal> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| Refusal::new("invalid_definition"))?;
-    let required = [
-        "action_ref",
-        "audit_fields",
-        "default_runner_classes",
-        "delivery_lane",
-        "handler_ref",
-        "idempotency",
-        "input_schema",
-        "interaction_class",
-        "material_classes",
-        "need_template",
-        "output_schema",
-        "provider_adapter",
-        "result_frame_count_ceiling",
-        "result_frame_payload_allowlist",
-        "risk_tier",
-        "runner_adapter",
-        "semantic_labels",
-        "summary",
-        "target_template",
-    ];
-    if object.len() != required.len() || required.iter().any(|key| !object.contains_key(*key)) {
-        return Err(Refusal::new("invalid_definition"));
-    }
-    if value["action_ref"] != serde_json::to_value(ActionRef::diagnostic()).unwrap()
-        || value["delivery_lane"] != "sealed-exec"
-        || value["result_frame_count_ceiling"] != 1
-        || value["runner_adapter"] != "builtin.diagnostic.authority-status/v1"
-        || value["handler_ref"] != "builtin.diagnostic.authority-status/v1"
-    {
-        return Err(Refusal::new("invalid_definition"));
-    }
-    let allowlist = value["result_frame_payload_allowlist"]
-        .as_array()
-        .ok_or_else(|| Refusal::new("invalid_definition"))?;
-    if allowlist.len() != 1
-        || allowlist[0]
-            != json!({
-                "payload_schema_identifier": "emberlink.diagnostic-facts",
-                "payload_schema_version": "v1",
-                "payload_semantics": "diagnostic-facts",
-            })
-    {
+    let canonical = serde_jcs::to_string(value).map_err(|_| Refusal::new("invalid_definition"))?;
+    if canonical != DIAGNOSTIC_DEFINITION {
         return Err(Refusal::new("invalid_definition"));
     }
     Ok(())

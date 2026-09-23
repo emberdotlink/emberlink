@@ -17,6 +17,7 @@ use crate::{
         SessionRecord, SessionState,
     },
     operation::OperationSettlement,
+    receipt::ReceiptProjection,
 };
 
 const MAX_ACTIVE_SESSIONS: usize = 256;
@@ -73,6 +74,7 @@ impl AuthorityControl {
             authority_epoch: 1,
             installation_id: uuid::Uuid::new_v4().to_string(),
             release_manifest_digest: validated.release_manifest_digest.clone(),
+            daemon_executable_digest: validated.daemon_executable_digest.clone(),
             operator_uid: validated.operator_uid,
             initialized_at: now,
             registry_bytes: validated.registry_bytes,
@@ -137,6 +139,7 @@ impl AuthorityControl {
     pub fn restore(root: &Path) -> Result<Self, Refusal> {
         let store = Arc::new(DurableStore::restore(root)?);
         verify_continuity(root, &store)?;
+        verify_stored_receipts(&store)?;
         OperationSettlement::recover_running(&store)?;
         Ok(Self { store })
     }
@@ -144,6 +147,7 @@ impl AuthorityControl {
     pub fn restore_read_only(root: &Path) -> Result<Self, Refusal> {
         let store = Arc::new(DurableStore::restore(root)?);
         verify_continuity(root, &store)?;
+        verify_stored_receipts(&store)?;
         Ok(Self { store })
     }
 
@@ -155,6 +159,7 @@ impl AuthorityControl {
         &self,
         challenge: &str,
         expected_uid: u32,
+        context: &crate::model::LaunchContext,
         endpoint: String,
     ) -> Result<SessionLaunch, Refusal> {
         crate::model::DiagnosticInput {
@@ -162,11 +167,38 @@ impl AuthorityControl {
         }
         .validate()?;
         self.store.transaction(|state| {
+            let expected_persona = format!("persona:operator:{expected_uid}");
+            let project_digest = sha256(context.project_root.as_bytes());
+            let worktree_digest = sha256(context.worktree.as_bytes());
             if state.operator_uid != expected_uid
                 || state.caller_eligibility.operator_uid != expected_uid
-                || now_unix() >= state.caller_eligibility.maintenance_window_expiry
+                || state.caller_eligibility.persona_id != expected_persona
+                || state.qualification_grant.persona_id != expected_persona
             {
                 return Err(Refusal::new("persona_mismatch"));
+            }
+            if state.caller_eligibility.principal_id != state.qualification_grant.principal_id
+                || state.caller_eligibility.persona_id != state.qualification_grant.persona_id
+                || state.caller_eligibility.profile_artifact_digest
+                    != state.harness_profile_authorization.artifact_digest
+                || state.caller_eligibility.executable_digest
+                    != state.harness_profile_authorization.executable_digest
+                || state.caller_eligibility.trusted_project_digest
+                    != crate::initialization::digest_encoded(
+                        &crate::initialization::encode_project(&state.trusted_project)?,
+                    )
+                || state.trusted_project.project_root_digest != project_digest
+                || state.trusted_project.worktree_digest != worktree_digest
+                || state.trusted_project.profile_artifact_digest
+                    != state.harness_profile_authorization.artifact_digest
+                || state.route.action_definition_digest
+                    != state.qualification_grant.action_definition_digest
+                || state.route.runner_class != "builtin"
+                || state.route.delivery_lane != "sealed-exec"
+                || state.qualification_grant.operation_class != "diagnostic.read"
+                || now_unix() >= state.caller_eligibility.maintenance_window_expiry
+            {
+                return Err(Refusal::new("launch_not_authorized"));
             }
             let active_count = state
                 .sessions
@@ -266,6 +298,14 @@ impl AuthorityControl {
     pub fn store(&self) -> &Arc<DurableStore> {
         &self.store
     }
+}
+
+fn verify_stored_receipts(store: &DurableStore) -> Result<(), Refusal> {
+    let receipt_ids = store.snapshot()?.receipts.into_keys().collect::<Vec<_>>();
+    for receipt_id in receipt_ids {
+        ReceiptProjection::verify(store, &receipt_id)?;
+    }
+    Ok(())
 }
 
 fn continuity_path(root: &Path) -> Result<PathBuf, Refusal> {

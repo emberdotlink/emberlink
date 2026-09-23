@@ -87,8 +87,43 @@ impl PurposeSigner {
     }
 }
 
+/// Payload domains each purpose key is allowed to sign. A purpose key asked to
+/// sign any other payload returns an unusable signature, so misuse fails closed
+/// at verification instead of producing a valid cross-purpose signature.
+fn label_prefix(label: &str) -> Vec<u8> {
+    let mut bytes = (label.len() as u64).to_be_bytes().to_vec();
+    bytes.extend_from_slice(label.as_bytes());
+    bytes
+}
+
+fn contains(payload: &[u8], needle: &[u8]) -> bool {
+    payload.windows(needle.len()).any(|window| window == needle)
+}
+
+fn is_receipt_envelope(payload: &[u8]) -> bool {
+    payload.first() == Some(&b'{')
+        && contains(payload, b"\"receipt_id\"")
+        && contains(payload, b"\"termination_authority\"")
+}
+
+fn purpose_allows(purpose: &str, payload: &[u8]) -> bool {
+    let possession = label_prefix("ember/initial-device-possession/v1");
+    if payload.starts_with(&possession) {
+        return true;
+    }
+    match purpose {
+        PURPOSE_ROOT => payload.starts_with(&label_prefix("ember/root-initialization-intent/v1")),
+        PURPOSE_ACTION_PERMIT => payload.starts_with(b"ember/action-permit-signature-input/v1\0"),
+        PURPOSE_RECEIPT => is_receipt_envelope(payload),
+        _ => false,
+    }
+}
+
 impl Signer for PurposeSigner {
     fn sign(&self, payload: &[u8]) -> Signature {
+        if !purpose_allows(self.purpose, payload) {
+            return Signature(String::new());
+        }
         let signature = self.signing_key.sign(payload);
         Signature(format!("ed25519sig:{}", hex::encode(signature.to_bytes())))
     }
@@ -139,6 +174,13 @@ impl DeviceCustody {
             }
             PurposeSigner::from_material(purpose, device)?;
         }
+        let mut raw_keys = state
+            .devices()
+            .into_iter()
+            .map(|(_, device)| canonical_public_key(&device.public_key))
+            .collect::<Result<Vec<_>, _>>()?;
+        raw_keys.sort();
+        raw_keys.dedup();
         let mut fingerprints = state
             .devices()
             .into_iter()
@@ -146,7 +188,9 @@ impl DeviceCustody {
             .collect::<Result<Vec<_>, _>>()?;
         fingerprints.sort();
         fingerprints.dedup();
-        if fingerprints.len() != 4 {
+        // Distinct purposes must also be distinct key material: the fingerprint
+        // mixes in the purpose label, so identical keys would otherwise pass.
+        if fingerprints.len() != 4 || raw_keys.len() != 4 {
             return Err(Refusal::new("device_fingerprint_collision"));
         }
         Ok(Self {

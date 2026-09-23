@@ -1,7 +1,5 @@
 //! Native macOS observation for a caller-reported process instance.
 
-#![allow(unsafe_code)]
-
 use std::{
     ffi::OsStr,
     io,

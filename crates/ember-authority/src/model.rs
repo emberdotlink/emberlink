@@ -4,15 +4,6 @@ use std::{collections::BTreeMap, fmt};
 pub const ACTION_REQUEST_SCHEMA: &str = "ember.action-request/v1";
 pub const ACTION_REF_TEXT: &str =
     "packet-fixture.local/packet-fixture/diagnostic:authority_status:v2";
-pub const DEFINITION_DIGEST: &str =
-    "sha256:998427af8d0f017dc17eb574796759a0b6173edc9f3cdbc72a93b981e0a224e0";
-pub const DEFINITION_BYTES: &str = r#"{"action_ref":{"action_key":"authority_status","action_version":"v2","plugin_address":"packet-fixture.local/packet-fixture/diagnostic"},"audit_fields":["action_ref","definition_digest","input.challenge","output.journal_health"],"default_runner_classes":["builtin"],"delivery_lane":"sealed-exec","handler_ref":"builtin.diagnostic.authority-status/v1","idempotency":"idempotent","input_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"}},"required":["challenge"],"type":"object"},"interaction_class":"inline_interactive","material_classes":["non_secret"],"need_template":{"items":[{"material_class":"non_secret","permissions":["authority.status.read"],"provider":"ember.local","required":true}],"schema":"emberlink.need-template/v1"},"output_schema":{"additionalProperties":false,"properties":{"challenge":{"maxLength":64,"minLength":1,"type":"string"},"journal_health":{"maxLength":5,"minLength":5,"type":"string"}},"required":["challenge","journal_health"],"type":"object"},"provider_adapter":"builtin/non-secret","result_frame_count_ceiling":1,"result_frame_payload_allowlist":[{"payload_schema_identifier":"emberlink.diagnostic-facts","payload_schema_version":"v1","payload_semantics":"diagnostic-facts"}],"risk_tier":"low","runner_adapter":"builtin.diagnostic.authority-status/v1","semantic_labels":["diagnostic"],"summary":"Read local authority journal health","target_template":{"input_path":"input.challenge","kind":"exact","schema":"emberlink.target-template/v1"}}"#;
-pub fn signed_bundle_bytes() -> String {
-    format!(
-        r#"{{"bundle":{{"bundle_revision":1,"definitions":[{}],"plugin_address":"packet-fixture.local/packet-fixture/diagnostic","plugin_version":"0.1.0","previous_bundle_digest":null,"published_at":0,"publisher_id":"publisher:packet-fixture","schema":"emberlink.action-definition-bundle/v1"}},"bundle_digest":"sha256:37210f48517ec2aaf7c1a6f3a9063f28de46a6fa7fad70e7f99de9533d592e31","signature":"bGHGGKspupxD2t/mR3ecNSCyLuN/9JjZGh0nBYodhVvfGpeYEqlYmEPhr0d64eo5So+dg1sHgUeJ/usQ+9k7Ag==","signer_key_id":"publisher:packet-fixture:key-productbase-s4-vector"}}"#,
-        DEFINITION_BYTES,
-    )
-}
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionRef {
@@ -212,12 +203,29 @@ pub enum SessionState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct LaunchContext {
+    pub project_root: String,
+    pub worktree: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionRequest {
     pub schema: String,
     pub submission_id: String,
     pub action_ref: ActionRef,
-    pub definition_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_digest: Option<String>,
     pub input: DiagnosticInput,
+}
+
+impl ActionRequest {
+    pub fn required_definition_digest(&self) -> Result<&str, Refusal> {
+        self.definition_digest
+            .as_deref()
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| Refusal::new("definition_digest_required"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -235,6 +243,7 @@ pub struct ActionPermit {
     pub execution_binding_digest: String,
     pub assurance_profile_id: String,
     pub assurance_profile_digest: String,
+    pub qualification_coverage_digest: String,
     pub action_definition_id: String,
     pub action_definition_version: String,
     pub action_definition_digest: String,
@@ -378,6 +387,10 @@ pub struct PersistentAuthorityState {
     pub authority_epoch: u64,
     pub installation_id: String,
     pub release_manifest_digest: String,
+    /// Digest of the reviewed `emberd` bootstrap artifact. Clients authenticate
+    /// the control endpoint's serving process against this value, so a
+    /// same-UID impostor socket cannot masquerade as the installed authority.
+    pub daemon_executable_digest: String,
     pub operator_uid: u32,
     pub initialized_at: u64,
     pub registry_bytes: String,
