@@ -133,7 +133,7 @@ fn handle_control(
     match request {
         ControlRequest::Ping => Ok(ControlResponse::Pong),
         ControlRequest::Status => Ok(ControlResponse::Status {
-            status: AuthorityControl::read_status(&state)?,
+            status: Box::new(AuthorityControl::read_status(&state)?),
         }),
         ControlRequest::OpenDiagnostic {
             challenge,
@@ -154,7 +154,7 @@ fn handle_control(
             ReceiptProjection::verify(control.store(), &receipt_id)?;
             Ok(ControlResponse::ReceiptVerified {
                 receipt_id,
-                classification: state.classification.clone(),
+                classification: Box::new(state.classification.clone()),
                 initialization_evidence: state.initialization.evidence.clone(),
             })
         }

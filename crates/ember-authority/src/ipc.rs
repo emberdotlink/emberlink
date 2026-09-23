@@ -31,7 +31,7 @@ pub enum ControlRequest {
 pub enum ControlResponse {
     Pong,
     Status {
-        status: crate::control::AuthorityStatus,
+        status: Box<crate::control::AuthorityStatus>,
     },
     SessionComplete {
         exit_code: i32,
@@ -46,7 +46,7 @@ pub enum ControlResponse {
     },
     ReceiptVerified {
         receipt_id: String,
-        classification: crate::model::ProductClassification,
+        classification: Box<crate::model::ProductClassification>,
         initialization_evidence: crate::model::InitializationEvidence,
     },
     Refusal {
