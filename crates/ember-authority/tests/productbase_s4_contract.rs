@@ -4,11 +4,11 @@ use core_crypto::Signer as _;
 use ember_authority::{
     action_admission::ActionAdmission,
     action_definition::ActionDefinitionRegistry,
-    audit::{decode_canonical, now_unix, sha256},
+    audit::{classification_digest, decode_canonical, now_unix, sha256},
     canonical::encode_action_permit,
     control::AuthorityControl,
     device::DeviceCustody,
-    diagnostic_bootstrap::build_request,
+    diagnostic_bootstrap::{build_request, validate_new_state_root},
     identity,
     initialization::{ArtifactSource, RootContinuityRecord},
     ipc::{CONTROL_FRAME_LIMIT, FRAME_LIMIT, read_control_frame, read_frame},
@@ -24,7 +24,10 @@ use ember_authority::{
     runtime_presence::AuthenticatedProcess,
 };
 use serde::{Deserialize, Serialize};
-use std::{io::Cursor, os::unix::net::UnixStream};
+use std::{
+    io::Cursor,
+    os::unix::{fs::PermissionsExt as _, net::UnixStream},
+};
 use tempfile::TempDir;
 
 use support::{
@@ -199,7 +202,7 @@ fn signed_initialization_vector_commits_once_and_rejects_untrusted_inputs() {
     );
 }
 #[test]
-fn failed_initialization_leaves_no_restorable_partial_authority() {
+fn failed_initialization_leaves_a_fail_closed_partial_authority() {
     let directory = tempfile::tempdir().unwrap();
     let oversized_name = "a".repeat(240);
     let malformed_root = directory.path().join(&oversized_name);
@@ -207,7 +210,7 @@ fn failed_initialization_leaves_no_restorable_partial_authority() {
     assert!(
         AuthorityControl::initialize_at(&malformed_root, request, &anchor(), now_unix()).is_err()
     );
-    assert!(!malformed_root.exists());
+    assert!(malformed_root.is_dir());
     assert!(
         !directory
             .path()
@@ -215,11 +218,52 @@ fn failed_initialization_leaves_no_restorable_partial_authority() {
             .exists()
     );
     assert!(AuthorityControl::restore(&malformed_root).is_err());
+    let retry = initialization_request(directory.path(), "atomic-initialization-retry");
+    assert_eq!(
+        AuthorityControl::initialize_at(&malformed_root, retry, &anchor(), now_unix())
+            .err()
+            .unwrap()
+            .code,
+        "already_initialized"
+    );
 
-    let retry_root = directory.path().join("authority");
-    let request = initialization_request(directory.path(), "atomic-initialization-retry");
-    AuthorityControl::initialize_at(&retry_root, request, &anchor(), now_unix()).unwrap();
-    AuthorityControl::restore(&retry_root).unwrap();
+    std::fs::remove_dir_all(&malformed_root).unwrap();
+    let replacement_root = directory.path().join("authority");
+    let replacement = initialization_request(directory.path(), "atomic-initialization-replacement");
+    AuthorityControl::initialize_at(&replacement_root, replacement, &anchor(), now_unix()).unwrap();
+    AuthorityControl::restore(&replacement_root).unwrap();
+}
+
+#[test]
+fn development_root_validation_refuses_aliases_permissions_and_existing_continuity() {
+    let parent = tempfile::Builder::new()
+        .prefix("pb-r2-root")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("authority");
+    validate_new_state_root(&root).unwrap();
+
+    let target = parent.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &root).unwrap();
+    assert!(validate_new_state_root(&root).is_err());
+    std::fs::remove_file(&root).unwrap();
+
+    let staged = parent.path().join("authority.continuity.next.json");
+    std::fs::write(&staged, b"unexpected").unwrap();
+    assert_eq!(
+        validate_new_state_root(&root).unwrap_err().code,
+        "already_initialized"
+    );
+    assert_eq!(std::fs::read(&staged).unwrap(), b"unexpected");
+    std::fs::remove_file(&staged).unwrap();
+
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        validate_new_state_root(&root).unwrap_err().code,
+        "state_root_untrusted"
+    );
 }
 
 #[test]
@@ -1034,6 +1078,7 @@ fn development_authority(label: &str) -> (TempDir, std::path::PathBuf, Authority
         .prefix(label)
         .tempdir_in("/private/tmp")
         .unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = directory.path().join("authority");
     let executable = std::env::current_exe().unwrap();
     let request = build_request(directory.path(), &executable, &executable, now_unix()).unwrap();
@@ -1088,4 +1133,22 @@ fn mutated_persisted_development_records_refuse_restore() {
         };
         assert_eq!(error.code, expected, "{label}");
     }
+}
+
+#[test]
+fn development_initialization_receipt_commits_classification_fact() {
+    let (_directory, _root, control) = development_authority("dev-classification-fact");
+    let state = control.store().snapshot().unwrap();
+    let receipt_id = state.initialization.receipt_id.as_ref().unwrap();
+    let expected = classification_digest(&state.classification)
+        .unwrap()
+        .strip_prefix("sha256:")
+        .unwrap()
+        .to_owned();
+    assert!(
+        state.receipts[receipt_id]
+            .fact_digests
+            .iter()
+            .any(|digest| digest == &expected)
+    );
 }

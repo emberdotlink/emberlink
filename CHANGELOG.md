@@ -4,6 +4,8 @@ All notable public changes to this project are recorded here.
 
 ## [Unreleased]
 
+- Added `ember init diagnostic` for explicit, clean local disposable ProductBase qualification roots, with authenticated daemon startup, durable initialization Receipts, exact non-production classification, restart verification, and fail-closed state and artifact checks. This path forbids Credentials, tokens, and production use.
+
 ## [0.3.0]
 
 See the annotated `v0.3.0` release tag for this milestone.

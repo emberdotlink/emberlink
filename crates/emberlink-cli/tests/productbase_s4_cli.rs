@@ -57,6 +57,22 @@ fn ember(cli: &Path, state_root: &Path, args: &[&str]) -> (i32, String, String) 
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
+fn expected_classification() -> serde_json::Value {
+    serde_json::json!({
+        "qualification_mode": "non-secret-diagnostic",
+        "qualification_state": "provisional",
+        "deployment_class": "disposable-qualification",
+        "production_classification": "non-production",
+        "release_provenance": "absent",
+        "credential_use": "forbidden",
+        "credential_scope": "none",
+        "federation": "not-applicable",
+    })
+}
+
+fn assert_exact_classification(value: &serde_json::Value) {
+    assert_eq!(value, &expected_classification());
+}
 
 #[test]
 fn session_action_and_post_session_receipt_use_real_binaries() {
@@ -91,14 +107,11 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let initialized: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(initialized["state"], "initialized");
-    assert_eq!(
-        initialized["classification"]["production_classification"],
-        "non-production"
-    );
-    assert_eq!(
-        initialized["classification"]["deployment_class"],
-        "disposable-qualification"
-    );
+    assert_exact_classification(&initialized["classification"]);
+    let initialization_receipt_id = initialized["receipt"]["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(initialized["evidence"]["kind"], "development");
     assert!(
         initialized["evidence"]["development_manifest_digest"]
@@ -141,16 +154,15 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     assert_eq!(code, 0, "{stderr}");
     let status: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(status["state"], "ready");
-    assert_eq!(
-        status["classification"]["production_classification"],
-        "non-production"
-    );
+    assert_exact_classification(&status["classification"]);
     assert_eq!(status["initialization"]["evidence"]["kind"], "development");
 
     let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["receipt", "list", "--json"]);
     assert_eq!(code, 0, "{stderr}");
     let initial_receipts: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(initial_receipts.as_array().unwrap().len(), 1);
+    assert_eq!(initial_receipts[0]["receipt_id"], initialization_receipt_id);
+    assert_exact_classification(&initial_receipts[0]["classification"]);
 
     let (code, _, stderr) = ember(
         &cli_binary,
@@ -196,16 +208,13 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     assert_eq!(result["status"], "success");
     assert_eq!(result["facts"]["challenge"], "pb-r2-ok");
     assert_eq!(result["facts"]["journal_health"], "ready");
-    assert_eq!(
-        result["classification"]["production_classification"],
-        "non-production"
-    );
+    assert_exact_classification(&result["classification"]);
     assert_eq!(result["initialization_evidence"]["kind"], "development");
     let receipt_id = result["receipt_id"].as_str().unwrap().to_owned();
 
     drop(daemon);
     std::fs::remove_file(state_root.join("control.sock")).unwrap();
-    let _restarted = Daemon(
+    let restarted = Daemon(
         Command::new(&daemon_binary)
             .args(["--state-dir", state_root.to_str().unwrap()])
             .spawn()
@@ -217,10 +226,7 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     let receipts: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(receipts.as_array().unwrap().len(), 2);
     assert!(stdout.contains(&receipt_id), "{stdout}");
-    assert_eq!(
-        receipts[0]["classification"]["production_classification"],
-        "non-production"
-    );
+    assert_exact_classification(&receipts[0]["classification"]);
     let (code, stdout, stderr) = ember(
         &cli_binary,
         &state_root,
@@ -230,19 +236,106 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
     let verified: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(verified["state"], "verified");
     assert_eq!(verified["receipt_id"], receipt_id);
-    assert_eq!(
-        verified["classification"]["production_classification"],
-        "non-production"
-    );
+    assert_exact_classification(&verified["classification"]);
     let (code, stdout, stderr) = ember(&cli_binary, &state_root, &["receipt", "show", &receipt_id]);
     assert_eq!(code, 0, "{stderr}");
     let shown: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(
-        shown["body"]["classification"]["production_classification"],
-        "non-production"
-    );
+    assert_exact_classification(&shown["body"]["classification"]);
     assert_eq!(
         shown["body"]["initialization_evidence"]["kind"],
         "development"
     );
+    let (code, stdout, stderr) = ember(
+        &cli_binary,
+        &state_root,
+        &["receipt", "verify", &initialization_receipt_id],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let verified_initialization: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(verified_initialization["state"], "verified");
+    assert_exact_classification(&verified_initialization["classification"]);
+    let (code, stdout, stderr) = ember(
+        &cli_binary,
+        &state_root,
+        &["receipt", "show", &initialization_receipt_id],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let shown_initialization: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        shown_initialization["body"]["initialization_evidence"]["kind"],
+        "development"
+    );
+    assert_exact_classification(&shown_initialization["body"]["classification"]);
+    let tip: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state_root.join("protected-tip.json")).unwrap())
+            .unwrap();
+    let generation = tip["generation"].as_u64().unwrap();
+    let generation_path = state_root
+        .join("generations")
+        .join(format!("{generation:020}.json"));
+    let mut tampered_generation = std::fs::read(&generation_path).unwrap();
+    tampered_generation.push(b' ');
+    std::fs::write(generation_path, tampered_generation).unwrap();
+    let (code, _, stderr) = ember(&cli_binary, &state_root, &["status", "--json"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("restore_failed"), "{stderr}");
+
+    drop(restarted);
+    home.close().unwrap();
+}
+
+#[test]
+fn initialization_refuses_untrusted_daemon_sibling_without_state_writes() {
+    let installation = tempfile::Builder::new()
+        .prefix("pb-r2-install")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let cli = installation.path().join("ember");
+    let daemon = installation.path().join("emberd");
+    std::fs::copy(PathBuf::from(env!("CARGO_BIN_EXE_ember")), &cli).unwrap();
+
+    let home = tempfile::Builder::new()
+        .prefix("pb-r2-init-refusal")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
+    std::fs::create_dir_all(state_root.parent().unwrap()).unwrap();
+    std::fs::set_permissions(
+        state_root.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let init_args = [
+        "init",
+        "diagnostic",
+        "--project",
+        home.path().to_str().unwrap(),
+    ];
+    let assert_no_state = || {
+        assert!(!state_root.exists());
+        let parent = state_root.parent().unwrap();
+        let name = state_root.file_name().unwrap().to_str().unwrap();
+        assert!(!parent.join(format!("{name}.continuity.json")).exists());
+        assert!(!parent.join(format!("{name}.continuity.next.json")).exists());
+        assert!(!parent.join(format!("{name}.high-water.json")).exists());
+    };
+
+    let (code, _, stderr) = ember(&cli, &state_root, &init_args);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("bootstrap_artifact_invalid"), "{stderr}");
+    assert_no_state();
+
+    std::os::unix::fs::symlink(daemon_binary(), &daemon).unwrap();
+    let (code, _, stderr) = ember(&cli, &state_root, &init_args);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("bootstrap_artifact_invalid"), "{stderr}");
+    assert_no_state();
+    std::fs::remove_file(&daemon).unwrap();
+
+    std::fs::copy(daemon_binary(), &daemon).unwrap();
+    std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (code, _, stderr) = ember(&cli, &state_root, &init_args);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("bootstrap_artifact_invalid"), "{stderr}");
+    assert_no_state();
 }

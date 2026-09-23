@@ -382,6 +382,8 @@ pub struct ProductClassification {
     pub production_classification: String,
     pub release_provenance: String,
     pub credential_use: String,
+    pub credential_scope: String,
+    pub federation: String,
 }
 
 impl ProductClassification {
@@ -393,6 +395,8 @@ impl ProductClassification {
             production_classification: "non-production".into(),
             release_provenance: "absent".into(),
             credential_use: "forbidden".into(),
+            credential_scope: "none".into(),
+            federation: "not-applicable".into(),
         }
     }
 
@@ -404,6 +408,8 @@ impl ProductClassification {
             production_classification: "non-production".into(),
             release_provenance: "present".into(),
             credential_use: "forbidden".into(),
+            credential_scope: "none".into(),
+            federation: "not-applicable".into(),
         }
     }
 }
@@ -484,6 +490,8 @@ pub struct PersistentAuthorityState {
     pub initialization: InitializationRecord,
     pub development_initialization:
         Option<crate::diagnostic_bootstrap::DevelopmentInitializationProof>,
+    /// Live code identity admitted for the daemon artifact in development mode.
+    pub daemon_executable_identity: Option<String>,
     pub qualification_grant: crate::initialization::QualificationGrantRecord,
     pub caller_eligibility: crate::initialization::CallerEligibilityRecord,
     pub harness_profile_authorization: crate::initialization::HarnessProfileAuthorization,

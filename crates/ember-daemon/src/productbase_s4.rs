@@ -78,8 +78,19 @@ fn verify_daemon_executable(control: &AuthorityControl) -> Result<(), Refusal> {
         .map_err(|_| Refusal::new("process_identity_unavailable"))?;
     let digest = identity::executable_digest(&executable)
         .map_err(|_| Refusal::new("process_identity_unavailable"))?;
-    if digest != control.store().snapshot()?.daemon_executable_digest {
+    let state = control.store().snapshot()?;
+    if digest != state.daemon_executable_digest {
         return Err(Refusal::new("untrusted_daemon"));
+    }
+    if let Some(expected_identity) = state.daemon_executable_identity {
+        let pid = std::process::id();
+        let pid_version = identity::process_pid_version(pid)
+            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        let loaded_identity = identity::process_executable_identity(pid, pid_version)
+            .map_err(|_| Refusal::new("process_identity_unavailable"))?;
+        if loaded_identity != expected_identity {
+            return Err(Refusal::new("untrusted_daemon"));
+        }
     }
     Ok(())
 }
@@ -95,6 +106,8 @@ fn handle_control(
         .map_err(|_| Refusal::new("transport_failed"))?;
     let request: ControlRequest = read_control_frame(stream)?;
     let peer = ExecutionBindingAuthority::authenticate_fd(stream)?;
+    verify_daemon_executable(control)?;
+    control.verify_persisted_state(state_root)?;
     let state = control.store().snapshot()?;
     if peer.uid != state.operator_uid {
         return Err(Refusal::new("persona_mismatch"));

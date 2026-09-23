@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -88,6 +87,7 @@ impl AuthorityControl {
             installation_id: uuid::Uuid::new_v4().to_string(),
             classification: ProductClassification::legacy_release_qualification(),
             daemon_executable_digest: validated.daemon_executable_digest.clone(),
+            daemon_executable_identity: None,
             operator_uid: validated.operator_uid,
             initialized_at: now,
             registry_bytes: validated.registry_bytes,
@@ -122,13 +122,7 @@ impl AuthorityControl {
         let stored_receipt =
             EvidenceJournal::append_initialization(&mut state, &custody.receipt_signer()?)?;
         let prior_digest = sha256(&encode_continuity(&request.prior_continuity)?);
-        let store = match DurableStore::initialize(root, state) {
-            Ok(store) => store,
-            Err(error) => {
-                cleanup_failed_initialization(root, &continuity_path);
-                return Err(error);
-            }
-        };
+        let store = DurableStore::initialize(root, state)?;
         let current_continuity = RootContinuityRecord {
             schema: "ember.root-continuity-record/v1".into(),
             generation: 1,
@@ -139,10 +133,8 @@ impl AuthorityControl {
         };
         let continuity_bytes = serde_jcs::to_vec(&current_continuity)
             .map_err(|_| Refusal::new("continuity_unavailable"))?;
-        if atomic_write(&continuity_path, &continuity_bytes).is_err() {
-            cleanup_failed_initialization(root, &continuity_path);
-            return Err(Refusal::new("continuity_unavailable"));
-        }
+        atomic_write(&continuity_path, &continuity_bytes)
+            .map_err(|_| Refusal::new("continuity_unavailable"))?;
         let control = Self {
             store: Arc::new(store),
         };
@@ -171,9 +163,7 @@ impl AuthorityControl {
         now: u64,
     ) -> Result<(Self, InitializationReceipt), Refusal> {
         let continuity_path = continuity_path(root)?;
-        if root.exists() || continuity_path.exists() {
-            return Err(Refusal::new("already_initialized"));
-        }
+        crate::diagnostic_bootstrap::validate_new_state_root(root)?;
         let validated = request.validate(now)?;
         let custody = DeviceCustody::restore(&request.devices)?;
         let development_initialization = request.proof();
@@ -186,6 +176,7 @@ impl AuthorityControl {
             installation_id: uuid::Uuid::new_v4().to_string(),
             classification: validated.classification,
             daemon_executable_digest: validated.daemon_executable_digest,
+            daemon_executable_identity: Some(validated.daemon_executable_identity),
             operator_uid: validated.operator_uid,
             initialized_at: now,
             registry_bytes: validated.registry_bytes,
@@ -217,13 +208,7 @@ impl AuthorityControl {
         let stored_receipt =
             EvidenceJournal::append_initialization(&mut state, &custody.receipt_signer()?)?;
         let prior_digest = sha256(&encode_continuity(&request.prior_continuity)?);
-        let store = match DurableStore::initialize(root, state) {
-            Ok(store) => store,
-            Err(error) => {
-                cleanup_failed_initialization(root, &continuity_path);
-                return Err(error);
-            }
-        };
+        let store = DurableStore::initialize(root, state)?;
         let current_continuity = RootContinuityRecord {
             schema: "ember.root-continuity-record/v1".into(),
             generation: 1,
@@ -234,10 +219,8 @@ impl AuthorityControl {
         };
         let continuity_bytes = serde_jcs::to_vec(&current_continuity)
             .map_err(|_| Refusal::new("continuity_unavailable"))?;
-        if atomic_write(&continuity_path, &continuity_bytes).is_err() {
-            cleanup_failed_initialization(root, &continuity_path);
-            return Err(Refusal::new("continuity_unavailable"));
-        }
+        atomic_write(&continuity_path, &continuity_bytes)
+            .map_err(|_| Refusal::new("continuity_unavailable"))?;
         let control = Self {
             store: Arc::new(store),
         };
@@ -255,7 +238,9 @@ impl AuthorityControl {
 
     pub fn restore(root: &Path) -> Result<Self, Refusal> {
         let store = Arc::new(DurableStore::restore(root)?);
-        verify_initialization_state(&store.snapshot()?)?;
+        let state = store.snapshot()?;
+        Self::verify_state_root_for_initialization(root, &state)?;
+        verify_initialization_state(&state)?;
         verify_continuity(root, &store)?;
         verify_stored_receipts(&store)?;
         OperationSettlement::recover_running(&store)?;
@@ -264,7 +249,9 @@ impl AuthorityControl {
 
     pub fn restore_read_only(root: &Path) -> Result<Self, Refusal> {
         let store = Arc::new(DurableStore::restore(root)?);
-        verify_initialization_state(&store.snapshot()?)?;
+        let state = store.snapshot()?;
+        Self::verify_state_root_for_initialization(root, &state)?;
+        verify_initialization_state(&state)?;
         verify_continuity(root, &store)?;
         verify_stored_receipts(&store)?;
         Ok(Self { store })
@@ -282,6 +269,14 @@ impl AuthorityControl {
             initialization: state.initialization,
             classification: state.classification,
         })
+    }
+    pub fn verify_persisted_state(&self, root: &Path) -> Result<(), Refusal> {
+        self.store.verify_persisted_state()?;
+        let state = self.store.snapshot()?;
+        Self::verify_state_root_for_initialization(root, &state)?;
+        verify_initialization_state(&state)?;
+        verify_continuity(root, &self.store)?;
+        verify_stored_receipts(&self.store)
     }
 
     pub fn generate_devices() -> Result<DeviceState, Refusal> {
@@ -433,6 +428,18 @@ impl AuthorityControl {
     pub fn store(&self) -> &Arc<DurableStore> {
         &self.store
     }
+    fn verify_state_root_for_initialization(
+        root: &Path,
+        state: &PersistentAuthorityState,
+    ) -> Result<(), Refusal> {
+        if matches!(
+            state.initialization.evidence,
+            InitializationEvidence::Development { .. }
+        ) {
+            crate::diagnostic_bootstrap::validate_development_state_root(root)?;
+        }
+        Ok(())
+    }
 }
 fn verify_initialization_state(state: &PersistentAuthorityState) -> Result<(), Refusal> {
     match &state.initialization.evidence {
@@ -449,22 +456,6 @@ fn verify_stored_receipts(store: &DurableStore) -> Result<(), Refusal> {
         ReceiptProjection::verify(store, &receipt_id)?;
     }
     Ok(())
-}
-
-fn cleanup_failed_initialization(root: &Path, continuity_path: &Path) {
-    let _ = fs::remove_file(root.join("protected-tip.json"));
-    let generations = root.join("generations");
-    let _ = fs::remove_file(generations.join("00000000000000000000.json"));
-    let _ = fs::remove_dir(&generations);
-    let _ = fs::remove_dir(root);
-    let _ = fs::remove_file(continuity_path);
-    if let (Some(parent), Some(name)) = (
-        root.parent(),
-        root.file_name().and_then(|value| value.to_str()),
-    ) {
-        let _ = fs::remove_file(parent.join(format!("{name}.continuity.next.json")));
-        let _ = fs::remove_file(parent.join(format!("{name}.high-water.json")));
-    }
 }
 
 fn continuity_path(root: &Path) -> Result<PathBuf, Refusal> {

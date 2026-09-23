@@ -19,7 +19,7 @@ use crate::{
         DeviceCustody, DeviceCustodyEvidence, DeviceState, authority_fingerprint,
         device_set_digest, signing_key_fingerprint,
     },
-    identity::executable_identity_from_file,
+    identity::{executable_identity_from_file, process_executable_identity, process_pid_version},
     initialization::{
         ArtifactDigestEntry, CallerEligibilityRecord, DenyByDefaultPolicy,
         DevelopmentInitialRecords, HarnessProfileAuthorization, InitialQualificationCoverageSet,
@@ -152,6 +152,7 @@ pub struct DevelopmentInitializationRequest {
 pub struct ValidatedDevelopmentInitialization {
     pub authority_fingerprint: String,
     pub daemon_executable_digest: String,
+    pub daemon_executable_identity: String,
     pub registry_bytes: String,
     pub operator_uid: u32,
     pub qualification_grant: QualificationGrantRecord,
@@ -182,6 +183,14 @@ pub fn build_request(
     let project_root = canonical_project;
     let cli = open_artifact("executable:ember", cli_path)?;
     let daemon = open_artifact("bootstrap:emberd", daemon_path)?;
+    let pid = std::process::id();
+    let pid_version =
+        process_pid_version(pid).map_err(|_| Refusal::new("bootstrap_artifact_invalid"))?;
+    let loaded_cli_identity = process_executable_identity(pid, pid_version)
+        .map_err(|_| Refusal::new("bootstrap_artifact_invalid"))?;
+    if loaded_cli_identity != cli.executable_identity {
+        return Err(Refusal::new("bootstrap_artifact_invalid"));
+    }
     let expiry = now.saturating_add(7_200);
     let devices = DeviceCustody::generate()?;
     let custody = DeviceCustody::restore(&devices)?;
@@ -534,6 +543,7 @@ impl DevelopmentInitializationRequest {
         Ok(ValidatedDevelopmentInitialization {
             authority_fingerprint: authority,
             daemon_executable_digest: daemon.digest.clone(),
+            daemon_executable_identity: daemon.executable_identity.clone(),
             registry_bytes,
             operator_uid: caller.operator_uid,
             qualification_grant: grant.clone(),
@@ -679,17 +689,44 @@ pub fn verify_persisted_development(
 }
 
 pub fn validate_new_state_root(root: &Path) -> Result<(), Refusal> {
-    if root.exists() {
-        return Err(Refusal::new("already_initialized"));
+    match fs::symlink_metadata(root) {
+        Ok(_) => return Err(Refusal::new("already_initialized")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(Refusal::new("state_root_untrusted")),
     }
-    validate_state_root(root, false)
+    for path in continuity_paths(root)? {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Err(Refusal::new("already_initialized")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Refusal::new("state_root_untrusted")),
+        }
+    }
+    validate_state_root(root, false, true)
+}
+fn continuity_paths(root: &Path) -> Result<[PathBuf; 3], Refusal> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| Refusal::new("state_root_untrusted"))?;
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Refusal::new("state_root_untrusted"))?;
+    Ok([
+        parent.join(format!("{name}.continuity.json")),
+        parent.join(format!("{name}.continuity.next.json")),
+        parent.join(format!("{name}.high-water.json")),
+    ])
 }
 
 pub fn validate_existing_state_root(root: &Path) -> Result<(), Refusal> {
-    validate_state_root(root, true)
+    validate_state_root(root, true, false)
 }
 
-fn validate_state_root(root: &Path, present: bool) -> Result<(), Refusal> {
+pub fn validate_development_state_root(root: &Path) -> Result<(), Refusal> {
+    validate_state_root(root, true, true)
+}
+
+fn validate_state_root(root: &Path, present: bool, exact_parent: bool) -> Result<(), Refusal> {
     if !root.is_absolute() {
         return Err(Refusal::new("state_root_untrusted"));
     }
@@ -701,7 +738,11 @@ fn validate_state_root(root: &Path, present: bool) -> Result<(), Refusal> {
     if canonical_parent != parent {
         return Err(Refusal::new("state_root_untrusted"));
     }
-    validate_owned_directory(parent)?;
+    if exact_parent {
+        validate_disposable_parent(parent)?;
+    } else {
+        validate_owned_parent(parent)?;
+    }
     if present {
         let metadata =
             fs::symlink_metadata(root).map_err(|_| Refusal::new("state_root_unavailable"))?;
@@ -716,11 +757,17 @@ fn validate_state_root(root: &Path, present: bool) -> Result<(), Refusal> {
     let expected_uid = crate::effective_uid();
     let mut ancestor = parent.parent();
     while let Some(path) = ancestor {
-        let metadata = fs::metadata(path).map_err(|_| Refusal::new("state_root_untrusted"))?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| Refusal::new("state_root_untrusted"))?;
         let mode = metadata.mode();
         let owner_ok = metadata.uid() == expected_uid || metadata.uid() == 0;
-        let writable_ok = mode & 0o022 == 0 || mode & 0o1000 != 0;
-        if !metadata.is_dir() || !owner_ok || !writable_ok {
+        let writable_ok =
+            mode & 0o022 == 0 || (metadata.uid() == 0 && mode & libc::S_ISVTX as u32 != 0);
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_dir()
+            || !owner_ok
+            || !writable_ok
+        {
             return Err(Refusal::new("state_root_untrusted"));
         }
         ancestor = path.parent();
@@ -728,12 +775,24 @@ fn validate_state_root(root: &Path, present: bool) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn validate_owned_directory(path: &Path) -> Result<(), Refusal> {
+fn validate_owned_parent(path: &Path) -> Result<(), Refusal> {
     let metadata = fs::symlink_metadata(path).map_err(|_| Refusal::new("state_root_untrusted"))?;
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_dir()
         || metadata.uid() != crate::effective_uid()
         || metadata.mode() & 0o022 != 0
+    {
+        return Err(Refusal::new("state_root_untrusted"));
+    }
+    Ok(())
+}
+
+fn validate_disposable_parent(path: &Path) -> Result<(), Refusal> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| Refusal::new("state_root_untrusted"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != crate::effective_uid()
+        || metadata.mode() & 0o777 != 0o700
     {
         return Err(Refusal::new("state_root_untrusted"));
     }
@@ -935,6 +994,8 @@ pub fn encode_development_qualification(
         .string(&value.classification.production_classification)?
         .string(&value.classification.release_provenance)?
         .string(&value.classification.credential_use)?
+        .string(&value.classification.credential_scope)?
+        .string(&value.classification.federation)?
         .digest(&value.attestation_key_fingerprint)?
         .list(&value.executable_artifact_digest_list, encode_artifact)?
         .list(&value.profile_artifact_digest_list, encode_artifact)?

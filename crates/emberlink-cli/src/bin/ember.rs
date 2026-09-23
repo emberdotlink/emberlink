@@ -83,8 +83,7 @@ fn init_command(root: &Path, args: &[String]) -> Result<i32, i32> {
     let cli = std::env::current_exe()
         .and_then(fs::canonicalize)
         .map_err(|_| report_code("bootstrap_artifact_invalid"))?;
-    let daemon = fs::canonicalize(cli.with_file_name("emberd"))
-        .map_err(|_| report_code("bootstrap_artifact_invalid"))?;
+    let daemon = cli.with_file_name("emberd");
     let request = build_request(&project, &cli, &daemon, now_unix()).map_err(report_refusal)?;
     let action_definition_digest = request.records.action_definitions[0]
         .action_definition_digest

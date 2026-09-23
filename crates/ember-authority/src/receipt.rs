@@ -3,8 +3,8 @@ use core_events::receipt::{ReceiptEnvelope, verify_receipt_v2};
 use crate::{
     action_definition::ActionDefinitionRegistry,
     audit::{
-        DurableStore, decode_canonical, initialization_receipt_body, linked_fact_set_digest,
-        operation_fact_digests, operation_receipt_body, sha256,
+        DurableStore, classification_digest, decode_canonical, initialization_receipt_body,
+        linked_fact_set_digest, operation_fact_digests, operation_receipt_body, sha256,
     },
     device::DeviceCustody,
     model::{ReceiptIndexRow, Refusal},
@@ -220,10 +220,13 @@ fn verify_initialization(
     {
         return Err(Refusal::new("receipt_invalid"));
     }
-    let expected_fact_count = 2 + record.evidence.fact_digests().len();
+    let classification_digest = classification_digest(&state.classification)
+        .map_err(|_| Refusal::new("receipt_invalid"))?;
+    let expected_fact_count = 3 + record.evidence.fact_digests().len();
     let mut initialization_facts = vec![
         record.root_intent_digest.as_str(),
         record.continuity_digest.as_str(),
+        classification_digest.as_str(),
     ];
     initialization_facts.extend(record.evidence.fact_digests());
     let mut facts = initialization_facts

@@ -4,9 +4,9 @@ use core_events::receipt::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, DirBuilder, OpenOptions},
     io::{self, Read as _, Write as _},
-    os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+    os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant},
@@ -45,9 +45,9 @@ impl DurableStore {
         if state.schema != STATE_SCHEMA || state.generation != 0 {
             return Err(Refusal::new("initialization_invalid"));
         }
-        ensure_private_directory(root)?;
+        create_private_directory(root)?;
         let generations = root.join("generations");
-        ensure_private_directory(&generations)?;
+        create_private_directory(&generations)?;
         if root.join("protected-tip.json").exists() {
             return Err(Refusal::new("already_initialized"));
         }
@@ -101,6 +101,30 @@ impl DurableStore {
             .lock()
             .map_err(|_| Refusal::new("state_unavailable"))
             .map(|state| state.clone())
+    }
+    pub fn verify_persisted_state(&self) -> Result<(), Refusal> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Refusal::new("state_unavailable"))?;
+        let tip_bytes = read_bounded(&self.root.join("protected-tip.json"), 16_384)?;
+        let tip: ProtectedTip = decode_canonical(&tip_bytes, 16_384, "restore_failed")?;
+        enforce_high_water(&self.root, tip.generation, &tip_bytes)?;
+        let state_bytes = read_bounded(
+            &generation_path(&self.root, tip.generation),
+            RECEIPT_ENVELOPE_LIMIT * 8,
+        )?;
+        let live_state_bytes =
+            serde_jcs::to_vec(&*state).map_err(|_| Refusal::new("state_unavailable"))?;
+        if tip.schema != TIP_SCHEMA
+            || tip.generation != state.generation
+            || tip.state_digest != sha256(&state_bytes)
+            || tip.state_digest != sha256(&live_state_bytes)
+            || tip.daemon_executable_digest != state.daemon_executable_digest
+        {
+            return Err(Refusal::new("restore_failed"));
+        }
+        Ok(())
     }
 
     pub fn transaction<T>(
@@ -270,10 +294,12 @@ impl EvidenceJournal {
             return Err(Refusal::new("initialization_receipt_invalid"));
         }
         let terminal_sequence = 1;
-        let expected_fact_count = 2 + state.initialization.evidence.fact_digests().len();
+        let classification_digest = classification_digest(&state.classification)?;
+        let expected_fact_count = 3 + state.initialization.evidence.fact_digests().len();
         let mut initialization_facts = vec![
             state.initialization.root_intent_digest.as_str(),
             state.initialization.continuity_digest.as_str(),
+            classification_digest.as_str(),
         ];
         initialization_facts.extend(state.initialization.evidence.fact_digests());
         let mut fact_digests = initialization_facts
@@ -390,6 +416,13 @@ pub fn initialization_receipt_body(
         "linked_fact_set_digest": linked_fact_set_digest,
         "signer_generation": signer_generation,
     })
+}
+pub fn classification_digest(
+    classification: &crate::model::ProductClassification,
+) -> Result<String, Refusal> {
+    let bytes =
+        serde_jcs::to_vec(classification).map_err(|_| Refusal::new("classification_invalid"))?;
+    Ok(sha256(&bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1034,10 +1067,26 @@ fn enforce_high_water(root: &Path, tip_generation: u64, tip_bytes: &[u8]) -> Res
     Ok(())
 }
 
+fn create_private_directory(path: &Path) -> Result<(), Refusal> {
+    DirBuilder::new().mode(0o700).create(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            Refusal::new("already_initialized")
+        } else {
+            Refusal::new("state_unavailable")
+        }
+    })
+}
+
 fn ensure_private_directory(path: &Path) -> Result<(), Refusal> {
-    fs::create_dir_all(path).map_err(|_| Refusal::new("state_unavailable"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|_| Refusal::new("state_unavailable"))
+    let metadata = fs::symlink_metadata(path).map_err(|_| Refusal::new("state_unavailable"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != crate::effective_uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(Refusal::new("state_unavailable"));
+    }
+    Ok(())
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
