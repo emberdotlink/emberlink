@@ -35,6 +35,17 @@ use support::{
     request as initialization_request,
 };
 
+fn short_temp_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::PathBuf::from("/private/tmp")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
 fn active_session(control: &AuthorityControl, challenge: &str) -> (String, AuthenticatedProcess) {
     let (peer, _other) = UnixStream::pair().unwrap();
     let process =
@@ -240,7 +251,7 @@ fn failed_initialization_leaves_a_fail_closed_partial_authority() {
 fn development_root_validation_refuses_aliases_permissions_and_existing_continuity() {
     let parent = tempfile::Builder::new()
         .prefix("pb-r2-root")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = parent.path().join("authority");
@@ -1122,7 +1133,7 @@ fn canonical_and_frame_limits_accept_exact_and_refuse_plus_one() {
 fn development_authority(label: &str) -> (TempDir, std::path::PathBuf, AuthorityControl) {
     let directory = tempfile::Builder::new()
         .prefix(label)
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = directory.path().join("authority");

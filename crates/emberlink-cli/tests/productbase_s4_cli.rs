@@ -10,6 +10,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn short_temp_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/private/tmp")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
 struct Daemon(Child);
 
 impl Drop for Daemon {
@@ -184,7 +195,7 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
 
     let home = tempfile::Builder::new()
         .prefix("pb4")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     let omitted = Command::new(&cli_binary)
         .env("HOME", home.path())
@@ -523,7 +534,7 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
 
     let replacement_home = tempfile::Builder::new()
         .prefix("pb-r2-replacement")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     let replacement_root = replacement_home.path().join(AUTHORITY_STATE_DIRECTORY);
     std::fs::create_dir_all(replacement_root.parent().unwrap()).unwrap();
@@ -559,7 +570,7 @@ fn session_action_and_post_session_receipt_use_real_binaries() {
 fn replaced_cli_refuses_after_initialization() {
     let installation = tempfile::Builder::new()
         .prefix("pb-r2-cli-replacement")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     let cli = installation.path().join("ember");
     let installed_daemon = installation.path().join("emberd");
@@ -568,7 +579,7 @@ fn replaced_cli_refuses_after_initialization() {
 
     let home = tempfile::Builder::new()
         .prefix("pb-r2-cli-replacement-home")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
@@ -621,7 +632,7 @@ fn replaced_cli_refuses_after_initialization() {
 fn initialization_refuses_untrusted_daemon_sibling_without_state_writes() {
     let installation = tempfile::Builder::new()
         .prefix("pb-r2-install")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     let cli = installation.path().join("ember");
     let daemon = installation.path().join("emberd");
@@ -629,7 +640,7 @@ fn initialization_refuses_untrusted_daemon_sibling_without_state_writes() {
 
     let home = tempfile::Builder::new()
         .prefix("pb-r2-init-refusal")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     let state_root = home.path().join(AUTHORITY_STATE_DIRECTORY);
     std::fs::create_dir_all(state_root.parent().unwrap()).unwrap();

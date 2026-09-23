@@ -14,6 +14,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn short_temp_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::PathBuf::from("/private/tmp")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
 struct Daemon(Child);
 
 impl Drop for Daemon {
@@ -58,7 +69,7 @@ fn replaced_daemon_artifact_refuses_before_opening_authority_rpc() {
 
     let home = tempfile::Builder::new()
         .prefix("pb4")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_root = home.path().join("authority");
@@ -91,7 +102,7 @@ fn daemon_refuses_concurrent_owner_and_recovers_stale_socket() {
     let daemon_binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_emberd"));
     let home = tempfile::Builder::new()
         .prefix("pb4-daemon-lease")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_root = home.path().join("authority");
@@ -169,7 +180,7 @@ fn daemon_sigterm_exits_cleanly_and_removes_control_socket() {
     let daemon_binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_emberd"));
     let home = tempfile::Builder::new()
         .prefix("pb4-daemon-stop")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(short_temp_dir())
         .unwrap();
     std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state_root = home.path().join("authority");
